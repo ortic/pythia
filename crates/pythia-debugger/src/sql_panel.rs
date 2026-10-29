@@ -43,6 +43,8 @@ pub(crate) struct SqlPanel {
     pub statistics: bool,
     /// The panel opens on a newly flagged statement (Settings → Debugger).
     pub open_on_flag: bool,
+    /// Opened since the app last looked: its tab comes to the front.
+    pub raise: bool,
     /// Stops so far: an answer for an earlier stop is outdated.
     stop: u64,
     /// The stop a lookup is on its way for.
@@ -75,6 +77,7 @@ impl Default for SqlPanel {
             show: false,
             statistics: true,
             open_on_flag: true,
+            raise: false,
             stop: 0,
             finding: None,
             found: None,
@@ -272,6 +275,7 @@ impl SqlPanel {
         );
         if self.open_on_flag && self.announced.insert(key.clone()) && !self.picked {
             self.show = true;
+            self.raise = true;
             self.selected = Some(key.clone());
             self.picked = true;
         }
@@ -923,6 +927,8 @@ mod tests {
         assert!(!panel.show && panel.flag_count() == 0);
         panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
         assert!(panel.show, "opens on the flagged statement");
+        assert!(panel.raise, "its tab comes to the front");
+        panel.raise = false;
         assert_eq!(panel.selected, Some(("orders".into(), 0)));
         let lines = panel.flagged_lines(Some(&pkg));
         assert_eq!(lines.len(), 1);
@@ -952,9 +958,9 @@ mod tests {
         );
         assert_eq!(loads(&out), ["loop", "orders"]);
         panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
-        assert!(!panel.show, "flagged before: stays closed");
+        assert!(!panel.show && !panel.raise, "flagged before: stays closed");
         panel.plan_loaded("loop".into(), 0, Ok(plan("loop", 1.0, 5_000.0)));
-        assert!(panel.show);
+        assert!(panel.show && panel.raise);
         assert_eq!(panel.flag_count(), 2);
 
         // The run ends: the flags go.

@@ -98,7 +98,7 @@ Integration tests against an Oracle Free container live with the crates
 
 - [x] Cargo workspace with crates listed above
 - [x] `eframe` app with the `wgpu` backend, GL fallback
-- [x] Dockable layout (`egui_dock`): object browser, editors, output, results, debugger panels
+- [x] Dockable layout (`egui_dock`): object browser, editors, output, results, debugger panels (each a tab of its own: controls and call stack, variables, watches, breakpoints, SQL plan)
 - [x] Save/restore layout and open tabs per workspace
 - [x] Main menu, toolbar, status bar (connection, session, transaction state, cursor pos, encoding)
 - [x] Command palette (Ctrl+Shift+P) with fuzzy search over all commands

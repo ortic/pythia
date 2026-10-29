@@ -96,7 +96,8 @@ for Linux, Windows and macOS.
   Units with breakpoints are compiled with debug information; Step into
   enters only units that have it (program windows can compile with it,
   Settings → Debugger, and the panel says when a step went over a unit
-  without).
+  without). Its panels (controls and call stack, variables, watches,
+  breakpoints, SQL plan) are tabs to arrange as you like.
 - **Debugger setup** (*Debug → Debugger Setup…*, the panel's *Setup…*,
   and on its own when a debug run can't connect): the database connects
   back to Pythia to debug, which takes `DEBUG CONNECT SESSION`, a network
