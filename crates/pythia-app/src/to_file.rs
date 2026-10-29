@@ -55,9 +55,11 @@ pub fn run(
         if writer.is_none()
             && let Some(out) = out.take()
         {
+            // INSERTs into the table a one-table query reads (#158).
+            let defaults = Options::default();
             let options = Options {
-                table: "my_table".into(),
-                ..Options::default()
+                table: crate::data_edit::single_table(sql).unwrap_or(defaults.table.clone()),
+                ..defaults
             };
             writer = Some(StreamWriter::new(format, columns.to_vec(), options, out).map_err(io)?);
         }
@@ -127,6 +129,16 @@ mod tests {
         assert_eq!(text.lines().count(), 2501);
         assert!(text.starts_with("N,LABEL\n1,row 1\n"));
         std::fs::remove_file(&path).unwrap();
+
+        // INSERTs go into the table the query reads (#158).
+        let sql_path = path.with_extension("sql");
+        run(&conn, "select * from dual", &sql_path, &progress).unwrap();
+        let text = std::fs::read_to_string(&sql_path).unwrap();
+        std::fs::remove_file(&sql_path).unwrap();
+        assert!(
+            text.starts_with("insert into dual (dummy) values ('X');"),
+            "{text}"
+        );
 
         // A failing query leaves no file behind.
         assert!(run(&conn, "select * from no_such_table_xyz", &path, &progress).is_err());

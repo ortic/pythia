@@ -426,6 +426,11 @@ fn data_editing() {
     });
     wait_until(&mut h, "query", |app| !app.test_focused_busy());
     let grid_window = h.state().test_focused();
+    // INSERTs of these rows go into the table they come from (#158).
+    let options = h.state_mut().test_sql_window().state.results[0]
+        .grid
+        .export_options();
+    assert_eq!(options.table, "pythia_edit_t");
 
     let cx = |app: &mut PythiaApp| {
         let (id, settings, connection) = app.test_cx();

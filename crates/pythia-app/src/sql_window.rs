@@ -1344,6 +1344,7 @@ impl SqlWindow {
                     link_relations: Vec::new(),
                 };
                 result.grid.dialect = cx.dialect;
+                result.grid.table = crate::data_edit::single_table(&result.sql);
                 let mut replace = None;
                 if let Some(Internal::EditQuery { edit, replaces }) =
                     running.and_then(|r| r.internal.as_ref())
@@ -1948,8 +1949,12 @@ impl SqlWindow {
                                     // The selection if there is one, else all fetched rows.
                                     let (columns, rows) =
                                         selection_data(&result.columns, &result.rows, &result.grid);
-                                    state.export =
-                                        Some(export_in_background(*format, columns, rows, cx.dialect));
+                                    state.export = Some(export_in_background(
+                                        *format,
+                                        columns,
+                                        rows,
+                                        result.grid.export_options(),
+                                    ));
                                     ui.close();
                                 }
                             }
@@ -2777,7 +2782,7 @@ fn export_in_background(
     format: pythia_data::Format,
     columns: Vec<Column>,
     rows: Vec<Vec<Cell>>,
-    dialect: pythia_db::Dialect,
+    options: pythia_data::Options,
 ) -> std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -2791,17 +2796,8 @@ fn export_in_background(
                 .map_err(|e| e.to_string())
                 .and_then(|file| {
                     let mut out = std::io::BufWriter::new(file);
-                    pythia_data::export(
-                        format,
-                        &columns,
-                        &rows,
-                        &pythia_data::Options {
-                            dialect,
-                            ..Default::default()
-                        },
-                        &mut out,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    pythia_data::export(format, &columns, &rows, &options, &mut out)
+                        .map_err(|e| e.to_string())?;
                     std::io::Write::flush(&mut out).map_err(|e| e.to_string())
                 })
                 .map(|()| Some(path)),
