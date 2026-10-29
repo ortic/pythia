@@ -6,6 +6,8 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-29
+
 ### Added
 - The debugger shows the SQL the stopped code ran, with the real plan
   (#152). The *SQL* panel beside the variables lists the statements the
@@ -1019,7 +1021,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/pythia/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ortic/pythia/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ortic/pythia/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ortic/pythia/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ortic/pythia/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ortic/pythia/compare/v0.4.1...v0.5.0
