@@ -803,6 +803,7 @@ fn sql_details_of_a_statement() {
     assert!(d.stats.as_ref().unwrap().executions >= 2.0, "{:?}", d.stats);
     assert!(d.children.len() >= 2, "{:?}", d.children);
     assert!(!d.plan.is_empty());
+    assert!(!d.plan_rows.is_empty(), "the plan's lines too");
     assert!(d.child.is_some());
 
     let first = d.children[0].child;
@@ -821,6 +822,70 @@ fn sql_details_of_a_statement() {
     // A statement gone from the shared pool.
     let d = queries::sql_detail(&conn, "0000000000000", None);
     assert!(d.text.is_none() && d.children.is_empty() && d.errors.is_empty());
+}
+
+/// A statement that collected row source statistics: its plan lines have
+/// the last execution's actual rows next to the estimates, in the SQL
+/// details and in the details of the session that ran it (#152).
+#[test]
+fn plans_with_actual_rows() {
+    let Some(conn) = dba() else { return };
+    let other = open_dba();
+    // Before the statement: it is the session's previous one then.
+    let (other_sid, other_serial) = (sid(&other), serial(&other));
+    let marker = format!(
+        "pythia_actuals_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Estimated at 1% of the rows, all of them match.
+    let sql = format!(
+        "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
+           from (select level n from dual connect by level <= 3000) \
+          where upper(to_char(n)) = to_char(n)"
+    );
+    let n: i64 = other.query_row_as(&sql, &[]).unwrap();
+    assert_eq!(n, 3000);
+    let sql_id: String = conn
+        .query_row_as(
+            "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
+               and sql_text not like '%v$sql%' and rownum = 1",
+            &[&marker],
+        )
+        .unwrap();
+
+    let d = queries::sql_detail(&conn, &sql_id, None);
+    assert!(d.errors.is_empty(), "{:?}", d.errors);
+    assert!(
+        pythia_ui::plan::has_actuals(&d.plan_rows),
+        "{:?}",
+        d.plan_rows
+    );
+    assert!(d.plan.iter().any(|l| l.contains("A-Rows")), "{:?}", d.plan);
+    let count = d
+        .plan_rows
+        .iter()
+        .find(|r| r.operation.starts_with("SORT AGGREGATE"))
+        .expect("the count");
+    assert_eq!(count.actual_rows, Some(1.0));
+    let (_, note) = pythia_ui::plan::misestimate_note(&d.plan_rows).expect("a misestimate");
+    assert!(note.contains("got 3,000"), "{note}");
+
+    let parts = [DetailTab::Plan];
+    let s = queries::session_details(&conn, other_sid, other_serial, &parts);
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert!(
+        pythia_ui::plan::has_actuals(&s.plan_rows),
+        "{:?}",
+        s.plan_rows
+    );
+    assert!(s.plan.iter().any(|l| l.contains("A-Rows")), "{:?}", s.plan);
+
+    // Without statistics: estimates only.
+    let d = queries::sql_detail(&conn, "0000000000000", None);
+    assert!(d.plan_rows.is_empty());
 }
 
 /// Wait events for the dashboard's rates and an event's histogram (#74).

@@ -67,9 +67,17 @@ impl PlanRow {
             String::new()
         };
         let direction = if actual >= expected { "more" } else { "fewer" };
+        let rows = |n: f64| {
+            let count = fmt_count(n);
+            if count == "1" {
+                "1 row".to_owned()
+            } else {
+                format!("{count} rows")
+            }
+        };
         Some(format!(
-            "estimated {} rows{per_start}, got {} ({}× {direction})",
-            fmt_count(expected),
+            "estimated {}{per_start}, got {} ({}× {direction})",
+            rows(expected),
             fmt_count(actual),
             fmt_count(factor)
         ))
@@ -93,6 +101,44 @@ pub fn worst_misestimate(plan: &[PlanRow]) -> Option<&PlanRow> {
         })
         .max_by(|(a, fa), (b, fb)| a.depth.cmp(&b.depth).then(fa.total_cmp(fb)))
         .map(|(r, _)| r)
+}
+
+/// The worst misestimate as a note above a plan, e.g. "⚠ Estimate off at
+/// 3 TABLE ACCESS FULL PYTHIA.T: estimated 25,000 rows, got 200 (125×
+/// fewer)", with its line's id.
+pub fn misestimate_note(plan: &[PlanRow]) -> Option<(u32, String)> {
+    let worst = worst_misestimate(plan)?;
+    let object = if worst.object.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", worst.object)
+    };
+    Some((
+        worst.id,
+        format!(
+            "⚠ Estimate off at {} {}{object}: {}",
+            worst.id,
+            worst.operation,
+            worst.misestimate_text().unwrap_or_default()
+        ),
+    ))
+}
+
+/// Plan rows of a cursor from `pythia_db::cursor_plan`. Its statistics
+/// are written when an execution ends: while the first one runs every
+/// line has 0 starts, and the rows get none rather than zeros.
+pub fn cursor_rows(columns: &[Column], data: &[Vec<Cell>]) -> Vec<PlanRow> {
+    let mut rows = rows(columns, data);
+    if !rows.iter().any(|r| r.starts.is_some_and(|s| s > 0.0)) {
+        for r in &mut rows {
+            r.starts = None;
+            r.actual_rows = None;
+            r.actual_time = None;
+            r.buffers = None;
+            r.reads = None;
+        }
+    }
+    rows
 }
 
 /// Reads plan rows: PLAN_TABLE's (as returned by `MetaQuery::ExplainPlan`)
@@ -216,9 +262,52 @@ pub fn text(plan: &[PlanRow]) -> String {
 pub struct PlanView {
     collapsed: HashSet<u32>,
     selected: Option<u32>,
+    /// [`PlanView::report_ui`] shows DBMS_XPLAN's text instead of the tree.
+    show_text: bool,
 }
 
 impl PlanView {
+    /// [`PlanView::report_ui`] shows DBMS_XPLAN's text rather than the tree.
+    pub fn shows_text(&self) -> bool {
+        self.show_text
+    }
+
+    /// A plan from the cursor cache: the tree, or DBMS_XPLAN's report of
+    /// it (`text`) a click away, with the worst misestimate named and Copy
+    /// (of the report). The tree fills the rest of `ui`.
+    pub fn report_ui(&mut self, ui: &mut Ui, plan: &[PlanRow], text: &str, id: egui::Id) {
+        if !plan.is_empty() {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.show_text, false, "Plan");
+                ui.selectable_value(&mut self.show_text, true, "DBMS_XPLAN")
+                    .on_hover_text("The plan as DBMS_XPLAN.DISPLAY_CURSOR shows it");
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(text.to_owned());
+                }
+                if let Some((line, note)) = misestimate_note(plan) {
+                    let note =
+                        egui::Label::new(RichText::new(note).color(ui.visuals().warn_fg_color))
+                            .truncate()
+                            .sense(Sense::click());
+                    if ui.add(note).on_hover_text("Show the line").clicked() {
+                        self.show_text = false;
+                        self.selected = Some(line);
+                    }
+                }
+            });
+            if !self.show_text {
+                self.ui(ui, plan, id);
+                return;
+            }
+        }
+        egui::ScrollArea::both()
+            .id_salt(id.with("text"))
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(text).monospace()).extend());
+            });
+    }
+
     /// Selects a plan line (shows its predicates), e.g. the worst
     /// misestimate.
     pub fn select(&mut self, id: Option<u32>) {
@@ -617,6 +706,10 @@ mod tests {
         assert_eq!(
             off.misestimate_text().as_deref(),
             Some("estimated 20 rows, got 2,000 (100× more)")
+        );
+        assert_eq!(
+            line(6, 1, 1.0, 1.0, 3000.0).misestimate_text().as_deref(),
+            Some("estimated 1 row, got 3,000 (3,000× more)")
         );
         let fewer = line(4, 1, 30.0, 10.0, 3.0);
         assert_eq!(fewer.misestimate(), Some(100.0));

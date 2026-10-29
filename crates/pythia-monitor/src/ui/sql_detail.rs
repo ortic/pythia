@@ -19,6 +19,8 @@ pub struct SqlDetailView {
     requested: bool,
     /// The child cursor asked for (else the most executed).
     child: Option<i64>,
+    /// The child's plan as a tree.
+    plan_view: pythia_ui::plan::PlanView,
     /// Its activity, plan history and monitored executions.
     pub(crate) history: HistoryView,
 }
@@ -33,6 +35,7 @@ impl SqlDetailView {
             loading: false,
             requested: false,
             child: None,
+            plan_view: pythia_ui::plan::PlanView::default(),
         }
     }
 
@@ -150,12 +153,27 @@ impl SqlDetailView {
                     section(ui, &format!("Plan of child {c}"), |ui| {
                         if d.plan.is_empty() {
                             ui.weak("No plan in the cursor cache");
+                            return;
                         }
-                        egui::ScrollArea::horizontal()
-                            .id_salt("sql-detail-plan")
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(d.plan.join("\n")).monospace());
-                            });
+                        // The page scrolls: the plan gets the height its
+                        // lines (or the report's) take, up to a limit, with
+                        // room for a line's predicates.
+                        let row = pythia_ui::row_height(ui) + 2.0;
+                        let shown = if self.plan_view.shows_text() || d.plan_rows.is_empty() {
+                            ui.text_style_height(&egui::TextStyle::Monospace)
+                                * (d.plan.len() as f32 + 1.0)
+                        } else {
+                            row * (d.plan_rows.len() as f32 + 1.0) + 100.0
+                        };
+                        let height = shown.min(560.0) + row;
+                        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                            self.plan_view.report_ui(
+                                ui,
+                                &d.plan_rows,
+                                &d.plan.join("\n"),
+                                egui::Id::new(("sql-detail-plan", &d.sql_id, c)),
+                            );
+                        });
                     });
                     ui.add_space(6.0);
                     if !d.binds.is_empty() {

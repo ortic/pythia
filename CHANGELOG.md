@@ -137,11 +137,12 @@ All notable changes to Pythia are documented here. The format follows
   `schema.table` now, as on MySQL 8.
 
 ### Changed
-- *Run with statistics* shows the actual plan as a tree with Starts,
-  E-Rows, A-Rows, A-Time, Buffers and Reads, the worst misestimate named
-  above it, and DBMS_XPLAN's report a click away (#152). The assistant gets
-  a cursor's plan with ALLSTATS LAST when its last execution collected
-  row source statistics.
+- *Run with statistics* and the monitor's session and SQL details show
+  the actual plan as a tree with Starts, E-Rows, A-Rows, A-Time, Buffers
+  and Reads, the worst misestimate named above it, and DBMS_XPLAN's
+  report a click away (#152). The session details' plan has the last
+  execution's statistics too (ALLSTATS LAST) when the cursor collected
+  them, and so does the plan the assistant gets for a cursor.
 
 
 ## [0.7.0] - 2026-10-28

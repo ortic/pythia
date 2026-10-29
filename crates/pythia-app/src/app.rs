@@ -4821,6 +4821,14 @@ impl PythiaApp {
         self.apply_browser(effects);
     }
 
+    pub fn test_monitor_window(&mut self) -> &mut crate::monitor_window::MonitorWindow {
+        let id = self.focused.expect("focused document");
+        match self.docs.get_mut(&id).map(|d| &mut d.kind) {
+            Some(DocKind::Monitor(m)) => m,
+            _ => panic!("not a monitor"),
+        }
+    }
+
     pub fn test_sql_window(&mut self) -> &mut SqlWindow {
         let id = self.focused.expect("focused document");
         self.docs

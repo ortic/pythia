@@ -354,7 +354,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 - [x] Lock tree / blocking sessions
 - [x] Long operations (`V$SESSION_LONGOPS`)
 - [x] Drill-down from the dashboard: tiles, wait classes, users, programs, machines, cursor holders, long operations and wait events lead to the sessions behind them
-- [x] Session details: overview (client, connection, transaction, PGA, temp, PL/SQL, time model, waits), captured binds, the session's own plan, statistic deltas, all columns
+- [x] Session details: overview (client, connection, transaction, PGA, temp, PL/SQL, time model, waits), captured binds, the session's own plan (as a tree with actual rows when the cursor collected statistics), statistic deltas, all columns
 - [x] SQL details: totals, child cursors, plans, binds, why children aren't shared, sessions running it
 - [x] With the Diagnostics Pack: ASH activity of a session or statement, filtered ASH reports, plan history from AWR
 - [x] Tablespace usage overview
