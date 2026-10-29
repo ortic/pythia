@@ -1065,8 +1065,7 @@ fn debugger_session() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     use pythia_debugger::{Unit, UnitType};
     let mut h = harness(true).alone();
     h.state_mut().test_connect(profile, password);
@@ -1239,8 +1238,7 @@ fn debugger_sql_panel() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     // The SQL panel's views, before any session connects (#154).
     crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
     let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
@@ -1428,13 +1426,27 @@ fn monitor_plan_with_actual_rows() {
     save(&mut h, "07-monitor-sql-plan-dark");
 }
 
+/// One test at a time runs [`debug_setup`]'s statements.
+static DEBUG_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lets `user` debug with the database connecting back to `host`, as the
+/// DBA. One test at a time: adding the same ACL entry from two sessions
+/// collides while it doesn't exist yet (#155). A lock of its own, held for
+/// the statements only: tests call it holding the UI lock, and
+/// `debugger_setup_fixes_the_acl` holds ACCOUNTS while it waits for that.
+fn debug_setup(user: &str, host: &str) {
+    let _setup = DEBUG_SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let setup = pythia_debugger::target::setup_statements(user, host);
+    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
 /// pythia-debugger's debugging scenario: order processing across packages.
 const DEBUG_SCENARIO: &str = include_str!("../../pythia-debugger/tests/scenario/orders.sql");
 
 /// The environment of the debugger scenario tests: the test user's profile
-/// and password, the debugger host and the DBA connect spec.
-fn debug_environment() -> Option<(ConnectionProfile, String, String, String)> {
-    let (Some((profile, password)), Ok(host), Ok(dba)) = (
+/// and password and the debugger host (the DBA must be set too).
+fn debug_environment() -> Option<(ConnectionProfile, String, String)> {
+    let (Some((profile, password)), Ok(host), Ok(_)) = (
         profile(),
         std::env::var("PYTHIA_DEBUG_HOST"),
         std::env::var("PYTHIA_TEST_DB_DBA"),
@@ -1442,23 +1454,20 @@ fn debug_environment() -> Option<(ConnectionProfile, String, String, String)> {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_TEST_DB_DBA / PYTHIA_DEBUG_HOST not set, skipping");
         return None;
     };
-    Some((profile, password, host, dba))
+    Some((profile, password, host))
 }
 
 /// Lets the test user debug (with the database connecting back to `host`)
 /// and installs [`DEBUG_SCENARIO`], compiled without debug information.
 /// Returns a connection of the test user. The tests share the scenario:
 /// create the harness first, [alone](Ui::alone).
-fn install_debug_scenario(host: &str, dba: &str) -> pythia_db::oracle::Connection {
+fn install_debug_scenario(host: &str) -> pythia_db::oracle::Connection {
     let connect = |spec: &str| {
         let (cred, db) = spec.rsplit_once('@').unwrap();
         let (user, pw) = cred.split_once('/').unwrap();
         pythia_db::oracle::Connection::connect(user, pw, db).unwrap()
     };
-    let dba = connect(dba);
-    for stmt in pythia_debugger::target::setup_statements("pythia", host) {
-        dba.execute(&stmt, &[]).unwrap();
-    }
+    debug_setup("pythia", host);
     let conn = connect(&std::env::var("PYTHIA_TEST_DB").unwrap());
     for drop in [
         "drop trigger dbgx_orders_bu",
@@ -1504,12 +1513,12 @@ fn scenario_marker(head: &str, name: &str) -> u32 {
 #[test]
 fn debugger_follows_execution() {
     use pythia_debugger::{DebugCommand, Unit, UnitType};
-    let Some((profile, password, host, dba)) = debug_environment() else {
+    let Some((profile, password, host)) = debug_environment() else {
         return;
     };
     let mut h = harness(true).alone();
     // Install the scenario, with debug information everywhere.
-    let conn = install_debug_scenario(&host, &dba);
+    let conn = install_debug_scenario(&host);
     let unit = |name: &str, t| Unit::new("PYTHIA", name, t);
     let api = unit("DBGX_ORDERS_API", UnitType::PackageBody);
     let trigger = unit("DBGX_ORDERS_BU", UnitType::Trigger);
@@ -1621,11 +1630,11 @@ fn debugger_follows_execution() {
 #[test]
 fn debugger_steps_into_unit_compiled_in_program_window() {
     use pythia_debugger::{DebugCommand, Unit, UnitType};
-    let Some((profile, password, host, dba)) = debug_environment() else {
+    let Some((profile, password, host)) = debug_environment() else {
         return;
     };
     let mut h = harness(true).alone();
-    let conn = install_debug_scenario(&host, &dba);
+    let conn = install_debug_scenario(&host);
     let api = Unit::new("PYTHIA", "DBGX_ORDERS_API", UnitType::PackageBody);
     let pricing = Unit::new("PYTHIA", "DBGX_PRICING", UnitType::PackageBody);
     pythia_debugger::target::compile_debug(&conn, &api).unwrap();
@@ -3775,8 +3784,7 @@ fn debug_from_package_spec() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
     let (cred, db) = spec.rsplit_once('@').unwrap();
     let (user, pw) = cred.split_once('/').unwrap();
