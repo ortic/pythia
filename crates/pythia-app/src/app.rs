@@ -42,10 +42,26 @@ pub enum Tab {
     Browser,
     Project,
     Log,
+    /// The debugger's controls and call stack; its other panels are tabs
+    /// of their own, to arrange freely (#163).
     Debugger,
     Doc(DocId),
     Assistant,
+    DebugVariables,
+    DebugWatches,
+    DebugBreakpoints,
+    DebugSql,
 }
+
+/// The debugger's panels, docked right of each other below the documents
+/// (breakpoints behind watches), each with the share the panel left of it
+/// keeps.
+const DEBUG_PANELS: [(Tab, f32); 4] = [
+    (Tab::Debugger, 0.5),
+    (Tab::DebugVariables, 0.3),
+    (Tab::DebugWatches, 0.55),
+    (Tab::DebugBreakpoints, 0.5),
+];
 
 /// A lookup of the debugger's SQL panel in flight.
 enum DebugSqlLookup {
@@ -69,6 +85,10 @@ struct Workspace {
     /// Breakpoints, watches and Break on exceptions.
     #[serde(default)]
     debug: pythia_debugger::ui::Saved,
+    /// The debugger's panels are tabs of their own (#163): before, the
+    /// Debugger tab had them all.
+    #[serde(default)]
+    debug_panels: bool,
 }
 
 pub struct PythiaApp {
@@ -262,6 +282,9 @@ impl PythiaApp {
                 let docs = &app.docs;
                 app.dock
                     .retain_tabs(|tab| !matches!(tab, Tab::Doc(id) if !docs.contains_key(id)));
+                if !ws.debug_panels && app.dock.find_tab(&Tab::Debugger).is_some() {
+                    app.add_debug_panels();
+                }
             }
         }
         if app.docs.is_empty() {
@@ -1002,13 +1025,72 @@ impl PythiaApp {
         }
     }
 
+    /// Shows the debugger with any of its panels that were closed. The SQL
+    /// plan comes with it while shown.
+    fn open_debugger(&mut self) {
+        self.add_debug_panels();
+        self.open_tab(Tab::Debugger);
+    }
+
+    fn add_debug_panels(&mut self) {
+        for (tab, _) in DEBUG_PANELS {
+            if self.dock.find_tab(&tab).is_none() {
+                self.place_tab(tab);
+            }
+        }
+        if self.debug.sql_shown() && self.dock.find_tab(&Tab::DebugSql).is_none() {
+            self.place_tab(Tab::DebugSql);
+        }
+    }
+
+    /// The SQL plan's tab follows its toggle: it opens, comes to the front
+    /// on a misestimate, and goes when hidden.
+    fn sync_debug_sql(&mut self) {
+        let raise = self.debug.take_sql_raise();
+        let tab = self.dock.find_tab(&Tab::DebugSql);
+        if !self.debug.sql_shown() {
+            if let Some(path) = tab {
+                self.dock.remove_tab(path);
+            }
+        } else if raise || tab.is_none() {
+            self.open_tab(Tab::DebugSql);
+        }
+    }
+
     fn place_tab(&mut self, tab: Tab) {
         // The debugger docks below the documents so code and variables are
-        // visible together, with room for the plans of its SQL panel.
+        // visible together.
         if tab == Tab::Debugger
             && let Some(path) = self.dock.find_tab_from(|t| matches!(t, Tab::Doc(_)))
         {
             self.dock[path.surface].split_below(path.node, 0.56, vec![tab]);
+            return;
+        }
+        if let Some(i) = DEBUG_PANELS.iter().position(|(t, _)| *t == tab) {
+            let before = DEBUG_PANELS[..i]
+                .iter()
+                .rev()
+                .find_map(|(t, _)| self.dock.find_tab(t).map(|path| (*t, path)));
+            match before {
+                Some((Tab::DebugWatches, path)) if tab == Tab::DebugBreakpoints => {
+                    self.dock.set_focused_node_and_surface(path.node_path());
+                    self.dock.push_to_focused_leaf(tab);
+                    // Watches stay in front.
+                    let _ = self.dock.set_active_tab(path);
+                    return;
+                }
+                Some((_, path)) => {
+                    self.dock[path.surface].split_right(path.node, DEBUG_PANELS[i].1, vec![tab]);
+                    return;
+                }
+                None => {}
+            }
+        }
+        // The SQL plan needs width and height: right of the code it ran.
+        if tab == Tab::DebugSql
+            && let Some(path) = self.dock.find_tab_from(|t| matches!(t, Tab::Doc(_)))
+        {
+            self.dock[path.surface].split_right(path.node, 0.5, vec![tab]);
             return;
         }
         // The assistant sits right of the documents it works with.
@@ -1859,7 +1941,7 @@ impl PythiaApp {
                 w.state.debug_start = None;
             }
         }
-        self.open_tab(Tab::Debugger);
+        self.open_debugger();
         self.open_tab(Tab::Doc(doc));
         self.debug_actions(actions);
     }
@@ -2509,7 +2591,7 @@ impl PythiaApp {
             Command::DebugRunToCursor => self.debug_run_to_cursor(),
             Command::DebugStop => self.debug.stop(),
             Command::DebugSetup => self.open_debug_setup(None),
-            Command::ShowDebugger => self.open_tab(Tab::Debugger),
+            Command::ShowDebugger => self.open_debugger(),
             Command::ShowVariables => {
                 if let Some(id) = self.focused
                     && let Some(w) = self.docs.get_mut(&id).and_then(Document::sql_window)
@@ -4681,6 +4763,7 @@ impl eframe::App for PythiaApp {
         } = viewer;
         // From the debugger panel, e.g. a call stack frame's source.
         self.debug_actions(debug_actions);
+        self.sync_debug_sql();
         for (id, connection) in rebind {
             self.rebind(id, connection);
         }
@@ -4718,6 +4801,7 @@ impl eframe::App for PythiaApp {
             project: std::mem::take(&mut self.project),
             marks: std::mem::take(&mut self.browser.marks),
             debug: self.debug.saved(),
+            debug_panels: true,
         };
         eframe::set_value(storage, WORKSPACE_KEY, &workspace);
         self.docs = workspace.docs;
@@ -5208,6 +5292,23 @@ impl PythiaApp {
         self.apply(self.focused, effects);
     }
 
+    /// Where `tab` is docked: its node, and whether it's in front there.
+    pub fn test_tab(&self, tab: Tab) -> Option<(egui_dock::NodePath, bool)> {
+        let path = self.dock.find_tab(&tab)?;
+        let front = match &self.dock[path.node_path()] {
+            egui_dock::Node::Leaf(leaf) => leaf.active == path.tab,
+            _ => false,
+        };
+        Some((path.node_path(), front))
+    }
+
+    /// Closes `tab` as its close button does, for tabs that need no more.
+    pub fn test_close_tab(&mut self, tab: Tab) {
+        if let Some(path) = self.dock.find_tab(&tab) {
+            self.dock.remove_tab(path);
+        }
+    }
+
     pub fn test_command(&mut self, command: Command) {
         let ctx = self.notify.0.clone();
         self.run_command(&ctx, command);
@@ -5384,6 +5485,10 @@ impl TabViewer for Viewer<'_> {
             Tab::Project => "Project".into(),
             Tab::Log => "Log".into(),
             Tab::Debugger => "Debugger".into(),
+            Tab::DebugVariables => "Variables".into(),
+            Tab::DebugWatches => "Watches".into(),
+            Tab::DebugBreakpoints => "Breakpoints".into(),
+            Tab::DebugSql => sql_plan_title(self.debug.sql_flag_count()).into(),
             Tab::Assistant => "Assistant".into(),
             Tab::Doc(id) => match self.docs.get(id) {
                 Some(doc) => {
@@ -5421,7 +5526,14 @@ impl TabViewer for Viewer<'_> {
                 self.project_actions.extend(actions);
             }
             Tab::Debugger => {
-                let actions = self.debug.ui(ui);
+                let actions = self.debug.stack_ui(ui);
+                self.debug_actions.extend(actions);
+            }
+            Tab::DebugVariables => self.debug.variables_ui(ui),
+            Tab::DebugWatches => self.debug.watches_ui(ui),
+            Tab::DebugBreakpoints => self.debug.breakpoints_ui(ui),
+            Tab::DebugSql => {
+                let actions = self.debug.sql_ui(ui);
                 self.debug_actions.extend(actions);
             }
             Tab::Assistant => {
@@ -5535,6 +5647,10 @@ impl TabViewer for Viewer<'_> {
             }
             self.closed.push(*id);
         }
+        // Closing the plan is hiding it, as with the SQL toggle.
+        if *tab == Tab::DebugSql {
+            self.debug.show_sql(false);
+        }
         egui_dock::widgets::tab_viewer::OnCloseResponse::Close
     }
 
@@ -5554,6 +5670,15 @@ impl TabViewer for Viewer<'_> {
             style.tab_body.inner_margin = egui::Margin::ZERO;
             style
         })
+    }
+}
+
+/// The SQL plan tab's title, with the statements whose estimates are off.
+fn sql_plan_title(flagged: usize) -> String {
+    if flagged > 0 {
+        format!("SQL plan ⚠ {flagged}")
+    } else {
+        "SQL plan".into()
     }
 }
 

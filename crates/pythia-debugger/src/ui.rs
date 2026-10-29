@@ -446,6 +446,7 @@ impl DebugSession {
 
     /// Shows or hides the SQL panel.
     pub fn show_sql(&mut self, show: bool) {
+        self.sql.raise |= show && !self.sql.show;
         self.sql.show = show;
         if show && self.is_suspended() {
             self.sql
@@ -481,6 +482,11 @@ impl DebugSession {
     /// by 10× or more, the first time it is flagged.
     pub fn set_open_sql_on_flag(&mut self, on: bool) {
         self.sql.open_on_flag = on;
+    }
+
+    /// Statements whose estimates were off by 10× or more in this run.
+    pub fn sql_flag_count(&self) -> usize {
+        self.sql.flag_count()
     }
 
     /// Lines of `unit` (`None`: the debugged block) whose statement's
@@ -824,131 +830,143 @@ impl DebugSession {
         }
     }
 
-    /// The debugger panel. Returns actions (e.g. jumping to a stack frame).
+    /// Every panel side by side under the controls, for screenshots. The
+    /// app docks each as a tab of its own (#163): [`Self::stack_ui`],
+    /// [`Self::variables_ui`], [`Self::watches_ui`],
+    /// [`Self::breakpoints_ui`] and [`Self::sql_ui`].
     pub fn ui(&mut self, ui: &mut Ui) -> Vec<DebugAction> {
-        let mut actions = Vec::new();
-        actions.extend(self.toolbar(ui));
-        actions.extend(self.connect_hint(ui));
-        ui.separator();
-        if self.sql.show {
-            let cx = sql_context(&self.state, &self.stack, self.frame, &self.variables);
-            let cx = sql_panel::Context {
-                active: self.is_active(),
-                ..cx
-            };
-            let width = ui.available_width();
-            let panel = egui::Panel::right("dbg-sql")
-                .resizable(true)
-                .default_size(width * 0.55)
-                .size_range(240.0..=width * 0.85)
-                .show(ui, |ui| self.sql.ui(ui, &cx, &mut actions));
-            // Columns don't keep clear of panels: the rest is theirs.
-            let mut rest = ui.available_rect_before_wrap();
-            rest.max.x = rest
-                .max
-                .x
-                .min(panel.response.rect.min.x - ui.spacing().item_spacing.x);
-            let mut columns = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rest)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            self.columns_ui(&mut columns, &mut actions);
-        } else {
-            self.columns_ui(ui, &mut actions);
-        }
-        actions
-    }
-
-    /// Call stack, variables, watches and breakpoints side by side.
-    fn columns_ui(&mut self, ui: &mut Ui, actions: &mut Vec<DebugAction>) {
+        let mut actions = self.controls_ui(ui);
         ui.columns(4, |cols| {
             // Long names and values stay in their column.
             for col in cols.iter_mut() {
                 let clip = col.max_rect().intersect(col.clip_rect());
                 col.set_clip_rect(clip);
             }
-            cols[0].strong("Call stack");
-            let mut select = None;
-            egui::ScrollArea::vertical()
-                .id_salt("dbg-stack")
-                .show(&mut cols[0], |ui| {
-                    for (i, frame) in self.stack.iter().enumerate() {
-                        let text = RichText::new(frame_label(frame)).monospace();
-                        if ui.selectable_label(i == self.frame, text).clicked() {
-                            select = Some(i);
-                        }
-                    }
-                    if self.stack.is_empty() {
-                        ui.weak("—");
-                    }
-                    if !self.log.is_empty() {
-                        ui.add_space(6.0);
-                        // Not justified: that would stretch the words.
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            for line in self.log.iter().rev().take(5) {
-                                ui.add(
-                                    egui::Label::new(RichText::new(line).small().weak()).truncate(),
-                                )
-                                .on_hover_text(line);
-                            }
-                        });
-                    }
-                });
-            if let Some(action) = select.and_then(|i| self.select_frame(i)) {
-                actions.push(action);
-            }
-
-            cols[1].horizontal(|ui| {
-                ui.strong("Variables")
-                    .on_hover_text("Double-click a value to change it while stopped");
-                // Say whose, when it isn't where execution stopped.
-                if self.is_suspended()
-                    && self.frame != self.execution_frame()
-                    && let Some(frame) = self.stack.get(self.frame)
-                {
-                    ui.add(
-                        egui::Label::new(RichText::new(frame_label(frame)).monospace().weak())
-                            .truncate(),
-                    );
-                }
-            });
-            let unit = self.stack.get(self.frame).map(|f| &f.location.unit);
-            let mut rows = Rows {
-                editable: self.is_suspended(),
-                edit: &mut self.value_edit,
-                error: self.value_error.as_ref(),
-                action: None,
-            };
-            egui::ScrollArea::vertical()
-                .id_salt("dbg-vars")
-                .show(&mut cols[1], |ui| {
-                    for (i, var) in self.variables.iter().enumerate() {
-                        let reason = unit
-                            .and_then(|u| self.opaque_reasons.get(&(u.clone(), var.name.clone())))
-                            .map(String::as_str);
-                        variable_ui(ui, var, "", i, &mut rows, reason);
-                    }
-                    if self.variables.is_empty() {
-                        ui.weak("—");
-                    }
-                });
-            let action = rows.action;
-            self.row_action(action);
-
+            self.call_stack_ui(&mut cols[0], &mut actions);
+            self.variables_ui(&mut cols[1]);
             self.watches_ui(&mut cols[2]);
             self.breakpoints_ui(&mut cols[3]);
         });
+        actions
+    }
+
+    /// The Debugger tab: stepping, the state and the call stack. Returns
+    /// actions (e.g. jumping to a stack frame).
+    pub fn stack_ui(&mut self, ui: &mut Ui) -> Vec<DebugAction> {
+        let mut actions = self.controls_ui(ui);
+        self.call_stack_ui(ui, &mut actions);
+        actions
+    }
+
+    /// The SQL plan tab: the statements the session ran and their plans.
+    pub fn sql_ui(&mut self, ui: &mut Ui) -> Vec<DebugAction> {
+        let mut actions = Vec::new();
+        let cx = sql_context(&self.state, &self.stack, self.frame, &self.variables);
+        let cx = sql_panel::Context {
+            active: self.is_active(),
+            ..cx
+        };
+        self.sql.ui(ui, &cx, &mut actions);
+        actions
+    }
+
+    /// Whether the SQL plan should come to the front: shown with the
+    /// toggle, or opened on a misestimate since the last call.
+    pub fn take_sql_raise(&mut self) -> bool {
+        std::mem::take(&mut self.sql.raise)
+    }
+
+    fn controls_ui(&mut self, ui: &mut Ui) -> Vec<DebugAction> {
+        let mut actions = Vec::new();
+        actions.extend(self.toolbar(ui));
+        actions.extend(self.connect_hint(ui));
+        ui.separator();
+        actions
+    }
+
+    fn call_stack_ui(&mut self, ui: &mut Ui, actions: &mut Vec<DebugAction>) {
+        ui.strong("Call stack");
+        let mut select = None;
+        egui::ScrollArea::vertical()
+            .id_salt("dbg-stack")
+            .show(ui, |ui| {
+                for (i, frame) in self.stack.iter().enumerate() {
+                    let text = RichText::new(frame_label(frame)).monospace();
+                    if ui.selectable_label(i == self.frame, text).clicked() {
+                        select = Some(i);
+                    }
+                }
+                if self.stack.is_empty() {
+                    ui.weak("—");
+                }
+                if !self.log.is_empty() {
+                    ui.add_space(6.0);
+                    // Not justified: that would stretch the words.
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        for line in self.log.iter().rev().take(5) {
+                            ui.add(egui::Label::new(RichText::new(line).small().weak()).truncate())
+                                .on_hover_text(line);
+                        }
+                    });
+                }
+            });
+        if let Some(action) = select.and_then(|i| self.select_frame(i)) {
+            actions.push(action);
+        }
+    }
+
+    /// The selected frame's variables; double-click a value to change it.
+    pub fn variables_ui(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Variables")
+                .on_hover_text("Double-click a value to change it while stopped");
+            // Say whose, when it isn't where execution stopped.
+            if self.is_suspended()
+                && self.frame != self.execution_frame()
+                && let Some(frame) = self.stack.get(self.frame)
+            {
+                ui.add(
+                    egui::Label::new(RichText::new(frame_label(frame)).monospace().weak())
+                        .truncate(),
+                );
+            }
+        });
+        let unit = self.stack.get(self.frame).map(|f| &f.location.unit);
+        let mut rows = Rows {
+            editable: self.is_suspended(),
+            edit: &mut self.value_edit,
+            error: self.value_error.as_ref(),
+            action: None,
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("dbg-vars")
+            .show(ui, |ui| {
+                for (i, var) in self.variables.iter().enumerate() {
+                    let reason = unit
+                        .and_then(|u| self.opaque_reasons.get(&(u.clone(), var.name.clone())))
+                        .map(String::as_str);
+                    variable_ui(ui, var, "", i, &mut rows, reason);
+                }
+                if self.variables.is_empty() {
+                    ui.weak("—");
+                }
+            });
+        let action = rows.action;
+        self.row_action(action);
     }
 
     fn toolbar(&mut self, ui: &mut Ui) -> Option<DebugAction> {
         let suspended = self.is_suspended();
         let active = self.is_active();
         let mut setup = false;
-        ui.horizontal(|ui| {
+        // Wraps in a narrow tab; the shortcuts are in the hover.
+        ui.horizontal_wrapped(|ui| {
             let button = |ui: &mut Ui, label: &str, shortcut: &KeyboardShortcut, enabled: bool| {
-                let text = format!("{label}  {}", ui.ctx().format_shortcut(shortcut));
-                ui.add_enabled(enabled, egui::Button::new(text)).clicked()
+                let shortcut = ui.ctx().format_shortcut(shortcut);
+                ui.add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(&shortcut)
+                    .on_disabled_hover_text(shortcut)
+                    .clicked()
             };
             if button(ui, "Continue", &CONTINUE, suspended) {
                 self.command(DebugCommand::Resume);
@@ -1002,7 +1020,8 @@ impl DebugSession {
             {
                 self.show_sql(show);
             }
-            ui.separator();
+        });
+        ui.horizontal(|ui| {
             let (text, color) = match &self.state {
                 State::Idle => ("Not debugging".to_owned(), ui.visuals().weak_text_color()),
                 State::Waiting => (
@@ -1088,7 +1107,8 @@ impl DebugSession {
         }
     }
 
-    fn watches_ui(&mut self, ui: &mut Ui) {
+    /// Watched expressions, with a field to add one.
+    pub fn watches_ui(&mut self, ui: &mut Ui) {
         ui.strong("Watches");
         let mut remove = None;
         let stale = !self.is_suspended();
@@ -1173,7 +1193,8 @@ impl DebugSession {
         }
     }
 
-    fn breakpoints_ui(&mut self, ui: &mut Ui) {
+    /// Every breakpoint, with its condition and hits.
+    pub fn breakpoints_ui(&mut self, ui: &mut Ui) {
         ui.strong("Breakpoints");
         let mut remove = None;
         let mut enable = None;

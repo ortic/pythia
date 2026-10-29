@@ -7117,3 +7117,52 @@ fn maintenance_scan_sqlserver() {
     );
     run_script(&mut h, connection, "drop table pythia_ms_frag;");
 }
+
+/// The debugger's panels are tabs of their own (#163): opened together,
+/// breakpoints behind watches, the SQL plan with its toggle, and a closed
+/// panel comes back when the debugger is shown again.
+#[test]
+fn debugger_panels_are_tabs() {
+    use crate::app::Tab;
+    let mut h = headless_harness();
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowDebugger);
+    h.run_steps(2);
+    let app = h.state();
+    let (debugger, front) = app.test_tab(Tab::Debugger).expect("debugger");
+    assert!(front);
+    let (variables, _) = app.test_tab(Tab::DebugVariables).expect("variables");
+    let (watches, watches_front) = app.test_tab(Tab::DebugWatches).expect("watches");
+    let (breakpoints, _) = app.test_tab(Tab::DebugBreakpoints).expect("breakpoints");
+    assert_ne!(debugger, variables);
+    assert_ne!(variables, watches);
+    assert_eq!(watches, breakpoints, "breakpoints behind watches");
+    assert!(watches_front);
+    assert!(app.test_tab(Tab::DebugSql).is_none(), "closed by default");
+
+    // The SQL toggle opens the plan in front, beside the code.
+    h.state_mut().test_debug_mut().show_sql(true);
+    h.run_steps(2);
+    save(&mut h, "debugger-panels");
+    let (sql, front) = h.state().test_tab(Tab::DebugSql).expect("SQL plan");
+    assert!(front);
+    assert!(![debugger, variables, watches].contains(&sql));
+    h.state_mut().test_debug_mut().show_sql(false);
+    h.run_steps(2);
+    assert!(h.state().test_tab(Tab::DebugSql).is_none(), "hidden: gone");
+
+    // Closed panels come back; open ones stay where they are.
+    h.state_mut().test_close_tab(Tab::DebugVariables);
+    h.run_steps(2);
+    assert!(h.state().test_tab(Tab::DebugVariables).is_none());
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowDebugger);
+    h.run_steps(2);
+    let app = h.state();
+    assert!(app.test_tab(Tab::DebugVariables).is_some());
+    assert_eq!(
+        app.test_tab(Tab::DebugBreakpoints).unwrap().0,
+        app.test_tab(Tab::DebugWatches).unwrap().0
+    );
+}

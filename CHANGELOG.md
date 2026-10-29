@@ -7,6 +7,16 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- The debugger's panels are tabs of their own (#163): *Debugger* (the
+  stepping buttons, the state and the call stack), *Variables*,
+  *Watches*, *Breakpoints* and *SQL plan*. Drag them into tabs, splits or
+  floating windows, or close the ones you don't need; the arrangement is
+  kept across restarts, and *Show Debugger* brings back a closed panel.
+  By default they sit side by side below the code, breakpoints behind
+  watches, and the SQL plan opens right of the code. Its tab follows the
+  toolbar's *SQL* (closing it hides the plan, the checks go on) and comes
+  to the front on a misestimate. The toolbar wraps in a narrow tab; the
+  shortcuts are in the buttons' hover text.
 - The debugger's SQL panel stays closed until it's needed (#162). Every
   stop checks the plans of the statements that ran in the step; one whose
   estimates are off by 10× or more (with at least 200 rows on one side)
