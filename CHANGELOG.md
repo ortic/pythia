@@ -6,6 +6,8 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-29
+
 ### Changed
 - The debugger's panels are tabs of their own (#163): *Debugger* (the
   stepping buttons, the state and the call stack), *Variables*,
@@ -31,6 +33,21 @@ All notable changes to Pythia are documented here. The format follows
   hr.orders where …` they write `insert into hr.orders`, the name as the
   query has it. Results of joins and other queries over several tables
   keep the placeholder `my_table`.
+- Hovering a selection in the debugger shows what it reads (#165):
+  selecting `art_(1)` and hovering it showed `art_`, the whole
+  collection. When the mouse rests in a selection that reads as a path
+  (`art_(1)`, `l_rec.items(2).name`), the hover shows that element or
+  field. In hovers and watches a subscript may name a variable of the
+  frame: `l_order.lines(i)` is `lines(3)` while `i` is 3, and a text
+  variable is a key of an `INDEX BY VARCHAR2` table. Hovering `amount` in
+  `l_order.lines(i).amount` shows the whole path, no longer `i.amount`.
+- The debugger says why an OPAQUE value has no contents (#166) when its
+  type is declared in the package spec of the debugged body (debugging
+  compiles only the body with debug information) or is a SQL type: the
+  unit owner's, another owner's (`sys.odcivarchar2list`) or one reached
+  by a synonym. Oracle's debugger can't read into an OPAQUE value at all;
+  a watch or hover on one of its elements or fields says "art_ is OPAQUE:
+  its contents aren't available" instead of "art_ has no (1)".
 
 ### Fixed
 - A `&` in an exported value turned into a substitution variable when
@@ -56,6 +73,8 @@ All notable changes to Pythia are documented here. The format follows
 - *New SQL* (toolbar, *File → New SQL Window*, Ctrl+N) opened the window
   without the keyboard focus in its editor: typing went nowhere until a
   click into it (#157).
+- Hovering a field in the debugger (`name` in `l_rec.name`) showed its
+  value for one frame only, then the popup was gone (#164).
 
 ## [0.8.0] - 2026-10-29
 
@@ -1072,7 +1091,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/pythia/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ortic/pythia/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ortic/pythia/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ortic/pythia/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ortic/pythia/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ortic/pythia/compare/v0.5.0...v0.6.0
