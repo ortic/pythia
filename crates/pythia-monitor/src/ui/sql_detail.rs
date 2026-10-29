@@ -47,6 +47,14 @@ impl SqlDetailView {
         }
     }
 
+    /// Reads the details again with the next frame, as *Refresh* does
+    /// (unless they are being read).
+    pub fn reload(&mut self) {
+        if !self.loading {
+            self.requested = false;
+        }
+    }
+
     pub fn title(&self) -> String {
         format!("SQL {}", self.sql_id)
     }

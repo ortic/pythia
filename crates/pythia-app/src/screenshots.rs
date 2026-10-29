@@ -1328,17 +1328,13 @@ fn monitor_plan_with_actual_rows() {
             .as_nanos()
     );
     // Estimated at 1% of the rows, all of them match.
-    let n: i64 = conn
-        .query_row_as(
-            &format!(
-                "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
-                   from (select level n from dual connect by level <= 3000) \
-                  where upper(to_char(n)) = to_char(n)"
-            ),
-            &[],
-        )
-        .unwrap();
-    assert_eq!(n, 3000);
+    let sql = format!(
+        "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
+           from (select level n from dual connect by level <= 3000) \
+          where upper(to_char(n)) = to_char(n)"
+    );
+    let run = || conn.query_row_as::<i64>(&sql, &[]).unwrap();
+    assert_eq!(run(), 3000);
     let sql_id: String = conn
         .query_row_as(
             "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
@@ -1375,12 +1371,49 @@ fn monitor_plan_with_actual_rows() {
             Err(e) => Err(e.to_owned()),
         }
     };
+    // Gone from the shared pool when the details read it (seen with the
+    // whole suite on a fresh database, #154): run it again, read again.
+    let gone = |app: &PythiaApp| {
+        app.test_monitor_window_ref()
+            .test_monitor_ref()
+            .and_then(|m| m.sql_detail(&sql_id))
+            .and_then(|v| v.detail().ok().flatten())
+            .is_some_and(|d| d.children.is_empty())
+    };
     let start = Instant::now();
+    let mut rerun = Instant::now();
     while !measured(h.state()).unwrap_or_else(|e| panic!("SQL details of {sql_id}: {e}")) {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "no plan with actual rows for {sql_id}"
-        );
+        if gone(h.state()) && rerun.elapsed() > Duration::from_secs(2) {
+            rerun = Instant::now();
+            run();
+            if let Some(view) = h
+                .state_mut()
+                .test_monitor_window()
+                .test_monitor()
+                .sql_detail_mut(&sql_id)
+            {
+                view.reload();
+            }
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let monitor = h.state().test_monitor_window_ref().test_monitor_ref();
+            let view = monitor.and_then(|m| m.sql_detail(&sql_id));
+            let detail = view.map(|v| {
+                v.detail()
+                    .map(|d| d.map(|d| (&d.child, &d.plan_rows, &d.plan)))
+            });
+            let dba = crate::test_db::connect("PYTHIA_TEST_DB_DBA");
+            let in_pool: Option<Vec<(i64, String, i64)>> = dba.map(|dba| {
+                dba.query_as::<(i64, String, i64)>(
+                    "select child_number, is_obsolete, invalidations from v$sql where sql_id = :1",
+                    &[&sql_id],
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+            });
+            panic!("no plan with actual rows for {sql_id}: {detail:#?}\nin V$SQL now: {in_pool:?}");
+        }
         h.step();
         std::thread::sleep(Duration::from_millis(15));
     }

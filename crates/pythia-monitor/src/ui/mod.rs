@@ -492,6 +492,13 @@ impl Monitor {
         })
     }
 
+    pub fn sql_detail_mut(&mut self, sql_id: &str) -> Option<&mut SqlDetailView> {
+        self.details.iter_mut().find_map(|d| match d {
+            DetailView::Sql(s) if s.sql_id == sql_id => Some(&mut **s),
+            _ => None,
+        })
+    }
+
     pub fn capabilities(&self) -> Option<&Capabilities> {
         self.caps.as_ref().and_then(|c| c.as_ref().ok())
     }
