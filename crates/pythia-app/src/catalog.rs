@@ -304,37 +304,68 @@ fn current_schema(conn: &Connection) -> Result<String, DbError> {
     )?)
 }
 
-/// Objects of a schema; for the current schema (`None`) also public
-/// synonyms, so `dbms_` completes to the supplied packages.
+/// Public synonyms read at most: a database has some ten thousand, Java's
+/// (with a `/`) left out.
+const PUBLIC_SYNONYMS: usize = 100_000;
+
+/// Objects of a schema, all of them; for the current schema (`None`) then
+/// public synonyms, so `dbms_` completes to the supplied packages. One
+/// capped query of both dropped an arbitrary part of a large schema (#161).
 fn objects(conn: &Connection, schema: Option<&str>) -> Result<Vec<CatalogObject>, DbError> {
     let owner = match schema {
         Some(s) => s.to_owned(),
         None => current_schema(conn)?,
     };
-    let mut sql = format!(
-        "select owner, object_name, object_type from all_objects \
-          where owner = :1 and object_type in ({TYPES}) and generated = 'N' and object_name not like 'BIN$%'"
-    );
-    if schema.is_none() {
-        sql.push_str(
-            " union all select 'PUBLIC', synonym_name, 'SYNONYM' from all_synonyms \
-               where owner = 'PUBLIC' and table_owner not in ('PUBLIC') and synonym_name not like '%/%'",
-        );
-    }
-    let rows = conn.query_as::<(String, String, String)>(
-        &pythia_db::compat::first_rows(&sql, 50000),
+    let read = |sql: &str, params: &[&dyn pythia_db::oracle::sql_type::ToSql]| {
+        let mut out = Vec::new();
+        for row in conn.query_as::<(String, String, String)>(sql, params)? {
+            let (owner, name, object_type) = row?;
+            out.push(CatalogObject {
+                owner,
+                name,
+                object_type,
+            });
+        }
+        Ok::<_, DbError>(out)
+    };
+    let mut out = without_mview_tables(read(
+        &format!(
+            "select owner, object_name, object_type from all_objects \
+              where owner = :1 and object_type in ({TYPES}) and generated = 'N' \
+                and object_name not like 'BIN$%'"
+        ),
         &[&owner],
-    )?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (owner, name, object_type) = row?;
-        out.push(CatalogObject {
-            owner,
-            name,
-            object_type,
-        });
+    )?);
+    if schema.is_none() {
+        let synonyms = read(
+            &pythia_db::compat::first_rows(
+                "select 'PUBLIC', synonym_name, 'SYNONYM' from all_synonyms \
+                  where owner = 'PUBLIC' and table_owner not in ('PUBLIC') \
+                    and synonym_name not like '%/%'",
+                PUBLIC_SYNONYMS,
+            ),
+            &[],
+        )?;
+        if synonyms.len() >= PUBLIC_SYNONYMS {
+            tracing::warn!("completion: only the first {PUBLIC_SYNONYMS} public synonyms");
+        }
+        out.extend(synonyms);
     }
     Ok(out)
+}
+
+/// A materialized view's container table has the view's name: completion
+/// offers the view once, not also the table.
+fn without_mview_tables(mut objects: Vec<CatalogObject>) -> Vec<CatalogObject> {
+    let mviews: std::collections::HashSet<(String, String)> = objects
+        .iter()
+        .filter(|o| o.object_type == "MATERIALIZED VIEW")
+        .map(|o| (o.owner.clone(), o.name.clone()))
+        .collect();
+    objects.retain(|o| {
+        o.object_type != "TABLE" || !mviews.contains(&(o.owner.clone(), o.name.clone()))
+    });
+    objects
 }
 
 /// Resolves a name the way Oracle does: own object, private synonym, public
@@ -546,6 +577,71 @@ mod tests {
             }
         }
         panic!("catalog requests did not settle");
+    }
+
+    #[test]
+    fn materialized_views_once() {
+        let obj = |name: &str, object_type: &str| CatalogObject {
+            owner: "IFSAPP".into(),
+            name: name.into(),
+            object_type: object_type.into(),
+        };
+        let objects = without_mview_tables(vec![
+            obj("MXN_ACTIVITY_MV", "TABLE"),
+            obj("MXN_ACTIVITY_MV", "MATERIALIZED VIEW"),
+            obj("MXN_ITEM_TAB", "TABLE"),
+            obj("MXN_ITEM", "VIEW"),
+        ]);
+        assert_eq!(
+            objects
+                .iter()
+                .map(|o| (o.name.as_str(), o.object_type.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("MXN_ACTIVITY_MV", "MATERIALIZED VIEW"),
+                ("MXN_ITEM_TAB", "TABLE"),
+                ("MXN_ITEM", "VIEW"),
+            ]
+        );
+    }
+
+    /// The catalog of the current schema: its objects, a materialized view
+    /// once, and the public synonyms after them (#161).
+    #[test]
+    fn schema_objects_and_public_synonyms() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            eprintln!("PYTHIA_TEST_DB not set, skipping");
+            return;
+        };
+        crate::test_db::demo_schema();
+        crate::test_db::as_dba(&["grant create materialized view to {user}"]);
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        let _ = conn.execute("drop materialized view pcat_mv", &[]);
+        conn.execute(
+            "create materialized view pcat_mv as select department_id, count(*) n \
+               from demo_employees group by department_id",
+            &[],
+        )
+        .unwrap();
+        let objects = objects(&conn, None).unwrap();
+        conn.execute("drop materialized view pcat_mv", &[]).unwrap();
+        let kinds = |name: &str| -> Vec<&str> {
+            objects
+                .iter()
+                .filter(|o| o.name == name)
+                .map(|o| o.object_type.as_str())
+                .collect()
+        };
+        assert_eq!(kinds("PCAT_MV"), ["MATERIALIZED VIEW"]);
+        assert_eq!(kinds("DEMO_EMPLOYEES"), ["TABLE"]);
+        let first_public = objects.iter().position(|o| o.owner == "PUBLIC");
+        assert!(kinds("DBMS_OUTPUT").contains(&"SYNONYM"));
+        assert!(
+            first_public.is_some_and(|p| objects[p..].iter().all(|o| o.owner == "PUBLIC")),
+            "the schema's objects first"
+        );
     }
 
     #[test]
