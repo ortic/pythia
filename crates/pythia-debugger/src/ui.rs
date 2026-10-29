@@ -178,27 +178,15 @@ const SLOW_CONNECT: Duration = Duration::from_secs(8);
 
 /// What the debugger keeps across restarts of Pythia: breakpoints with
 /// their state, conditions and hit counts, the watches, Break on
-/// exceptions, Plan statistics and whether the SQL panel is shown.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// exceptions and whether the SQL panel is shown. (Plan statistics are a
+/// setting, Settings → Debugger.)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Saved {
     pub breakpoints: Vec<SavedBreakpoint>,
     pub watches: Vec<String>,
     pub break_on_exception: bool,
-    pub plan_statistics: bool,
     pub sql_panel: bool,
-}
-
-impl Default for Saved {
-    fn default() -> Self {
-        Self {
-            breakpoints: Vec::new(),
-            watches: Vec::new(),
-            break_on_exception: false,
-            plan_statistics: true,
-            sql_panel: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -402,7 +390,6 @@ impl DebugSession {
                 .collect(),
             watches: self.watches.clone(),
             break_on_exception: self.break_on_exception,
-            plan_statistics: self.sql.statistics,
             sql_panel: self.sql.show,
         }
     }
@@ -426,7 +413,6 @@ impl DebugSession {
         }
         self.watches = saved.watches;
         self.break_on_exception = saved.break_on_exception;
-        self.sql.statistics = saved.plan_statistics;
         self.sql.show = saved.sql_panel;
     }
 
@@ -463,7 +449,7 @@ impl DebugSession {
         self.sql.show = show;
         if show && self.is_suspended() {
             self.sql
-                .find(self.target_session.as_ref(), &mut self.queued);
+                .opened(self.target_session.as_ref(), &mut self.queued);
         }
     }
 
@@ -482,13 +468,26 @@ impl DebugSession {
     }
 
     /// Whether debug runs collect row source statistics for the SQL
-    /// panel's plans (from the next start).
+    /// panel's plans (from the next start), and check them at every stop.
     pub fn set_plan_statistics(&mut self, on: bool) {
         self.sql.statistics = on;
     }
 
     pub fn plan_statistics(&self) -> bool {
         self.sql.statistics
+    }
+
+    /// Whether the SQL panel opens on a statement whose estimates are off
+    /// by 10× or more, the first time it is flagged.
+    pub fn set_open_sql_on_flag(&mut self, on: bool) {
+        self.sql.open_on_flag = on;
+    }
+
+    /// Lines of `unit` (`None`: the debugged block) whose statement's
+    /// estimates were off by 10× or more in this run, with the note, for
+    /// gutter markers.
+    pub fn sql_flags(&self, unit: Option<&Unit>) -> Vec<(u32, String)> {
+        self.sql.flagged_lines(unit)
     }
 
     /// Adds a breakpoint, enables a disabled one, or removes it.
@@ -798,6 +797,7 @@ impl DebugSession {
                 self.value_edit = None;
                 self.value_error = None;
                 self.log.push("Debug session ended".into());
+                self.sql.finished();
                 actions.push(DebugAction::Finished);
             }
             DebugEvent::Error(e) => self.log.push(e),
@@ -980,16 +980,24 @@ impl DebugSession {
             {
                 self.set_break_on_exception(on);
             }
-            ui.checkbox(&mut self.sql.statistics, "Plan statistics")
-                .on_hover_text(
-                    "Collect row source statistics in the debugged session (STATISTICS_LEVEL = \
-                     ALL), so the plans of the statements it runs show actual rows next to the \
-                     estimates. Costs some time per row; applies from the next start.",
-                );
             let mut show = self.sql.show;
+            let flagged = self.sql.flag_count();
+            let label = if flagged > 0 {
+                RichText::new(format!("SQL ⚠ {flagged}")).color(ui.visuals().warn_fg_color)
+            } else {
+                RichText::new("SQL")
+            };
+            let hover = if flagged > 0 {
+                format!(
+                    "The statements the session ran, by line, with their plans: {flagged} with \
+                     estimates off by 10× or more"
+                )
+            } else {
+                "The statements the session ran, by line, with their plans".to_owned()
+            };
             if ui
-                .toggle_value(&mut show, "SQL")
-                .on_hover_text("The statements the session ran, by line, with their plans")
+                .toggle_value(&mut show, label)
+                .on_hover_text(hover)
                 .changed()
             {
                 self.show_sql(show);

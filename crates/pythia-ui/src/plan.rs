@@ -11,6 +11,11 @@ use pythia_db::{Cell, Column};
 /// Estimates off by this factor or more are marked.
 pub const MISESTIMATE: f64 = 10.0;
 
+/// A misestimate is worth a flag outside the plan (the debugger's gutter)
+/// only with this many rows on one side: estimated 1, got 12 is 12× but
+/// costs nothing.
+pub const NOTICEABLE_ROWS: f64 = 200.0;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanRow {
     pub id: u32,
@@ -103,25 +108,43 @@ pub fn worst_misestimate(plan: &[PlanRow]) -> Option<&PlanRow> {
         .map(|(r, _)| r)
 }
 
+/// The misestimate worth a flag outside the plan: the deepest off by
+/// [`MISESTIMATE`] or more with [`NOTICEABLE_ROWS`] on one side.
+pub fn flagged_misestimate(plan: &[PlanRow]) -> Option<&PlanRow> {
+    let noticeable = |r: &PlanRow| {
+        let expected = r.rows.unwrap_or(0.0) * r.starts.unwrap_or(0.0);
+        expected.max(r.actual_rows.unwrap_or(0.0)) >= NOTICEABLE_ROWS
+    };
+    plan.iter()
+        .filter_map(|r| {
+            r.misestimate()
+                .filter(|f| *f >= MISESTIMATE && noticeable(r))
+                .map(|f| (r, f))
+        })
+        .max_by(|(a, fa), (b, fb)| a.depth.cmp(&b.depth).then(fa.total_cmp(fb)))
+        .map(|(r, _)| r)
+}
+
 /// The worst misestimate as a note above a plan, e.g. "⚠ Estimate off at
 /// 3 TABLE ACCESS FULL PYTHIA.T: estimated 25,000 rows, got 200 (125×
 /// fewer)", with its line's id.
 pub fn misestimate_note(plan: &[PlanRow]) -> Option<(u32, String)> {
-    let worst = worst_misestimate(plan)?;
-    let object = if worst.object.is_empty() {
+    worst_misestimate(plan).map(|r| (r.id, note(r)))
+}
+
+/// The note on a misestimated plan line.
+pub fn note(row: &PlanRow) -> String {
+    let object = if row.object.is_empty() {
         String::new()
     } else {
-        format!(" {}", worst.object)
+        format!(" {}", row.object)
     };
-    Some((
-        worst.id,
-        format!(
-            "⚠ Estimate off at {} {}{object}: {}",
-            worst.id,
-            worst.operation,
-            worst.misestimate_text().unwrap_or_default()
-        ),
-    ))
+    format!(
+        "⚠ Estimate off at {} {}{object}: {}",
+        row.id,
+        row.operation,
+        row.misestimate_text().unwrap_or_default()
+    )
 }
 
 /// Plan rows of a cursor from `pythia_db::cursor_plan`. Its statistics
@@ -725,6 +748,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(estimate_only.misestimate(), None);
+    }
+
+    #[test]
+    fn flags_need_rows() {
+        // 12× off, but 1 row against 12: not worth a flag outside the plan.
+        let small = vec![line(0, 0, 1.0, 1.0, 12.0)];
+        assert!(worst_misestimate(&small).is_some());
+        assert!(flagged_misestimate(&small).is_none());
+        let big = vec![line(0, 0, 25_000.0, 1.0, 200.0), line(1, 1, 1.0, 1.0, 12.0)];
+        assert_eq!(flagged_misestimate(&big).map(|r| r.id), Some(0));
     }
 
     #[test]

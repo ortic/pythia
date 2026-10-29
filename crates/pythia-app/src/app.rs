@@ -1842,6 +1842,10 @@ impl PythiaApp {
             Some(DocKind::Sql(w)) => w.state.debug_entry.clone(),
             _ => None,
         };
+        self.debug
+            .set_plan_statistics(self.settings.debug_plan_statistics);
+        self.debug
+            .set_open_sql_on_flag(self.settings.debug_open_sql_panel);
         let actions = self
             .debug
             .start(block, host, ports.as_ref(), entry, self.notify.callback());

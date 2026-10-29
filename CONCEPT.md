@@ -275,7 +275,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 - [x] Modify variable values while paused (scalars: locals, IN OUT/OUT parameters, fields, elements, package globals; numbers checked against precision and range first, as the agent crashes the session on some; not IN parameters or LOBs)
 - [x] Hover over variable shows value while paused
 - [x] DBMS_OUTPUT during debugging (shown when the run ends)
-- [x] SQL panel: the statements the stopped session ran, by unit and line, with the selected one's plan and the last execution's actual rows (`STATISTICS_LEVEL = ALL` in the debugged session), misestimates marked, Ask AI
+- [x] SQL panel: the statements the stopped session ran, by unit and line, with the selected one's plan and the last execution's actual rows (`STATISTICS_LEVEL = ALL` in the debugged session), misestimates marked, Ask AI; closed until a step's statement is off by 10× or more, which is flagged in the gutter and opens it
 - [x] Auto-compile with debug info before starting
 - [ ] Debug triggers and code called from other sessions (attach mode)
 

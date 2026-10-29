@@ -174,7 +174,14 @@ impl Editor {
     }
 
     /// Breakpoint lines and the execution line (1-based) from the debugger.
-    pub fn set_debug_lines(&mut self, breakpoints: &[u32], current: Option<u32>) {
+    /// Breakpoints, where the debugger stopped, and lines whose statement's
+    /// estimates were off in the run (with the note, #162).
+    pub fn set_debug_lines(
+        &mut self,
+        breakpoints: &[u32],
+        current: Option<u32>,
+        flagged: &[(u32, String)],
+    ) {
         let mut markers: Vec<Marker> = breakpoints
             .iter()
             .map(|l| Marker {
@@ -183,6 +190,11 @@ impl Editor {
                 message: "Breakpoint".into(),
             })
             .collect();
+        markers.extend(flagged.iter().map(|(line, note)| Marker {
+            line: *line as usize,
+            kind: MarkerKind::Warning,
+            message: format!("{note}\nThe debugger's SQL panel shows the plan."),
+        }));
         if let Some(line) = current {
             markers.push(Marker {
                 line: line as usize,
@@ -194,7 +206,7 @@ impl Editor {
             && markers
                 .iter()
                 .zip(&self.debug_markers)
-                .all(|(a, b)| a.line == b.line && a.kind == b.kind);
+                .all(|(a, b)| a.line == b.line && a.kind == b.kind && a.message == b.message);
         if !same {
             self.debug_markers = markers;
             self.push_markers();

@@ -7,6 +7,14 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- The debugger's SQL panel stays closed until it's needed (#162). Every
+  stop checks the plans of the statements that ran in the step; one whose
+  estimates are off by 10× or more (with at least 200 rows on one side)
+  gets a warning in the gutter on its line, with the note as hover text,
+  and the toolbar's *SQL* shows ⚠ and their number. The panel opens on
+  such a statement by itself the first time it is flagged (*Open the SQL
+  panel on a misestimate*, Settings → Debugger). *Plan statistics* moved
+  from the debugger's toolbar to Settings → Debugger.
 - INSERT statements of a result go into the table the query reads
   (#158): *Copy as → SQL INSERT*, *Export* and *Execute to file* (`.sql`)
   wrote `insert into my_table` whatever the query. For `select * from
