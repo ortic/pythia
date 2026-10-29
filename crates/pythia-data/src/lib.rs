@@ -424,8 +424,38 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
         }
         Kind::TimestampTz => format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS TZR')"),
         Kind::Binary => format!("hextoraw({quoted})"),
-        Kind::Text => quoted,
+        Kind::Text => apart_from_ampersands(
+            v,
+            |p| format!("'{}'", p.replace('\'', "''")),
+            "chr(38)",
+            " || ",
+        ),
     }
+}
+
+/// A text literal with each `&` outside the quotes, as `amp` joined by
+/// `concat`. Where scripts run, in SQL*Plus and Pythia's SQL windows, a
+/// `&name` inside a literal is a substitution variable: `'Missing (H&L)'`
+/// would ask for `L` (#159).
+fn apart_from_ampersands(
+    v: &str,
+    quote: impl Fn(&str) -> String,
+    amp: &str,
+    concat: &str,
+) -> String {
+    if !v.contains('&') {
+        return quote(v);
+    }
+    let mut parts = Vec::new();
+    for (i, piece) in v.split('&').enumerate() {
+        if i > 0 {
+            parts.push(amp.to_owned());
+        }
+        if !piece.is_empty() {
+            parts.push(quote(piece));
+        }
+    }
+    parts.join(concat)
 }
 
 /// Renders a value as a SQL literal for `col` in `dialect`'s SQL.
@@ -442,7 +472,8 @@ pub fn literal(dialect: Dialect, col: &Column, value: Option<&str>) -> String {
 /// and GEOMETRY) are shown as hex and written as `X'…'`. Text with a
 /// backslash goes as hex too: a quoted `\` means one thing with
 /// `NO_BACKSLASH_ESCAPES` and another without, `_utf8mb4 X'…'` the same
-/// either way.
+/// either way. So does text with a `&`, which Pythia's SQL windows read as
+/// a substitution variable even in a literal (#159).
 fn mysql_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
@@ -456,7 +487,7 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
     );
     if binary && v.chars().all(|c| c.is_ascii_hexdigit()) {
         format!("X'{v}'")
-    } else if v.contains(['\\', '\0']) {
+    } else if v.contains(['\\', '\0', '&']) {
         let hex: String = v.bytes().map(|b| format!("{b:02X}")).collect();
         format!("_utf8mb4 X'{hex}'")
     } else {
@@ -466,7 +497,9 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
 
 /// PostgreSQL takes back the text it shows (`\x00ff` bytea, `t`, dates) as
 /// a quoted literal. With a backslash, `E'…'` says how to read it whatever
-/// `standard_conforming_strings` is.
+/// `standard_conforming_strings` is; a `&` goes in as `\x26`, as Pythia's
+/// SQL windows read `&name` as a substitution variable even in a literal
+/// (#159).
 fn postgres_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
@@ -475,8 +508,8 @@ fn postgres_literal(col: &Column, value: Option<&str>) -> String {
         return v.to_owned();
     }
     let quoted = v.replace('\'', "''");
-    if v.contains('\\') {
-        format!("E'{}'", quoted.replace('\\', "\\\\"))
+    if v.contains(['\\', '&']) {
+        format!("E'{}'", quoted.replace('\\', "\\\\").replace('&', "\\x26"))
     } else {
         format!("'{quoted}'")
     }
@@ -498,7 +531,12 @@ fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
     match col.type_name.as_str() {
         "binary" | "varbinary" | "image" if hex => v.to_owned(),
         "datetime" | "smalldatetime" => format!("'{}'", v.replacen(' ', "T", 1)),
-        _ => format!("N'{}'", v.replace('\'', "''")),
+        _ => apart_from_ampersands(
+            v,
+            |p| format!("N'{}'", p.replace('\'', "''")),
+            "NCHAR(38)",
+            " + ",
+        ),
     }
 }
 
@@ -728,6 +766,34 @@ mod tests {
                 Some("2026-01-02 00:00:00")
             ),
             "to_date('2026-01-02 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+        );
+    }
+
+    /// No `&` in a literal: where scripts run it would be a substitution
+    /// variable (#159).
+    #[test]
+    fn ampersands_outside_literals() {
+        let col = |t: &str| Column {
+            name: "C".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let ora = |v| literal(Dialect::ORACLE, &col("VARCHAR2"), Some(v));
+        assert_eq!(ora("Missing (H&L)"), "'Missing (H' || chr(38) || 'L)'");
+        assert_eq!(ora("&"), "chr(38)");
+        assert_eq!(ora("a&&b"), "'a' || chr(38) || chr(38) || 'b'");
+        assert_eq!(ora("&x'"), "chr(38) || 'x'''");
+        assert_eq!(
+            literal(Dialect::MYSQL, &col("VARCHAR"), Some("H&L")),
+            "_utf8mb4 X'48264C'"
+        );
+        assert_eq!(
+            literal(Dialect::POSTGRES, &col("text"), Some(r"H&L\x")),
+            r"E'H\x26L\\x'"
+        );
+        assert_eq!(
+            literal(Dialect::SQLSERVER, &col("nvarchar"), Some("H&L")),
+            "N'H' + NCHAR(38) + N'L'"
         );
     }
 

@@ -15,6 +15,12 @@ All notable changes to Pythia are documented here. The format follows
   keep the placeholder `my_table`.
 
 ### Fixed
+- A `&` in an exported value turned into a substitution variable when
+  the INSERT statements ran (#159): `'Missing (H&L)'` asked for `L` in a
+  SQL window (and in SQL*Plus) and inserted other text. The `&` is
+  written outside the quotes now: `'Missing (H' || chr(38) || 'L)'` on
+  Oracle, `N'…' + NCHAR(38) + N'…'` on SQL Server, `E'…\x26…'` on
+  PostgreSQL and a hex literal on MySQL.
 - Completion offered wrong names in large schemas (#160). The popup asked
   once, after two letters, for the best 300 names, then only filtered
   those while typing on: names past the first 300 for those letters (in

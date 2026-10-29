@@ -140,6 +140,30 @@ mod tests {
             "{text}"
         );
 
+        // A `&` in a value comes back as it was, and the statement asks
+        // for no substitution variable when it runs (#159).
+        run(
+            &conn,
+            "select 'Missing (H&L) && &x.' as name from dual",
+            &sql_path,
+            &progress,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&sql_path).unwrap();
+        std::fs::remove_file(&sql_path).unwrap();
+        assert!(
+            crate::sql_window::find_substitutions(&text).is_empty(),
+            "{text}"
+        );
+        let value = text
+            .split_once("values (")
+            .and_then(|(_, rest)| rest.trim_end().strip_suffix(");"))
+            .unwrap();
+        let back: String = conn
+            .query_row_as(&format!("select {value} from dual"), &[])
+            .unwrap();
+        assert_eq!(back, "Missing (H&L) && &x.");
+
         // A failing query leaves no file behind.
         assert!(run(&conn, "select * from no_such_table_xyz", &path, &progress).is_err());
         assert!(!path.exists());
