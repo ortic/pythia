@@ -625,11 +625,15 @@ impl DebugSession {
         if !same {
             return None;
         }
-        let path = condition::parse_path(expression)?;
+        // Subscripts may be variables: `lines(i)` is `lines(3)` when i = 3.
+        let subscripts = condition::subscripts(&self.variables);
+        let path = condition::parse_path_with(expression, &subscripts)?;
         let var = condition::lookup(&self.variables, &path).or_else(|| {
             self.watch_values
                 .iter()
-                .find(|w| condition::parse_path(&w.expression).as_ref() == Some(&path))
+                .find(|w| {
+                    condition::parse_path_with(&w.expression, &subscripts).as_ref() == Some(&path)
+                })
                 .and_then(|w| w.value.as_ref().ok())
         })?;
         let title = format!("{} {}", expression.trim(), var.type_name)
@@ -1842,6 +1846,52 @@ mod tests {
         assert_eq!(s.hover(&unit, "l_other"), None);
         let other = Unit::new("PYTHIA", "Q", UnitType::Procedure);
         assert_eq!(s.hover(&other, "l_total"), None, "other unit");
+    }
+
+    /// An element: `l_lines(2)`, or by a variable's value, `l_lines(i)` (#165).
+    #[test]
+    fn hover_elements() {
+        let mut s = DebugSession::default();
+        let unit = Unit::new("PYTHIA", "P", UnitType::Procedure);
+        s.stack = vec![frame(&unit, "P", Some(3))];
+        s.state = State::Suspended {
+            reason: StopReason::Step,
+        };
+        let line = |n: &str, product: &str| Variable {
+            type_name: "T_LINE".into(),
+            ..var(
+                &format!("({n})"),
+                None,
+                vec![
+                    Variable {
+                        type_name: "VARCHAR2".into(),
+                        ..var("PRODUCT", Some(product), vec![])
+                    },
+                    var("QTY", Some(n), vec![]),
+                ],
+            )
+        };
+        s.variables = vec![
+            var("I", Some("2"), vec![]),
+            var("J", Some("7"), vec![]),
+            var(
+                "L_LINES",
+                Some("2 element(s)"),
+                vec![line("1", "Widget"), line("2", "Gadget")],
+            ),
+        ];
+        let hover = |expr| s.hover(&unit, expr);
+        assert_eq!(
+            hover("l_lines(1)"),
+            Some((
+                "l_lines(1) T_LINE".into(),
+                "product = Widget\nqty = 1".into()
+            ))
+        );
+        assert_eq!(hover("l_lines(i)").unwrap().1, "product = Gadget\nqty = 2");
+        assert_eq!(hover("l_lines(i).product").unwrap().1, "Gadget");
+        assert_eq!(hover("l_lines(j)"), None, "no element 7");
+        assert_eq!(hover("l_lines(k)"), None, "no variable k");
     }
 
     /// Opaque variables are explained once per session, for the frame they

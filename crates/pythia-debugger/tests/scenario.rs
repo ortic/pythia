@@ -290,6 +290,7 @@ fn order_processing_walkthrough() {
         "dbgx_types.c_vat".into(),
         "dbgx_types.g_trace".into(),
         "l_order.lines(3).product".into(),
+        "l_order.lines(i).product".into(),
         "l_order.customer.name".into(),
     ]));
     let target = run_with_output(h.debugger.port(), RUN);
@@ -341,6 +342,11 @@ fn order_processing_walkthrough() {
     assert_eq!(
         watch(w, "l_order.lines(3).product"),
         Ok(Some("Cable".into()))
+    );
+    assert_eq!(
+        watch(w, "l_order.lines(i).product"),
+        Ok(Some("Cable".into())),
+        "i = 3"
     );
     assert_eq!(watch(w, "l_order.customer.name"), Ok(Some("ACME".into())));
     // Globals of a package without a body (process_all set one).

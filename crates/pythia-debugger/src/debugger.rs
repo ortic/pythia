@@ -1092,7 +1092,7 @@ impl Session {
         variables: &[Variable],
         class: Option<u64>,
     ) -> Result<Variable, String> {
-        let path = condition::parse_path(expression)
+        let path = condition::parse_path_with(expression, &condition::subscripts(variables))
             .ok_or_else(|| format!("not a variable: {}", expression.trim()))?;
         let (first, rest) = path.split_first().expect("non-empty path");
         if let Some(var) = variables
@@ -1744,10 +1744,7 @@ fn element_name(key: &str, text: bool) -> String {
 
 /// Whether an index-by table key of this type is text (`INDEX BY VARCHAR2`).
 fn key_is_text(signature: &str) -> bool {
-    matches!(
-        type_name(signature).as_str(),
-        "VARCHAR2" | "VARCHAR" | "STRING" | "CHAR" | "NVARCHAR2" | "NCHAR" | "LONG"
-    )
+    condition::is_text(&type_name(signature))
 }
 
 /// Nesting limit for records/collections (each PL/SQL level is ~2 objects).

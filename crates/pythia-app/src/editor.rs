@@ -407,6 +407,7 @@ pub struct DroppedText(pub String);
 
 /// The dotted path ending with the word at `offset`, e.g. `l_rec.name` when
 /// hovering `name` (or `l_rec` when hovering `l_rec`), with its byte range.
+/// Subscripts on the way are part of it: `l_rec.items(i).name`.
 pub fn path_at(text: &str, offset: usize) -> Option<(Range<usize>, &str)> {
     let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '#');
     let offset = offset.min(text.len());
@@ -416,16 +417,24 @@ pub fn path_at(text: &str, offset: usize) -> Option<(Range<usize>, &str)> {
     let end = text[offset..]
         .find(|c: char| !word(c))
         .map_or(text.len(), |i| offset + i);
-    // Back over the word and any `name.` / `name(1).` before it.
+    // Back over the word and any `name.` / `name(1).` / `name(i).` before it.
     let mut start = text[..offset]
         .rfind(|c: char| !word(c))
         .map_or(0, |i| i + 1);
     loop {
         let before = &text[..start];
-        let Some(head) = before.strip_suffix('.') else {
+        let Some(mut head) = before.strip_suffix('.') else {
             break;
         };
-        let head = head.trim_end_matches(|c: char| c.is_ascii_digit() || c == '(' || c == ')');
+        while let Some(inner) = head.strip_suffix(')') {
+            let Some(open) = inner
+                .rfind(['(', ')', '\n'])
+                .filter(|i| inner[*i..].starts_with('('))
+            else {
+                break;
+            };
+            head = &inner[..open];
+        }
         let begin = head.rfind(|c: char| !word(c)).map_or(0, |i| i + 1);
         if begin == head.len() {
             break;
@@ -436,17 +445,27 @@ pub fn path_at(text: &str, offset: usize) -> Option<(Range<usize>, &str)> {
 }
 
 /// Answers a hover request with the debugger's value of the path under the
-/// mouse, if stopped in `unit`. Returns whether it did.
+/// mouse, if stopped in `unit`: the selection when the mouse is in it and
+/// it is a path (`art_(1)`), else [`path_at`]. Returns whether it did.
 pub fn debug_hover(
     editor: &mut Editor,
     offset: usize,
     debug: &pythia_debugger::ui::DebugSession,
     unit: &pythia_debugger::Unit,
 ) -> bool {
-    let Some((range, path)) = path_at(editor.text(), offset) else {
-        return false;
-    };
-    let Some((title, body)) = debug.hover(unit, path) else {
+    let text = editor.text();
+    let selected = editor.selection().filter(|s| s.contains(&offset)).map(|s| {
+        let trimmed = text[s.clone()].trim_start();
+        let start = s.end - trimmed.len();
+        (start..start + trimmed.trim_end().len(), trimmed.trim_end())
+    });
+    let Some((range, (title, body))) = selected
+        .and_then(|(range, path)| Some((range, debug.hover(unit, path)?)))
+        .or_else(|| {
+            let (range, path) = path_at(text, offset)?;
+            Some((range, debug.hover(unit, path)?))
+        })
+    else {
         return false;
     };
     editor.inner().show_hover(range, title, body);
@@ -494,6 +513,17 @@ mod tests {
         assert_eq!(at("l_rec"), Some("l_rec"));
         assert_eq!(at("l_total"), Some("l_total"));
         assert_eq!(path_at(text, text.find(":=").unwrap()), None);
+        // Subscripts that are variables or keys (#165).
+        let text = "x := a(i).b(j)(2).c + f(x).d + g('k').h;";
+        let at = |word: &str| path_at(text, text.find(word).unwrap() + 1).map(|(_, p)| p);
+        assert_eq!(at("c "), Some("a(i).b(j)(2).c"));
+        assert_eq!(at("d "), Some("f(x).d"));
+        assert_eq!(at("h;"), Some("g('k').h"));
+        let text = "f(x\n).d";
+        assert_eq!(
+            path_at(text, text.find('d').unwrap()).map(|(_, p)| p),
+            Some("d")
+        );
     }
 
     #[test]
