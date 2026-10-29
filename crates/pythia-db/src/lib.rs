@@ -29,7 +29,7 @@ mod types;
 pub use dialect::{DbKind, Dialect, Feature};
 pub use meta::{
     CompileError, DbObject, Detail, Member, MetaQuery, MetaResult, ObjectType, TableColumn,
-    like_pattern, object_ddl, object_source,
+    cursor_plan, like_pattern, object_ddl, object_source,
 };
 pub use session::{Session, open_connection, stream_query};
 pub use types::{

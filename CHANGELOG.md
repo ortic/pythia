@@ -7,6 +7,25 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The debugger shows the SQL the stopped code ran, with the real plan
+  (#152). The *SQL* panel beside the variables lists the statements the
+  debugged session ran from PL/SQL since the start, each with the unit
+  and line it came from (`V$SQL.PROGRAM_ID` / `PROGRAM_LINE#`, anonymous
+  blocks and dynamic SQL included); the line link opens it. At every stop
+  it selects the statement at the stopped line, or the closest one before
+  it, and shows its plan with the last execution's Starts, E-Rows, A-Rows,
+  A-Time and Buffers next to the estimates. Lines where E-Rows × Starts is
+  off by 10× or more are marked, the deepest one named above the plan
+  ("estimated 25,000 rows, got 200 (125× fewer)"). It says when a
+  statement is still running (stopped inside its loop: the figures are its
+  last finished execution's, or come when the cursor is closed) and when
+  other sessions run it with another plan. *Ask AI* sends the plan with
+  the statistics, the code around the line and the variables at the stop
+  (as bind values, under the data policy); *Copy plan* copies DBMS_XPLAN's
+  report. *Plan statistics* in the debugger toolbar (on by default) runs
+  the debugged session with `STATISTICS_LEVEL = ALL`, which gives its
+  statements child cursors of their own. Needs SELECT_CATALOG_ROLE (or
+  SELECT on V$OPEN_CURSOR, V$SQL and V$SQL_PLAN_STATISTICS_ALL).
 - Users and roles of MySQL/MariaDB, PostgreSQL and SQL Server can be
   created and edited (#142), like Oracle's. *New user…* / *New role…* on
   the Users and Roles sections (and in *File → New Object*), and *Edit
@@ -116,6 +135,14 @@ All notable changes to Pythia are documented here. The format follows
 - The MySQL dashboard's lock waits named the table as
   `` `schema`.`table` `` on MariaDB and MySQL 5.7 (#149). They show
   `schema.table` now, as on MySQL 8.
+
+### Changed
+- *Run with statistics* shows the actual plan as a tree with Starts,
+  E-Rows, A-Rows, A-Time, Buffers and Reads, the worst misestimate named
+  above it, and DBMS_XPLAN's report a click away (#152). The assistant gets
+  a cursor's plan with ALLSTATS LAST when its last execution collected
+  row source statistics.
+
 
 ## [0.7.0] - 2026-10-28
 

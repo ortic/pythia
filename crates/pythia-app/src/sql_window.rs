@@ -83,6 +83,9 @@ pub struct RunState {
     pub plan: Option<Plan>,
     /// "Run with statistics": request id and report.
     pub statistics: Option<(u64, Option<Result<crate::statistics::Report, String>>)>,
+    /// Its plan as a tree, and whether DBMS_XPLAN's text shows instead.
+    pub statistics_view: pythia_ui::plan::PlanView,
+    pub statistics_text: bool,
     /// "Profile": request id and the DBMS_HPROF profile.
     pub profile: Option<(u64, Option<Result<crate::profiler::Profile, String>>)>,
     pub messages: Vec<Message>,
@@ -181,8 +184,8 @@ pub struct QueryResult {
 
 pub struct Plan {
     pub id: u64,
-    pub view: crate::plan_view::PlanView,
-    pub result: Option<Result<Vec<crate::plan_view::PlanRow>, String>>,
+    pub view: pythia_ui::plan::PlanView,
+    pub result: Option<Result<Vec<pythia_ui::plan::PlanRow>, String>>,
 }
 
 pub struct Message {
@@ -1602,7 +1605,7 @@ impl SqlWindow {
                 if let Some(plan) = self.state.plan.as_mut().filter(|p| p.id == id) {
                     plan.result = Some(match result {
                         Ok(MetaResult::Table { columns, rows }) => {
-                            Ok(crate::plan_view::rows(&columns, &rows))
+                            Ok(pythia_ui::plan::rows(&columns, &rows))
                         }
                         Ok(_) => Err("unexpected result".into()),
                         Err(e) => Err(e.to_string()),
@@ -2140,7 +2143,12 @@ impl SqlWindow {
                             .commands
                             .push(crate::commands::Command::AiAnalyzePlan);
                     }
-                    statistics_ui(ui, report)
+                    statistics_ui(
+                        ui,
+                        report,
+                        &mut state.statistics_view,
+                        &mut state.statistics_text,
+                    )
                 }
                 Some((_, Some(Err(e)))) => {
                     ui.colored_label(ui.visuals().error_fg_color, e.as_str());
@@ -2482,7 +2490,12 @@ impl SqlWindow {
 }
 
 /// Session statistics next to the actual execution plan.
-fn statistics_ui(ui: &mut Ui, report: &crate::statistics::Report) {
+fn statistics_ui(
+    ui: &mut Ui,
+    report: &crate::statistics::Report,
+    view: &mut pythia_ui::plan::PlanView,
+    text: &mut bool,
+) {
     ui.label(
         RichText::new(format!(
             "{} rows fetched in {}",
@@ -2519,17 +2532,57 @@ fn statistics_ui(ui: &mut Ui, report: &crate::statistics::Report) {
             }
         });
         ui.separator();
-        egui::ScrollArea::both()
-            .id_salt("xplan")
-            .auto_shrink(false)
-            .show(ui, |ui| match &report.plan {
-                Ok(plan) => {
-                    ui.add(egui::Label::new(RichText::new(plan).monospace()).extend());
+        ui.vertical(|ui| {
+            if let Ok(plan) = &report.plan
+                && !report.plan_rows.is_empty()
+            {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(text, false, "Plan");
+                    ui.selectable_value(text, true, "DBMS_XPLAN")
+                        .on_hover_text("The plan as DBMS_XPLAN.DISPLAY_CURSOR shows it");
+                    if let Some(worst) = pythia_ui::plan::worst_misestimate(&report.plan_rows) {
+                        let note = format!(
+                            "⚠ Estimate off at {} {}: {}",
+                            worst.id,
+                            worst.operation,
+                            worst.misestimate_text().unwrap_or_default()
+                        );
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(note).color(ui.visuals().warn_fg_color),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Show the line")
+                            .clicked()
+                        {
+                            *text = false;
+                            view.select(Some(worst.id));
+                        }
+                    }
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(plan.clone());
+                    }
+                });
+                if !*text {
+                    view.ui(ui, &report.plan_rows, egui::Id::new("statistics-plan"));
+                    return;
                 }
-                Err(e) => {
-                    ui.colored_label(ui.visuals().warn_fg_color, e.as_str());
-                }
-            });
+            }
+            egui::ScrollArea::both()
+                .id_salt("xplan")
+                .auto_shrink(false)
+                .show(ui, |ui| match &report.plan {
+                    Ok(plan) => {
+                        ui.add(egui::Label::new(RichText::new(plan).monospace()).extend());
+                    }
+                    Err(e) => {
+                        ui.colored_label(ui.visuals().warn_fg_color, e.as_str());
+                    }
+                });
+        });
     });
 }
 

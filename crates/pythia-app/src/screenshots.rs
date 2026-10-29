@@ -1203,6 +1203,110 @@ fn debugger_session() {
     wait_until(&mut h, "finish", |app| !app.test_debug_running());
 }
 
+/// Orders mostly shipped, a few new: without a histogram the optimizer
+/// expects half of them new.
+const SHOP: &[&str] = &[
+    "create table shop_customers as
+       select level id, 'Customer ' || level name from dual connect by level <= 500",
+    "create table shop_orders as
+       select level id, mod(level, 500) + 1 customer_id,
+              case when level <= 200 then 'NEW' else 'SHIPPED' end status,
+              rpad('x', 60, 'x') note
+         from dual connect by level <= 50000",
+    "begin
+       dbms_stats.gather_table_stats(user, 'SHOP_CUSTOMERS');
+       dbms_stats.gather_table_stats(user, 'SHOP_ORDERS', method_opt => 'for all columns size 1');
+     end;",
+    "create or replace procedure ship_new_orders is
+  l_shipped pls_integer := 0;
+begin
+  for o in (select o.id, c.name
+              from shop_orders o
+              join shop_customers c on c.id = o.customer_id
+             where o.status = 'NEW') loop
+    l_shipped := l_shipped + 1;
+  end loop;
+  dbms_output.put_line(l_shipped || ' orders shipped');
+end;",
+];
+
+/// The SQL panel while stopped: the loop's statement, matched to its line,
+/// with the estimated and actual rows of its plan.
+#[test]
+fn debugger_sql_panel() {
+    let (Some((profile, password)), Ok(host)) = (profile(), std::env::var("PYTHIA_DEBUG_HOST"))
+    else {
+        eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
+        return;
+    };
+    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
+    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
+    for drop in [
+        "drop table shop_orders purge",
+        "drop table shop_customers purge",
+    ] {
+        let _ = conn.execute(drop, &[]);
+    }
+    for ddl in SHOP {
+        conn.execute(ddl, &[])
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
+    use pythia_debugger::{Unit, UnitType};
+    let unit = Unit::new("PYTHIA", "SHIP_NEW_ORDERS", UnitType::Procedure);
+    let mut h = Ui {
+        harness: new_harness(true, out_dir().is_some(), egui::vec2(1440.0, 1000.0)),
+        lock: Some(UI_LOCK.alone()),
+    };
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    // After the loop.
+    h.state_mut().test_debug_setup(&host, unit.clone(), 10);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: "begin\n  ship_new_orders;\nend;".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    wait_until(&mut h, "the loop's plan", |app| {
+        app.test_debug().sql_plan().is_some_and(|p| p.measured())
+    });
+    let debug = h.state().test_debug();
+    let statement = &debug.sql_statements()[0];
+    assert_eq!(
+        (statement.unit.as_ref(), statement.line),
+        (Some(&unit), 4),
+        "{:?}",
+        debug.sql_statements()
+    );
+    let plan = debug.sql_plan().unwrap();
+    assert!(
+        plan.text.contains("WHERE O.STATUS = 'NEW'"),
+        "{}",
+        plan.text
+    );
+    let worst = pythia_ui::plan::worst_misestimate(&plan.rows).expect("a misestimate");
+    assert_eq!(worst.object, "PYTHIA.SHOP_ORDERS", "{worst:?}");
+    assert_eq!(worst.actual_rows, Some(200.0));
+    assert!(worst.misestimate().unwrap() >= 100.0, "{worst:?}");
+    save(&mut h, "13-debugger-sql-plan-dark");
+    h.state_mut()
+        .test_debug_mut()
+        .command(pythia_debugger::DebugCommand::Resume);
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    drop(h);
+    let _ = conn.execute("drop procedure ship_new_orders", &[]);
+    for drop in [
+        "drop table shop_orders purge",
+        "drop table shop_customers purge",
+    ] {
+        let _ = conn.execute(drop, &[]);
+    }
+}
+
 /// pythia-debugger's debugging scenario: order processing across packages.
 const DEBUG_SCENARIO: &str = include_str!("../../pythia-debugger/tests/scenario/orders.sql");
 

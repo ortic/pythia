@@ -30,6 +30,9 @@ pub struct Report {
     pub elapsed: Duration,
     /// DISPLAY_CURSOR output, or why it isn't available.
     pub plan: Result<String, String>,
+    /// The plan lines with estimated and actual rows (empty if the plan
+    /// isn't available).
+    pub plan_rows: Vec<pythia_ui::plan::PlanRow>,
     /// (statistic, delta), or why they aren't available.
     pub stats: Result<Vec<(String, i64)>, String>,
 }
@@ -113,17 +116,25 @@ pub fn run(conn: &Connection, sql: &str) -> Result<Report, DbError> {
             .collect()),
         (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => Err(privilege_hint(e)),
     };
-    let plan = actual_plan(conn, &marker).map_err(privilege_hint);
+    let (plan, plan_rows) = match actual_plan(conn, &marker) {
+        Ok((plan, rows)) => (Ok(plan), rows),
+        Err(e) => (Err(privilege_hint(e)), Vec::new()),
+    };
     Ok(Report {
         rows,
         elapsed,
         plan,
+        plan_rows,
         stats,
     })
 }
 
-/// DISPLAY_CURSOR output for the cursor tagged with `marker`.
-fn actual_plan(conn: &Connection, marker: &str) -> Result<String, DbError> {
+/// DISPLAY_CURSOR output for the cursor tagged with `marker`, and its plan
+/// lines with the statistics.
+fn actual_plan(
+    conn: &Connection,
+    marker: &str,
+) -> Result<(String, Vec<pythia_ui::plan::PlanRow>), DbError> {
     let (sql_id, child): (String, i64) = conn.query_row_as(
         &pythia_db::compat::first_rows(
             "select sql_id, child_number from v$sql \
@@ -140,7 +151,11 @@ fn actual_plan(conn: &Connection, marker: &str) -> Result<String, DbError> {
     let lines: Vec<String> = lines
         .map(|l| l.map(Option::unwrap_or_default))
         .collect::<Result<_, _>>()?;
-    Ok(lines.join("\n"))
+    let rows = match pythia_db::cursor_plan(conn, &sql_id, child)? {
+        pythia_db::MetaResult::Table { columns, rows } => pythia_ui::plan::rows(&columns, &rows),
+        _ => Vec::new(),
+    };
+    Ok((lines.join("\n"), rows))
 }
 
 fn privilege_hint(e: DbError) -> String {

@@ -47,6 +47,14 @@ pub enum Tab {
     Assistant,
 }
 
+/// A lookup of the debugger's SQL panel in flight.
+enum DebugSqlLookup {
+    /// The statements the session ran, at this stop.
+    Find(u64),
+    /// A statement's plan: SQL_ID and child.
+    Plan(String, i64),
+}
+
 /// Layout and documents, restored on the next start.
 #[derive(Serialize, Deserialize)]
 struct Workspace {
@@ -128,6 +136,10 @@ pub struct PythiaApp {
     invalid_again: std::collections::HashSet<String>,
     /// Lookups of why debugger variables are opaque: request id → unit.
     opaque_inflight: HashMap<u64, pythia_debugger::Unit>,
+    /// The debugged session saying who it is (request id).
+    debug_session_task: Option<u64>,
+    /// Lookups for the debugger's SQL panel: request id → what.
+    debug_sql_inflight: HashMap<u64, DebugSqlLookup>,
     /// Requests already sent (or answered) per connection, to avoid repeats.
     catalog_requested: std::collections::HashSet<(String, pythia_lsp_core::CatalogRequest)>,
     log: Vec<String>,
@@ -218,6 +230,8 @@ impl PythiaApp {
             invalid_inflight: HashMap::new(),
             invalid_again: std::collections::HashSet::new(),
             opaque_inflight: HashMap::new(),
+            debug_session_task: None,
+            debug_sql_inflight: HashMap::new(),
             catalog_requested: std::collections::HashSet::new(),
             log: Vec::new(),
             connect_dialog: ConnectDialog::default(),
@@ -990,11 +1004,11 @@ impl PythiaApp {
 
     fn place_tab(&mut self, tab: Tab) {
         // The debugger docks below the documents so code and variables are
-        // visible together.
+        // visible together, with room for the plans of its SQL panel.
         if tab == Tab::Debugger
             && let Some(path) = self.dock.find_tab_from(|t| matches!(t, Tab::Doc(_)))
         {
-            self.dock[path.surface].split_below(path.node, 0.62, vec![tab]);
+            self.dock[path.surface].split_below(path.node, 0.56, vec![tab]);
             return;
         }
         // The assistant sits right of the documents it works with.
@@ -1899,7 +1913,12 @@ impl PythiaApp {
         use pythia_debugger::ui::DebugAction;
         for action in actions {
             match action {
-                DebugAction::RunTarget { host, port, block } => {
+                DebugAction::RunTarget {
+                    host,
+                    port,
+                    block,
+                    statistics,
+                } => {
                     let Some((doc, _)) = self.debug_run else {
                         continue;
                     };
@@ -1936,10 +1955,17 @@ impl PythiaApp {
                             task,
                         });
                     }
+                    // Who the session is, for the SQL panel's lookups.
                     let id = request_id();
                     session.session.send(DbRequest::Task {
                         id,
-                        task: pythia_debugger::target::debug_task(host, port, block),
+                        task: pythia_debugger::target::session_task(),
+                    });
+                    self.debug_session_task = Some(id);
+                    let id = request_id();
+                    session.session.send(DbRequest::Task {
+                        id,
+                        task: pythia_debugger::target::debug_task(host, port, block, statistics),
                     });
                     self.debug_run = Some((doc, id));
                 }
@@ -1961,10 +1987,12 @@ impl PythiaApp {
                             None
                         }
                     };
+                    // Also once the run ended (the SQL panel's line links).
                     let connection = self
                         .debug_run
                         .and_then(|(doc, _)| self.docs.get(&doc))
-                        .and_then(|d| d.connection.clone());
+                        .and_then(|d| d.connection.clone())
+                        .or_else(|| self.debug_connection.clone());
                     if let (Some(object_type), Some(connection), Some(line)) =
                         (object_type, connection, location.line)
                     {
@@ -2013,8 +2041,159 @@ impl PythiaApp {
                 }
                 DebugAction::Finished => self.log("Debug session ended"),
                 DebugAction::Setup { reason } => self.open_debug_setup(reason),
+                DebugAction::FindSql { session, stop } => {
+                    let task: pythia_db::TaskFn =
+                        Box::new(move |c: &pythia_db::oracle::Connection| {
+                            let found = pythia_debugger::sql::session_sql(c, &session)
+                                .map_err(|e| pythia_debugger::sql::explain_error(&e));
+                            Ok(Box::new(found) as Box<dyn std::any::Any + Send>)
+                        });
+                    self.debug_meta_task(DebugSqlLookup::Find(stop), task);
+                }
+                DebugAction::LoadPlan { sql_id, child } => {
+                    let key = (sql_id.clone(), child);
+                    let task: pythia_db::TaskFn =
+                        Box::new(move |c: &pythia_db::oracle::Connection| {
+                            let plan = pythia_debugger::sql::cursor_plan(c, &sql_id, child)
+                                .map_err(|e| pythia_debugger::sql::explain_error(&e));
+                            Ok(Box::new(plan) as Box<dyn std::any::Any + Send>)
+                        });
+                    self.debug_meta_task(DebugSqlLookup::Plan(key.0, key.1), task);
+                }
+                DebugAction::OpenSource(location) => {
+                    use pythia_debugger::UnitType;
+                    let Some(line) = location.line else {
+                        continue;
+                    };
+                    if location.unit.unit_type == UnitType::Block {
+                        let Some(doc) = self.debug_doc() else {
+                            continue;
+                        };
+                        if let Some(DocKind::Sql(w)) = self.docs.get_mut(&doc).map(|d| &mut d.kind)
+                            && let Some(start) = w.state.debug_start
+                        {
+                            w.editor.goto(start + line as usize - 1, 1);
+                        }
+                        self.open_tab(Tab::Doc(doc));
+                    } else {
+                        self.debug_actions(vec![DebugAction::ShowLocation(location)]);
+                    }
+                }
+                DebugAction::AnalyzeSql(question) => self.debug_analyze_sql(question),
             }
         }
+    }
+
+    /// The SQL window of the current or last debug run, whose block the
+    /// debugger's anonymous-block lines count in.
+    fn debug_doc(&self) -> Option<DocId> {
+        self.debug_run.map(|(doc, _)| doc).or_else(|| {
+            self.docs.iter().find_map(|(id, d)| match &d.kind {
+                DocKind::Sql(w) if w.state.debug_start.is_some() => Some(*id),
+                _ => None,
+            })
+        })
+    }
+
+    /// Runs a lookup of the debugger's SQL panel on the debugged
+    /// connection's metadata session (the debugged one is busy).
+    fn debug_meta_task(&mut self, lookup: DebugSqlLookup, task: pythia_db::TaskFn) {
+        let Some(connection) = self.debug_connection.clone() else {
+            return;
+        };
+        let Some(conn) = self.conns.get_mut(&connection) else {
+            return;
+        };
+        let id = request_id();
+        self.debug_sql_inflight.insert(id, lookup);
+        conn.send_meta(id, DbRequest::Task { id, task }, &self.notify);
+    }
+
+    /// Asks the assistant about a statement the debugged session ran: its
+    /// plan with the statistics, the code around it and the variables at
+    /// the stop (bind values, for the data policy).
+    fn debug_analyze_sql(&mut self, question: pythia_debugger::ui::SqlQuestion) {
+        use pythia_ai::{Part, Task};
+        let mut parts = vec![Part::code("Statement", question.sql.clone())];
+        if let Some((title, source)) = question
+            .location
+            .as_ref()
+            .and_then(|l| self.debug_source(l))
+        {
+            parts.push(Part::code(title, source));
+        }
+        parts.push(Part::text(
+            if question.measured {
+                "Execution plan with the last execution's row source statistics \
+                 (DBMS_XPLAN ALLSTATS LAST; E-Rows is per start, A-Rows over all starts)"
+            } else {
+                "Execution plan from the cursor cache (no row source statistics)"
+            },
+            question.plan,
+        ));
+        if !question.variables.is_empty() {
+            parts.push(Part::bind_values(
+                "PL/SQL variables at the stop (the statement's binds :B1… are among them)",
+                question.variables.join("\n"),
+            ));
+        }
+        let request = crate::ai::AiRequest {
+            task: Task::AnalyzeSlow(question.title.clone()),
+            parts,
+            lookup: crate::ai::Lookup {
+                tables: crate::ai::context::table_refs(&question.sql),
+                ..Default::default()
+            },
+        };
+        let connection = self.debug_connection.clone();
+        self.ai_start(
+            request,
+            None,
+            format!("Debugger · {}", question.title),
+            connection,
+        );
+    }
+
+    /// The code around a line the debugger names, from the program window
+    /// showing the unit or the SQL window with the block being debugged:
+    /// (title, numbered lines).
+    fn debug_source(&self, location: &pythia_debugger::Location) -> Option<(String, String)> {
+        const AROUND: usize = 12;
+        let line = location.line? as usize;
+        let (text, first) = if location.unit.unit_type == pythia_debugger::UnitType::Block {
+            let doc = self.debug_doc()?;
+            match self.docs.get(&doc).map(|d| &d.kind) {
+                Some(DocKind::Sql(w)) => (w.editor.text(), w.state.debug_start?),
+                _ => return None,
+            }
+        } else {
+            self.docs.values().find_map(|d| match &d.kind {
+                DocKind::Program(w) => w
+                    .parts
+                    .iter()
+                    .find(|p| {
+                        crate::program_window::debug_unit(&w.object, p.object_type) == location.unit
+                    })
+                    .map(|p| (p.editor.text(), 1)),
+                _ => None,
+            })?
+        };
+        let lines: Vec<&str> = text.lines().skip(first - 1).collect();
+        let from = line.saturating_sub(AROUND + 1);
+        let to = (line + AROUND).min(lines.len());
+        if from >= to {
+            return None;
+        }
+        let numbered: Vec<String> = (from..to)
+            .map(|i| {
+                let mark = if i + 1 == line { ">" } else { " " };
+                format!("{mark}{:>5}  {}", i + 1, lines[i])
+            })
+            .collect();
+        Some((
+            format!("PL/SQL around line {line} of {}", location.unit),
+            numbered.join("\n"),
+        ))
     }
 
     /// Fetches dictionary data for code assistance in the background.
@@ -3054,6 +3233,21 @@ impl PythiaApp {
                 SessionKey::Main | SessionKey::Meta => self.main_event(&name, event),
                 SessionKey::Doc(id) => match event {
                     DbEvent::TaskDone { id: task, result }
+                        if self.debug_session_task == Some(task) =>
+                    {
+                        self.debug_session_task = None;
+                        match result
+                            .map(|any| any.downcast::<pythia_debugger::sql::TargetSession>())
+                        {
+                            Ok(Ok(session)) => self.debug.set_target_session(*session),
+                            Ok(Err(_)) => {}
+                            Err(e) => self.log(format!(
+                                "Debugger: the SQL panel can't tell which session is debugged: {}",
+                                e.text()
+                            )),
+                        }
+                    }
+                    DbEvent::TaskDone { id: task, result }
                         if self.debug_run.is_some_and(|(_, t)| t == task) =>
                     {
                         self.debug_run = None;
@@ -3179,6 +3373,29 @@ impl PythiaApp {
                     Err(e) => {
                         self.log(format!("Reading the schema's source: {e}"));
                         self.settings_dialog.learned("the schema".into(), None);
+                    }
+                }
+            }
+            DbEvent::TaskDone { id, result } if self.debug_sql_inflight.contains_key(&id) => {
+                let lookup = self.debug_sql_inflight.remove(&id).expect("checked");
+                type Found = Result<Vec<pythia_debugger::sql::SessionSql>, String>;
+                type Plan = Result<pythia_debugger::sql::CursorPlan, String>;
+                match lookup {
+                    DebugSqlLookup::Find(stop) => {
+                        let found = match result.map(|any| any.downcast::<Found>()) {
+                            Ok(Ok(found)) => *found,
+                            Ok(Err(_)) => Err("unexpected result".into()),
+                            Err(e) => Err(e.text()),
+                        };
+                        self.debug.sql_found(stop, found);
+                    }
+                    DebugSqlLookup::Plan(sql_id, child) => {
+                        let plan = match result.map(|any| any.downcast::<Plan>()) {
+                            Ok(Ok(plan)) => *plan,
+                            Ok(Err(_)) => Err("unexpected result".into()),
+                            Err(e) => Err(e.text()),
+                        };
+                        self.debug.plan_loaded(sql_id, child, plan);
                     }
                 }
             }

@@ -822,6 +822,43 @@ fn explain_plan(conn: &Connection, sql: &str) -> Result<MetaResult, DbError> {
     result
 }
 
+/// The plan of a cursor in the shared pool with the row source statistics
+/// of its last execution (`GATHER_PLAN_STATISTICS` or `STATISTICS_LEVEL =
+/// ALL`), as a table with [`MetaQuery::ExplainPlan`]'s columns plus STARTS,
+/// A_ROWS, A_TIME (seconds), BUFFERS and READS. Those are empty without
+/// statistics, and 0 while the first execution is still running.
+pub fn cursor_plan(conn: &Connection, sql_id: &str, child: i64) -> Result<MetaResult, DbError> {
+    let rows = conn.query(
+        "select id, parent_id, depth, operation || nvl2(options, ' ' || options, '') as operation, \
+                nvl2(object_name, nvl2(object_owner, object_owner || '.', '') || object_name, '') as object, \
+                cost, cardinality as \"ROWS\", bytes, time, \
+                access_predicates as access_pred, filter_predicates as filter_pred, \
+                last_starts as starts, last_output_rows as a_rows, \
+                last_elapsed_time / 1000000 as a_time, \
+                last_cr_buffer_gets + last_cu_buffer_gets as buffers, last_disk_reads as reads \
+           from v$sql_plan_statistics_all \
+          where sql_id = :1 and child_number = :2 order by id",
+        &[&sql_id, &child],
+    )?;
+    table_result(
+        rows,
+        &[
+            "ID",
+            "PARENT_ID",
+            "DEPTH",
+            "COST",
+            "ROWS",
+            "BYTES",
+            "TIME",
+            "STARTS",
+            "A_ROWS",
+            "A_TIME",
+            "BUFFERS",
+            "READS",
+        ],
+    )
+}
+
 /// Collects a result set into a generic table; `numeric` names right-aligned columns.
 fn table_result(
     rows: crate::oracle::ResultSet<'static, crate::oracle::Row>,

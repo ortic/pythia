@@ -34,7 +34,6 @@ mod monitor_window;
 mod object_editor;
 mod object_files;
 mod object_view;
-mod plan_view;
 mod profiler;
 mod program_window;
 mod project;

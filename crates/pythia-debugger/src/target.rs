@@ -10,25 +10,42 @@ use crate::types::{Unit, UnitType};
 ///
 /// Blocks for the whole debug session, so run it on a dedicated session
 /// (e.g. as a `DbRequest::Task`). The block's own error is returned; a
-/// terminated session fails with ORA-30687.
+/// terminated session fails with ORA-30687. With `statistics` the session
+/// collects row source statistics meanwhile (see [`debug_task`]).
 pub fn run_under_debugger(
     conn: &Connection,
     host: &str,
     port: u16,
     block: &str,
+    statistics: bool,
 ) -> Result<(), DbError> {
-    run(conn, host, port, block).1
+    run(conn, host, port, block, statistics).1
 }
 
 /// [`run_under_debugger`], also saying whether the session connected to
 /// the debugger (`CONNECT_TCP` failing is a setup problem, see
 /// [`crate::setup::Problem`]).
-fn run(conn: &Connection, host: &str, port: u16, block: &str) -> (bool, Result<(), DbError>) {
+fn run(
+    conn: &Connection,
+    host: &str,
+    port: u16,
+    block: &str,
+    statistics: bool,
+) -> (bool, Result<(), DbError>) {
     // Compiled at level 1 the block itself has debug information, so it
     // can be stepped through (and stepping out of a unit lands in it).
     let level = optimize_level(conn);
     if let Err(e) = conn.execute("alter session set plsql_optimize_level = 1", &[]) {
         return (false, Err(e.into()));
+    }
+    // Actual rows, times and reads per plan line of every statement the
+    // code runs, for the SQL panel ([`crate::sql`]).
+    let statistics_level = statistics
+        .then(|| parameter(conn, "statistics_level"))
+        .flatten()
+        .filter(|level| !level.eq_ignore_ascii_case("ALL"));
+    if statistics_level.is_some() {
+        let _ = conn.execute("alter session set statistics_level = all", &[]);
     }
     let connected = conn
         .execute(
@@ -46,20 +63,29 @@ fn run(conn: &Connection, host: &str, port: u16, block: &str) -> (bool, Result<(
         &format!("alter session set plsql_optimize_level = {level}"),
         &[],
     );
+    if let Some(level) = statistics_level.filter(|l| l.chars().all(|c| c.is_ascii_alphabetic())) {
+        let _ = conn.execute(
+            &format!("alter session set statistics_level = {level}"),
+            &[],
+        );
+    }
     (connected.is_ok(), result)
+}
+
+/// The session's value of a parameter, if `V$PARAMETER` is readable.
+fn parameter(conn: &Connection, name: &str) -> Option<String> {
+    conn.query_row_as::<Option<String>>("select value from v$parameter where name = :1", &[&name])
+        .ok()
+        .flatten()
 }
 
 /// The session's `PLSQL_OPTIMIZE_LEVEL`, or Oracle's default (2) when
 /// `V$PARAMETER` isn't readable.
 fn optimize_level(conn: &Connection) -> u8 {
-    conn.query_row_as::<String>(
-        "select value from v$parameter where name = 'plsql_optimize_level'",
-        &[],
-    )
-    .ok()
-    .and_then(|v| v.trim().parse().ok())
-    .filter(|l| *l <= 3)
-    .unwrap_or(2)
+    parameter(conn, "plsql_optimize_level")
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|l| *l <= 3)
+        .unwrap_or(2)
 }
 
 /// How a debugged block ended: what it printed with DBMS_OUTPUT and its own
@@ -76,15 +102,36 @@ pub struct DebugOutcome {
 /// [`run_under_debugger`] as a task for `pythia_db::DbRequest::Task`. The task
 /// result is a [`DebugOutcome`] (the block's error is part of it, so its
 /// output isn't lost).
-pub fn debug_task(host: String, port: u16, block: String) -> TaskFn {
+///
+/// With `statistics` the session runs with `STATISTICS_LEVEL = ALL`, so
+/// the plans of the statements it runs have actual rows next to the
+/// estimates. That costs some time per row, and the statements get child
+/// cursors of their own (`STATS_ROW_MISMATCH`), parsed with this run's
+/// binds.
+pub fn debug_task(host: String, port: u16, block: String, statistics: bool) -> TaskFn {
     Box::new(move |conn: &Connection| {
-        let (connected, result) = run(conn, &host, port, &block);
+        let (connected, result) = run(conn, &host, port, &block, statistics);
         let output = read_output(conn).unwrap_or_default();
         Ok(Box::new(DebugOutcome {
             output,
             connected,
             error: result.err(),
         }) as Box<dyn std::any::Any + Send>)
+    })
+}
+
+/// A task for the session about to be debugged, sent before
+/// [`debug_task`]: who the session is, so its SQL can be looked up from
+/// another session while it is stopped. The result is a
+/// [`crate::sql::TargetSession`].
+pub fn session_task() -> TaskFn {
+    Box::new(|conn: &Connection| {
+        let (sid, started): (u32, String) = conn.query_row_as(
+            "select to_number(sys_context('userenv', 'sid')), \
+                    to_char(sysdate, 'yyyy-mm-dd hh24:mi:ss') from dual",
+            &[],
+        )?;
+        Ok(Box::new(crate::sql::TargetSession { sid, started }) as Box<dyn std::any::Any + Send>)
     })
 }
 

@@ -275,6 +275,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 - [x] Modify variable values while paused (scalars: locals, IN OUT/OUT parameters, fields, elements, package globals; numbers checked against precision and range first, as the agent crashes the session on some; not IN parameters or LOBs)
 - [x] Hover over variable shows value while paused
 - [x] DBMS_OUTPUT during debugging (shown when the run ends)
+- [x] SQL panel: the statements the stopped session ran, by unit and line, with the selected one's plan and the last execution's actual rows (`STATISTICS_LEVEL = ALL` in the debugged session), misestimates marked, Ask AI
 - [x] Auto-compile with debug info before starting
 - [ ] Debug triggers and code called from other sessions (attach mode)
 
@@ -340,7 +341,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 ### 5.19 Explain Plan & Performance (M8)
 
 - [x] Explain plan as a tree grid (cost, cardinality, bytes, predicates)
-- [x] Actual execution plan via `DBMS_XPLAN.DISPLAY_CURSOR` with `GATHER_PLAN_STATISTICS`
+- [x] Actual execution plan via `DBMS_XPLAN.DISPLAY_CURSOR` with `GATHER_PLAN_STATISTICS`, as a tree with E-Rows next to A-Rows (E-Rows × Starts against A-Rows, misestimates of 10× and more marked)
 - [x] SQL Monitor report viewer (if licensed): monitored executions of a session or statement, report as text or HTML
 - [x] Statistics of the last execution (`V$MYSTAT` deltas: consistent gets, physical reads, ...)
 - [x] PL/SQL profiler (`DBMS_HPROF`) with result view, hot lines in the editor (per subprogram and statement; double-click opens the line; no editor markers)

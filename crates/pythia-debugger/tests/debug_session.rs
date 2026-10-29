@@ -299,7 +299,7 @@ fn debug_procedures_and_packages() {
         let conn = connect("PYTHIA_TEST_DB").unwrap();
         conn.execute("begin dbms_output.enable(null); end;", &[])
             .unwrap();
-        let task = target::debug_task(host, port, "begin dbg_exc; end;".into());
+        let task = target::debug_task(host, port, "begin dbg_exc; end;".into(), false);
         task(&conn)
     });
     h.until_terminated();

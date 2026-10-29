@@ -1,9 +1,10 @@
-//! Reusable widgets: code editor and data grid.
+//! Reusable widgets: code editor, data grid and execution plan.
 
 pub mod code_editor;
 mod editor;
 mod grid;
 pub mod icons;
+pub mod plan;
 
 pub use editor::{EditorOutput, SqlEditor, SyntaxTheme, highlight};
 pub use grid::{
