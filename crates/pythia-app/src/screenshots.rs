@@ -4396,6 +4396,9 @@ fn program_compile_refreshes_invalid_count() {
     let Some((profile, password)) = profile() else {
         return;
     };
+    // Alone before the package is invalid: another test may compile the
+    // schema's invalid objects meanwhile (#156).
+    let mut h = harness(true).alone();
     let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
     let (cred, db) = spec.rsplit_once('@').unwrap();
     let (user, pw) = cred.split_once('/').unwrap();
@@ -4422,7 +4425,6 @@ fn program_compile_refreshes_invalid_count() {
         .unwrap()
     };
     assert_eq!(ours(), 2, "spec and body invalid");
-    let mut h = harness(true).alone();
     // Only compiles refresh the count.
     h.state_mut().test_settings_mut().invalid.refresh_minutes = 0;
     h.state_mut().test_connect(profile, password);
