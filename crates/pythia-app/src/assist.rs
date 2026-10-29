@@ -390,7 +390,9 @@ impl Assist {
                 {
                     entries.extend(editor.inner().snippet_completions(&prefix));
                 }
-                editor.inner().show_completions(replace, entries);
+                editor
+                    .inner()
+                    .show_completions(replace, entries, completion.incomplete);
                 completion.missing
             }
             Pending::Signature(offset) => match self.analyzed().signature_help(at(offset), catalog)

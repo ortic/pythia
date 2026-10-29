@@ -113,6 +113,9 @@ pub struct Completion {
     pub scroll: f32,
     /// Width the filtered items need, measured by the view.
     pub width: Option<f32>,
+    /// The items were cut short: typing on asks for them again rather
+    /// than filtering these, which may lack the names it is after (#160).
+    pub incomplete: bool,
 }
 
 impl Completion {
@@ -147,8 +150,21 @@ impl Completion {
             page: 1,
             scroll: 0.0,
             width: None,
+            incomplete: false,
         };
         c.update(state).then_some(c)
+    }
+
+    /// Selects the item labeled `label`, if it is offered.
+    pub fn select_label(&mut self, label: &str) {
+        if let Some(i) = self
+            .filtered
+            .iter()
+            .position(|&i| self.items[i].label == label)
+        {
+            self.selected = i;
+            self.scroll_to_selected = true;
+        }
     }
 
     /// Char index where the completed word starts.
@@ -253,37 +269,24 @@ impl Completion {
     }
 }
 
-/// Matches by case-insensitive prefix first, then by subsequence ("fuzzy").
+/// Matches as completion ranks (`pythia_lsp_core::match_rank`):
+/// prefix, then word starts (`fn` → `first_name`), then substring; a
+/// prefix in the typed case first.
 pub fn filter(items: &[CompletionEntry], prefix: &str) -> Vec<usize> {
     if prefix.is_empty() {
         return (0..items.len()).collect();
     }
-    let lower = prefix.to_lowercase();
-    let mut scored: Vec<(u8, usize)> = items
+    let mut scored: Vec<((u8, bool), usize)> = items
         .iter()
         .enumerate()
         .filter_map(|(i, item)| {
-            let label = item.label.to_lowercase();
-            let score = if item.label.starts_with(prefix) {
-                3
-            } else if label.starts_with(&lower) {
-                2
-            } else if is_subsequence(&lower, &label) {
-                1
-            } else {
-                return None;
-            };
-            Some((score, i))
+            let rank = pythia_lsp_core::match_rank(&item.label, prefix)?;
+            Some(((rank, !item.label.starts_with(prefix)), i))
         })
         .collect();
-    // Stable: equal scores keep the app's order.
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    // Stable: equal ranks keep the app's order.
+    scored.sort_by_key(|(rank, _)| *rank);
     scored.into_iter().map(|(_, i)| i).collect()
-}
-
-fn is_subsequence(needle: &str, hay: &str) -> bool {
-    let mut hay = hay.chars();
-    needle.chars().all(|c| hay.any(|h| h == c))
 }
 
 /// Number of identifier chars directly before `pos`.
@@ -385,10 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_and_prefix_order() {
-        let found = filter(&items(), "dpt");
-        assert_eq!(found, vec![2]);
+    fn prefix_word_start_and_substring_order() {
         assert_eq!(filter(&items(), "EMP"), vec![0, 1, 3]);
+        // Word start, then substring.
+        assert_eq!(filter(&items(), "nam"), vec![1]);
+        assert_eq!(filter(&items(), "part"), vec![2]);
+        // Letters scattered through a word don't match (#160).
+        assert!(filter(&items(), "dpt").is_empty());
     }
 
     #[test]

@@ -7,6 +7,15 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Completion offered wrong names in large schemas (#160). The popup asked
+  once, after two letters, for the best 300 names, then only filtered
+  those while typing on: names past the first 300 for those letters (in
+  IFS, `mxn_it…` after hundreds of `mxn_a…`) never showed, and names that
+  merely contained the typed letters somewhere (`mxn_access_mgmt_hist`
+  for `mxn_it`) filled the list. A list cut short is asked for again
+  while typing on, and names match by prefix, word starts (`mxn_it` →
+  `mxn_inventory_transaction_tab`) or substring, no longer by letters
+  scattered through them.
 - *New SQL* (toolbar, *File → New SQL Window*, Ctrl+N) opened the window
   without the keyboard focus in its editor: typing went nowhere until a
   click into it (#157).

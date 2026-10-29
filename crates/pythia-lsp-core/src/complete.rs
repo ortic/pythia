@@ -60,6 +60,10 @@ pub struct Completion {
     /// Range of the source to replace with the chosen item (the typed prefix).
     pub replace: Range<usize>,
     pub items: Vec<CompletionItem>,
+    /// `items` were cut at `max_items`: names that match what is typed so
+    /// far are missing, so typing on should complete again rather than
+    /// filter these (LSP's `isIncomplete`).
+    pub incomplete: bool,
     /// Dictionary data that would improve the result; fetch and call again.
     pub missing: Vec<CatalogRequest>,
 }
@@ -217,7 +221,7 @@ pub(crate) fn complete(sema: &Sema, offset: usize, opts: &CompletionOptions) -> 
     let ctx = context(sema, word_start, offset);
     let mut b = Builder::new(prefix, quoted, opts, sema.cat.names());
     fill(sema, &ctx, word_start, prefix, &mut b);
-    completion.items = b.finish(opts.max_items);
+    (completion.items, completion.incomplete) = b.finish(opts.max_items);
     completion
 }
 
@@ -649,19 +653,26 @@ impl Builder {
         )
     }
 
-    fn finish(mut self, max: usize) -> Vec<CompletionItem> {
+    /// The best `max` items, and whether there were more.
+    fn finish(mut self, max: usize) -> (Vec<CompletionItem>, bool) {
         self.items.sort_by(|a, b| a.0.cmp(&b.0));
-        self.items
+        let cut = self.items.len() > max;
+        let items = self
+            .items
             .into_iter()
             .take(max)
             .map(|(_, item)| item)
-            .collect()
+            .collect();
+        (items, cut)
     }
 }
 
 /// How well `label` matches `prefix` (case-insensitive): 0 = prefix,
-/// 1 = word starts (`fn` → `first_name`), 2 = substring, 3 = subsequence.
-fn match_rank(label: &str, prefix: &str) -> Option<u8> {
+/// 1 = word starts (`fn` → `first_name`, `mxn_it` → `mxn_inventory_tab`),
+/// 2 = substring. Letters scattered through words don't match: in a large
+/// schema they match nearly everything (#160). The editor filters with the
+/// same rule while the popup is open.
+pub fn match_rank(label: &str, prefix: &str) -> Option<u8> {
     if prefix.is_empty() {
         return Some(0);
     }
@@ -679,19 +690,18 @@ fn match_rank(label: &str, prefix: &str) -> Option<u8> {
     if l.contains(&p) {
         return Some(2);
     }
-    let mut chars = l.chars();
-    if p.chars().all(|c| chars.any(|x| x == c)) && p.len() >= 2 {
-        return Some(3);
-    }
     None
 }
 
 fn word_start_match(segments: &[&str], p: &str) -> bool {
     /// Consumes `p` with non-empty prefixes of segments, in order (segments
-    /// may be skipped).
+    /// may be skipped). A typed `_` is where a segment ends.
     fn go(segments: &[&str], p: &str) -> bool {
         if p.is_empty() {
             return true;
+        }
+        if let Some(rest) = p.strip_prefix(['_', ' ', '.']) {
+            return go(segments, rest);
         }
         for (i, segment) in segments.iter().enumerate() {
             let common = segment
@@ -1197,8 +1207,18 @@ mod tests {
         assert_eq!(match_rank("FIRST_NAME", "fn"), Some(1));
         assert_eq!(match_rank("FIRST_NAME", "name"), Some(1));
         assert_eq!(match_rank("FIRST_NAME", "rst"), Some(2));
-        assert_eq!(match_rank("FIRST_NAME", "frnm"), Some(3));
         assert_eq!(match_rank("FIRST_NAME", "xyz"), None);
+        // Letters scattered through words don't match (#160).
+        assert_eq!(match_rank("FIRST_NAME", "frnm"), None);
+        assert_eq!(match_rank("mxn_access_mgmt_hist", "mxn_it"), None);
+        assert_eq!(match_rank("mxn75_inventory_part_hist", "mxn_it"), None);
+        // A typed `_` ends a word.
+        assert_eq!(match_rank("mxn_item_tab", "mxn_it"), Some(0));
+        assert_eq!(
+            match_rank("mxn_inventory_transaction_tab", "mxn_it"),
+            Some(1)
+        );
+        assert_eq!(match_rank("mxnit_x", "mxn_it"), None);
     }
 
     #[test]
