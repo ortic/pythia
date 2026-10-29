@@ -442,14 +442,32 @@ impl CodeEditor {
 
     /// Opens the completion popup. `replace` is the byte range the accepted
     /// item replaces (usually the identifier prefix before the caret);
-    /// typing afterwards extends it and filters the list. An empty or
-    /// non-matching list closes the popup.
-    pub fn show_completions(&mut self, replace: Range<usize>, items: Vec<CompletionEntry>) {
+    /// typing afterwards extends it and filters the list, or asks again if
+    /// the list is `incomplete` (cut short, #160). An empty or non-matching
+    /// list closes the popup. A new list for an open popup keeps its
+    /// selection, if offered.
+    pub fn show_completions(
+        &mut self,
+        replace: Range<usize>,
+        items: Vec<CompletionEntry>,
+        incomplete: bool,
+    ) {
         let rope = &self.state.rope;
         let len = rope.len_bytes();
         let chars =
             rope.byte_to_char(replace.start.min(len))..rope.byte_to_char(replace.end.min(len));
-        self.completion = Completion::new(&self.state, chars, items);
+        let selected = self
+            .completion
+            .as_ref()
+            .and_then(Completion::selected_entry)
+            .map(|e| e.label.clone());
+        self.completion = Completion::new(&self.state, chars, items).map(|mut c| {
+            c.incomplete = incomplete;
+            if let Some(label) = &selected {
+                c.select_label(label);
+            }
+            c
+        });
         self.pending_completion = None;
     }
 

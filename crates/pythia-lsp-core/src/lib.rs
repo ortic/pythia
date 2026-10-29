@@ -22,7 +22,9 @@ pub use catalog::{
     Catalog, CatalogCache, CatalogColumn, CatalogMember, CatalogObject, CatalogParam,
     CatalogRequest, EmptyCatalog, Lookup, MemberKind, NameStyle, ParamMode,
 };
-pub use complete::{CaseStyle, Completion, CompletionItem, CompletionKind, CompletionOptions};
+pub use complete::{
+    CaseStyle, Completion, CompletionItem, CompletionKind, CompletionOptions, match_rank,
+};
 pub use navigate::{Definition, DefinitionResult, Hover, Signature, SignatureHelp};
 pub use outline::{OutlineItem, OutlineKind};
 pub use pythia_plsql::ast::{Diagnostic, Severity};

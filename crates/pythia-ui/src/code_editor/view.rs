@@ -867,13 +867,14 @@ impl CodeEditor {
             c if is_word_char(c) => {
                 let typed = assist::word_prefix_len(&self.state.rope, caret);
                 let enough = typed >= config.auto_complete_min_chars.max(1);
-                // With the popup open, typing just filters it.
-                self.pending_completion =
-                    (enough && self.completion.is_none()).then(|| PendingCompletion {
-                        deadline: time + config.auto_complete_delay_ms as f64 / 1000.0,
-                        caret,
-                        revision: self.state.revision,
-                    });
+                // With the popup open, typing just filters it, unless its
+                // list was cut short: then it asks again (#160).
+                let ask = self.completion.as_ref().is_none_or(|c| c.incomplete);
+                self.pending_completion = (enough && ask).then(|| PendingCompletion {
+                    deadline: time + config.auto_complete_delay_ms as f64 / 1000.0,
+                    caret,
+                    revision: self.state.revision,
+                });
             }
             _ => self.pending_completion = None,
         }
@@ -2318,7 +2319,7 @@ mod tests {
         let mut items: Vec<_> = (0..50).map(|i| entry(&format!("col_{i:02}"))).collect();
         items.extend(["zz_a", "zz_b", "zz_c"].map(entry));
         frames(&ctx, &mut editor, 2, vec![]);
-        editor.show_completions(7..7, items.clone());
+        editor.show_completions(7..7, items.clone(), false);
         frames(&ctx, &mut editor, 3, vec![]);
         assert_eq!(visible_rows(&editor), rows);
 
@@ -2336,12 +2337,49 @@ mod tests {
             vec![key(Key::Backspace), key(Key::Backspace)],
         );
         assert_eq!(editor.text(), "select ");
-        editor.show_completions(7..7, items);
+        editor.show_completions(7..7, items, false);
         frames(&ctx, &mut editor, 3, vec![]);
         assert_eq!(visible_rows(&editor), rows);
         // PageDown moves by what is shown.
         frames(&ctx, &mut editor, 2, vec![key(Key::PageDown)]);
         assert_eq!(editor.completion.as_ref().unwrap().selected, rows);
+    }
+
+    /// Typing into an open popup filters a complete list, but asks for
+    /// completions again when the list was cut short (#160).
+    #[test]
+    fn typing_into_a_cut_list_asks_again() {
+        let ctx = egui::Context::default();
+        let mut editor = CodeEditor::new("select mx");
+        editor.goto(1, 10);
+        editor.request_focus();
+        frames(&ctx, &mut editor, 2, vec![]);
+        let items: Vec<_> = (0..20).map(|i| entry(&format!("mxn_a{i:02}"))).collect();
+        for incomplete in [false, true] {
+            editor.show_completions(7..9, items.clone(), incomplete);
+            frames(&ctx, &mut editor, 1, vec![]);
+            let mut events = vec![Event::Text("n".into())];
+            let mut asked = false;
+            // Past the debounce (150 ms at 1/60 s a frame).
+            for _ in 0..30 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))),
+                    events: std::mem::take(&mut events),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    asked |= editor
+                        .ui(ui, &EditorConfig::default())
+                        .completion_request
+                        .is_some();
+                });
+                output.textures_delta.clear();
+            }
+            assert_eq!(editor.text(), "select mxn");
+            assert_eq!(asked, incomplete, "incomplete: {incomplete}");
+            assert!(editor.is_completion_open(), "still filtered meanwhile");
+            frames(&ctx, &mut editor, 2, vec![key(Key::Backspace)]);
+        }
     }
 
     #[test]
@@ -2359,7 +2397,7 @@ mod tests {
             editor.request_focus();
             frames(&ctx, &mut editor, 2, vec![]);
             let at = editor.cursor();
-            editor.show_completions(at - 1..at, items.clone());
+            editor.show_completions(at - 1..at, items.clone(), false);
             frames(&ctx, &mut editor, 3, vec![]);
             let layout = editor.last_layout.as_ref().unwrap();
             let (top, bottom) = (layout.row_y(line - 1), layout.row_y(line));
@@ -2400,7 +2438,7 @@ mod tests {
         editor.goto(1, 8);
         editor.request_focus();
         frames(&ctx, &mut editor, 2, vec![]);
-        editor.show_completions(7..7, ["alpha", "beta", "gamma"].map(entry).to_vec());
+        editor.show_completions(7..7, ["alpha", "beta", "gamma"].map(entry).to_vec(), false);
         frames(&ctx, &mut editor, 3, vec![]);
         // The list is the only foreground area (no details pane).
         let list = ctx

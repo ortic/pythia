@@ -224,7 +224,7 @@ impl eframe::App for Demo {
                     let prefix = &self.editor.text()[word_start..trigger.offset];
                     items.extend(self.editor.snippet_completions(prefix));
                     self.editor
-                        .show_completions(word_start..trigger.offset, items);
+                        .show_completions(word_start..trigger.offset, items, false);
                 }
                 if let Some(off) = out.goto_request {
                     self.log.push(format!("goto {off}"));

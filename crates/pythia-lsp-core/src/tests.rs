@@ -1173,3 +1173,29 @@ fn hover_shows_the_comment_above_a_declaration() {
     let h = Analysis::new(NAV_PKG).hover(at, &hr()).unwrap();
     assert_eq!(h.detail, "g_limit number");
 }
+
+/// A large schema: more names start with `mx` than fit the list. Completing
+/// at `mx` says the list was cut, and completing again at `mxn_it` finds
+/// the names past the cut, without names that merely contain the letters
+/// (#160).
+#[test]
+fn cut_lists_say_so() {
+    let mut c = CatalogCache::new("IFSAPP");
+    let mut objects: Vec<CatalogObject> = (0..400)
+        .map(|i| obj("IFSAPP", &format!("MXN_ACCESS_{i:03}_HIST"), "TABLE"))
+        .collect();
+    objects.push(obj("IFSAPP", "MXN_ITEM_TAB", "TABLE"));
+    objects.push(obj("IFSAPP", "MXN_INVENTORY_TRANSACTION_TAB", "TABLE"));
+    c.set_objects(None, objects);
+    let early = completion("select * from mx¦", &c);
+    assert!(early.incomplete);
+    assert_eq!(early.items.len(), CompletionOptions::default().max_items);
+    let names = |c: &Completion| c.items.iter().map(|i| i.label.clone()).collect::<Vec<_>>();
+    assert!(!names(&early).contains(&"mxn_item_tab".to_owned()));
+    let later = completion("select * from mxn_it¦", &c);
+    assert!(!later.incomplete);
+    assert_eq!(
+        names(&later),
+        ["mxn_item_tab", "mxn_inventory_transaction_tab"]
+    );
+}

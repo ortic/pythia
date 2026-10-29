@@ -10,6 +10,7 @@ egui_extras = { workspace = true, features = ["svg", "datepicker", "serde"] }
 jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 pythia-data.workspace = true
 pythia-db.workspace = true
+pythia-lsp-core.workspace = true
 pythia-plsql.workspace = true
 regex.workspace = true
 ropey.workspace = true
