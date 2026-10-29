@@ -1065,8 +1065,7 @@ fn debugger_session() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     use pythia_debugger::{Unit, UnitType};
     let mut h = harness(true).alone();
     h.state_mut().test_connect(profile, password);
@@ -1239,8 +1238,7 @@ fn debugger_sql_panel() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     // The SQL panel's views, before any session connects (#154).
     crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
     let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
@@ -1328,17 +1326,13 @@ fn monitor_plan_with_actual_rows() {
             .as_nanos()
     );
     // Estimated at 1% of the rows, all of them match.
-    let n: i64 = conn
-        .query_row_as(
-            &format!(
-                "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
-                   from (select level n from dual connect by level <= 3000) \
-                  where upper(to_char(n)) = to_char(n)"
-            ),
-            &[],
-        )
-        .unwrap();
-    assert_eq!(n, 3000);
+    let sql = format!(
+        "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
+           from (select level n from dual connect by level <= 3000) \
+          where upper(to_char(n)) = to_char(n)"
+    );
+    let run = || conn.query_row_as::<i64>(&sql, &[]).unwrap();
+    assert_eq!(run(), 3000);
     let sql_id: String = conn
         .query_row_as(
             "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
@@ -1375,12 +1369,49 @@ fn monitor_plan_with_actual_rows() {
             Err(e) => Err(e.to_owned()),
         }
     };
+    // Gone from the shared pool when the details read it (seen with the
+    // whole suite on a fresh database, #154): run it again, read again.
+    let gone = |app: &PythiaApp| {
+        app.test_monitor_window_ref()
+            .test_monitor_ref()
+            .and_then(|m| m.sql_detail(&sql_id))
+            .and_then(|v| v.detail().ok().flatten())
+            .is_some_and(|d| d.children.is_empty())
+    };
     let start = Instant::now();
+    let mut rerun = Instant::now();
     while !measured(h.state()).unwrap_or_else(|e| panic!("SQL details of {sql_id}: {e}")) {
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "no plan with actual rows for {sql_id}"
-        );
+        if gone(h.state()) && rerun.elapsed() > Duration::from_secs(2) {
+            rerun = Instant::now();
+            run();
+            if let Some(view) = h
+                .state_mut()
+                .test_monitor_window()
+                .test_monitor()
+                .sql_detail_mut(&sql_id)
+            {
+                view.reload();
+            }
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let monitor = h.state().test_monitor_window_ref().test_monitor_ref();
+            let view = monitor.and_then(|m| m.sql_detail(&sql_id));
+            let detail = view.map(|v| {
+                v.detail()
+                    .map(|d| d.map(|d| (&d.child, &d.plan_rows, &d.plan)))
+            });
+            let dba = crate::test_db::connect("PYTHIA_TEST_DB_DBA");
+            let in_pool: Option<Vec<(i64, String, i64)>> = dba.map(|dba| {
+                dba.query_as::<(i64, String, i64)>(
+                    "select child_number, is_obsolete, invalidations from v$sql where sql_id = :1",
+                    &[&sql_id],
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+            });
+            panic!("no plan with actual rows for {sql_id}: {detail:#?}\nin V$SQL now: {in_pool:?}");
+        }
         h.step();
         std::thread::sleep(Duration::from_millis(15));
     }
@@ -1395,13 +1426,27 @@ fn monitor_plan_with_actual_rows() {
     save(&mut h, "07-monitor-sql-plan-dark");
 }
 
+/// One test at a time runs [`debug_setup`]'s statements.
+static DEBUG_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Lets `user` debug with the database connecting back to `host`, as the
+/// DBA. One test at a time: adding the same ACL entry from two sessions
+/// collides while it doesn't exist yet (#155). A lock of its own, held for
+/// the statements only: tests call it holding the UI lock, and
+/// `debugger_setup_fixes_the_acl` holds ACCOUNTS while it waits for that.
+fn debug_setup(user: &str, host: &str) {
+    let _setup = DEBUG_SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let setup = pythia_debugger::target::setup_statements(user, host);
+    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
 /// pythia-debugger's debugging scenario: order processing across packages.
 const DEBUG_SCENARIO: &str = include_str!("../../pythia-debugger/tests/scenario/orders.sql");
 
 /// The environment of the debugger scenario tests: the test user's profile
-/// and password, the debugger host and the DBA connect spec.
-fn debug_environment() -> Option<(ConnectionProfile, String, String, String)> {
-    let (Some((profile, password)), Ok(host), Ok(dba)) = (
+/// and password and the debugger host (the DBA must be set too).
+fn debug_environment() -> Option<(ConnectionProfile, String, String)> {
+    let (Some((profile, password)), Ok(host), Ok(_)) = (
         profile(),
         std::env::var("PYTHIA_DEBUG_HOST"),
         std::env::var("PYTHIA_TEST_DB_DBA"),
@@ -1409,23 +1454,20 @@ fn debug_environment() -> Option<(ConnectionProfile, String, String, String)> {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_TEST_DB_DBA / PYTHIA_DEBUG_HOST not set, skipping");
         return None;
     };
-    Some((profile, password, host, dba))
+    Some((profile, password, host))
 }
 
 /// Lets the test user debug (with the database connecting back to `host`)
 /// and installs [`DEBUG_SCENARIO`], compiled without debug information.
 /// Returns a connection of the test user. The tests share the scenario:
 /// create the harness first, [alone](Ui::alone).
-fn install_debug_scenario(host: &str, dba: &str) -> pythia_db::oracle::Connection {
+fn install_debug_scenario(host: &str) -> pythia_db::oracle::Connection {
     let connect = |spec: &str| {
         let (cred, db) = spec.rsplit_once('@').unwrap();
         let (user, pw) = cred.split_once('/').unwrap();
         pythia_db::oracle::Connection::connect(user, pw, db).unwrap()
     };
-    let dba = connect(dba);
-    for stmt in pythia_debugger::target::setup_statements("pythia", host) {
-        dba.execute(&stmt, &[]).unwrap();
-    }
+    debug_setup("pythia", host);
     let conn = connect(&std::env::var("PYTHIA_TEST_DB").unwrap());
     for drop in [
         "drop trigger dbgx_orders_bu",
@@ -1471,12 +1513,12 @@ fn scenario_marker(head: &str, name: &str) -> u32 {
 #[test]
 fn debugger_follows_execution() {
     use pythia_debugger::{DebugCommand, Unit, UnitType};
-    let Some((profile, password, host, dba)) = debug_environment() else {
+    let Some((profile, password, host)) = debug_environment() else {
         return;
     };
     let mut h = harness(true).alone();
     // Install the scenario, with debug information everywhere.
-    let conn = install_debug_scenario(&host, &dba);
+    let conn = install_debug_scenario(&host);
     let unit = |name: &str, t| Unit::new("PYTHIA", name, t);
     let api = unit("DBGX_ORDERS_API", UnitType::PackageBody);
     let trigger = unit("DBGX_ORDERS_BU", UnitType::Trigger);
@@ -1588,11 +1630,11 @@ fn debugger_follows_execution() {
 #[test]
 fn debugger_steps_into_unit_compiled_in_program_window() {
     use pythia_debugger::{DebugCommand, Unit, UnitType};
-    let Some((profile, password, host, dba)) = debug_environment() else {
+    let Some((profile, password, host)) = debug_environment() else {
         return;
     };
     let mut h = harness(true).alone();
-    let conn = install_debug_scenario(&host, &dba);
+    let conn = install_debug_scenario(&host);
     let api = Unit::new("PYTHIA", "DBGX_ORDERS_API", UnitType::PackageBody);
     let pricing = Unit::new("PYTHIA", "DBGX_PRICING", UnitType::PackageBody);
     pythia_debugger::target::compile_debug(&conn, &api).unwrap();
@@ -3742,8 +3784,7 @@ fn debug_from_package_spec() {
         eprintln!("PYTHIA_TEST_DB / PYTHIA_DEBUG_HOST not set, skipping");
         return;
     };
-    let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
-    crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    debug_setup(&profile.username, &host);
     let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
     let (cred, db) = spec.rsplit_once('@').unwrap();
     let (user, pw) = cred.split_once('/').unwrap();
@@ -4355,6 +4396,9 @@ fn program_compile_refreshes_invalid_count() {
     let Some((profile, password)) = profile() else {
         return;
     };
+    // Alone before the package is invalid: another test may compile the
+    // schema's invalid objects meanwhile (#156).
+    let mut h = harness(true).alone();
     let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
     let (cred, db) = spec.rsplit_once('@').unwrap();
     let (user, pw) = cred.split_once('/').unwrap();
@@ -4381,7 +4425,6 @@ fn program_compile_refreshes_invalid_count() {
         .unwrap()
     };
     assert_eq!(ours(), 2, "spec and body invalid");
-    let mut h = harness(true).alone();
     // Only compiles refresh the count.
     h.state_mut().test_settings_mut().invalid.refresh_minutes = 0;
     h.state_mut().test_connect(profile, password);
