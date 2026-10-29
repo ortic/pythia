@@ -300,6 +300,11 @@ impl Editor {
         self.refresh();
     }
 
+    /// Takes the keyboard focus with the next frame.
+    pub fn request_focus(&mut self) {
+        self.inner.request_focus();
+    }
+
     pub fn select_all(&mut self) {
         self.inner.select_all();
         self.inner.request_focus();

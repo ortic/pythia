@@ -2446,10 +2446,10 @@ impl PythiaApp {
             Command::NewSqlWindow => {
                 let title = self.new_sql_title();
                 let connection = self.current_connection();
-                self.add_doc(
-                    connection,
-                    DocKind::Sql(SqlWindow::new(title, String::new())),
-                );
+                let mut window = SqlWindow::new(title, String::new());
+                // Ready to type into (#157).
+                window.editor.request_focus();
+                self.add_doc(connection, DocKind::Sql(window));
             }
             Command::CloseTab => {
                 if let Some(id) = self.focused

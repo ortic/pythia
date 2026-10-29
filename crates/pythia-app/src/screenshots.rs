@@ -1202,6 +1202,28 @@ fn debugger_session() {
     wait_until(&mut h, "finish", |app| !app.test_debug_running());
 }
 
+/// *New SQL* puts the keyboard focus into the new window's editor: typing
+/// right away goes there, from the toolbar button and from Ctrl+N (#157).
+#[test]
+fn new_sql_window_has_the_focus() {
+    let mut h = headless_harness();
+    h.run_steps(2);
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1".into()));
+    h.run_steps(2);
+    let first = h.state_mut().test_sql_window().title.clone();
+    assert_eq!(h.state_mut().test_sql_window().editor.text(), "select 1");
+
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 2".into()));
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    assert_ne!(w.title, first, "a new window");
+    assert_eq!(w.editor.text(), "select 2");
+}
+
 /// Orders mostly shipped, a few new: without a histogram the optimizer
 /// expects half of them new.
 const SHOP: &[&str] = &[

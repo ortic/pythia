@@ -6,6 +6,11 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- *New SQL* (toolbar, *File → New SQL Window*, Ctrl+N) opened the window
+  without the keyboard focus in its editor: typing went nowhere until a
+  click into it (#157).
+
 ## [0.8.0] - 2026-10-29
 
 ### Added
