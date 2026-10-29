@@ -2,6 +2,13 @@
 //! with the line it came from, and a statement's plan with estimated and
 //! actual rows side by side. At every stop it selects the statement at the
 //! stopped line, or the closest one before it in the unit.
+//!
+//! It stays closed until it's needed: every stop checks the plans of the
+//! statements that ran in the step, flags those off by 10× or more (in the
+//! gutter, and with ⚠ on the toolbar's *SQL*), and opens on one the first
+//! time it is flagged (#162).
+
+use std::collections::{HashMap, HashSet};
 
 use egui::{Align, Layout, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
@@ -11,41 +18,75 @@ use crate::sql::{CursorPlan, SessionSql, TargetSession};
 use crate::types::{Location, Unit};
 use crate::ui::{DebugAction, SqlQuestion};
 
+/// A statement: SQL_ID and child.
+type Key = (String, i64);
+
+/// Plans of what ran in a step checked at most, the longest-running first.
+const CHECKED_PER_STOP: usize = 5;
+
+/// A statement whose last execution's estimates are off: where it is and
+/// what the note says.
+#[derive(Debug, Clone, PartialEq)]
+struct Flag {
+    /// Its unit, `None` for the debugged anonymous block.
+    unit: Option<Unit>,
+    line: u32,
+    note: String,
+}
+
 pub(crate) struct SqlPanel {
-    /// The panel is shown (kept across restarts).
+    /// The panel is shown (kept across restarts). Closed by default: it
+    /// opens on a statement whose estimates are off (#162).
     pub show: bool,
-    /// The debugged session collects row source statistics (kept).
+    /// The debugged session collects row source statistics (Settings →
+    /// Debugger). Then every stop checks what ran, shown or not.
     pub statistics: bool,
+    /// The panel opens on a newly flagged statement (Settings → Debugger).
+    pub open_on_flag: bool,
     /// Stops so far: an answer for an earlier stop is outdated.
     stop: u64,
     /// The stop a lookup is on its way for.
     finding: Option<u64>,
     /// The statements found at a stop, or why there are none.
     found: Option<(u64, Result<Vec<SessionSql>, String>)>,
-    /// The statement shown: SQL_ID and child.
-    selected: Option<(String, i64)>,
+    /// The statement shown.
+    selected: Option<Key>,
     /// The user picked `selected` at this stop; else it follows the code.
     picked: bool,
-    /// The plan being loaded.
-    loading: Option<(String, i64)>,
+    /// Plans being loaded.
+    loading: HashSet<Key>,
     /// The selected statement's plan, or why it isn't there.
-    plan: Option<((String, i64), Result<CursorPlan, String>)>,
+    plan: Option<(Key, Result<CursorPlan, String>)>,
     view: PlanView,
+    /// Each statement's executions at the last lookup, and whether one was
+    /// running: what ran in a step.
+    seen: HashMap<Key, (i64, bool)>,
+    /// Plans loaded to check a statement that ran in a step.
+    checking: HashSet<Key>,
+    /// Statements whose last execution is off by 10× or more.
+    flags: HashMap<Key, Flag>,
+    /// Flagged statements the panel opened on (each once).
+    announced: HashSet<Key>,
 }
 
 impl Default for SqlPanel {
     fn default() -> Self {
         Self {
-            show: true,
+            show: false,
             statistics: true,
+            open_on_flag: true,
             stop: 0,
             finding: None,
             found: None,
             selected: None,
             picked: false,
-            loading: None,
+            loading: HashSet::new(),
             plan: None,
             view: PlanView::default(),
+            seen: HashMap::new(),
+            checking: HashSet::new(),
+            flags: HashMap::new(),
+            announced: HashSet::new(),
         }
     }
 }
@@ -64,14 +105,20 @@ pub(crate) struct Context<'a> {
 }
 
 impl SqlPanel {
-    /// A new debug run: nothing found yet.
+    /// A new debug run: nothing found or flagged yet.
     pub fn reset(&mut self) {
-        let (show, statistics) = (self.show, self.statistics);
+        let (show, statistics, open_on_flag) = (self.show, self.statistics, self.open_on_flag);
         *self = Self {
             show,
             statistics,
+            open_on_flag,
             ..Self::default()
         };
+    }
+
+    /// The run ended: its flags go (the lines may change from here on).
+    pub fn finished(&mut self) {
+        self.flags.clear();
     }
 
     /// Execution stopped: look the statements up again.
@@ -82,9 +129,10 @@ impl SqlPanel {
     }
 
     /// Asks for the statements at this stop, unless a lookup is on its way
-    /// (its answer asks again if it is outdated by then).
+    /// (its answer asks again if it is outdated by then). Closed, the panel
+    /// still looks while there are statistics to check.
     pub fn find(&mut self, session: Option<&TargetSession>, out: &mut Vec<DebugAction>) {
-        if !self.show || self.finding.is_some() {
+        if !(self.show || self.statistics) || self.finding.is_some() {
             return;
         }
         let Some(session) = session else {
@@ -104,8 +152,9 @@ impl SqlPanel {
         });
     }
 
-    /// The statements of stop `stop`. Selects the one at the code (unless
-    /// the user picked one) and loads its plan.
+    /// The statements of stop `stop`. Checks the plans of those that ran
+    /// in the step, selects the one at the code (unless the user picked
+    /// one) and loads its plan.
     pub fn found(
         &mut self,
         stop: u64,
@@ -119,30 +168,130 @@ impl SqlPanel {
             self.find(session, out);
             return;
         }
+        if let Ok(list) = &result {
+            self.check_what_ran(list, out);
+        }
         self.found = Some((stop, result));
         if !self.picked {
             self.follow(cx);
         }
-        self.load(out);
+        if self.show {
+            self.load(out);
+        }
+    }
+
+    /// The user opened the panel: the selected statement's plan, or the
+    /// statements first if they weren't looked up at this stop.
+    pub fn opened(&mut self, session: Option<&TargetSession>, out: &mut Vec<DebugAction>) {
+        if self
+            .found
+            .as_ref()
+            .is_some_and(|(stop, _)| *stop == self.stop)
+        {
+            self.load(out);
+        } else {
+            self.find(session, out);
+        }
+    }
+
+    /// Loads the plans of the statements that finished an execution since
+    /// the last lookup, to flag them if their estimates are off. A running
+    /// one is checked once it finished.
+    fn check_what_ran(&mut self, list: &[SessionSql], out: &mut Vec<DebugAction>) {
+        if !self.statistics {
+            return;
+        }
+        let mut ran: Vec<&SessionSql> = list
+            .iter()
+            .filter(|s| {
+                !s.running
+                    && self.seen.get(&(s.sql_id.clone(), s.child)) != Some(&(s.executions, false))
+            })
+            .collect();
+        ran.sort_by(|a, b| b.elapsed.total_cmp(&a.elapsed));
+        for s in ran.into_iter().take(CHECKED_PER_STOP) {
+            let key = (s.sql_id.clone(), s.child);
+            self.checking.insert(key.clone());
+            if self.loading.insert(key) {
+                out.push(DebugAction::LoadPlan {
+                    sql_id: s.sql_id.clone(),
+                    child: s.child,
+                });
+            }
+        }
+        self.seen = list
+            .iter()
+            .map(|s| ((s.sql_id.clone(), s.child), (s.executions, s.running)))
+            .collect();
     }
 
     /// Another frame was selected: show its statement.
     pub fn frame_selected(&mut self, cx: &Context, out: &mut Vec<DebugAction>) {
         if !self.picked {
             self.follow(cx);
-            self.load(out);
+            if self.show {
+                self.load(out);
+            }
         }
     }
 
     pub fn plan_loaded(&mut self, sql_id: String, child: i64, result: Result<CursorPlan, String>) {
         let key = (sql_id, child);
-        if self.loading.as_ref() == Some(&key) {
-            self.loading = None;
+        self.loading.remove(&key);
+        if self.checking.remove(&key)
+            && let Ok(plan) = &result
+        {
+            self.flag(&key, plan);
         }
-        if self.selected.as_ref() != Some(&key) {
+        if self.selected.as_ref() == Some(&key) {
+            self.plan = Some((key, result));
+        }
+    }
+
+    /// Flags a statement whose plan is off by 10× or more with rows to
+    /// show for it, and opens the panel on it the first time.
+    fn flag(&mut self, key: &Key, plan: &CursorPlan) {
+        let Some(row) = plan::flagged_misestimate(&plan.rows) else {
+            self.flags.remove(key);
             return;
+        };
+        let Some(statement) = self
+            .statements()
+            .iter()
+            .find(|s| (&s.sql_id, s.child) == (&key.0, key.1))
+        else {
+            return;
+        };
+        self.flags.insert(
+            key.clone(),
+            Flag {
+                unit: statement.unit.clone(),
+                line: statement.line,
+                note: plan::note(row),
+            },
+        );
+        if self.open_on_flag && self.announced.insert(key.clone()) && !self.picked {
+            self.show = true;
+            self.selected = Some(key.clone());
+            self.picked = true;
         }
-        self.plan = Some((key, result));
+    }
+
+    /// Lines of flagged statements in `unit` (`None`: the debugged block),
+    /// with their notes.
+    pub fn flagged_lines(&self, unit: Option<&Unit>) -> Vec<(u32, String)> {
+        let mut lines: Vec<(u32, String)> = self
+            .flags
+            .values()
+            .filter(|f| f.unit.as_ref() == unit)
+            .map(|f| (f.line, f.note.clone()))
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    pub fn flag_count(&self) -> usize {
+        self.flags.len()
     }
 
     /// The plan shown, once loaded.
@@ -180,16 +329,15 @@ impl SqlPanel {
         self.selected = pick.map(|s| (s.sql_id.clone(), s.child));
     }
 
+    /// Loads the selected statement's plan, unless it is on its way.
     fn load(&mut self, out: &mut Vec<DebugAction>) {
         let Some((sql_id, child)) = self.selected.clone() else {
             self.plan = None;
             return;
         };
-        if self.loading.as_ref() == Some(&(sql_id.clone(), child)) {
-            return;
+        if self.loading.insert((sql_id.clone(), child)) {
+            out.push(DebugAction::LoadPlan { sql_id, child });
         }
-        self.loading = Some((sql_id.clone(), child));
-        out.push(DebugAction::LoadPlan { sql_id, child });
     }
 
     fn label(s: &SessionSql) -> String {
@@ -220,7 +368,7 @@ impl SqlPanel {
                     if count == 1 { "" } else { "s" }
                 ));
             }
-            if self.finding.is_some() || self.loading.is_some() {
+            if self.finding.is_some() || !self.loading.is_empty() {
                 ui.spinner();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -320,6 +468,10 @@ impl SqlPanel {
                                 "   "
                             };
                             ui.label(RichText::new(marker).monospace());
+                            if let Some(flag) = self.flags.get(&(s.sql_id.clone(), s.child)) {
+                                ui.label(RichText::new("⚠").color(ui.visuals().warn_fg_color))
+                                    .on_hover_text(&flag.note);
+                            }
                             let link = ui.link(RichText::new(Self::label(s)).monospace());
                             if link.clicked() {
                                 open = Self::location(s, cx.block);
@@ -599,7 +751,7 @@ mod tests {
             sid: 7,
             started: "2026-10-29 10:00:00".into(),
         };
-        let mut panel = SqlPanel::default();
+        let mut panel = following();
         let mut out = Vec::new();
         panel.stopped(Some(&session), &mut out);
         assert_eq!(
@@ -664,7 +816,7 @@ mod tests {
             sid: 7,
             started: "2026-10-29 10:00:00".into(),
         };
-        let mut panel = SqlPanel::default();
+        let mut panel = following();
         let mut out = Vec::new();
         panel.stopped(Some(&session), &mut out);
         // Stepping on before the answer: no second lookup meanwhile.
@@ -685,10 +837,129 @@ mod tests {
         assert!(out.is_empty());
         assert!(panel.found.is_some());
 
-        // Hidden, it looks nothing up.
+        // Hidden and without statistics to check, it looks nothing up.
         panel.show = false;
         panel.stopped(Some(&session), &mut out);
         assert!(out.is_empty());
+    }
+    /// A panel that only follows the code: open, no statistics to check.
+    fn following() -> SqlPanel {
+        SqlPanel {
+            show: true,
+            statistics: false,
+            ..SqlPanel::default()
+        }
+    }
+
+    fn plan(key: &str, estimate: f64, actual: f64) -> CursorPlan {
+        let row = |id, depth| pythia_ui::plan::PlanRow {
+            id,
+            depth,
+            operation: "TABLE ACCESS FULL".into(),
+            object: "PYTHIA.SHOP_ORDERS".into(),
+            rows: Some(estimate),
+            starts: Some(1.0),
+            actual_rows: Some(actual),
+            ..Default::default()
+        };
+        CursorPlan {
+            sql_id: key.into(),
+            child: 0,
+            rows: vec![row(0, 0), row(1, 1)],
+            text: "SELECT".into(),
+            executions: 1,
+            running: false,
+            other_plans: Vec::new(),
+            xplan: Ok(String::new()),
+        }
+    }
+
+    /// Closed, the panel checks what ran in each step, flags a statement
+    /// whose estimates are off and opens on it once; a statement still
+    /// running is checked when it finished (#162).
+    #[test]
+    fn flags_what_ran_and_opens_once() {
+        let pkg = Unit::new("PYTHIA", "SHIP", UnitType::Procedure);
+        let session = TargetSession {
+            sid: 7,
+            started: "2026-10-29 10:00:00".into(),
+        };
+        let mut panel = SqlPanel::default();
+        assert!(!panel.show, "closed by default");
+        let mut out = Vec::new();
+        let ran = |id: &str, line, executions, running| SessionSql {
+            executions,
+            running,
+            elapsed: f64::from(line),
+            ..sql(id, Some(&pkg), line)
+        };
+        let loads = |out: &[DebugAction]| -> Vec<String> {
+            out.iter()
+                .filter_map(|a| match a {
+                    DebugAction::LoadPlan { sql_id, .. } => Some(sql_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Stop 1: both ran; the longest first. The loop is still running.
+        panel.stopped(Some(&session), &mut out);
+        assert!(matches!(out[..], [DebugAction::FindSql { stop: 1, .. }]));
+        out.clear();
+        let list = vec![
+            ran("orders", 4, 1, false),
+            ran("count", 2, 1, false),
+            ran("loop", 8, 1, true),
+        ];
+        panel.found(
+            1,
+            Ok(list),
+            Some(&session),
+            &cx(Some((&pkg, 9)), None),
+            &mut out,
+        );
+        assert_eq!(loads(&out), ["orders", "count"]);
+        panel.plan_loaded("count".into(), 0, Ok(plan("count", 10.0, 12.0)));
+        assert!(!panel.show && panel.flag_count() == 0);
+        panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
+        assert!(panel.show, "opens on the flagged statement");
+        assert_eq!(panel.selected, Some(("orders".into(), 0)));
+        let lines = panel.flagged_lines(Some(&pkg));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, 4);
+        assert!(
+            lines[0].1.contains("estimated 25,000 rows, got 200"),
+            "{lines:?}"
+        );
+
+        // Closed by the user; the statement runs and is off again, and the
+        // loop finished, off too: only the loop opens it again.
+        panel.show = false;
+        out.clear();
+        panel.stopped(Some(&session), &mut out);
+        let list = vec![
+            ran("orders", 4, 2, false),
+            ran("count", 2, 1, false),
+            ran("loop", 8, 1, false),
+        ];
+        out.clear();
+        panel.found(
+            2,
+            Ok(list),
+            Some(&session),
+            &cx(Some((&pkg, 10)), None),
+            &mut out,
+        );
+        assert_eq!(loads(&out), ["loop", "orders"]);
+        panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
+        assert!(!panel.show, "flagged before: stays closed");
+        panel.plan_loaded("loop".into(), 0, Ok(plan("loop", 1.0, 5_000.0)));
+        assert!(panel.show);
+        assert_eq!(panel.flag_count(), 2);
+
+        // The run ends: the flags go.
+        panel.finished();
+        assert!(panel.flagged_lines(Some(&pkg)).is_empty());
     }
 
     #[test]

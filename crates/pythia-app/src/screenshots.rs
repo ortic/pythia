@@ -1298,10 +1298,18 @@ fn debugger_sql_panel() {
     h.state_mut()
         .test_command(crate::commands::Command::DebugStart);
     wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    // Closed until a statement's estimates are off: then it opens on it,
+    // and the gutter flags its line (#162).
+    assert!(!h.state().test_debug().sql_shown());
     wait_until(&mut h, "the loop's plan", |app| {
         app.test_debug().sql_plan().is_some_and(|p| p.measured())
     });
     let debug = h.state().test_debug();
+    assert!(debug.sql_shown(), "opened on the misestimate");
+    let flags = debug.sql_flags(Some(&unit));
+    assert_eq!(flags.len(), 1, "{flags:?}");
+    assert_eq!(flags[0].0, 4);
+    assert!(flags[0].1.contains("PYTHIA.SHOP_ORDERS"), "{flags:?}");
     let statement = &debug.sql_statements()[0];
     assert_eq!(
         (statement.unit.as_ref(), statement.line),

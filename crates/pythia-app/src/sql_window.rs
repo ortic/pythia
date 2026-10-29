@@ -1708,7 +1708,12 @@ impl SqlWindow {
             }
             if let (Some(start), Some(debug)) = (self.state.debug_start, cx.debug) {
                 let line = block_line(debug).map(|l| (start + l as usize - 1) as u32);
-                self.editor.set_debug_lines(&[], line);
+                let flagged: Vec<(u32, String)> = debug
+                    .sql_flags(None)
+                    .into_iter()
+                    .map(|(l, note)| ((start + l as usize - 1) as u32, note))
+                    .collect();
+                self.editor.set_debug_lines(&[], line, &flagged);
             }
             effects.extend(self.assist.handle(&mut self.editor, &out, cx));
             effects.extend(crate::editor_menu::show(

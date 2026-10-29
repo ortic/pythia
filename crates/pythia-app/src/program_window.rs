@@ -840,7 +840,8 @@ impl ProgramWindow {
             }
             if let Some(debug) = cx.debug {
                 let (lines, current) = debug.markers(&unit);
-                part.editor.set_debug_lines(&lines, current);
+                part.editor
+                    .set_debug_lines(&lines, current, &debug.sql_flags(Some(&unit)));
             }
         });
         // Looked up next frame, as from the editor's menu: the list of
