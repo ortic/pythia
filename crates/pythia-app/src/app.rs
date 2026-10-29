@@ -4829,6 +4829,14 @@ impl PythiaApp {
         }
     }
 
+    pub fn test_monitor_window_ref(&self) -> &crate::monitor_window::MonitorWindow {
+        let id = self.focused.expect("focused document");
+        match self.docs.get(&id).map(|d| &d.kind) {
+            Some(DocKind::Monitor(m)) => m,
+            _ => panic!("not a monitor"),
+        }
+    }
+
     pub fn test_sql_window(&mut self) -> &mut SqlWindow {
         let id = self.focused.expect("focused document");
         self.docs
