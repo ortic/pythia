@@ -6,6 +6,14 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- INSERT statements of a result go into the table the query reads
+  (#158): *Copy as → SQL INSERT*, *Export* and *Execute to file* (`.sql`)
+  wrote `insert into my_table` whatever the query. For `select * from
+  hr.orders where …` they write `insert into hr.orders`, the name as the
+  query has it. Results of joins and other queries over several tables
+  keep the placeholder `my_table`.
+
 ### Fixed
 - Completion offered wrong names in large schemas (#160). The popup asked
   once, after two letters, for the best 300 names, then only filtered

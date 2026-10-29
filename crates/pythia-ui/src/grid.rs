@@ -64,6 +64,9 @@ pub struct GridState {
     value_editor: Option<ValueEditor>,
     /// The database the rows come from: *Copy as* INSERT writes its SQL.
     pub dialect: pythia_db::Dialect,
+    /// The table the rows come from, as the query names it (one table
+    /// only): INSERT statements go into it (#158).
+    pub table: Option<String>,
 }
 
 /// A header being dragged to another place.
@@ -167,6 +170,17 @@ pub struct GridOutput {
 }
 
 impl GridState {
+    /// How the rows are exported: in the database's SQL, INSERTs into the
+    /// table they come from (else a placeholder name).
+    pub fn export_options(&self) -> pythia_data::Options {
+        let defaults = pythia_data::Options::default();
+        pythia_data::Options {
+            dialect: self.dialect,
+            table: self.table.clone().unwrap_or(defaults.table.clone()),
+            ..defaults
+        }
+    }
+
     /// Shows only rows containing `text` (case-insensitive) in any cell.
     pub fn set_filter(&mut self, text: &str) {
         if self.filter != text {
@@ -1580,15 +1594,9 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
         {
             if ui.button(format.label()).clicked() {
                 let (cols, data) = selection_data(columns, rows, state);
-                if let Ok(bytes) = pythia_data::export_to_vec(
-                    *format,
-                    &cols,
-                    &data,
-                    &pythia_data::Options {
-                        dialect: state.dialect,
-                        ..Default::default()
-                    },
-                ) {
+                if let Ok(bytes) =
+                    pythia_data::export_to_vec(*format, &cols, &data, &state.export_options())
+                {
                     ui.ctx()
                         .copy_text(String::from_utf8_lossy(&bytes).into_owned());
                 }
@@ -2206,6 +2214,20 @@ pub fn to_tsv(columns: &[Column], rows: &[Vec<Cell>]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// INSERTs go into the result's table, or a placeholder (#158).
+    #[test]
+    fn export_options_name_the_table() {
+        let mut state = GridState {
+            dialect: pythia_db::Dialect::MYSQL,
+            ..Default::default()
+        };
+        let options = state.export_options();
+        assert_eq!(options.table, "my_table");
+        assert_eq!(options.dialect, pythia_db::Dialect::MYSQL);
+        state.table = Some("shop.orders".into());
+        assert_eq!(state.export_options().table, "shop.orders");
+    }
 
     fn cols() -> Vec<Column> {
         vec![
