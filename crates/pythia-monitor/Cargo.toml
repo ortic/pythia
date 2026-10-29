@@ -9,6 +9,7 @@ egui.workspace = true
 egui_extras.workspace = true
 egui_plot = "0.37"
 pythia-db.workspace = true
+pythia-ui.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

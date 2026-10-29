@@ -480,21 +480,8 @@ impl SqlPanel {
 fn notes(plan: &CursorPlan, statistics: bool) -> Vec<(String, bool)> {
     let mut notes = Vec::new();
     let measured = plan.measured();
-    if let Some(worst) = plan::worst_misestimate(&plan.rows) {
-        notes.push((
-            format!(
-                "⚠ Estimate off at {} {}{}: {}",
-                worst.id,
-                worst.operation,
-                if worst.object.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", worst.object)
-                },
-                worst.misestimate_text().unwrap_or_default()
-            ),
-            true,
-        ));
+    if let Some((_, note)) = plan::misestimate_note(&plan.rows) {
+        notes.push((note, true));
     } else if measured {
         notes.push((
             "Estimates within 10× of the actual rows on every line".into(),

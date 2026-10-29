@@ -4671,6 +4671,7 @@ dependencies = [
  "egui_plot",
  "pythia-config",
  "pythia-db",
+ "pythia-ui",
  "tracing",
 ]
 

@@ -249,21 +249,10 @@ pub fn cursor_plan(conn: &Connection, sql_id: &str, child: i64) -> Result<Cursor
                from v$sql where sql_id = :1 and child_number = :2",
         &[&sql_id, &child],
     )?;
-    let mut rows = match pythia_db::cursor_plan(conn, sql_id, child)? {
-        MetaResult::Table { columns, rows } => pythia_ui::plan::rows(&columns, &rows),
+    let rows = match pythia_db::cursor_plan(conn, sql_id, child)? {
+        MetaResult::Table { columns, rows } => pythia_ui::plan::cursor_rows(&columns, &rows),
         _ => Vec::new(),
     };
-    // Statistics are written when an execution ends: while the first one
-    // runs every line has 0 starts.
-    if !rows.iter().any(|r| r.starts.is_some_and(|s| s > 0.0)) {
-        for r in &mut rows {
-            r.starts = None;
-            r.actual_rows = None;
-            r.actual_time = None;
-            r.buffers = None;
-            r.reads = None;
-        }
-    }
     let other_plans = conn
         .query_as::<(i64, i64, i64)>(
             "select child_number, plan_hash_value, executions from v$sql \

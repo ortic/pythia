@@ -40,6 +40,11 @@ impl MonitorWindow {
         Self { start, state: None }
     }
 
+    #[cfg(test)]
+    pub fn test_monitor(&mut self) -> &mut Monitor {
+        &mut self.state().monitor
+    }
+
     fn state(&mut self) -> &mut State {
         let start = self.start;
         self.state.get_or_insert_with(|| {

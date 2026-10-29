@@ -1307,6 +1307,73 @@ fn debugger_sql_panel() {
     }
 }
 
+/// The monitor's SQL details of a statement that collected row source
+/// statistics: the plan as a tree with E-Rows and A-Rows (#152).
+#[test]
+fn monitor_plan_with_actual_rows() {
+    let Some((profile, password)) = profile() else {
+        eprintln!("PYTHIA_TEST_DB not set, skipping");
+        return;
+    };
+    let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
+    let marker = format!(
+        "pythia_monplan_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    // Estimated at 1% of the rows, all of them match.
+    let n: i64 = conn
+        .query_row_as(
+            &format!(
+                "select /*+ gather_plan_statistics */ /* {marker} */ count(*) \
+                   from (select level n from dual connect by level <= 3000) \
+                  where upper(to_char(n)) = to_char(n)"
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(n, 3000);
+    let sql_id: String = conn
+        .query_row_as(
+            "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
+               and sql_text not like '%v$sql%' and rownum = 1",
+            &[&marker],
+        )
+        .unwrap();
+    // Tall enough for the plan below the totals.
+    let mut h = sized_harness(egui::vec2(1440.0, 1450.0));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Monitor {
+        connection: "pythia@FREEPDB1".into(),
+        start: crate::monitor_window::MonitorStart::Sessions,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_monitor_window()
+        .test_monitor()
+        .open_sql(sql_id.clone());
+    let start = Instant::now();
+    while h.query_by_label("A-Rows").is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no plan with actual rows for {sql_id}"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    h.run_steps(3);
+    assert!(
+        h.query_all_by_label_contains("Estimate off at")
+            .next()
+            .is_some(),
+        "the misestimate is named"
+    );
+    save(&mut h, "07-monitor-sql-plan-dark");
+}
+
 /// pythia-debugger's debugging scenario: order processing across packages.
 const DEBUG_SCENARIO: &str = include_str!("../../pythia-debugger/tests/scenario/orders.sql");
 

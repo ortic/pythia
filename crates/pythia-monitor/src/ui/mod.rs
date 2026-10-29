@@ -479,6 +479,11 @@ impl Monitor {
         });
     }
 
+    /// Opens (or focuses) the SQL details of a statement.
+    pub fn open_sql(&mut self, sql_id: String) {
+        self.deferred.push(Want::OpenSqlDetail { sql_id });
+    }
+
     pub fn capabilities(&self) -> Option<&Capabilities> {
         self.caps.as_ref().and_then(|c| c.as_ref().ok())
     }

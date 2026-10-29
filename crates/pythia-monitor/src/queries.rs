@@ -1237,7 +1237,10 @@ pub struct SessionDetail {
     /// Captured bind values of the current and the previous SQL.
     pub binds: Vec<Bind>,
     pub prev_binds: Vec<Bind>,
+    /// DBMS_XPLAN's report of the session's cursor, and its lines with the
+    /// last execution's statistics if it collected them.
     pub plan: Vec<String>,
+    pub plan_rows: Vec<pythia_ui::plan::PlanRow>,
     pub waits: Vec<WaitHistory>,
     pub stats: Vec<(String, f64)>,
     pub cursors: Vec<OpenCursor>,
@@ -1276,7 +1279,10 @@ impl SessionDetail {
                     self.binds = std::mem::take(&mut newer.binds);
                     self.prev_binds = std::mem::take(&mut newer.prev_binds);
                 }
-                DetailTab::Plan => self.plan = std::mem::take(&mut newer.plan),
+                DetailTab::Plan => {
+                    self.plan = std::mem::take(&mut newer.plan);
+                    self.plan_rows = std::mem::take(&mut newer.plan_rows);
+                }
                 DetailTab::Waits => self.waits = std::mem::take(&mut newer.waits),
                 DetailTab::Stats => self.stats = std::mem::take(&mut newer.stats),
                 DetailTab::Cursors => self.cursors = std::mem::take(&mut newer.cursors),
@@ -1471,14 +1477,10 @@ pub fn session_details(
                 if let Some((id, child)) = cursor {
                     section(
                         "Plan",
-                        query(
-                            conn,
-                            "select plan_table_output \
-                               from table(dbms_xplan.display_cursor(:1, :2, 'TYPICAL +PEEKED_BINDS'))",
-                            &[id, &child],
-                            |r| Ok(get::<Option<String>>(r, 0)?.unwrap_or_default()),
-                        )
-                        .map(|p| d.plan = p),
+                        cursor_plan(conn, id, child).map(|(text, rows)| {
+                            d.plan = text;
+                            d.plan_rows = rows;
+                        }),
                     );
                 }
             }
@@ -1552,6 +1554,37 @@ pub fn session_details(
     d
 }
 
+/// DBMS_XPLAN's report of a child cursor and its plan lines. With row
+/// source statistics (GATHER_PLAN_STATISTICS or STATISTICS_LEVEL = ALL)
+/// both have the last execution's actual rows and times.
+fn cursor_plan(
+    conn: &Connection,
+    sql_id: &str,
+    child: Option<i64>,
+) -> Result<(Vec<String>, Vec<pythia_ui::plan::PlanRow>)> {
+    let rows = match child {
+        Some(child) => match pythia_db::cursor_plan(conn, sql_id, child)? {
+            pythia_db::MetaResult::Table { columns, rows } => {
+                pythia_ui::plan::cursor_rows(&columns, &rows)
+            }
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    let format = if pythia_ui::plan::has_actuals(&rows) {
+        "ALLSTATS LAST +PEEKED_BINDS"
+    } else {
+        "TYPICAL +PEEKED_BINDS"
+    };
+    let text = query(
+        conn,
+        "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, :3))",
+        &[&sql_id, &child, &format],
+        |r| Ok(get::<Option<String>>(r, 0)?.unwrap_or_default()),
+    )?;
+    Ok((text, rows))
+}
+
 /// A statement in the shared pool, for SQL details.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SqlDetail {
@@ -1561,7 +1594,10 @@ pub struct SqlDetail {
     pub children: Vec<ChildCursor>,
     /// The child cursor the plan, binds and sharing are of.
     pub child: Option<i64>,
+    /// DBMS_XPLAN's report of the child, and its lines with the last
+    /// execution's statistics if it collected them.
     pub plan: Vec<String>,
+    pub plan_rows: Vec<pythia_ui::plan::PlanRow>,
     pub binds: Vec<Bind>,
     /// Why the child isn't shared with the others (`V$SQL_SHARED_CURSOR`).
     pub not_shared: Vec<String>,
@@ -1716,27 +1752,10 @@ pub fn sql_detail(conn: &Connection, sql_id: &str, child: Option<i64>) -> SqlDet
     if let Some(child) = d.child {
         section(
             "Plan",
-            (|| {
-                // Row source statistics (GATHER_PLAN_STATISTICS or
-                // STATISTICS_LEVEL=ALL): actual rows and times.
-                let measured: i64 = conn.query_row_as(
-                    "select count(*) from v$sql_plan_statistics \
-                      where sql_id = :1 and child_number = :2 and rownum = 1",
-                    &[&sql_id, &child],
-                )?;
-                let format = if measured > 0 {
-                    "ALLSTATS LAST +PEEKED_BINDS"
-                } else {
-                    "TYPICAL +PEEKED_BINDS"
-                };
-                d.plan = query(
-                    conn,
-                    "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, :3))",
-                    &[&sql_id, &child, &format],
-                    |r| Ok(get::<Option<String>>(r, 0)?.unwrap_or_default()),
-                )?;
-                Ok(())
-            })(),
+            cursor_plan(conn, sql_id, Some(child)).map(|(text, rows)| {
+                d.plan = text;
+                d.plan_rows = rows;
+            }),
         );
         section(
             "Binds",

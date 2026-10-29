@@ -46,6 +46,8 @@ pub struct SessionDetailView {
     confirm: Option<KillConfirm>,
     /// Analyze with AI waits for the parts it needs.
     analyze: bool,
+    /// The Plan tab's tree.
+    plan_view: pythia_ui::plan::PlanView,
     /// Its activity, ASH report and monitored executions.
     pub(crate) history: HistoryView,
 }
@@ -67,6 +69,7 @@ impl SessionDetailView {
             column_filter: String::new(),
             confirm: None,
             analyze: false,
+            plan_view: pythia_ui::plan::PlanView::default(),
             history: HistoryView::new(Scope::Session { sid, serial }),
         }
     }
@@ -431,14 +434,16 @@ impl SessionDetailView {
                     });
             }
             DetailTab::Plan => {
-                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    if d.plan.is_empty() {
-                        ui.weak(
-                            "No plan available (the session has no current or previous cursor).",
-                        );
-                    }
-                    ui.label(RichText::new(d.plan.join("\n")).monospace());
-                });
+                if d.plan.is_empty() {
+                    ui.weak("No plan available (the session has no current or previous cursor).");
+                } else {
+                    self.plan_view.report_ui(
+                        ui,
+                        &d.plan_rows,
+                        &d.plan.join("\n"),
+                        egui::Id::new(("session-plan", self.sid, self.serial)),
+                    );
+                }
             }
             DetailTab::Waits => {
                 table(
