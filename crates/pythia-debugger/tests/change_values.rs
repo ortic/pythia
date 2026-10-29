@@ -107,7 +107,7 @@ fn run(port: u16, nls: Option<&'static str>) -> thread::JoinHandle<DebugOutcome>
         }
         conn.execute("begin dbms_output.enable(null); end;", &[])
             .unwrap();
-        let task = target::debug_task(host, port, RUN.into());
+        let task = target::debug_task(host, port, RUN.into(), false);
         *task(&conn).unwrap().downcast::<DebugOutcome>().unwrap()
     })
 }

@@ -107,7 +107,7 @@ pub fn sql_window(w: &SqlWindow, doc: DocId, task: &Task) -> Snapshot {
             if let Some(Ok(rows)) = w.state.plan.as_ref().and_then(|p| p.result.as_ref()) {
                 s.parts.push(Part::text(
                     "Execution plan shown in the window",
-                    plan_text(rows),
+                    pythia_ui::plan::text(rows),
                 ));
             }
         }
@@ -256,31 +256,6 @@ fn statistics_parts(report: &crate::statistics::Report) -> Vec<Part> {
     }
     parts.push(Part::text("Session statistics of the run", text));
     parts
-}
-
-/// A plan as rows of text with predicates.
-fn plan_text(rows: &[crate::plan_view::PlanRow]) -> String {
-    let num = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_default();
-    let mut out = String::from("Id | Operation | Object | Rows | Bytes | Cost");
-    for r in rows {
-        out.push_str(&format!(
-            "\n{} | {}{} | {} | {} | {} | {}",
-            r.id,
-            "  ".repeat(r.depth),
-            r.operation,
-            r.object,
-            num(r.rows),
-            num(r.bytes),
-            num(r.cost)
-        ));
-        if let Some(a) = &r.access {
-            out.push_str(&format!("\n    access: {a}"));
-        }
-        if let Some(f) = &r.filter {
-            out.push_str(&format!("\n    filter: {f}"));
-        }
-    }
-    out
 }
 
 pub fn program_window(w: &ProgramWindow, doc: DocId, task: &Task) -> Snapshot {

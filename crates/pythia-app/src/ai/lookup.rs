@@ -531,14 +531,30 @@ fn explain(conn: &Connection, sql: &str) -> Part {
     }
 }
 
-/// The plan of a cursor in the shared pool.
+/// The plan of a cursor in the shared pool, with the actual rows of its
+/// last execution if it collected row source statistics.
 fn cursor_plan(conn: &Connection, sql_id: &str) -> Part {
-    let title = format!("Execution plan of SQL_ID {sql_id} (cursor cache)");
-    match xplan(
-        conn,
-        "select plan_table_output from table(dbms_xplan.display_cursor(:1, null, 'TYPICAL'))",
-        sql_id,
-    ) {
+    let measured = conn
+        .query_row_as::<i64>(
+            "select count(*) from v$sql_plan_statistics where sql_id = :1 and rownum = 1",
+            &[&sql_id],
+        )
+        .is_ok_and(|n| n > 0);
+    let (title, sql) = if measured {
+        (
+            format!(
+                "Execution plan of SQL_ID {sql_id} with the last execution's row source \
+                 statistics (cursor cache; E-Rows is per start, A-Rows over all starts)"
+            ),
+            "select plan_table_output from table(dbms_xplan.display_cursor(:1, null, 'ALLSTATS LAST'))",
+        )
+    } else {
+        (
+            format!("Execution plan of SQL_ID {sql_id} (cursor cache)"),
+            "select plan_table_output from table(dbms_xplan.display_cursor(:1, null, 'TYPICAL'))",
+        )
+    };
+    match xplan(conn, sql, sql_id) {
         Ok(plan) => Part::text(title, plan),
         Err(e) => Part::text(title, format!("Not available: {e}")),
     }

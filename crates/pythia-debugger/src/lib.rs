@@ -12,6 +12,8 @@
 //! - [`setup`]: what the database needs to connect back (privileges,
 //!   network ACL, a host it reaches), finding out what's missing and the
 //!   SQL that allows it.
+//! - [`sql`]: the SQL the stopped session ran, by line of code, and a
+//!   statement's plan with estimated and actual rows.
 //! - [`ui`]: an egui debugger panel and the breakpoint model.
 //! - [`jdwp`]: the wire protocol.
 
@@ -19,6 +21,8 @@ mod condition;
 mod debugger;
 pub mod jdwp;
 pub mod setup;
+pub mod sql;
+mod sql_panel;
 pub mod target;
 mod types;
 pub mod ui;

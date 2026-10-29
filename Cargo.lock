@@ -4641,9 +4641,11 @@ name = "pythia-debugger"
 version = "0.7.0"
 dependencies = [
  "egui",
+ "egui_extras",
  "egui_kittest",
  "pythia-db",
  "pythia-plsql",
+ "pythia-ui",
  "serde",
  "thiserror 2.0.21",
  "tracing",

@@ -74,7 +74,9 @@ end;
 /
 ";
 
-fn connect(var: &str) -> Option<Connection> {
+/// A connection to the database of `env` (`user/password@connect
+/// string`), if it is set.
+pub fn connect(var: &str) -> Option<Connection> {
     let spec = std::env::var(var).ok()?;
     let (credentials, connect_string) = spec.rsplit_once('@')?;
     let (user, password) = credentials.split_once('/')?;

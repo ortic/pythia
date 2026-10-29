@@ -254,6 +254,6 @@ pub fn run_target(
     let host = host();
     thread::spawn(move || {
         let conn = connect("PYTHIA_TEST_DB").unwrap();
-        target::run_under_debugger(&conn, &host, port, block)
+        target::run_under_debugger(&conn, &host, port, block, false)
     })
 }

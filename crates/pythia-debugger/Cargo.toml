@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
+egui_extras.workspace = true
 pythia-db.workspace = true
 pythia-plsql.workspace = true
+pythia-ui.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,5 +1,6 @@
 //! Debugger UI: a session driver the app hosts, plus an egui panel with
-//! toolbar, call stack, variables, watches and breakpoints.
+//! toolbar, call stack, variables, watches and breakpoints, and beside them
+//! the SQL the stopped session ran with its plans.
 //!
 //! Keys (chosen not to clash with Pythia's PL/SQL Developer keymap, where F5 is
 //! explain plan, F8 execute and F10/Shift+F10 commit/rollback):
@@ -24,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::Debugger;
 use crate::condition;
 use crate::setup::{Ports, Problem};
+use crate::sql::{CursorPlan, SessionSql, TargetSession};
+use crate::sql_panel::{self, SqlPanel};
 use crate::types::{
     Breakpoint, BreakpointOptions, DebugCommand, DebugEvent, Frame, Location, StopReason, Unit,
     UnitType, Variable, Watch,
@@ -42,11 +45,14 @@ pub const TOGGLE_BREAKPOINT: KeyboardShortcut = KeyboardShortcut::new(Modifiers:
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebugAction {
     /// Run `block` on a dedicated session under the debugger:
-    /// `DbRequest::Task { task: target::debug_task(host, port, block) }`.
+    /// `DbRequest::Task { task: target::debug_task(host, port, block,
+    /// statistics) }`, after `target::session_task()` on the same session,
+    /// whose answer goes to [`DebugSession::set_target_session`].
     RunTarget {
         host: String,
         port: u16,
         block: String,
+        statistics: bool,
     },
     /// Execution stopped here: open the unit and mark the line.
     ShowLocation(Location),
@@ -65,6 +71,33 @@ pub enum DebugAction {
     /// Open the debugger setup, saying why (a failed start) if there is a
     /// reason.
     Setup { reason: Option<String> },
+    /// Look up the SQL the stopped session ran, on another session:
+    /// `sql::session_sql`, then [`DebugSession::sql_found`] with `stop`.
+    FindSql { session: TargetSession, stop: u64 },
+    /// Load a statement's plan, on another session: `sql::cursor_plan`,
+    /// then [`DebugSession::plan_loaded`].
+    LoadPlan { sql_id: String, child: i64 },
+    /// Open a unit at a line (a statement's), not marking execution there.
+    OpenSource(Location),
+    /// Ask the assistant about a statement of the SQL panel.
+    AnalyzeSql(SqlQuestion),
+}
+
+/// What the assistant gets about a statement the debugged session ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlQuestion {
+    /// E.g. "statement 7hmwardbdtjab at procedure PYTHIA.P line 12".
+    pub title: String,
+    pub sql: String,
+    /// DBMS_XPLAN's report of the plan and what the panel noted about it.
+    pub plan: String,
+    /// The plan has actual rows.
+    pub measured: bool,
+    /// The variables of the stopped frame (`name = value`): the
+    /// statement's binds are among them.
+    pub variables: Vec<String>,
+    /// Where the statement is in the code.
+    pub location: Option<Location>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -131,6 +164,12 @@ pub struct DebugSession {
     waiting_since: Option<Instant>,
     /// Why the last start failed to connect, if it was a setup problem.
     pub problem: Option<String>,
+    /// The debugged session, once it said who it is.
+    target_session: Option<TargetSession>,
+    /// The SQL panel: the statements the session ran, and their plans.
+    sql: SqlPanel,
+    /// Actions from outside the panel, for [`Self::poll`] to hand over.
+    queued: Vec<DebugAction>,
 }
 
 /// After this long without the session connecting, the panel suggests
@@ -138,14 +177,28 @@ pub struct DebugSession {
 const SLOW_CONNECT: Duration = Duration::from_secs(8);
 
 /// What the debugger keeps across restarts of Pythia: breakpoints with
-/// their state, conditions and hit counts, the watches and Break on
-/// exceptions.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// their state, conditions and hit counts, the watches, Break on
+/// exceptions, Plan statistics and whether the SQL panel is shown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Saved {
     pub breakpoints: Vec<SavedBreakpoint>,
     pub watches: Vec<String>,
     pub break_on_exception: bool,
+    pub plan_statistics: bool,
+    pub sql_panel: bool,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Self {
+            breakpoints: Vec::new(),
+            watches: Vec::new(),
+            break_on_exception: false,
+            plan_statistics: true,
+            sql_panel: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -207,6 +260,8 @@ impl DebugSession {
         self.problem = None;
         self.target = None;
         self.waiting_since = None;
+        self.target_session = None;
+        self.sql.reset();
         match crate::setup::listen(ports).and_then(|l| Debugger::with_listener(l, notify)) {
             Ok(debugger) => {
                 for bp in self.breakpoints.difference(&self.disabled) {
@@ -242,7 +297,12 @@ impl DebugSession {
                 self.log.push(format!(
                     "Waiting for the session to connect to {host}:{port}…"
                 ));
-                vec![DebugAction::RunTarget { host, port, block }]
+                vec![DebugAction::RunTarget {
+                    host,
+                    port,
+                    block,
+                    statistics: self.sql.statistics,
+                }]
             }
             Err(e) => {
                 self.log.push(format!("Could not start the debugger: {e}"));
@@ -342,6 +402,8 @@ impl DebugSession {
                 .collect(),
             watches: self.watches.clone(),
             break_on_exception: self.break_on_exception,
+            plan_statistics: self.sql.statistics,
+            sql_panel: self.sql.show,
         }
     }
 
@@ -364,6 +426,69 @@ impl DebugSession {
         }
         self.watches = saved.watches;
         self.break_on_exception = saved.break_on_exception;
+        self.sql.statistics = saved.plan_statistics;
+        self.sql.show = saved.sql_panel;
+    }
+
+    /// The debugged session said who it is
+    /// ([`crate::target::session_task`]): its SQL can be looked up.
+    pub fn set_target_session(&mut self, session: TargetSession) {
+        self.target_session = Some(session);
+        if self.is_suspended() {
+            self.sql
+                .find(self.target_session.as_ref(), &mut self.queued);
+        }
+    }
+
+    /// The statements the session ran, as looked up at stop `stop`
+    /// ([`DebugAction::FindSql`]).
+    pub fn sql_found(&mut self, stop: u64, result: Result<Vec<SessionSql>, String>) {
+        let cx = sql_context(&self.state, &self.stack, self.frame, &self.variables);
+        self.sql.found(
+            stop,
+            result,
+            self.target_session.as_ref(),
+            &cx,
+            &mut self.queued,
+        );
+    }
+
+    /// A statement's plan ([`DebugAction::LoadPlan`]).
+    pub fn plan_loaded(&mut self, sql_id: String, child: i64, result: Result<CursorPlan, String>) {
+        self.sql.plan_loaded(sql_id, child, result);
+    }
+
+    /// Shows or hides the SQL panel.
+    pub fn show_sql(&mut self, show: bool) {
+        self.sql.show = show;
+        if show && self.is_suspended() {
+            self.sql
+                .find(self.target_session.as_ref(), &mut self.queued);
+        }
+    }
+
+    pub fn sql_shown(&self) -> bool {
+        self.sql.show
+    }
+
+    /// The statements the SQL panel lists.
+    pub fn sql_statements(&self) -> &[SessionSql] {
+        self.sql.statements()
+    }
+
+    /// The plan the SQL panel shows, once loaded.
+    pub fn sql_plan(&self) -> Option<&CursorPlan> {
+        self.sql.shown_plan()
+    }
+
+    /// Whether debug runs collect row source statistics for the SQL
+    /// panel's plans (from the next start).
+    pub fn set_plan_statistics(&mut self, on: bool) {
+        self.sql.statistics = on;
+    }
+
+    pub fn plan_statistics(&self) -> bool {
+        self.sql.statistics
     }
 
     /// Adds a breakpoint, enables a disabled one, or removes it.
@@ -563,7 +688,7 @@ impl DebugSession {
 
     /// Drains debugger events; call every frame.
     pub fn poll(&mut self) -> Vec<DebugAction> {
-        let mut actions = Vec::new();
+        let mut actions = std::mem::take(&mut self.queued);
         let Some(debugger) = &self.debugger else {
             return actions;
         };
@@ -628,6 +753,7 @@ impl DebugSession {
                 let shown = self.current_frame().map(|f| f.location.clone());
                 actions.push(DebugAction::ShowLocation(shown.unwrap_or(location)));
                 self.explain_opaque(actions);
+                self.sql.stopped(self.target_session.as_ref(), actions);
             }
             DebugEvent::Watches(values) => self.watch_values = values,
             DebugEvent::ValueSet { expression, error } => {
@@ -645,6 +771,8 @@ impl DebugSession {
                 self.variables = variables;
                 self.watch_values = watches;
                 self.explain_opaque(actions);
+                let cx = sql_context(&self.state, &self.stack, self.frame, &self.variables);
+                self.sql.frame_selected(&cx, actions);
             }
             DebugEvent::FrameSelected { .. } => {}
             DebugEvent::SteppedOver(units) => {
@@ -702,7 +830,44 @@ impl DebugSession {
         actions.extend(self.toolbar(ui));
         actions.extend(self.connect_hint(ui));
         ui.separator();
+        if self.sql.show {
+            let cx = sql_context(&self.state, &self.stack, self.frame, &self.variables);
+            let cx = sql_panel::Context {
+                active: self.is_active(),
+                ..cx
+            };
+            let width = ui.available_width();
+            let panel = egui::Panel::right("dbg-sql")
+                .resizable(true)
+                .default_size(width * 0.55)
+                .size_range(240.0..=width * 0.85)
+                .show(ui, |ui| self.sql.ui(ui, &cx, &mut actions));
+            // Columns don't keep clear of panels: the rest is theirs.
+            let mut rest = ui.available_rect_before_wrap();
+            rest.max.x = rest
+                .max
+                .x
+                .min(panel.response.rect.min.x - ui.spacing().item_spacing.x);
+            let mut columns = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rest)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            self.columns_ui(&mut columns, &mut actions);
+        } else {
+            self.columns_ui(ui, &mut actions);
+        }
+        actions
+    }
+
+    /// Call stack, variables, watches and breakpoints side by side.
+    fn columns_ui(&mut self, ui: &mut Ui, actions: &mut Vec<DebugAction>) {
         ui.columns(4, |cols| {
+            // Long names and values stay in their column.
+            for col in cols.iter_mut() {
+                let clip = col.max_rect().intersect(col.clip_rect());
+                col.set_clip_rect(clip);
+            }
             cols[0].strong("Call stack");
             let mut select = None;
             egui::ScrollArea::vertical()
@@ -774,7 +939,6 @@ impl DebugSession {
             self.watches_ui(&mut cols[2]);
             self.breakpoints_ui(&mut cols[3]);
         });
-        actions
     }
 
     fn toolbar(&mut self, ui: &mut Ui) -> Option<DebugAction> {
@@ -815,6 +979,20 @@ impl DebugSession {
                 .changed()
             {
                 self.set_break_on_exception(on);
+            }
+            ui.checkbox(&mut self.sql.statistics, "Plan statistics")
+                .on_hover_text(
+                    "Collect row source statistics in the debugged session (STATISTICS_LEVEL = \
+                     ALL), so the plans of the statements it runs show actual rows next to the \
+                     estimates. Costs some time per row; applies from the next start.",
+                );
+            let mut show = self.sql.show;
+            if ui
+                .toggle_value(&mut show, "SQL")
+                .on_hover_text("The statements the session ran, by line, with their plans")
+                .changed()
+            {
+                self.show_sql(show);
             }
             ui.separator();
             let (text, color) = match &self.state {
@@ -1384,6 +1562,52 @@ fn error_ui(ui: &mut Ui, error: &str) {
         )
         .wrap(),
     );
+}
+
+/// Where the SQL panel's statements are: the selected frame, the block
+/// being debugged (the outermost frame) and the frame's variables.
+fn sql_context<'a>(
+    state: &State,
+    stack: &'a [Frame],
+    frame: usize,
+    variables: &[Variable],
+) -> sql_panel::Context<'a> {
+    let suspended = matches!(state, State::Suspended { .. });
+    let at = stack
+        .get(frame)
+        .and_then(|f| Some((&f.location.unit, f.location.line?)))
+        .filter(|_| suspended);
+    let block = stack
+        .last()
+        .map(|f| &f.location.unit)
+        .filter(|u| u.unit_type == UnitType::Block);
+    const MAX: usize = 40;
+    let mut shown: Vec<String> = variables
+        .iter()
+        .take(MAX)
+        .map(|v| {
+            let name = v.name.to_lowercase();
+            if v.children.is_empty() {
+                format!("{name} = {}", v.value.as_deref().unwrap_or("NULL"))
+            } else {
+                format!(
+                    "{name} ({}) = {}",
+                    v.type_name,
+                    describe(v).replace('\n', "; ")
+                )
+            }
+        })
+        .collect();
+    if variables.len() > MAX {
+        shown.push(format!("… {} more", variables.len() - MAX));
+    }
+    sql_panel::Context {
+        suspended,
+        active: suspended,
+        at,
+        block,
+        variables: shown,
+    }
 }
 
 /// Hover text for a variable: its value, or its fields/elements.

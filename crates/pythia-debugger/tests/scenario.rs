@@ -177,7 +177,7 @@ fn run_with_output(port: u16, block: &'static str) -> thread::JoinHandle<DebugOu
         let conn = connect("PYTHIA_TEST_DB").unwrap();
         conn.execute("begin dbms_output.enable(null); end;", &[])
             .unwrap();
-        let task = target::debug_task(host, port, block.into());
+        let task = target::debug_task(host, port, block.into(), false);
         *task(&conn).unwrap().downcast::<DebugOutcome>().unwrap()
     })
 }

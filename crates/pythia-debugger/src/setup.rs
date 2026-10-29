@@ -793,19 +793,21 @@ mod tests {
 
     #[test]
     fn listens_in_range() {
-        let first = listen(Some(&(47_100..=47_101))).unwrap();
-        let second = listen(Some(&(47_100..=47_101))).unwrap();
+        // Below 32768: no OS hands these out to outgoing connections, which
+        // would hold them now and then (#153).
+        let first = listen(Some(&(29_100..=29_101))).unwrap();
+        let second = listen(Some(&(29_100..=29_101))).unwrap();
         let ports = [
             first.local_addr().unwrap().port(),
             second.local_addr().unwrap().port(),
         ];
         assert!(
-            ports.contains(&47_100) && ports.contains(&47_101),
+            ports.contains(&29_100) && ports.contains(&29_101),
             "{ports:?}"
         );
-        let full = listen(Some(&(47_100..=47_101))).unwrap_err();
+        let full = listen(Some(&(29_100..=29_101))).unwrap_err();
         assert!(
-            full.to_string().contains("no free port in 47100-47101"),
+            full.to_string().contains("no free port in 29100-29101"),
             "{full}"
         );
     }
