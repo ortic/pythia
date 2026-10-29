@@ -148,6 +148,9 @@ pub fn matches(name: &str, segment: &str) -> bool {
 pub fn descend<'a>(var: &'a Variable, rest: &[String]) -> Result<&'a Variable, String> {
     let mut var = var;
     for seg in rest {
+        if var.type_name == OPAQUE {
+            return Err(no_contents(var));
+        }
         var = var
             .children
             .iter()
@@ -155,6 +158,30 @@ pub fn descend<'a>(var: &'a Variable, rest: &[String]) -> Result<&'a Variable, S
             .ok_or_else(|| format!("{} has no {seg}", var.name.to_lowercase()))?;
     }
     Ok(var)
+}
+
+/// Type of values whose contents Oracle's agent doesn't show: their type
+/// was compiled without debug information.
+pub const OPAQUE: &str = "OPAQUE";
+
+/// The opaque variable that `rest` would have to go into from `var`.
+pub fn opaque_on_path<'a>(var: &'a Variable, rest: &[String]) -> Option<&'a Variable> {
+    let mut var = var;
+    for seg in rest {
+        if var.type_name == OPAQUE {
+            return Some(var);
+        }
+        var = var.children.iter().find(|c| matches(&c.name, seg))?;
+    }
+    None
+}
+
+/// Why there are no fields or elements to follow in an opaque variable.
+pub fn no_contents(var: &Variable) -> String {
+    format!(
+        "{} is {OPAQUE}: its contents aren't available",
+        var.name.to_lowercase()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]

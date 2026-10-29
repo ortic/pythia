@@ -628,21 +628,40 @@ impl DebugSession {
         // Subscripts may be variables: `lines(i)` is `lines(3)` when i = 3.
         let subscripts = condition::subscripts(&self.variables);
         let path = condition::parse_path_with(expression, &subscripts)?;
-        let var = condition::lookup(&self.variables, &path).or_else(|| {
+        let root = self
+            .variables
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(&path[0]));
+        let found = condition::lookup(&self.variables, &path).or_else(|| {
             self.watch_values
                 .iter()
                 .find(|w| {
                     condition::parse_path_with(&w.expression, &subscripts).as_ref() == Some(&path)
                 })
                 .and_then(|w| w.value.as_ref().ok())
-        })?;
-        let title = format!("{} {}", expression.trim(), var.type_name)
-            .trim()
-            .to_owned();
-        let mut text = describe(var);
-        if let Some(reason) = self
-            .opaque_reasons
-            .get(&(selected.clone(), var.name.clone()))
+        });
+        let (title, mut text, shown) = match found {
+            Some(var) => (
+                format!("{} {}", expression.trim(), var.type_name)
+                    .trim()
+                    .to_owned(),
+                describe(var),
+                var,
+            ),
+            // A field or element of an opaque variable: say why it has none.
+            None => {
+                let opaque = condition::opaque_on_path(root?, &path[1..])?;
+                (
+                    expression.trim().to_owned(),
+                    condition::no_contents(opaque),
+                    opaque,
+                )
+            }
+        };
+        // Reasons are known for the frame's variables, not their fields.
+        if let Some(reason) = root
+            .filter(|r| std::ptr::eq(*r, shown))
+            .and_then(|r| self.opaque_reasons.get(&(selected.clone(), r.name.clone())))
         {
             text = format!("{text}\n{reason}");
         }
@@ -673,7 +692,7 @@ impl DebugSession {
         let names: Vec<String> = self
             .variables
             .iter()
-            .filter(|v| v.type_name == "OPAQUE")
+            .filter(|v| v.type_name == condition::OPAQUE)
             .map(|v| v.name.clone())
             .filter(|name| self.opaque_asked.insert((unit.clone(), name.clone())))
             .collect();
@@ -1941,6 +1960,17 @@ mod tests {
                 .1
                 .ends_with("declared in TYPES, …")
         );
+        // Its elements say why there are none (#166).
+        assert_eq!(
+            s.hover(&api, "l_order.lines(2)"),
+            Some((
+                "l_order.lines(2)".into(),
+                "l_order is OPAQUE: its contents aren't available\n\
+                 T_ORDER is declared in TYPES, …"
+                    .into()
+            ))
+        );
+        assert_eq!(s.hover(&api, "l_total.x"), None, "not opaque");
         // The next stop doesn't ask again.
         let mut actions = Vec::new();
         s.on_event(stop(42), &mut actions);

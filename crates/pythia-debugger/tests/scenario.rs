@@ -934,6 +934,122 @@ fn records_of_a_spec_without_debug_information() {
     );
 }
 
+/// A value is opaque when its type was compiled without debug information,
+/// wherever it's declared: in the unit's own package spec (debugging
+/// compiles only the body), or as a SQL type, also SYS's or by a synonym.
+/// A type declared in the debugged code itself is readable (#166).
+#[test]
+fn opaque_types_of_the_own_spec_and_sql_types() {
+    let Some((_lock, conn, _s)) = setup() else {
+        return;
+    };
+    for sql in [
+        "create or replace synonym dbgx_list for sys.odcivarchar2list",
+        "create or replace package dbgx_opaque as
+  type t_arr is table of number index by pls_integer;
+  procedure run;
+end;",
+        "create or replace package body dbgx_opaque as
+  procedure run is
+    type t_local is table of number index by pls_integer;
+    l_arr   t_arr;
+    l_codes dbgx_codes;
+    l_tags  sys.odcivarchar2list;
+    l_list  dbgx_list;
+    l_local t_local;
+  begin
+    l_arr(1) := 1;
+    l_codes := dbgx_codes(7);
+    l_tags := sys.odcivarchar2list('a');
+    l_list := dbgx_list('b');
+    l_local(1) := 2;
+    null;
+  end;
+end;",
+        "alter package dbgx_opaque compile debug body",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let spec = Unit::new(OWNER, "DBGX_OPAQUE", UnitType::Package);
+    let body = Unit::new(OWNER, "DBGX_OPAQUE", UnitType::PackageBody);
+    assert!(!target::has_debug_info(&conn, &spec).unwrap());
+    assert!(target::has_debug_info(&conn, &body).unwrap());
+
+    let h = Harness::new();
+    let stop_at = Breakpoint {
+        unit: body.clone(),
+        line: 15,
+    };
+    h.send(DebugCommand::SetBreakpoint(stop_at.clone()));
+    let run = run_target(h.debugger.port(), "begin dbgx_opaque.run; end;");
+    let (stop, _) = h.stop_full();
+    assert_eq!(stop.line, Some(15));
+    let names: Vec<String> = ["L_ARR", "L_CODES", "L_TAGS", "L_LIST"]
+        .map(String::from)
+        .into();
+    for name in &names {
+        assert_eq!(var(&stop.variables, name).type_name, "OPAQUE", "{name}");
+    }
+    assert_eq!(val(&stop.variables, "L_LOCAL.(1)"), Some("2"));
+    let reason = |r: &str| format!("{r}, compiled without debug information");
+    let mut asked = names.clone();
+    asked.push("L_LOCAL".into());
+    assert_eq!(
+        target::opaque_reasons(&conn, &body, stop.line, &asked, None).unwrap(),
+        [
+            (
+                "L_ARR".to_string(),
+                reason("T_ARR is declared in the specification of DBGX_OPAQUE")
+            ),
+            (
+                "L_CODES".to_string(),
+                "DBGX_CODES is a SQL type compiled without debug information".to_string()
+            ),
+            (
+                "L_TAGS".to_string(),
+                "SYS.ODCIVARCHAR2LIST is a SQL type compiled without debug information".to_string()
+            ),
+            (
+                "L_LIST".to_string(),
+                "SYS.ODCIVARCHAR2LIST is a SQL type compiled without debug information".to_string()
+            ),
+        ]
+    );
+    h.send(DebugCommand::ClearBreakpoint(stop_at.clone()));
+    h.send(DebugCommand::Resume);
+    h.until_terminated();
+    run.join().unwrap().expect("target ran to completion");
+
+    // Compiled with debug information, the spec's and the SQL type's values
+    // have their contents.
+    target::compile_debug(&conn, &spec).unwrap();
+    conn.execute("alter type dbgx_codes compile debug specification", &[])
+        .unwrap();
+    assert!(
+        target::opaque_reasons(&conn, &body, Some(15), &names[..2], None)
+            .unwrap()
+            .is_empty()
+    );
+    let h = Harness::new();
+    h.send(DebugCommand::SetBreakpoint(stop_at.clone()));
+    let run = run_target(h.debugger.port(), "begin dbgx_opaque.run; end;");
+    let (stop, _) = h.stop_full();
+    assert_eq!(val(&stop.variables, "L_ARR.(1)"), Some("1"));
+    assert_eq!(val(&stop.variables, "L_CODES.(1)"), Some("7"));
+    assert_eq!(var(&stop.variables, "L_TAGS").type_name, "OPAQUE", "SYS's");
+    h.send(DebugCommand::ClearBreakpoint(stop_at));
+    h.send(DebugCommand::Resume);
+    h.until_terminated();
+    run.join().unwrap().expect("target ran to completion");
+    for sql in [
+        "drop package dbgx_opaque",
+        "drop synonym dbgx_list",
+        "alter type dbgx_codes compile",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+}
+
 /// Recompiling, as the object browser's Compile and the invalid objects
 /// window do, keeps debug information: valid units and invalid ones.
 #[test]

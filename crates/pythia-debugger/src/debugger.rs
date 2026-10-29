@@ -1570,9 +1570,10 @@ impl Session {
                     var.type_name = type_name(&self.jdwp.signature(class)?);
                 }
                 let fields = self.jdwp.fields(class)?;
-                if fields.is_empty() && var.type_name == "OPAQUE" {
-                    // SQL collection types (and the like): the agent shows
-                    // no contents, but the value isn't NULL.
+                if fields.is_empty() && var.type_name == condition::OPAQUE {
+                    // A type compiled without debug information (a package
+                    // spec's, a SQL type, SYS's): the agent shows no
+                    // contents, but the value isn't NULL.
                     var.value = Some(OPAQUE_VALUE.into());
                     return Ok(var);
                 }
@@ -1730,7 +1731,9 @@ fn predefined_exception(code: u32) -> Option<&'static str> {
     })
 }
 
-/// Shown for values the agent doesn't expose (SQL collection types).
+/// Shown for values the agent doesn't expose: their type was compiled
+/// without debug information. Oracle's agent tells nothing about them (the
+/// class has no fields or methods), so there is no way to read them.
 const OPAQUE_VALUE: &str = "(contents not available)";
 
 /// Display name of a collection element by its key: `(3)` or `('L1')`.
