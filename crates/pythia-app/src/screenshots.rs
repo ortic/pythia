@@ -1367,14 +1367,20 @@ fn monitor_plan_with_actual_rows() {
           where upper(to_char(n)) = to_char(n)"
     );
     let run = || conn.query_row_as::<i64>(&sql, &[]).unwrap();
-    assert_eq!(run(), 3000);
-    let sql_id: String = conn
-        .query_row_as(
-            "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
-               and sql_text not like '%v$sql%' and rownum = 1",
-            &[&marker],
-        )
-        .unwrap();
+    // It can leave the pool before it's looked up, too (#167): run it again.
+    let sql_id: String = (0..10)
+        .find_map(|_| {
+            assert_eq!(run(), 3000);
+            conn.query_as::<String>(
+                "select sql_id from v$sql where sql_text like '%' || :1 || '%' \
+                   and sql_text not like '%v$sql%' and rownum = 1",
+                &[&marker],
+            )
+            .unwrap()
+            .next()
+            .map(Result::unwrap)
+        })
+        .expect("the statement in V$SQL");
     // Tall enough for the plan below the totals.
     let mut h = sized_harness(egui::vec2(1440.0, 1450.0));
     h.state_mut().test_connect(profile, password);
@@ -1406,12 +1412,14 @@ fn monitor_plan_with_actual_rows() {
     };
     // Gone from the shared pool when the details read it (seen with the
     // whole suite on a fresh database, #154): run it again, read again.
+    // Also when it went between the child cursors and the plan: a child,
+    // but no plan lines, DBMS_XPLAN's "cannot be found" (#167).
     let gone = |app: &PythiaApp| {
         app.test_monitor_window_ref()
             .test_monitor_ref()
             .and_then(|m| m.sql_detail(&sql_id))
             .and_then(|v| v.detail().ok().flatten())
-            .is_some_and(|d| d.children.is_empty())
+            .is_some_and(|d| d.plan_rows.is_empty())
     };
     let start = Instant::now();
     let mut rerun = Instant::now();
