@@ -1773,6 +1773,63 @@ fn debugger_steps_into_unit_compiled_in_program_window() {
     std::mem::swap(&mut session, h.state_mut().test_debug_mut());
     save(&mut h, "12b-debugger-caller-dark");
 
+    // Hovering the selected `l_order.lines(i)` (#165): the record is
+    // opaque, and the hover says why it has no elements (#166).
+    let hover_element = |h: &mut Ui| {
+        let mut session = pythia_debugger::ui::DebugSession::default();
+        std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+        let editor = h
+            .state_mut()
+            .test_program_editor()
+            .expect("package body editor");
+        let start = editor.text().find("line_amount(l_order").unwrap() + "line_amount(".len();
+        let element = start..start + "l_order.lines(i)".len();
+        editor.inner().select(element.clone());
+        let mouse = editor.inner().offset_pos(element.start + 2).expect("drawn");
+        let shown = crate::editor::debug_hover(editor, element.start + 2, &session, &api);
+        std::mem::swap(&mut session, h.state_mut().test_debug_mut());
+        assert!(shown, "{:?}", h.state().test_debug().variables);
+        // The mouse rests there, so the hover stays (and is asked again).
+        h.hover_at(mouse);
+        h.run_steps(4);
+        h.state()
+            .test_debug()
+            .hover(&api, "l_order.lines(i)")
+            .unwrap()
+    };
+    assert_eq!(
+        hover_element(&mut h),
+        (
+            "l_order.lines(i)".into(),
+            "l_order is OPAQUE: its contents aren't available\n\
+             T_ORDER is declared in DBGX_TYPES, compiled without debug information"
+                .into()
+        )
+    );
+    save(&mut h, "12c-debugger-opaque-element-dark");
+    h.state_mut().test_debug_mut().stop();
+    wait_until(&mut h, "finish", |app| !app.test_debug_running());
+
+    // With debug information for DBGX_TYPES, the element has its fields.
+    let types = Unit::new("PYTHIA", "DBGX_TYPES", UnitType::Package);
+    pythia_debugger::target::compile_debug(&conn, &types).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: "declare\n  l_count pls_integer;\nbegin\n  dbgx_orders_api.process_all(l_count);\n  \
+               rollback;\nend;"
+            .into(),
+        run: false,
+    });
+    h.run_steps(2);
+    h.state_mut()
+        .test_command(crate::commands::Command::DebugStart);
+    wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    assert_eq!(h.state().test_debug().stack[0].location.unit, api);
+    let (title, body) = hover_element(&mut h);
+    assert_eq!(title, "l_order.lines(i) T_LINE");
+    assert!(body.starts_with("line_no = 1\nproduct = "), "{body}");
+    save(&mut h, "12d-debugger-element-dark");
+
     h.state_mut().test_debug_mut().stop();
     wait_until(&mut h, "finish", |app| !app.test_debug_running());
 }
