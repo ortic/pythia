@@ -1092,7 +1092,7 @@ impl Session {
         variables: &[Variable],
         class: Option<u64>,
     ) -> Result<Variable, String> {
-        let path = condition::parse_path(expression)
+        let path = condition::parse_path_with(expression, &condition::subscripts(variables))
             .ok_or_else(|| format!("not a variable: {}", expression.trim()))?;
         let (first, rest) = path.split_first().expect("non-empty path");
         if let Some(var) = variables
@@ -1570,9 +1570,10 @@ impl Session {
                     var.type_name = type_name(&self.jdwp.signature(class)?);
                 }
                 let fields = self.jdwp.fields(class)?;
-                if fields.is_empty() && var.type_name == "OPAQUE" {
-                    // SQL collection types (and the like): the agent shows
-                    // no contents, but the value isn't NULL.
+                if fields.is_empty() && var.type_name == condition::OPAQUE {
+                    // A type compiled without debug information (a package
+                    // spec's, a SQL type, SYS's): the agent shows no
+                    // contents, but the value isn't NULL.
                     var.value = Some(OPAQUE_VALUE.into());
                     return Ok(var);
                 }
@@ -1730,7 +1731,9 @@ fn predefined_exception(code: u32) -> Option<&'static str> {
     })
 }
 
-/// Shown for values the agent doesn't expose (SQL collection types).
+/// Shown for values the agent doesn't expose: their type was compiled
+/// without debug information. Oracle's agent tells nothing about them (the
+/// class has no fields or methods), so there is no way to read them.
 const OPAQUE_VALUE: &str = "(contents not available)";
 
 /// Display name of a collection element by its key: `(3)` or `('L1')`.
@@ -1744,10 +1747,7 @@ fn element_name(key: &str, text: bool) -> String {
 
 /// Whether an index-by table key of this type is text (`INDEX BY VARCHAR2`).
 fn key_is_text(signature: &str) -> bool {
-    matches!(
-        type_name(signature).as_str(),
-        "VARCHAR2" | "VARCHAR" | "STRING" | "CHAR" | "NVARCHAR2" | "NCHAR" | "LONG"
-    )
+    condition::is_text(&type_name(signature))
 }
 
 /// Nesting limit for records/collections (each PL/SQL level is ~2 objects).

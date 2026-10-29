@@ -939,7 +939,13 @@ impl CodeEditor {
             self.hover = None;
             return;
         };
-        if self.hover.as_ref().is_some_and(|h| h.range != *range) {
+        // A hover can be for more than the word (`l_rec.name`, a
+        // selection): it stays while the mouse is on a word in it.
+        if self
+            .hover
+            .as_ref()
+            .is_some_and(|h| range.start < h.range.start || h.range.end < range.end)
+        {
             self.hover = None;
         }
         let delay = self.hover_delay;
@@ -2429,6 +2435,33 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    /// A hover for more than the word (`l_rec.name`, a selection) stays
+    /// while the mouse rests on any word in it.
+    #[test]
+    fn a_hover_over_a_path_stays() {
+        let ctx = egui::Context::default();
+        let text = "x := l_rec.name;";
+        let mut editor = CodeEditor::new(text);
+        frames(&ctx, &mut editor, 2, vec![]);
+        let layout = editor.last_layout.as_ref().unwrap();
+        let at = |col: usize| {
+            pos2(
+                layout.text_x() + (col as f32 + 0.5) * layout.char_w,
+                layout.text_y(0) + 2.0,
+            )
+        };
+        let (on_name, on_rec, on_x) = (at(text.find("name").unwrap()), at(6), at(0));
+        frames(&ctx, &mut editor, 2, vec![Event::PointerMoved(on_name)]);
+        let path = text.find("l_rec").unwrap()..text.find(';').unwrap();
+        editor.show_hover(path, "l_rec.name VARCHAR2".into(), "ACME".into());
+        frames(&ctx, &mut editor, 2, vec![]);
+        assert!(editor.hover.is_some(), "on the word asked about");
+        frames(&ctx, &mut editor, 2, vec![Event::PointerMoved(on_rec)]);
+        assert!(editor.hover.is_some(), "on another word of the path");
+        frames(&ctx, &mut editor, 2, vec![Event::PointerMoved(on_x)]);
+        assert!(editor.hover.is_none(), "off the path");
     }
 
     #[test]

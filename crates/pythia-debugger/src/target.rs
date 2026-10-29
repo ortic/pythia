@@ -215,19 +215,38 @@ pub fn is_debug_notice(text: &str) -> bool {
 
 /// Whether a stored unit was compiled with debug information.
 pub fn has_debug_info(conn: &Connection, unit: &Unit) -> Result<bool, DbError> {
-    let flag: Option<String> = conn.query_row_as(
-        "select max(plsql_debug) from all_plsql_object_settings where owner = :1 and name = :2 and type = :3",
-        &[&unit.owner, &unit.name, &unit.unit_type.dictionary_name()],
+    let setting = debug_setting(
+        conn,
+        &unit.owner,
+        &unit.name,
+        unit.unit_type.dictionary_name(),
     )?;
-    Ok(flag.as_deref() == Some("TRUE"))
+    Ok(setting == Some(true))
+}
+
+/// Whether a stored object (`object_type` as the dictionary names it) was
+/// compiled with debug information; `None` if there's no such object.
+fn debug_setting(
+    conn: &Connection,
+    owner: &str,
+    name: &str,
+    object_type: &str,
+) -> Result<Option<bool>, DbError> {
+    let flag: Option<String> = conn.query_row_as(
+        "select max(nvl(plsql_debug, 'FALSE')) from all_plsql_object_settings \
+         where owner = :1 and name = :2 and type = :3",
+        &[&owner, &name, &object_type],
+    )?;
+    Ok(flag.map(|f| f == "TRUE"))
 }
 
 /// Why variables of `unit` stopped at `line` come without contents, for
-/// those of `names` with a reason Pythia can name: their type is declared
-/// in a package compiled without debug information, so Oracle's agent
-/// hands the value over as an opaque object. `source` is the unit's text
-/// if the database doesn't store it (an anonymous block). Returns
-/// (variable name, reason).
+/// those of `names` with a reason Pythia can name: their type was compiled
+/// without debug information, so Oracle's agent hands the value over as an
+/// opaque object. The type is declared in a package, in the unit's own
+/// package spec (debugging compiles only the body), or is a SQL type.
+/// `source` is the unit's text if the database doesn't store it (an
+/// anonymous block). Returns (variable name, reason).
 pub fn opaque_reasons(
     conn: &Connection,
     unit: &Unit,
@@ -235,36 +254,111 @@ pub fn opaque_reasons(
     names: &[String],
     source: Option<&str>,
 ) -> Result<Vec<(String, String)>, DbError> {
+    const WITHOUT: &str = "compiled without debug information";
     let source = match source {
         Some(s) => s.to_owned(),
         None => stored_source(conn, unit)?,
     };
+    let qualified = |owner: &str, name: &str| {
+        if owner == unit.owner {
+            name.to_owned()
+        } else {
+            format!("{owner}.{name}")
+        }
+    };
+    let mut spec_types: Option<Vec<String>> = None;
     let mut reasons = Vec::new();
     for (name, path) in declared_types(&source, line, names) {
-        // `pkg.type` or `owner.pkg.type`; one part is a local or SQL type.
-        let (owner, package, type_name) = match path.as_slice() {
-            [package, type_name] => (unit.owner.as_str(), package, type_name),
-            [owner, package, type_name] => (owner.as_str(), package, type_name),
-            _ => continue,
+        let reason = match path.as_slice() {
+            // The package's own spec, else a SQL type.
+            [type_name] => {
+                let in_spec = unit.unit_type == UnitType::PackageBody && {
+                    let types = match &mut spec_types {
+                        Some(types) => types,
+                        None => spec_types.insert(spec_type_names(conn, unit)?),
+                    };
+                    types.contains(type_name)
+                };
+                if in_spec {
+                    let spec = Unit::new(&unit.owner, &unit.name, UnitType::Package);
+                    (!has_debug_info(conn, &spec)?).then(|| {
+                        format!(
+                            "{type_name} is declared in the specification of {}, {WITHOUT}",
+                            unit.name
+                        )
+                    })
+                } else {
+                    sql_type(conn, &unit.owner, type_name)?
+                        .filter(|(_, _, debug)| !debug)
+                        .map(|(owner, name, _)| {
+                            format!("{} is a SQL type {WITHOUT}", qualified(&owner, &name))
+                        })
+                }
+            }
+            // `pkg.type`, else a SQL type `owner.type`.
+            [first, type_name] => match debug_setting(conn, &unit.owner, first, "PACKAGE")? {
+                Some(debug) => {
+                    (!debug).then(|| format!("{type_name} is declared in {first}, {WITHOUT}"))
+                }
+                None => (debug_setting(conn, first, type_name, "TYPE")? == Some(false))
+                    .then(|| format!("{} is a SQL type {WITHOUT}", qualified(first, type_name))),
+            },
+            [owner, package, type_name] => {
+                (debug_setting(conn, owner, package, "PACKAGE")? == Some(false)).then(|| {
+                    format!(
+                        "{type_name} is declared in {}, {WITHOUT}",
+                        qualified(owner, package)
+                    )
+                })
+            }
+            _ => None,
         };
-        let without_debug_info: i64 = conn.query_row_as(
-            "select count(*) from all_plsql_object_settings where owner = :1 and name = :2 \
-             and type = 'PACKAGE' and nvl(plsql_debug, 'FALSE') <> 'TRUE'",
-            &[&owner, package],
-        )?;
-        if without_debug_info > 0 {
-            let package = if owner == unit.owner {
-                package.clone()
-            } else {
-                format!("{owner}.{package}")
-            };
-            reasons.push((
-                name,
-                format!("{type_name} is declared in {package}, compiled without debug information"),
-            ));
-        }
+        reasons.extend(reason.map(|reason| (name, reason)));
     }
     Ok(reasons)
+}
+
+/// Names of the types and subtypes declared in a package body's spec.
+fn spec_type_names(conn: &Connection, body: &Unit) -> Result<Vec<String>, DbError> {
+    use pythia_plsql::ast::SymbolKind;
+    let spec = Unit::new(&body.owner, &body.name, UnitType::Package);
+    let ast = pythia_plsql::parse(&stored_source(conn, &spec)?);
+    Ok(ast
+        .scopes
+        .iter()
+        .flat_map(|s| &s.symbols)
+        .filter(|s| matches!(s.kind, SymbolKind::Type | SymbolKind::Subtype))
+        .map(|s| s.name.name.clone())
+        .collect())
+}
+
+/// The SQL type `name` as `owner`'s code names it: `owner`'s own, else by
+/// a private or public synonym (`odcivarchar2list`). Returns its owner and
+/// name, and whether it was compiled with debug information.
+fn sql_type(
+    conn: &Connection,
+    owner: &str,
+    name: &str,
+) -> Result<Option<(String, String, bool)>, DbError> {
+    let rows = conn.query_as::<(String, String, String)>(
+        "select o.owner, o.name, nvl(o.plsql_debug, 'FALSE') \
+         from all_plsql_object_settings o \
+         join (select :1 owner, :2 name, 0 pos from dual \
+               union all \
+               select table_owner, table_name, decode(owner, 'PUBLIC', 2, 1) \
+               from all_synonyms where owner in (:3, 'PUBLIC') and synonym_name = :4) c \
+           on o.owner = c.owner and o.name = c.name \
+         where o.type = 'TYPE' \
+         order by c.pos",
+        &[&owner, &name, &owner, &name],
+    )?;
+    match rows.into_iter().next() {
+        Some(row) => {
+            let (owner, name, debug) = row?;
+            Ok(Some((owner, name, debug == "TRUE")))
+        }
+        None => Ok(None),
+    }
 }
 
 /// A stored unit's source as a `CREATE` statement, with the dictionary's
@@ -283,7 +377,8 @@ fn stored_source(conn: &Connection, unit: &Unit) -> Result<String, DbError> {
 
 /// The declared types (dotted, as Oracle stores names) of the variables,
 /// constants and parameters `names` in scope at `line` of `source`.
-/// `%TYPE` and `%ROWTYPE` declarations are left out.
+/// `%TYPE` and `%ROWTYPE` declarations are left out, and so are types
+/// declared in `source` itself.
 fn declared_types(source: &str, line: Option<u32>, names: &[String]) -> Vec<(String, Vec<String>)> {
     use pythia_plsql::ast::{SymbolKind, TypeAttr};
     let ast = pythia_plsql::parse(source);
@@ -312,10 +407,17 @@ fn declared_types(source: &str, line: Option<u32>, names: &[String]) -> Vec<(Str
                         )
                 })?;
             let ty = symbol.ty.as_ref().filter(|t| t.attr == TypeAttr::None)?;
-            Some((
-                name.clone(),
-                ty.path.iter().map(|i| i.name.clone()).collect(),
-            ))
+            let path: Vec<String> = ty.path.iter().map(|i| i.name.clone()).collect();
+            // A type declared here has the unit's debug information.
+            let local = path.len() == 1
+                && ast
+                    .ancestors(scope)
+                    .flat_map(|s| ast.scope(s).symbols.iter())
+                    .any(|s| {
+                        s.name.is(&path[0])
+                            && matches!(s.kind, SymbolKind::Type | SymbolKind::Subtype)
+                    });
+            (!local).then(|| (name.clone(), path))
         })
         .collect()
 }
@@ -386,6 +488,12 @@ mod tests {
   begin
     null;
   end;
+  procedure third is
+    type local_t is table of number;
+    l_order local_t;
+  begin
+    null;
+  end;
 end;";
         let names: Vec<String> = ["P_ORDER", "P_ID", "L_ORDER", "L_COUNT", "L_ROW", "MISSING"]
             .map(String::from)
@@ -405,6 +513,8 @@ end;";
             declared_types(source, Some(12), &names[2..3]),
             [("L_ORDER".to_string(), path(&["LOCAL_T"]))]
         );
+        // The third procedure's L_ORDER is of a type declared there.
+        assert_eq!(declared_types(source, Some(18), &names[2..3]), []);
     }
 
     #[test]

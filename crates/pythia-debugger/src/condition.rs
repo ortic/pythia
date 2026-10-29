@@ -12,6 +12,15 @@ use crate::types::Variable;
 /// Unquoted names are upper-cased; `"Quoted"` names keep their case. Text
 /// keys of index-by tables stay quoted: `g_rates('L1')` → `["G_RATES", "('L1')"]`.
 pub fn parse_path(expr: &str) -> Option<Vec<String>> {
+    parse_path_with(expr, &|_| None)
+}
+
+/// [`parse_path`] where a subscript may be a variable (`lines(i)`, `art_(rec_.n)`):
+/// `subscript` turns its path into the segment, e.g. [`subscripts`].
+pub fn parse_path_with(
+    expr: &str,
+    subscript: &dyn Fn(&[String]) -> Option<String>,
+) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut chars = expr.trim().chars().peekable();
     let mut expect_name = true;
@@ -47,10 +56,11 @@ pub fn parse_path(expr: &str) -> Option<Vec<String>> {
                     }
                     let index = index.trim();
                     let digits = index.strip_prefix('-').unwrap_or(index);
-                    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-                        return None;
+                    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                        out.push(format!("({index})"));
+                    } else {
+                        out.push(subscript(&parse_path_with(index, subscript)?)?);
                     }
-                    out.push(format!("({index})"));
                 }
             }
             '"' if expect_name => {
@@ -102,6 +112,28 @@ pub fn lookup<'a>(vars: &'a [Variable], path: &[String]) -> Option<&'a Variable>
     descend(var, rest).ok()
 }
 
+/// Subscripts from the values of `vars`, for [`parse_path_with`]: `(3)`,
+/// or `('L1')` for text.
+pub fn subscripts(vars: &[Variable]) -> impl Fn(&[String]) -> Option<String> + '_ {
+    |path| {
+        let var = lookup(vars, path).filter(|v| v.children.is_empty())?;
+        let value = var.value.as_ref()?;
+        Some(if is_text(&var.type_name) {
+            format!("('{}')", value.replace('\'', "''"))
+        } else {
+            format!("({value})")
+        })
+    }
+}
+
+/// Whether values of this type (as the debugger names it) are text.
+pub fn is_text(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "VARCHAR2" | "VARCHAR" | "STRING" | "CHAR" | "NVARCHAR2" | "NCHAR" | "LONG"
+    )
+}
+
 /// Whether a field or element name matches a path segment: names ignore
 /// case, text keys don't.
 pub fn matches(name: &str, segment: &str) -> bool {
@@ -116,6 +148,9 @@ pub fn matches(name: &str, segment: &str) -> bool {
 pub fn descend<'a>(var: &'a Variable, rest: &[String]) -> Result<&'a Variable, String> {
     let mut var = var;
     for seg in rest {
+        if var.type_name == OPAQUE {
+            return Err(no_contents(var));
+        }
         var = var
             .children
             .iter()
@@ -123,6 +158,30 @@ pub fn descend<'a>(var: &'a Variable, rest: &[String]) -> Result<&'a Variable, S
             .ok_or_else(|| format!("{} has no {seg}", var.name.to_lowercase()))?;
     }
     Ok(var)
+}
+
+/// Type of values whose contents Oracle's agent doesn't show: their type
+/// was compiled without debug information.
+pub const OPAQUE: &str = "OPAQUE";
+
+/// The opaque variable that `rest` would have to go into from `var`.
+pub fn opaque_on_path<'a>(var: &'a Variable, rest: &[String]) -> Option<&'a Variable> {
+    let mut var = var;
+    for seg in rest {
+        if var.type_name == OPAQUE {
+            return Some(var);
+        }
+        var = var.children.iter().find(|c| matches(&c.name, seg))?;
+    }
+    None
+}
+
+/// Why there are no fields or elements to follow in an opaque variable.
+pub fn no_contents(var: &Variable) -> String {
+    format!(
+        "{} is {OPAQUE}: its contents aren't available",
+        var.name.to_lowercase()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -428,6 +487,43 @@ mod tests {
         assert_eq!(parse_path("a(x)"), None);
         assert_eq!(parse_path("a('open"), None);
         assert_eq!(parse_path("a('x' y)"), None);
+    }
+
+    /// Subscripts that are variables take their values (#165).
+    #[test]
+    fn variable_subscripts() {
+        let vars = vec![
+            var("I", Some("3"), vec![]),
+            Variable {
+                type_name: "VARCHAR2".into(),
+                ..var("L_CODE", Some("O'K"), vec![])
+            },
+            var("L_REC", None, vec![var("N", Some("2"), vec![])]),
+            var("L_NULL", None, vec![]),
+        ];
+        let parse = |expr| parse_path_with(expr, &subscripts(&vars));
+        assert_eq!(
+            parse("l_order.lines(i).qty"),
+            Some(vec![
+                "L_ORDER".into(),
+                "LINES".into(),
+                "(3)".into(),
+                "QTY".into()
+            ])
+        );
+        assert_eq!(
+            parse("g_rates(l_code)"),
+            Some(vec!["G_RATES".into(), "('O''K')".into()])
+        );
+        assert_eq!(
+            parse("art_( l_rec.n )"),
+            Some(vec!["ART_".into(), "(2)".into()])
+        );
+        assert_eq!(parse("a(2)"), Some(vec!["A".into(), "(2)".into()]));
+        assert_eq!(parse("a(l_null)"), None, "NULL");
+        assert_eq!(parse("a(l_rec)"), None, "a record");
+        assert_eq!(parse("a(j)"), None, "unknown");
+        assert_eq!(parse("a(i + 1)"), None);
     }
 
     #[test]

@@ -625,20 +625,43 @@ impl DebugSession {
         if !same {
             return None;
         }
-        let path = condition::parse_path(expression)?;
-        let var = condition::lookup(&self.variables, &path).or_else(|| {
+        // Subscripts may be variables: `lines(i)` is `lines(3)` when i = 3.
+        let subscripts = condition::subscripts(&self.variables);
+        let path = condition::parse_path_with(expression, &subscripts)?;
+        let root = self
+            .variables
+            .iter()
+            .find(|v| v.name.eq_ignore_ascii_case(&path[0]));
+        let found = condition::lookup(&self.variables, &path).or_else(|| {
             self.watch_values
                 .iter()
-                .find(|w| condition::parse_path(&w.expression).as_ref() == Some(&path))
+                .find(|w| {
+                    condition::parse_path_with(&w.expression, &subscripts).as_ref() == Some(&path)
+                })
                 .and_then(|w| w.value.as_ref().ok())
-        })?;
-        let title = format!("{} {}", expression.trim(), var.type_name)
-            .trim()
-            .to_owned();
-        let mut text = describe(var);
-        if let Some(reason) = self
-            .opaque_reasons
-            .get(&(selected.clone(), var.name.clone()))
+        });
+        let (title, mut text, shown) = match found {
+            Some(var) => (
+                format!("{} {}", expression.trim(), var.type_name)
+                    .trim()
+                    .to_owned(),
+                describe(var),
+                var,
+            ),
+            // A field or element of an opaque variable: say why it has none.
+            None => {
+                let opaque = condition::opaque_on_path(root?, &path[1..])?;
+                (
+                    expression.trim().to_owned(),
+                    condition::no_contents(opaque),
+                    opaque,
+                )
+            }
+        };
+        // Reasons are known for the frame's variables, not their fields.
+        if let Some(reason) = root
+            .filter(|r| std::ptr::eq(*r, shown))
+            .and_then(|r| self.opaque_reasons.get(&(selected.clone(), r.name.clone())))
         {
             text = format!("{text}\n{reason}");
         }
@@ -669,7 +692,7 @@ impl DebugSession {
         let names: Vec<String> = self
             .variables
             .iter()
-            .filter(|v| v.type_name == "OPAQUE")
+            .filter(|v| v.type_name == condition::OPAQUE)
             .map(|v| v.name.clone())
             .filter(|name| self.opaque_asked.insert((unit.clone(), name.clone())))
             .collect();
@@ -1844,6 +1867,52 @@ mod tests {
         assert_eq!(s.hover(&other, "l_total"), None, "other unit");
     }
 
+    /// An element: `l_lines(2)`, or by a variable's value, `l_lines(i)` (#165).
+    #[test]
+    fn hover_elements() {
+        let mut s = DebugSession::default();
+        let unit = Unit::new("PYTHIA", "P", UnitType::Procedure);
+        s.stack = vec![frame(&unit, "P", Some(3))];
+        s.state = State::Suspended {
+            reason: StopReason::Step,
+        };
+        let line = |n: &str, product: &str| Variable {
+            type_name: "T_LINE".into(),
+            ..var(
+                &format!("({n})"),
+                None,
+                vec![
+                    Variable {
+                        type_name: "VARCHAR2".into(),
+                        ..var("PRODUCT", Some(product), vec![])
+                    },
+                    var("QTY", Some(n), vec![]),
+                ],
+            )
+        };
+        s.variables = vec![
+            var("I", Some("2"), vec![]),
+            var("J", Some("7"), vec![]),
+            var(
+                "L_LINES",
+                Some("2 element(s)"),
+                vec![line("1", "Widget"), line("2", "Gadget")],
+            ),
+        ];
+        let hover = |expr| s.hover(&unit, expr);
+        assert_eq!(
+            hover("l_lines(1)"),
+            Some((
+                "l_lines(1) T_LINE".into(),
+                "product = Widget\nqty = 1".into()
+            ))
+        );
+        assert_eq!(hover("l_lines(i)").unwrap().1, "product = Gadget\nqty = 2");
+        assert_eq!(hover("l_lines(i).product").unwrap().1, "Gadget");
+        assert_eq!(hover("l_lines(j)"), None, "no element 7");
+        assert_eq!(hover("l_lines(k)"), None, "no variable k");
+    }
+
     /// Opaque variables are explained once per session, for the frame they
     /// belong to; the reason shows with the value.
     #[test]
@@ -1891,6 +1960,17 @@ mod tests {
                 .1
                 .ends_with("declared in TYPES, …")
         );
+        // Its elements say why there are none (#166).
+        assert_eq!(
+            s.hover(&api, "l_order.lines(2)"),
+            Some((
+                "l_order.lines(2)".into(),
+                "l_order is OPAQUE: its contents aren't available\n\
+                 T_ORDER is declared in TYPES, …"
+                    .into()
+            ))
+        );
+        assert_eq!(s.hover(&api, "l_total.x"), None, "not opaque");
         // The next stop doesn't ask again.
         let mut actions = Vec::new();
         s.on_event(stop(42), &mut actions);
