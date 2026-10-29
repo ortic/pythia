@@ -16,6 +16,11 @@ All notable changes to Pythia are documented here. The format follows
   while typing on, and names match by prefix, word starts (`mxn_it` →
   `mxn_inventory_transaction_tab`) or substring, no longer by letters
   scattered through them.
+- Completion could lack objects of a large schema (#161): the schema's
+  objects and the public synonyms were read in one query cut at 50,000
+  rows, in no order. The schema's objects are read in full now, the public
+  synonyms after them. A materialized view is offered once, no longer
+  also as its table of the same name.
 - *New SQL* (toolbar, *File → New SQL Window*, Ctrl+N) opened the window
   without the keyboard focus in its editor: typing went nowhere until a
   click into it (#157).
