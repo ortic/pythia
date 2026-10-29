@@ -45,6 +45,11 @@ impl MonitorWindow {
         &mut self.state().monitor
     }
 
+    #[cfg(test)]
+    pub fn test_monitor_ref(&self) -> Option<&Monitor> {
+        self.state.as_ref().map(|s| &s.monitor)
+    }
+
     fn state(&mut self) -> &mut State {
         let start = self.start;
         self.state.get_or_insert_with(|| {

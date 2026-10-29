@@ -1241,6 +1241,8 @@ fn debugger_sql_panel() {
     };
     let setup = pythia_debugger::target::setup_statements(&profile.username, &host);
     crate::test_db::as_dba(&setup.iter().map(String::as_str).collect::<Vec<_>>());
+    // The SQL panel's views, before any session connects (#154).
+    crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
     let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
     for drop in [
         "drop table shop_orders purge",
@@ -1315,6 +1317,8 @@ fn monitor_plan_with_actual_rows() {
         eprintln!("PYTHIA_TEST_DB not set, skipping");
         return;
     };
+    // The plan views, before any session connects (#154).
+    crate::test_db::as_dba(&["grant select_catalog_role to {user}"]);
     let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
     let marker = format!(
         "pythia_monplan_{}",
@@ -1355,8 +1359,24 @@ fn monitor_plan_with_actual_rows() {
         .test_monitor_window()
         .test_monitor()
         .open_sql(sql_id.clone());
+    // The details read, with the plan's statistics.
+    let measured = |app: &PythiaApp| -> Result<bool, String> {
+        let Some(view) = app
+            .test_monitor_window_ref()
+            .test_monitor_ref()
+            .and_then(|m| m.sql_detail(&sql_id))
+        else {
+            return Ok(false);
+        };
+        match view.detail() {
+            Ok(Some(d)) if !d.errors.is_empty() => Err(format!("{:?}", d.errors)),
+            Ok(Some(d)) => Ok(pythia_ui::plan::has_actuals(&d.plan_rows)),
+            Ok(None) => Ok(false),
+            Err(e) => Err(e.to_owned()),
+        }
+    };
     let start = Instant::now();
-    while h.query_by_label("A-Rows").is_none() {
+    while !measured(h.state()).unwrap_or_else(|e| panic!("SQL details of {sql_id}: {e}")) {
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "no plan with actual rows for {sql_id}"
@@ -1365,6 +1385,7 @@ fn monitor_plan_with_actual_rows() {
         std::thread::sleep(Duration::from_millis(15));
     }
     h.run_steps(3);
+    assert!(h.query_by_label("A-Rows").is_some(), "the tree's columns");
     assert!(
         h.query_all_by_label_contains("Estimate off at")
             .next()

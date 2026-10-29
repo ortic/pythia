@@ -57,7 +57,10 @@ fn at<'a>(list: &'a [SessionSql], unit: Option<&Unit>, line: u32) -> &'a Session
 
 #[test]
 fn statements_by_line_with_actual_rows() {
-    let (Some(dba), Some(conn)) = (connect("PYTHIA_TEST_DB_DBA"), connect("PYTHIA_TEST_DB")) else {
+    let (Some(dba), true) = (
+        connect("PYTHIA_TEST_DB_DBA"),
+        std::env::var("PYTHIA_TEST_DB").is_ok(),
+    ) else {
         eprintln!("PYTHIA_TEST_DB_DBA / PYTHIA_TEST_DB not set, skipping");
         return;
     };
@@ -66,6 +69,10 @@ fn statements_by_line_with_actual_rows() {
         dba.execute(&stmt, &[])
             .unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
+    // The lookups' views, before the test user connects (#154).
+    dba.execute("grant select_catalog_role to pythia", &[])
+        .unwrap();
+    let conn = connect("PYTHIA_TEST_DB").unwrap();
     let _ = conn.execute("drop table dbgq_t purge", &[]);
     conn.execute(TABLE, &[]).unwrap();
     conn.execute(

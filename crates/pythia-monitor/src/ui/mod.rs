@@ -484,6 +484,14 @@ impl Monitor {
         self.deferred.push(Want::OpenSqlDetail { sql_id });
     }
 
+    /// The open SQL details of a statement.
+    pub fn sql_detail(&self, sql_id: &str) -> Option<&SqlDetailView> {
+        self.details.iter().find_map(|d| match d {
+            DetailView::Sql(s) if s.sql_id == sql_id => Some(&**s),
+            _ => None,
+        })
+    }
+
     pub fn capabilities(&self) -> Option<&Capabilities> {
         self.caps.as_ref().and_then(|c| c.as_ref().ok())
     }

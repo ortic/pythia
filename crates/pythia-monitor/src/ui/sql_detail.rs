@@ -39,6 +39,14 @@ impl SqlDetailView {
         }
     }
 
+    /// The statement's details once read, or why they couldn't be.
+    pub fn detail(&self) -> Result<Option<&SqlDetail>, &str> {
+        match &self.error {
+            Some(e) => Err(e),
+            None => Ok(self.detail.as_ref()),
+        }
+    }
+
     pub fn title(&self) -> String {
         format!("SQL {}", self.sql_id)
     }
