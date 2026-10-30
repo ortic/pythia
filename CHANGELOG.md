@@ -15,6 +15,10 @@ All notable changes to Pythia are documented here. The format follows
   (`$IF` without `$END`, `$END` without `$IF`). Folding no longer closes
   an IF at `$END`, and the directives, `$$PLSQL_UNIT` too, show as
   keywords instead of a red `$`.
+- *Format* broke conditional compilation (#172): `$IF x $THEN` became
+  `$ if x $ then`, which Oracle doesn't compile. Statements with `$IF`
+  are kept as written (their branches are often half a construct);
+  `$$PLSQL_UNIT` and the other inquiry directives format like names.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later

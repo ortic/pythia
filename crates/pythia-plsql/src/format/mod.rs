@@ -396,6 +396,14 @@ fn try_format_statement(
         return Err(Kept::Opaque);
     }
     let toks: Vec<Tok> = tokens(text).into_iter().map(|(t, _)| t).collect();
+    // Conditional compilation (#172): a branch is often part of a construct
+    // (a WHERE clause, one of two headers), which the layout can't place.
+    if toks
+        .iter()
+        .any(|t| t.kind == TokenKind::Directive && !t.text.starts_with("$$"))
+    {
+        return Err(Kept::Unsupported);
+    }
     let mut layout = Layout::new(&toks, o);
     let doc = layout.statement();
     if layout.opaque {
