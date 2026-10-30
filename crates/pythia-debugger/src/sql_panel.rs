@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(
             texts(notes(&plan, true)),
             [
-                "⚠ Estimate off at 1 TABLE ACCESS FULL PYTHIA.T: estimated 20 rows, got 2,000 (100× more)",
+                "⚠ Row estimate off at plan line 1 (TABLE ACCESS FULL PYTHIA.T): estimated 20 rows, got 2,000 (100× more)",
                 "Running now: the figures are of its last finished execution",
                 "Other sessions may run it with another plan: 42 (child 0, 17 runs)",
             ]

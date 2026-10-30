@@ -57,21 +57,12 @@ impl PlanRow {
     }
 
     /// E-Rows × Starts against A-Rows, e.g. "estimated 20 rows, got
-    /// 2,000 (100× more)".
+    /// 2,000 (100× more)" or "estimated 1 row per start × 318 starts =
+    /// 318 rows, got none".
     pub fn misestimate_text(&self) -> Option<String> {
         let factor = self.misestimate()?;
         let (estimate, actual, starts) = (self.rows?, self.actual_rows?, self.starts?);
         let expected = estimate * starts;
-        let per_start = if starts > 1.0 {
-            format!(
-                " ({} per start × {} starts)",
-                fmt_count(estimate),
-                fmt_count(starts)
-            )
-        } else {
-            String::new()
-        };
-        let direction = if actual >= expected { "more" } else { "fewer" };
         let rows = |n: f64| {
             let count = fmt_count(n);
             if count == "1" {
@@ -80,12 +71,25 @@ impl PlanRow {
                 format!("{count} rows")
             }
         };
-        Some(format!(
-            "estimated {}{per_start}, got {} ({}× {direction})",
-            rows(expected),
-            fmt_count(actual),
-            fmt_count(factor)
-        ))
+        // The optimizer estimates per start; the starts are the actual ones.
+        let estimated = if starts > 1.0 {
+            format!(
+                "{} per start × {} starts = {}",
+                rows(estimate),
+                fmt_count(starts),
+                rows(expected)
+            )
+        } else {
+            rows(expected)
+        };
+        // The factor counts no rows as 1: "got 0 (318× fewer)" isn't true.
+        let got = if fmt_count(actual) == "0" {
+            "none".to_owned()
+        } else {
+            let direction = if actual >= expected { "more" } else { "fewer" };
+            format!("{} ({}× {direction})", fmt_count(actual), fmt_count(factor))
+        };
+        Some(format!("estimated {estimated}, got {got}"))
     }
 }
 
@@ -125,14 +129,14 @@ pub fn flagged_misestimate(plan: &[PlanRow]) -> Option<&PlanRow> {
         .map(|(r, _)| r)
 }
 
-/// The worst misestimate as a note above a plan, e.g. "⚠ Estimate off at
-/// 3 TABLE ACCESS FULL PYTHIA.T: estimated 25,000 rows, got 200 (125×
-/// fewer)", with its line's id.
+/// The worst misestimate as a note above a plan, with its line's id.
 pub fn misestimate_note(plan: &[PlanRow]) -> Option<(u32, String)> {
     worst_misestimate(plan).map(|r| (r.id, note(r)))
 }
 
-/// The note on a misestimated plan line.
+/// The note on a misestimated plan line, e.g. "⚠ Row estimate off at plan
+/// line 3 (TABLE ACCESS FULL PYTHIA.T): estimated 25,000 rows, got 200
+/// (125× fewer)". The line is its Id, as DBMS_XPLAN shows it.
 pub fn note(row: &PlanRow) -> String {
     let object = if row.object.is_empty() {
         String::new()
@@ -140,7 +144,7 @@ pub fn note(row: &PlanRow) -> String {
         format!(" {}", row.object)
     };
     format!(
-        "⚠ Estimate off at {} {}{object}: {}",
+        "⚠ Row estimate off at plan line {} ({}{object}): {}",
         row.id,
         row.operation,
         row.misestimate_text().unwrap_or_default()
@@ -397,7 +401,9 @@ impl PlanView {
             {
                 if let Some(row) = self.selected.and_then(|s| plan.iter().find(|r| r.id == s)) {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.label(RichText::new(format!("{} {}", row.id, row.operation)).strong());
+                        ui.label(
+                            RichText::new(format!("Line {}: {}", row.id, row.operation)).strong(),
+                        );
                         if let Some(off) = row.misestimate_text() {
                             ui.label(RichText::new(off).color(
                                 if row.misestimate().is_some_and(|f| f >= MISESTIMATE) {
@@ -738,7 +744,19 @@ mod tests {
         assert_eq!(fewer.misestimate(), Some(100.0));
         assert_eq!(
             fewer.misestimate_text().as_deref(),
-            Some("estimated 300 rows (30 per start × 10 starts), got 3 (100× fewer)")
+            Some("estimated 30 rows per start × 10 starts = 300 rows, got 3 (100× fewer)")
+        );
+        // A unique scan that never found its row: 0 isn't 318× fewer.
+        let none = PlanRow {
+            object: "IFSAPP.X_PK".into(),
+            operation: "INDEX UNIQUE SCAN".into(),
+            ..line(35, 3, 1.0, 318.0, 0.0)
+        };
+        assert_eq!(none.misestimate(), Some(318.0));
+        assert_eq!(
+            note(&none),
+            "⚠ Row estimate off at plan line 35 (INDEX UNIQUE SCAN IFSAPP.X_PK): \
+             estimated 1 row per start × 318 starts = 318 rows, got none"
         );
         // Never started (the other branch of a filter): nothing to hold
         // against the estimate. Without statistics neither.
