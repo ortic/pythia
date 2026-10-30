@@ -1229,6 +1229,62 @@ fn new_sql_window_has_the_focus() {
     assert_eq!(w.editor.text(), "select 2");
 }
 
+/// *View → Variables* is for a SQL window with variables (#168): off
+/// without them, ticked while the panel shows them. Run from elsewhere
+/// without variables, it says so instead of switching the panel off for
+/// the variables typed later.
+#[test]
+fn variables_menu_item() {
+    use egui_kittest::kittest::NodeT;
+    let item = "Variables (SQL window)";
+    // The item's state in the View menu: (enabled, ticked).
+    let state = |h: &mut Ui| {
+        h.get_by_label("View").click();
+        h.run_steps(2);
+        let node = h.get_by_label_contains(item).accesskit_node();
+        let state = (
+            !node.is_disabled(),
+            node.toggled() == Some(egui::accesskit::Toggled::True),
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        state
+    };
+    let mut h = headless_harness();
+    h.run_steps(2);
+    assert_eq!(state(&mut h), (false, false), "no SQL window");
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1 from dual".into()));
+    h.run_steps(2);
+    assert_eq!(state(&mut h), (false, false), "no variables");
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ShowVariables);
+    h.run_steps(2);
+    assert!(h.state_mut().test_sql_window().show_variables);
+    assert_eq!(
+        h.state().test_log().last().map(String::as_str),
+        Some("This SQL window has no bind (:name) or substitution (&name) variables")
+    );
+
+    // A bind: the panel opens, and the item hides it.
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("select 1 from dual where 1 = :id");
+    h.run_steps(2);
+    assert!(h.query_by_label("Variables").is_some(), "the panel");
+    assert_eq!(state(&mut h), (true, true));
+    h.get_by_label("View").click();
+    h.run_steps(2);
+    h.get_by_label_contains(item).click();
+    h.run_steps(2);
+    assert!(!h.state_mut().test_sql_window().show_variables);
+    assert!(h.query_by_label("Variables").is_none(), "hidden");
+    assert_eq!(state(&mut h), (true, false));
+}
+
 /// Orders mostly shipped, a few new: without a histogram the optimizer
 /// expects half of them new.
 const SHOP: &[&str] = &[

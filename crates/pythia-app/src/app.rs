@@ -31,6 +31,10 @@ use pythia_ui::icons::{Icon, icon_label};
 // Named before the app became Pythia; kept so saved workspaces still load.
 const WORKSPACE_KEY: &str = "orui-workspace-v2";
 
+/// Why *View → Variables* has nothing to show (#168).
+const NO_VARIABLES: &str = "This SQL window has no bind (:name) or substitution (&name) variables";
+const NO_SQL_WINDOW: &str = "The Variables panel belongs to a SQL window";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     Open,
@@ -2592,15 +2596,17 @@ impl PythiaApp {
             Command::DebugStop => self.debug.stop(),
             Command::DebugSetup => self.open_debug_setup(None),
             Command::ShowDebugger => self.open_debugger(),
-            Command::ShowVariables => {
-                if let Some(id) = self.focused
-                    && let Some(w) = self.docs.get_mut(&id).and_then(Document::sql_window)
-                {
-                    w.show_variables = !w.show_variables;
-                } else {
-                    self.log("The Variables panel belongs to a SQL window");
+            Command::ShowVariables => match self.variables_state() {
+                // Without variables the panel stays hidden either way:
+                // switching it off now would keep it closed later (#168).
+                Some((0, _)) => self.log(NO_VARIABLES),
+                Some(_) => {
+                    if let Some(w) = self.focused_sql_window() {
+                        w.show_variables = !w.show_variables;
+                    }
                 }
-            }
+                None => self.log(NO_SQL_WINDOW),
+            },
             Command::OpenFile => self.file_dialog(FileAction::Open, None),
             Command::SaveFile | Command::SaveFileAs => {
                 let Some(id) = self.focused else { return };
@@ -3089,6 +3095,19 @@ impl PythiaApp {
         self.conns.get(connection)?.docs.get(&id)
     }
 
+    /// The SQL window that has the focus, if one has.
+    fn focused_sql_window(&mut self) -> Option<&mut SqlWindow> {
+        let id = self.focused?;
+        self.docs.get_mut(&id)?.sql_window()
+    }
+
+    /// The focused SQL window's variables: how many, and whether its
+    /// Variables panel is switched on. `None` without a SQL window.
+    fn variables_state(&mut self) -> Option<(usize, bool)> {
+        let w = self.focused_sql_window()?;
+        Some((w.variables().len(), w.show_variables))
+    }
+
     /// Whether Commit and Rollback apply to the focused window, or why not.
     fn transaction_state(&self) -> Result<(), &'static str> {
         match self.focused_doc_session() {
@@ -3566,6 +3585,7 @@ impl PythiaApp {
         commands: &mut Vec<Command>,
         open_report: &mut Option<(String, String)>,
     ) {
+        let variables = self.variables_state();
         let keymap = &self.keymap;
         let user_reports = &self.user_reports;
         let mut delete = None;
@@ -3573,10 +3593,26 @@ impl PythiaApp {
         let autocommit = self.settings.autocommit;
         let dialect = self.dialect();
         let mut item = |ui: &mut Ui, command: Command| {
+            // Variables only with some to show, ticked while they show (#168).
+            let (enabled, selected) = match command {
+                Command::ToggleAutocommit => (true, autocommit),
+                Command::ShowVariables => match variables {
+                    Some((n, shown)) => (n > 0, n > 0 && shown),
+                    None => (false, false),
+                },
+                _ => (true, false),
+            };
             let button = egui::Button::new(command.short_label())
-                .selected(command == Command::ToggleAutocommit && autocommit)
+                .selected(selected)
                 .shortcut_text(keymap.shortcut_text(&ctx, command));
-            if ui.add(button).clicked() {
+            let mut response = ui.add_enabled(enabled, button);
+            if command == Command::ShowVariables {
+                response = response.on_disabled_hover_text(match variables {
+                    Some(_) => NO_VARIABLES,
+                    None => NO_SQL_WINDOW,
+                });
+            }
+            if response.clicked() {
                 commands.push(command);
             }
         };

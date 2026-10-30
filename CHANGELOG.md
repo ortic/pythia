@@ -6,6 +6,14 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- *View → Variables (SQL window)* did nothing in a SQL window without
+  bind (`:name`) or substitution (`&name`) variables, and switched the
+  panel off unseen: it then didn't open for variables typed later
+  (#168). The item is disabled there, with a hover text saying why, and
+  ticked while the panel shows; from the command palette it says the
+  window has no variables.
+
 ## [0.9.0] - 2026-10-29
 
 ### Changed
