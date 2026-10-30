@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Ui};
+use pythia_ui::icons::Icon;
 use serde::{Deserialize, Serialize};
 
 use crate::Debugger;
@@ -478,12 +479,6 @@ impl DebugSession {
         self.sql.statistics
     }
 
-    /// Whether the SQL panel opens on a statement whose estimates are off
-    /// by 10× or more, the first time it is flagged.
-    pub fn set_open_sql_on_flag(&mut self, on: bool) {
-        self.sql.open_on_flag = on;
-    }
-
     /// Statements whose estimates were off by 10× or more in this run.
     pub fn sql_flag_count(&self) -> usize {
         self.sql.flag_count()
@@ -894,7 +889,7 @@ impl DebugSession {
     }
 
     /// Whether the SQL plan should come to the front: shown with the
-    /// toggle, or opened on a misestimate since the last call.
+    /// toolbar's plan button since the last call.
     pub fn take_sql_raise(&mut self) -> bool {
         std::mem::take(&mut self.sql.raise)
     }
@@ -1021,27 +1016,42 @@ impl DebugSession {
             {
                 self.set_break_on_exception(on);
             }
-            let mut show = self.sql.show;
+            // The plan behind an icon that blinks on a misestimate (#169).
+            let show = self.sql.show;
             let flagged = self.sql.flag_count();
-            let label = if flagged > 0 {
-                RichText::new(format!("SQL ⚠ {flagged}")).color(ui.visuals().warn_fg_color)
-            } else {
-                RichText::new("SQL")
-            };
-            let hover = if flagged > 0 {
-                format!(
-                    "The statements the session ran, by line, with their plans: {flagged} with \
-                     estimates off by 10× or more"
+            let lit = self.sql.blinking(ui.input(|i| i.time));
+            if lit.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            let warn = ui.visuals().warn_fg_color;
+            let icon = Icon::Explain.image(ui);
+            let mut button = if flagged > 0 {
+                egui::Button::image_and_text(
+                    icon,
+                    RichText::new(format!("⚠ {flagged}")).color(warn),
                 )
             } else {
-                "The statements the session ran, by line, with their plans".to_owned()
+                egui::Button::image(icon)
+            }
+            .selected(show)
+            .min_size(egui::vec2(24.0, 0.0));
+            if lit == Some(true) {
+                button = button.fill(warn.gamma_multiply(0.35));
+            }
+            let hover = if flagged > 0 {
+                format!(
+                    "SQL plan: the statements the session ran, by line, with their plans. \
+                     {flagged} with estimates off by 10× or more, marked in the gutter."
+                )
+            } else {
+                "SQL plan: the statements the session ran, by line, with their plans".to_owned()
             };
-            if ui
-                .toggle_value(&mut show, label)
-                .on_hover_text(hover)
-                .changed()
-            {
-                self.show_sql(show);
+            let response = ui.add(button);
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Button, true, show, "SQL plan")
+            });
+            if response.on_hover_text(hover).clicked() {
+                self.show_sql(!show);
             }
         });
         ui.horizontal(|ui| {

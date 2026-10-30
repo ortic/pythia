@@ -1052,8 +1052,8 @@ impl PythiaApp {
         }
     }
 
-    /// The SQL plan's tab follows its toggle: it opens, comes to the front
-    /// on a misestimate, and goes when hidden.
+    /// The SQL plan's tab follows the debugger's plan button: it opens in
+    /// front, and goes when hidden. It never opens by itself (#169).
     fn sync_debug_sql(&mut self) {
         let raise = self.debug.take_sql_raise();
         let tab = self.dock.find_tab(&Tab::DebugSql);
@@ -1935,8 +1935,6 @@ impl PythiaApp {
         };
         self.debug
             .set_plan_statistics(self.settings.debug_plan_statistics);
-        self.debug
-            .set_open_sql_on_flag(self.settings.debug_open_sql_panel);
         let actions = self
             .debug
             .start(block, host, ports.as_ref(), entry, self.notify.callback());
@@ -5699,7 +5697,7 @@ impl TabViewer for Viewer<'_> {
             }
             self.closed.push(*id);
         }
-        // Closing the plan is hiding it, as with the SQL toggle.
+        // Closing the plan is hiding it, as with the plan button.
         if *tab == Tab::DebugSql {
             self.debug.show_sql(false);
         }

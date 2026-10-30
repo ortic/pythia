@@ -6,6 +6,15 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- The debugger's SQL plan no longer opens by itself (#169). On a
+  misestimate it came up beside the code in the middle of stepping and
+  halved the code's width. The toolbar's *SQL* is now a plan icon. It
+  blinks for a few seconds when a statement's estimates are off by 10×
+  or more, and then shows ⚠ with the number of such statements; opened,
+  the plan shows the flagged statement. The gutter still marks its line.
+  The setting *Open the SQL panel on a misestimate* is gone.
+
 ### Fixed
 - Conditional compilation (`$IF … $THEN … $ELSE … $END`) showed errors
   that aren't (#171): `$ELSE` as "ELSE outside of IF or CASE", `$END`

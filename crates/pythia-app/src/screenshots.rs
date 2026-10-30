@@ -1335,6 +1335,7 @@ fn debugger_sql_panel() {
         conn.execute(ddl, &[])
             .unwrap_or_else(|e| panic!("{ddl}: {e}"));
     }
+    use crate::app::Tab;
     use pythia_debugger::{Unit, UnitType};
     let unit = Unit::new("PYTHIA", "SHIP_NEW_ORDERS", UnitType::Procedure);
     let mut h = Ui {
@@ -1359,14 +1360,29 @@ fn debugger_sql_panel() {
     let program = h.state_mut().test_program();
     assert_eq!(program.object.name, "SHIP_NEW_ORDERS");
     assert!(!program.show_outline, "no outline");
-    // Closed until a statement's estimates are off: then it opens on it,
-    // and the gutter flags its line (#162).
+    // Closed; a statement whose estimates are off is flagged in the
+    // gutter (#162) and by the plan button, but the plan doesn't open
+    // (#169).
     assert!(!h.state().test_debug().sql_shown());
+    wait_until(&mut h, "the loop's flag", |app| {
+        app.test_debug().sql_flag_count() > 0
+    });
+    h.run_steps(2);
+    assert!(!h.state().test_debug().sql_shown(), "stays closed");
+    assert!(h.state().test_tab(Tab::DebugSql).is_none());
+    // Opened, it shows the flagged statement.
+    h.get_by_label("SQL plan").click();
     wait_until(&mut h, "the loop's plan", |app| {
         app.test_debug().sql_plan().is_some_and(|p| p.measured())
     });
+    assert!(
+        h.state()
+            .test_tab(Tab::DebugSql)
+            .is_some_and(|(_, front)| front),
+        "in front"
+    );
     let debug = h.state().test_debug();
-    assert!(debug.sql_shown(), "opened on the misestimate");
+    assert!(debug.sql_shown());
     let flags = debug.sql_flags(Some(&unit));
     assert_eq!(flags.len(), 1, "{flags:?}");
     assert_eq!(flags[0].0, 4);
@@ -7245,8 +7261,8 @@ fn maintenance_scan_sqlserver() {
 }
 
 /// The debugger's panels are tabs of their own (#163): opened together,
-/// breakpoints behind watches, the SQL plan with its toggle, and a closed
-/// panel comes back when the debugger is shown again.
+/// breakpoints behind watches, the SQL plan with its button (#169), and a
+/// closed panel comes back when the debugger is shown again.
 #[test]
 fn debugger_panels_are_tabs() {
     use crate::app::Tab;
@@ -7267,14 +7283,14 @@ fn debugger_panels_are_tabs() {
     assert!(watches_front);
     assert!(app.test_tab(Tab::DebugSql).is_none(), "closed by default");
 
-    // The SQL toggle opens the plan in front, beside the code.
-    h.state_mut().test_debug_mut().show_sql(true);
+    // The plan button opens the plan in front, beside the code.
+    h.get_by_label("SQL plan").click();
     h.run_steps(2);
     save(&mut h, "debugger-panels");
     let (sql, front) = h.state().test_tab(Tab::DebugSql).expect("SQL plan");
     assert!(front);
     assert!(![debugger, variables, watches].contains(&sql));
-    h.state_mut().test_debug_mut().show_sql(false);
+    h.get_by_label("SQL plan").click();
     h.run_steps(2);
     assert!(h.state().test_tab(Tab::DebugSql).is_none(), "hidden: gone");
 

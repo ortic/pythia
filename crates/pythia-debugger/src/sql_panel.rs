@@ -4,9 +4,10 @@
 //! stopped line, or the closest one before it in the unit.
 //!
 //! It stays closed until it's needed: every stop checks the plans of the
-//! statements that ran in the step, flags those off by 10× or more (in the
-//! gutter, and with ⚠ on the toolbar's *SQL*), and opens on one the first
-//! time it is flagged (#162).
+//! statements that ran in the step and flags those off by 10× or more, in
+//! the gutter and with ⚠ on the toolbar's plan button (#162). It never
+//! opens by itself: the button blinks on a newly flagged statement, and
+//! the panel shows it when opened (#169).
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +25,11 @@ type Key = (String, i64);
 /// Plans of what ran in a step checked at most, the longest-running first.
 const CHECKED_PER_STOP: usize = 5;
 
+/// How long the toolbar's plan button blinks on a newly flagged statement,
+/// and how long each of its phases (lit, not lit) lasts, in seconds.
+const BLINK: f64 = 4.0;
+const BLINK_PHASE: f64 = 0.5;
+
 /// A statement whose last execution's estimates are off: where it is and
 /// what the note says.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,16 +41,18 @@ struct Flag {
 }
 
 pub(crate) struct SqlPanel {
-    /// The panel is shown (kept across restarts). Closed by default: it
-    /// opens on a statement whose estimates are off (#162).
+    /// The panel is shown (kept across restarts). Closed by default (#162),
+    /// and only the user opens it (#169).
     pub show: bool,
     /// The debugged session collects row source statistics (Settings →
     /// Debugger). Then every stop checks what ran, shown or not.
     pub statistics: bool,
-    /// The panel opens on a newly flagged statement (Settings → Debugger).
-    pub open_on_flag: bool,
     /// Opened since the app last looked: its tab comes to the front.
     pub raise: bool,
+    /// A statement was newly flagged: the plan button starts blinking.
+    blink: bool,
+    /// When the plan button started blinking (egui's clock).
+    blinking_since: Option<f64>,
     /// Stops so far: an answer for an earlier stop is outdated.
     stop: u64,
     /// The stop a lookup is on its way for.
@@ -67,7 +75,7 @@ pub(crate) struct SqlPanel {
     checking: HashSet<Key>,
     /// Statements whose last execution is off by 10× or more.
     flags: HashMap<Key, Flag>,
-    /// Flagged statements the panel opened on (each once).
+    /// Flagged statements the plan button blinked for (each once).
     announced: HashSet<Key>,
 }
 
@@ -76,8 +84,9 @@ impl Default for SqlPanel {
         Self {
             show: false,
             statistics: true,
-            open_on_flag: true,
             raise: false,
+            blink: false,
+            blinking_since: None,
             stop: 0,
             finding: None,
             found: None,
@@ -110,11 +119,10 @@ pub(crate) struct Context<'a> {
 impl SqlPanel {
     /// A new debug run: nothing found or flagged yet.
     pub fn reset(&mut self) {
-        let (show, statistics, open_on_flag) = (self.show, self.statistics, self.open_on_flag);
+        let (show, statistics) = (self.show, self.statistics);
         *self = Self {
             show,
             statistics,
-            open_on_flag,
             ..Self::default()
         };
     }
@@ -122,6 +130,8 @@ impl SqlPanel {
     /// The run ended: its flags go (the lines may change from here on).
     pub fn finished(&mut self) {
         self.flags.clear();
+        self.blink = false;
+        self.blinking_since = None;
     }
 
     /// Execution stopped: look the statements up again.
@@ -252,7 +262,9 @@ impl SqlPanel {
     }
 
     /// Flags a statement whose plan is off by 10× or more with rows to
-    /// show for it, and opens the panel on it the first time.
+    /// show for it. The first time, the plan button blinks unless the
+    /// panel is open, and the panel shows the statement (unless the user
+    /// picked another at this stop).
     fn flag(&mut self, key: &Key, plan: &CursorPlan) {
         let Some(row) = plan::flagged_misestimate(&plan.rows) else {
             self.flags.remove(key);
@@ -273,12 +285,28 @@ impl SqlPanel {
                 note: plan::note(row),
             },
         );
-        if self.open_on_flag && self.announced.insert(key.clone()) && !self.picked {
-            self.show = true;
-            self.raise = true;
-            self.selected = Some(key.clone());
-            self.picked = true;
+        if self.announced.insert(key.clone()) {
+            self.blink |= !self.show;
+            if !self.picked {
+                self.selected = Some(key.clone());
+                self.picked = true;
+            }
         }
+    }
+
+    /// While the plan button blinks, whether it is lit at `now` (egui's
+    /// clock): for [`BLINK`] seconds after a statement was newly flagged,
+    /// until the panel is opened.
+    pub fn blinking(&mut self, now: f64) -> Option<bool> {
+        if std::mem::take(&mut self.blink) {
+            self.blinking_since = Some(now);
+        }
+        let since = now - self.blinking_since?;
+        if self.show || since >= BLINK {
+            self.blinking_since = None;
+            return None;
+        }
+        Some(((since / BLINK_PHASE) as u64).is_multiple_of(2))
     }
 
     /// Lines of flagged statements in `unit` (`None`: the debugged block),
@@ -878,11 +906,12 @@ mod tests {
         }
     }
 
-    /// Closed, the panel checks what ran in each step, flags a statement
-    /// whose estimates are off and opens on it once; a statement still
-    /// running is checked when it finished (#162).
+    /// Closed, the panel checks what ran in each step and flags a statement
+    /// whose estimates are off (#162); a statement still running is checked
+    /// when it finished. It doesn't open: the plan button blinks once per
+    /// statement, and the panel shows it when opened (#169).
     #[test]
-    fn flags_what_ran_and_opens_once() {
+    fn flags_what_ran_and_blinks_once() {
         let pkg = Unit::new("PYTHIA", "SHIP", UnitType::Procedure);
         let session = TargetSession {
             sid: 7,
@@ -925,11 +954,21 @@ mod tests {
         assert_eq!(loads(&out), ["orders", "count"]);
         panel.plan_loaded("count".into(), 0, Ok(plan("count", 10.0, 12.0)));
         assert!(!panel.show && panel.flag_count() == 0);
+        assert_eq!(panel.blinking(100.0), None);
         panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
-        assert!(panel.show, "opens on the flagged statement");
-        assert!(panel.raise, "its tab comes to the front");
-        panel.raise = false;
-        assert_eq!(panel.selected, Some(("orders".into(), 0)));
+        assert!(!panel.show && !panel.raise, "stays closed");
+        assert_eq!(
+            panel.selected,
+            Some(("orders".into(), 0)),
+            "shown when opened"
+        );
+        assert!(panel.shown_plan().is_some());
+        // Lit, dark, lit … for a few seconds from the next frame.
+        assert_eq!(panel.blinking(200.0), Some(true));
+        assert_eq!(panel.blinking(200.0 + BLINK_PHASE), Some(false));
+        assert_eq!(panel.blinking(200.0 + 2.0 * BLINK_PHASE), Some(true));
+        assert_eq!(panel.blinking(200.0 + BLINK), None);
+        assert_eq!(panel.blinking(300.0), None, "over");
         let lines = panel.flagged_lines(Some(&pkg));
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0, 4);
@@ -938,9 +977,8 @@ mod tests {
             "{lines:?}"
         );
 
-        // Closed by the user; the statement runs and is off again, and the
-        // loop finished, off too: only the loop opens it again.
-        panel.show = false;
+        // The statement runs and is off again, and the loop finished, off
+        // too: only the loop blinks.
         out.clear();
         panel.stopped(Some(&session), &mut out);
         let list = vec![
@@ -958,10 +996,14 @@ mod tests {
         );
         assert_eq!(loads(&out), ["loop", "orders"]);
         panel.plan_loaded("orders".into(), 0, Ok(plan("orders", 25_000.0, 200.0)));
-        assert!(!panel.show && !panel.raise, "flagged before: stays closed");
+        assert_eq!(panel.blinking(400.0), None, "flagged before");
         panel.plan_loaded("loop".into(), 0, Ok(plan("loop", 1.0, 5_000.0)));
-        assert!(panel.show && panel.raise);
+        assert_eq!(panel.blinking(500.0), Some(true));
+        assert!(!panel.show);
         assert_eq!(panel.flag_count(), 2);
+        // Opening the panel ends it.
+        panel.show = true;
+        assert_eq!(panel.blinking(500.1), None);
 
         // The run ends: the flags go.
         panel.finished();
