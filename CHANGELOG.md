@@ -35,6 +35,11 @@ All notable changes to Pythia are documented here. The format follows
 - The SQL plan's note without row source statistics said to turn on
   *Plan statistics* in the debugger toolbar; it is in Settings →
   Debugger since #162, and the note says so (#174).
+- Pressing Shift, Ctrl or Alt in an editor scrolled back to the caret
+  (#175), so a Shift+click (select to there), Ctrl+click (go to
+  definition) or Alt+drag on lines scrolled away from the caret landed
+  somewhere else. egui sends these keys as presses of their own since
+  0.36; the editor no longer reacts to them.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later
