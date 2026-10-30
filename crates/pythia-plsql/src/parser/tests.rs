@@ -325,3 +325,100 @@ fn never_panics_on_mangled_input() {
         }
     }
 }
+
+/// Messages of a parse's diagnostics, with the text each one marks.
+fn messages(src: &str) -> Vec<(String, &str)> {
+    parse(src)
+        .diagnostics
+        .into_iter()
+        .map(|d| (d.message, &src[d.span]))
+        .collect()
+}
+
+#[test]
+fn conditional_compilation() {
+    // IFS code (#171): `$ELSE` read as a stray ELSE, `$END` and the next
+    // line's IF as an END IF, and the real END IF without its IF.
+    let ifs = "create or replace package body p is
+  procedure refresh(n_ number) is
+    ret_ varchar2(100);
+  begin
+    $IF Component_Order_SYS.INSTALLED $THEN
+    for r in (select 1 x from dual) loop
+      null;
+    end loop;
+    IF n_ > 0 THEN
+      commit;
+      ret_ := n_;
+    END IF;
+$ELSE
+NULL;
+$END
+    IF ret_ is null then
+      ret_ := 'no data';
+    END IF;
+  end refresh;
+end p;";
+    assert_eq!(messages(ifs), []);
+    // Alternatives: each branch opens the IF that follows.
+    let alternatives = "create or replace procedure p is
+begin
+  $if dbms_db_version.ver_le_11 $then
+  if a = 1 then
+  $elsif $$new_code $then
+  if a = 2 then
+  $else
+  if a = 3 then
+  $end
+    null;
+  end if;
+end;";
+    assert_eq!(messages(alternatives), []);
+    // `$ERROR … $END`, and inquiry directives as values.
+    let error = "create or replace procedure p is
+begin
+  $IF $$debug_level IS NULL $THEN
+    $ERROR 'no debug level for ' || $$PLSQL_UNIT $END
+  $END
+  if $$debug_level > 1 then
+    dbms_output.put_line($$PLSQL_UNIT || ':' || $$PLSQL_LINE);
+  end if;
+end;";
+    assert_eq!(messages(error), []);
+    // The first branch is the code: its declarations, not the others'.
+    let ast = parse(
+        "create or replace package body p is
+  $IF x.y $THEN
+  procedure a is begin null; end;
+  $ELSE
+  procedure b is begin null; end;
+  $END
+  procedure c is begin null; end;
+end;",
+    );
+    assert_eq!(ast.diagnostics, []);
+    let names: Vec<&str> = ast
+        .scopes
+        .iter()
+        .filter_map(|s| s.name.as_ref().map(|n| n.name.as_str()))
+        .collect();
+    assert_eq!(names, ["P", "A", "C"]);
+
+    // Directives that don't pair up.
+    assert_eq!(
+        messages("begin\n  $IF x $THEN\n  null;\nend;"),
+        [("$IF without $END".to_owned(), "$IF")]
+    );
+    assert_eq!(
+        messages("begin\n  null;\n  $END\nend;"),
+        [("$END without matching $IF".to_owned(), "$END")]
+    );
+    assert_eq!(
+        messages("begin\n  $else\n  null;\nend;"),
+        [("$ELSE outside of $IF".to_owned(), "$else")]
+    );
+    assert_eq!(
+        messages("begin\n  $IF x null; $END\n  null;\nend;"),
+        [("$IF without $THEN".to_owned(), "$IF")]
+    );
+}

@@ -1335,6 +1335,7 @@ fn debugger_sql_panel() {
         conn.execute(ddl, &[])
             .unwrap_or_else(|e| panic!("{ddl}: {e}"));
     }
+    use crate::app::Tab;
     use pythia_debugger::{Unit, UnitType};
     let unit = Unit::new("PYTHIA", "SHIP_NEW_ORDERS", UnitType::Procedure);
     let mut h = Ui {
@@ -1354,14 +1355,34 @@ fn debugger_sql_panel() {
     h.state_mut()
         .test_command(crate::commands::Command::DebugStart);
     wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
-    // Closed until a statement's estimates are off: then it opens on it,
-    // and the gutter flags its line (#162).
+    h.run_steps(2);
+    // The window the debugger opened leaves the code its width (#170).
+    let program = h.state_mut().test_program();
+    assert_eq!(program.object.name, "SHIP_NEW_ORDERS");
+    assert!(!program.show_outline, "no outline");
+    // Closed; a statement whose estimates are off is flagged in the
+    // gutter (#162) and by the plan button, but the plan doesn't open
+    // (#169).
     assert!(!h.state().test_debug().sql_shown());
+    wait_until(&mut h, "the loop's flag", |app| {
+        app.test_debug().sql_flag_count() > 0
+    });
+    h.run_steps(2);
+    assert!(!h.state().test_debug().sql_shown(), "stays closed");
+    assert!(h.state().test_tab(Tab::DebugSql).is_none());
+    // Opened, it shows the flagged statement.
+    h.get_by_label("SQL plan").click();
     wait_until(&mut h, "the loop's plan", |app| {
         app.test_debug().sql_plan().is_some_and(|p| p.measured())
     });
+    assert!(
+        h.state()
+            .test_tab(Tab::DebugSql)
+            .is_some_and(|(_, front)| front),
+        "in front"
+    );
     let debug = h.state().test_debug();
-    assert!(debug.sql_shown(), "opened on the misestimate");
+    assert!(debug.sql_shown());
     let flags = debug.sql_flags(Some(&unit));
     assert_eq!(flags.len(), 1, "{flags:?}");
     assert_eq!(flags[0].0, 4);
@@ -2535,6 +2556,46 @@ fn settings_keyboard() {
     h.state_mut().test_settings_keyboard();
     h.run_steps(3);
     save(&mut h, "settings-keyboard");
+}
+
+/// Recording a shortcut waits past the modifiers for its key (#176): egui
+/// sends Ctrl and Shift as key presses of their own, and Ctrl became the
+/// shortcut, "Ctrl+ControlLeft".
+#[test]
+fn settings_record_shortcut_with_modifiers() {
+    let mut h = headless_harness();
+    h.state_mut().test_settings_keyboard();
+    h.state_mut().test_filter_keyboard("format code");
+    h.run_steps(3);
+    h.get_by_label("Alt+Shift+F").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_some());
+    // Ctrl+Shift+K as a keyboard sends it: Ctrl, then Shift, then K.
+    let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    for (key, modifiers) in [
+        (egui::Key::ControlLeft, egui::Modifiers::COMMAND),
+        (egui::Key::ShiftLeft, ctrl_shift),
+        (egui::Key::K, ctrl_shift),
+    ] {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    assert_eq!(
+        h.state_mut()
+            .test_settings_mut()
+            .keybindings
+            .get("Format")
+            .map(String::as_str),
+        Some("Ctrl+Shift+K")
+    );
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_none());
 }
 
 /// A font file for code replaces Hack; a bad file is reported, not loaded.
@@ -4360,6 +4421,85 @@ fn outline_context_menu() {
         .iter()
         .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "g_limit"));
     assert!(copied, "{:?}", h.output().platform_output.commands);
+}
+
+/// A filter narrows a large package's outline to the names that contain
+/// it, with their parents; Enter goes to the first in the code, Escape
+/// clears it (#173).
+#[test]
+fn outline_filter() {
+    let mut body = String::from("create or replace package body pkg as\n");
+    for i in 0..30 {
+        body +=
+            &format!("  procedure add_to_attr_from_rec_{i}___ is\n  begin\n    null;\n  end;\n");
+    }
+    body += "  procedure refresh_lines2_invoice___ is\n  begin\n    null;\n  end;\n\
+             \x20 procedure do_refresh_lines2_invoice is\n  begin\n    refresh_lines2_invoice___;\n  end;\n\
+             end pkg;";
+    let mut h = harness(true);
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "PYTHIA".into(),
+            name: "PKG".into(),
+            object_type: pythia_db::ObjectType::PackageBody,
+        },
+        "create or replace package pkg as\n  procedure do_refresh_lines2_invoice;\nend pkg;",
+        &body,
+    );
+    h.state_mut().test_program().active = 1;
+    h.run_steps(3);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+
+    let field = |h: &mut Ui| {
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Filter the outline")
+            .focus();
+        h.run_steps(1);
+    };
+    field(&mut h);
+    h.event(egui::Event::Text("Lines2".into()));
+    h.run_steps(2);
+    save(&mut h, "outline-filter");
+    assert!(h.query_by_label("2 matches").is_some());
+    assert!(h.query_by_label("refresh_lines2_invoice___").is_some());
+    assert!(h.query_by_label("do_refresh_lines2_invoice").is_some());
+    assert!(
+        h.query_by_label("pkg").is_some(),
+        "the package, around them"
+    );
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_none());
+
+    // Enter: the first match's name is selected, and typing replaces it.
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    let start = body.find("refresh_lines2_invoice___").unwrap();
+    assert_eq!(
+        editor.selection(),
+        Some(start..start + "refresh_lines2_invoice___".len())
+    );
+    h.event(egui::Event::Text("renamed".into()));
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    assert!(
+        editor.text().contains("procedure renamed is"),
+        "the code has the focus"
+    );
+    // The outline follows the code once it's analyzed again.
+    for _ in 0..40 {
+        if h.query_by_label("1 match").is_some() {
+            break;
+        }
+        h.step();
+    }
+    assert!(h.query_by_label("1 match").is_some(), "the outline follows");
+
+    // Escape clears it.
+    field(&mut h);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+    assert!(h.query_by_label("1 match").is_none());
+    assert_eq!(h.state_mut().test_program().parts[1].outline_filter, "");
 }
 
 /// Test… and Debug… from the outline of a package body: for the
@@ -7240,8 +7380,8 @@ fn maintenance_scan_sqlserver() {
 }
 
 /// The debugger's panels are tabs of their own (#163): opened together,
-/// breakpoints behind watches, the SQL plan with its toggle, and a closed
-/// panel comes back when the debugger is shown again.
+/// breakpoints behind watches, the SQL plan with its button (#169), and a
+/// closed panel comes back when the debugger is shown again.
 #[test]
 fn debugger_panels_are_tabs() {
     use crate::app::Tab;
@@ -7262,14 +7402,14 @@ fn debugger_panels_are_tabs() {
     assert!(watches_front);
     assert!(app.test_tab(Tab::DebugSql).is_none(), "closed by default");
 
-    // The SQL toggle opens the plan in front, beside the code.
-    h.state_mut().test_debug_mut().show_sql(true);
+    // The plan button opens the plan in front, beside the code.
+    h.get_by_label("SQL plan").click();
     h.run_steps(2);
     save(&mut h, "debugger-panels");
     let (sql, front) = h.state().test_tab(Tab::DebugSql).expect("SQL plan");
     assert!(front);
     assert!(![debugger, variables, watches].contains(&sql));
-    h.state_mut().test_debug_mut().show_sql(false);
+    h.get_by_label("SQL plan").click();
     h.run_steps(2);
     assert!(h.state().test_tab(Tab::DebugSql).is_none(), "hidden: gone");
 

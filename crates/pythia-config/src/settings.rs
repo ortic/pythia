@@ -55,9 +55,6 @@ pub struct Settings {
     /// (`STATISTICS_LEVEL = ALL`): the SQL panel shows actual rows and
     /// flags statements whose estimates are off.
     pub debug_plan_statistics: bool,
-    /// The debugger's SQL panel opens on a statement whose estimates are
-    /// off by 10× or more, the first time it is flagged.
-    pub debug_open_sql_panel: bool,
     /// Code formatter rules.
     pub format: pythia_plsql::FormatOptions,
     /// Named formatter rule sets to switch between and share.
@@ -135,7 +132,6 @@ impl Default for Settings {
             debug_ports: String::new(),
             compile_debug_info: false,
             debug_plan_statistics: true,
-            debug_open_sql_panel: true,
             format: pythia_plsql::FormatOptions::default(),
             format_profiles: Default::default(),
             format_profile: None,

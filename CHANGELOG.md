@@ -6,7 +6,49 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A filter for the outline of a program window (#173), for large
+  packages. Typing part of a name lists the declarations that contain it,
+  with the package or subprogram around them, and says how many match.
+  Enter goes to the first one in the code, Escape clears the filter.
+
+### Changed
+- The debugger's SQL plan no longer opens by itself (#169). On a
+  misestimate it came up beside the code in the middle of stepping and
+  halved the code's width. The toolbar's *SQL* is now a plan icon. It
+  blinks for a few seconds when a statement's estimates are off by 10×
+  or more, and then shows ⚠ with the number of such statements; opened,
+  the plan shows the flagged statement. The gutter still marks its line.
+  The setting *Open the SQL panel on a misestimate* is gone.
+
 ### Fixed
+- Conditional compilation (`$IF … $THEN … $ELSE … $END`) showed errors
+  that aren't (#171): `$ELSE` as "ELSE outside of IF or CASE", `$END`
+  before an IF as "END IF without matching IF", and the real END IF after
+  it the same. The editor reads each `$IF`'s first branch as the code, as
+  if its condition held, and reports only directives that don't pair up
+  (`$IF` without `$END`, `$END` without `$IF`). Folding no longer closes
+  an IF at `$END`, and the directives, `$$PLSQL_UNIT` too, show as
+  keywords instead of a red `$`.
+- *Format* broke conditional compilation (#172): `$IF x $THEN` became
+  `$ if x $ then`, which Oracle doesn't compile. Statements with `$IF`
+  are kept as written (their branches are often half a construct);
+  `$$PLSQL_UNIT` and the other inquiry directives format like names.
+- A program window the debugger opens, at a stop or from a line of the
+  SQL plan, comes without the outline (#170): it took the code's width
+  while stepping. *Outline* shows it; a window that was already open
+  keeps it as it was.
+- The SQL plan's note without row source statistics said to turn on
+  *Plan statistics* in the debugger toolbar; it is in Settings →
+  Debugger since #162, and the note says so (#174).
+- Pressing Shift, Ctrl or Alt in an editor scrolled back to the caret
+  (#175), so a Shift+click (select to there), Ctrl+click (go to
+  definition) or Alt+drag on lines scrolled away from the caret landed
+  somewhere else. egui sends these keys as presses of their own since
+  0.36; the editor no longer reacts to them.
+- Settings → Keyboard recorded a shortcut's first modifier as the
+  shortcut (#176): pressing Ctrl+Shift+K saved "Ctrl+ControlLeft". It
+  waits for the key after the modifiers now.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later

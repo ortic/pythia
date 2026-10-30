@@ -536,6 +536,31 @@ fn kept_as_written_lists_what_could_be_formatted() {
 }
 
 #[test]
+fn conditional_compilation_is_kept() {
+    // `$IF x $THEN` became `$ if x $ then` (#172), which Oracle doesn't
+    // compile; the safety check saw the same tokens.
+    let src = "begin\n$IF x $THEN\nnull;\n$END\nend;";
+    assert_eq!(format(src, &FormatOptions::default()).text, src);
+    let kept = kept_as_written(src, &FormatOptions::default());
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0], 0..src.len());
+    assert!(!equivalent(
+        "$IF x $THEN null; $END",
+        "$ IF x $ THEN null; $ END"
+    ));
+    // Inquiry directives are values.
+    let out = check(
+        "begin dbms_output.put_line($$plsql_unit||':'||$$PLSQL_LINE); end;",
+        &FormatOptions::default(),
+        "inquiry",
+    );
+    assert_eq!(
+        out,
+        "begin\n  dbms_output.put_line($$plsql_unit || ':' || $$PLSQL_LINE);\nend;"
+    );
+}
+
+#[test]
 fn rules_in_words() {
     let rules = describe(&FormatOptions {
         indent: 4,

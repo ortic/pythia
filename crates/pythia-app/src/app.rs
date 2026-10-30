@@ -986,9 +986,9 @@ impl PythiaApp {
         }
     }
 
-    /// Focuses an open program window / object view for the object, if any.
-    fn focus_existing(&mut self, connection: &str, object: &ObjectRef, program: bool) -> bool {
-        let found = self.docs.iter().find_map(|(id, d)| {
+    /// The open program window (`program`) or object view for the object.
+    fn existing_doc(&self, connection: &str, object: &ObjectRef, program: bool) -> Option<DocId> {
+        self.docs.iter().find_map(|(id, d)| {
             let same = match &d.kind {
                 DocKind::Program(w) if program => {
                     w.object.owner == object.owner
@@ -999,7 +999,12 @@ impl PythiaApp {
                 _ => false,
             };
             (same && d.connection.as_deref() == Some(connection)).then_some(*id)
-        });
+        })
+    }
+
+    /// Focuses an open program window / object view for the object, if any.
+    fn focus_existing(&mut self, connection: &str, object: &ObjectRef, program: bool) -> bool {
+        let found = self.existing_doc(connection, object, program);
         if let Some(id) = found {
             self.open_tab(Tab::Doc(id));
             self.focused = Some(id);
@@ -1047,8 +1052,8 @@ impl PythiaApp {
         }
     }
 
-    /// The SQL plan's tab follows its toggle: it opens, comes to the front
-    /// on a misestimate, and goes when hidden.
+    /// The SQL plan's tab follows the debugger's plan button: it opens in
+    /// front, and goes when hidden. It never opens by itself (#169).
     fn sync_debug_sql(&mut self) {
         let raise = self.debug.take_sql_raise();
         let tab = self.dock.find_tab(&Tab::DebugSql);
@@ -1930,8 +1935,6 @@ impl PythiaApp {
         };
         self.debug
             .set_plan_statistics(self.settings.debug_plan_statistics);
-        self.debug
-            .set_open_sql_on_flag(self.settings.debug_open_sql_panel);
         let actions = self
             .debug
             .start(block, host, ports.as_ref(), entry, self.notify.callback());
@@ -2091,11 +2094,22 @@ impl PythiaApp {
                             name: location.unit.name,
                             object_type,
                         };
+                        let new = self.existing_doc(&connection, &object, true).is_none();
                         self.open(OpenRequest::ProgramAt {
                             connection,
                             object,
                             line: line as usize,
                         });
+                        // A window the debugger opens comes without the
+                        // outline, which takes the code's width (#170).
+                        if new
+                            && let Some(DocKind::Program(w)) = self
+                                .focused
+                                .and_then(|id| self.docs.get_mut(&id))
+                                .map(|d| &mut d.kind)
+                        {
+                            w.show_outline = false;
+                        }
                     }
                 }
                 DebugAction::ExplainOpaque {
@@ -5294,6 +5308,10 @@ impl PythiaApp {
             .insert("Format".into(), "Alt+Shift+F".into());
     }
 
+    pub fn test_filter_keyboard(&mut self, filter: &str) {
+        self.settings_dialog.filter_keyboard(filter);
+    }
+
     pub fn test_close_settings(&mut self) {
         self.settings_dialog.open = false;
     }
@@ -5683,7 +5701,7 @@ impl TabViewer for Viewer<'_> {
             }
             self.closed.push(*id);
         }
-        // Closing the plan is hiding it, as with the SQL toggle.
+        // Closing the plan is hiding it, as with the plan button.
         if *tab == Tab::DebugSql {
             self.debug.show_sql(false);
         }

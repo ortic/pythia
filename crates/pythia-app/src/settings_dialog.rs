@@ -207,6 +207,12 @@ impl SettingsDialog {
         self.section = Section::Keyboard;
     }
 
+    /// Lists only the commands and shortcuts matching `filter`.
+    #[cfg(test)]
+    pub fn filter_keyboard(&mut self, filter: &str) {
+        self.keys.filter = filter.to_owned();
+    }
+
     pub fn show_ai(&mut self) {
         self.section = Section::Ai;
     }
@@ -742,24 +748,11 @@ fn debugger(ui: &mut Ui, s: &mut Settings) -> bool {
         ui,
         "Plan statistics",
         "The debugged session collects row source statistics (STATISTICS_LEVEL = ALL): the \
-         SQL panel shows the actual rows of each statement's plan next to the estimates, and \
-         statements off by 10× or more are flagged in the gutter. Costs some time per row; \
-         applies from the next start.",
+         SQL plan shows the actual rows of each statement's plan next to the estimates, and \
+         statements off by 10× or more are flagged in the gutter, and by the debugger's plan \
+         button, which blinks. Costs some time per row; applies from the next start.",
         |ui| {
             ui.checkbox(&mut s.debug_plan_statistics, "");
-        },
-    );
-    row(
-        ui,
-        "Open the SQL panel on a misestimate",
-        "The debugger's SQL panel opens by itself on a statement whose estimates are off by 10× \
-         or more, the first time it is flagged. Off: the gutter and the toolbar's SQL button \
-         flag it.",
-        |ui| {
-            ui.add_enabled(
-                s.debug_plan_statistics,
-                egui::Checkbox::without_text(&mut s.debug_open_sql_panel),
-            );
         },
     );
     check
@@ -1395,7 +1388,8 @@ fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut KeysState) {
     let current = Keymap::with_overrides(s.keymap, &s.keybindings);
 
     if let Some(command) = st.recording {
-        // The next key press (with modifiers) becomes the shortcut.
+        // The next key press (with modifiers) becomes the shortcut. egui
+        // sends the modifiers as key presses too: those wait (#176).
         let pressed = ui.ctx().input_mut(|i| {
             let found = i.events.iter().find_map(|e| match e {
                 egui::Event::Key {
@@ -1403,7 +1397,7 @@ fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut KeysState) {
                     pressed: true,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } if !pythia_ui::is_modifier(*key) => Some((*key, *modifiers)),
                 _ => None,
             });
             if let Some((key, modifiers)) = found {

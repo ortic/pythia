@@ -64,6 +64,10 @@ pub enum TokenKind {
 
     /// Reserved word (produced by [`tokenize`], never by the raw lexer).
     Keyword,
+    /// Oracle's conditional compilation: the directives `$IF`, `$THEN`,
+    /// `$ELSIF`, `$ELSE`, `$END` and `$ERROR`, and inquiry directives like
+    /// `$$PLSQL_UNIT` (produced by [`tokenize`]).
+    Directive,
     /// SQL*Plus command (`PROMPT`, `SET SERVEROUTPUT`, `@file`, `/`); only
     /// produced by the editor's line highlighter.
     SqlPlus,
@@ -105,6 +109,19 @@ pub fn tokenize(src: &str) -> Vec<Token> {
             Ok(kind) => kind,
             Err(()) => TokenKind::Error,
         };
+        // Oracle's `$IF` and `$$name` (#171): the raw lexer knows `$` only
+        // in dollar-quoted strings.
+        if matches!(kind, TokenKind::Ident | TokenKind::Keyword)
+            && let Some(last) = tokens.last_mut().filter(|t: &&mut Token| {
+                t.kind == TokenKind::Error
+                    && t.span.end == span.start
+                    && is_directive(&src[t.span.clone()], &src[span.clone()])
+            })
+        {
+            last.kind = TokenKind::Directive;
+            last.span.end = span.end;
+            continue;
+        }
         // Merge consecutive error bytes into one token.
         if kind == TokenKind::Error
             && let Some(last) = tokens
@@ -117,6 +134,17 @@ pub fn tokenize(src: &str) -> Vec<Token> {
         tokens.push(Token { kind, span });
     }
     tokens
+}
+
+/// `$` and a word make a selection or error directive; `$$` and a name an
+/// inquiry directive.
+fn is_directive(dollars: &str, word: &str) -> bool {
+    const DIRECTIVES: [&str; 6] = ["IF", "THEN", "ELSIF", "ELSE", "END", "ERROR"];
+    match dollars {
+        "$" => DIRECTIVES.iter().any(|d| d.eq_ignore_ascii_case(word)),
+        "$$" => true,
+        _ => false,
+    }
 }
 
 /// Consumes a block comment body up to and including `*/` (or end of input).
@@ -146,8 +174,8 @@ fn string(lex: &mut logos::Lexer<TokenKind>) {
 
 /// Consumes the rest of a dollar-quoted string after its first `$`: the tag,
 /// the body and the closing tag (or the rest of the input). A `$` that
-/// doesn't open one stays an error token, as Oracle's `$IF` and `$$name`
-/// directives and PostgreSQL's `$1` always were.
+/// doesn't open one stays an error token, as PostgreSQL's `$1` always was;
+/// [`tokenize`] makes Oracle's `$IF` and `$$name` directives of it.
 fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
     let rest = lex.remainder();
     let tag_len = rest
@@ -284,14 +312,33 @@ mod tests {
         assert_eq!(
             kinds("$IF $$debug $THEN $1"),
             vec![
-                (TokenKind::Error, "$"),
-                (TokenKind::Keyword, "IF"),
-                (TokenKind::Error, "$$"),
-                (TokenKind::Ident, "debug"),
-                (TokenKind::Error, "$"),
-                (TokenKind::Keyword, "THEN"),
+                (TokenKind::Directive, "$IF"),
+                (TokenKind::Directive, "$$debug"),
+                (TokenKind::Directive, "$THEN"),
                 (TokenKind::Error, "$"),
                 (TokenKind::Number, "1"),
+            ]
+        );
+        assert_eq!(
+            kinds("$else $End $error 'x' $$PLSQL_UNIT"),
+            vec![
+                (TokenKind::Directive, "$else"),
+                (TokenKind::Directive, "$End"),
+                (TokenKind::Directive, "$error"),
+                (TokenKind::String, "'x'"),
+                (TokenKind::Directive, "$$PLSQL_UNIT"),
+            ]
+        );
+        // Only the directives: a `$` before another word, or apart from it,
+        // stays an error.
+        assert_eq!(
+            kinds("$loop $ if x$if"),
+            vec![
+                (TokenKind::Error, "$"),
+                (TokenKind::Keyword, "loop"),
+                (TokenKind::Error, "$"),
+                (TokenKind::Keyword, "if"),
+                (TokenKind::Ident, "x$if"),
             ]
         );
     }

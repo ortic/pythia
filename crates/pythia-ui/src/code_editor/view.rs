@@ -571,6 +571,13 @@ impl CodeEditor {
         let ro = config.read_only;
         let mut find = None;
         for event in events {
+            // A modifier on its own moves nothing: no scrolling back to the
+            // caret before a Shift+click, Ctrl+click or Alt+drag (#175).
+            if let Event::Key { key, .. } = &event
+                && crate::is_modifier(*key)
+            {
+                continue;
+            }
             if let Event::Key {
                 key,
                 pressed: true,
@@ -2268,6 +2275,95 @@ mod tests {
             &config,
         );
         assert_eq!(editor.line_col().0, 2);
+    }
+
+    /// A modifier pressed on its own leaves the view where it is, so a
+    /// Shift+click selects up to a line far from the caret (#175). egui
+    /// sends Shift, Ctrl and Alt as key presses of their own.
+    #[test]
+    fn modifiers_alone_keep_the_view() {
+        let ctx = egui::Context::default();
+        let text: String = (1..=500)
+            .map(|i| format!("select {i} from dual\n"))
+            .collect();
+        let mut editor = CodeEditor::new(&text);
+        editor.request_focus();
+        frames(&ctx, &mut editor, 3, vec![]);
+        let first = |e: &CodeEditor| e.last_layout.as_ref().unwrap().visible_lines().start;
+        // Scrolling is animated: a second at 60 frames.
+        let wheel_up = |ctx: &egui::Context, editor: &mut CodeEditor| {
+            let wheel = Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 100_000.0),
+                modifiers: Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            };
+            frames(
+                ctx,
+                editor,
+                60,
+                vec![Event::PointerMoved(pos2(500.0, 400.0)), wheel],
+            );
+        };
+        editor.goto(500, 1);
+        frames(&ctx, &mut editor, 60, vec![]);
+        assert!(first(&editor) > 400, "at the caret: {}", first(&editor));
+        wheel_up(&ctx, &mut editor);
+        assert_eq!(first(&editor), 0);
+
+        for (key, modifiers) in [
+            (Key::ShiftLeft, Modifiers::SHIFT),
+            (Key::ControlRight, Modifiers::COMMAND),
+            (Key::AltLeft, Modifiers::ALT),
+        ] {
+            let press = Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            frames(&ctx, &mut editor, 60, vec![press]);
+            assert_eq!(first(&editor), 0, "{key:?} scrolled to the caret");
+        }
+        // Other keys still bring the caret into view.
+        frames(&ctx, &mut editor, 60, vec![key(Key::ArrowUp)]);
+        assert!(first(&editor) > 400, "{}", first(&editor));
+        wheel_up(&ctx, &mut editor);
+
+        // Shift down, then a click on line 3: lines 3 to 499 selected.
+        let layout = editor.last_layout.as_ref().unwrap();
+        let at = pos2(layout.text_x() + 1.0, layout.text_y(2) + 1.0);
+        let shift = |pressed| Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::SHIFT,
+        };
+        let shift_down = Event::Key {
+            key: Key::ShiftLeft,
+            physical_key: Some(Key::ShiftLeft),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        };
+        frames(
+            &ctx,
+            &mut editor,
+            60,
+            vec![Event::ModifiersChanged(Modifiers::SHIFT), shift_down],
+        );
+        frames(
+            &ctx,
+            &mut editor,
+            2,
+            vec![Event::PointerMoved(at), shift(true), shift(false)],
+        );
+        assert_eq!(editor.line_col(), (3, 1));
+        let selected = editor.selected_text().expect("a selection");
+        assert!(selected.starts_with("select 3 from dual\n"), "{selected}");
+        assert!(selected.ends_with("select 498 from dual\n"), "{selected}");
+        assert_eq!(first(&editor), 0);
     }
 
     /// A blinking caret asks for the next blink; a steady one doesn't.

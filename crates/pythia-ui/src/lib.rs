@@ -12,6 +12,23 @@ pub use grid::{
     set_grid_style, shown_data, to_tsv,
 };
 
+/// A modifier pressed on its own, which egui (0.36) sends as a key press
+/// of its own: Shift, Ctrl, Alt or Super, left or right (#175, #176).
+pub fn is_modifier(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+    )
+}
+
 /// Height of a list, tree or table row of body text: the text and the
 /// vertical padding of buttons, which the density setting sets.
 pub fn row_height(ui: &egui::Ui) -> f32 {
