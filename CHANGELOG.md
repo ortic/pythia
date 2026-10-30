@@ -19,6 +19,10 @@ All notable changes to Pythia are documented here. The format follows
   `$ if x $ then`, which Oracle doesn't compile. Statements with `$IF`
   are kept as written (their branches are often half a construct);
   `$$PLSQL_UNIT` and the other inquiry directives format like names.
+- A program window the debugger opens, at a stop or from a line of the
+  SQL plan, comes without the outline (#170): it took the code's width
+  while stepping. *Outline* shows it; a window that was already open
+  keeps it as it was.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later

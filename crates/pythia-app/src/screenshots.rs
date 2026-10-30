@@ -1354,6 +1354,11 @@ fn debugger_sql_panel() {
     h.state_mut()
         .test_command(crate::commands::Command::DebugStart);
     wait_until(&mut h, "breakpoint", |app| app.test_debug().is_suspended());
+    h.run_steps(2);
+    // The window the debugger opened leaves the code its width (#170).
+    let program = h.state_mut().test_program();
+    assert_eq!(program.object.name, "SHIP_NEW_ORDERS");
+    assert!(!program.show_outline, "no outline");
     // Closed until a statement's estimates are off: then it opens on it,
     // and the gutter flags its line (#162).
     assert!(!h.state().test_debug().sql_shown());
