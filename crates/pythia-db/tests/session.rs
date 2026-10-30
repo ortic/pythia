@@ -816,3 +816,64 @@ fn error_stack_frames_point_at_source_lines() {
     exec(&mut h, 6, "drop table pythia_stk_t purge");
     exec(&mut h, 7, "drop package pythia_stk_p");
 }
+
+/// DISPLAY_CURSOR's report has the whole statement, where DBMS_XPLAN
+/// prints V$SQL.SQL_TEXT, its first 1000 characters (#178).
+#[test]
+fn display_cursor_has_the_whole_statement() {
+    let Some(dba) = dba_with_catalog_role() else {
+        return;
+    };
+    let marker = format!("PYTHIA_XPLAN_{}", std::process::id());
+    let values = (0..60)
+        .map(|i| format!("'{i:0>20}'"))
+        .collect::<Vec<_>>()
+        .join(",\n  ");
+    let sql = format!(
+        "select /* {marker} */ count(*) from dual where dummy not in (\n  {values}\n) \
+         and 'the end' is not null"
+    );
+    assert!(sql.len() > 1500);
+    dba.query_row_as::<i64>(&sql, &[]).unwrap();
+    let (sql_id, child): (String, i64) = dba
+        .query_row_as(
+            "select sql_id, child_number from v$sql where sql_text like :1 and rownum = 1",
+            &[&format!("select /* {marker} */%")],
+        )
+        .unwrap();
+
+    // The statement's lines, between the underline and the plan hash value.
+    let statement = |report: &[String]| {
+        let start = report.iter().position(|l| l.starts_with("---")).unwrap() + 1;
+        let end = report
+            .iter()
+            .position(|l| l.starts_with("Plan hash value"))
+            .unwrap();
+        report[start..end].concat().trim_end().to_owned()
+    };
+    let raw = dba
+        .query_as::<Option<String>>(
+            "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2))",
+            &[&sql_id, &child],
+        )
+        .unwrap()
+        .map(|l| l.unwrap().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(statement(&raw).len(), 1000, "{raw:#?}");
+
+    let whole = sql.replace('\n', " ");
+    let report = pythia_db::display_cursor(&dba, &sql_id, Some(child), "TYPICAL").unwrap();
+    assert_eq!(statement(&report), whole, "{report:#?}");
+    // The plan as it was.
+    let plan = |r: &[String]| {
+        let at = r
+            .iter()
+            .position(|l| l.starts_with("Plan hash value"))
+            .unwrap();
+        r[at..].to_vec()
+    };
+    assert_eq!(plan(&report), plan(&raw));
+    // Every child, in BASIC.
+    let basic = pythia_db::display_cursor(&dba, &sql_id, None, "BASIC").unwrap();
+    assert_eq!(statement(&basic), whole, "{basic:#?}");
+}

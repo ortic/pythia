@@ -266,20 +266,9 @@ pub fn cursor_plan(conn: &Connection, sql_id: &str, child: i64) -> Result<Cursor
     } else {
         "TYPICAL +PEEKED_BINDS"
     };
-    let xplan = conn
-        .query_as::<Option<String>>(
-            "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, :3))",
-            &[&sql_id, &child, &format],
-        )
-        .and_then(|lines| lines.collect::<Result<Vec<_>, _>>())
-        .map(|lines| {
-            lines
-                .into_iter()
-                .map(Option::unwrap_or_default)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .map_err(|e| DbError::from(e).text());
+    let xplan = pythia_db::display_cursor(conn, sql_id, Some(child), format)
+        .map(|lines| lines.join("\n"))
+        .map_err(|e| e.text());
     Ok(CursorPlan {
         sql_id: sql_id.to_owned(),
         child,

@@ -859,6 +859,101 @@ pub fn cursor_plan(conn: &Connection, sql_id: &str, child: i64) -> Result<MetaRe
     )
 }
 
+/// DBMS_XPLAN.DISPLAY_CURSOR's report of child `child` of `sql_id` (of
+/// every child with `None`) in `format`, a line per row. DBMS_XPLAN prints
+/// `V$SQL.SQL_TEXT`, the statement's first 1000 characters; the report has
+/// the whole statement (`SQL_FULLTEXT`) instead (#178).
+pub fn display_cursor(
+    conn: &Connection,
+    sql_id: &str,
+    child: Option<i64>,
+    format: &str,
+) -> Result<Vec<String>, DbError> {
+    let lines = conn.query_as::<Option<String>>(
+        "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, :3))",
+        &[&sql_id, &child, &format],
+    )?;
+    let lines = lines
+        .map(|l| l.map(Option::unwrap_or_default))
+        .collect::<Result<Vec<_>, _>>()?;
+    // A cursor that aged out since keeps the report as DBMS_XPLAN made it.
+    let text = conn
+        .query_row_as::<Option<String>>(
+            "select sql_fulltext from v$sql where sql_id = :1 and rownum = 1",
+            &[&sql_id],
+        )
+        .ok()
+        .flatten();
+    Ok(match text {
+        Some(text) => full_statement(lines, &text),
+        None => lines,
+    })
+}
+
+/// DBMS_XPLAN's `report` with `text` in place of each statement in it that
+/// it cut short, the beginning of `text`.
+fn full_statement(mut report: Vec<String>, text: &str) -> Vec<String> {
+    // DBMS_XPLAN breaks the statement's lines anywhere, and turns its line
+    // breaks into spaces.
+    let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let whole = squash(text);
+    let mut i = 0;
+    while i + 1 < report.len() {
+        // "SQL_ID  …, child number 0" ("EXPLAINED SQL STATEMENT:" in BASIC),
+        // underlined, then the statement up to the plan hash value.
+        let header =
+            report[i].starts_with("SQL_ID") || report[i].starts_with("EXPLAINED SQL STATEMENT");
+        let underline = &report[i + 1];
+        if !header || underline.len() < 3 || underline.chars().any(|c| c != '-') {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let Some(end) = report[start..]
+            .iter()
+            .position(|l| l.starts_with("Plan hash value"))
+            .map(|n| start + n)
+        else {
+            break;
+        };
+        let mut stop = end;
+        while stop > start && report[stop - 1].trim().is_empty() {
+            stop -= 1;
+        }
+        let shown = squash(&report[start..stop].concat());
+        i = end;
+        if whole.len() > shown.len() && whole.starts_with(&shown) {
+            let lines = wrap_statement(text);
+            i = start + lines.len();
+            report.splice(start..stop, lines);
+        }
+    }
+    report
+}
+
+/// `text` as DBMS_XPLAN shows a statement: line breaks as spaces, on lines
+/// of up to 72 characters that end after a space where there is one.
+fn wrap_statement(text: &str) -> Vec<String> {
+    const WIDTH: usize = 72;
+    let chars: Vec<char> = text
+        .trim_end()
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let mut lines = Vec::new();
+    let mut rest = &chars[..];
+    while rest.len() > WIDTH {
+        let cut = rest[..WIDTH]
+            .iter()
+            .rposition(|&c| c == ' ')
+            .map_or(WIDTH, |p| p + 1);
+        lines.push(rest[..cut].iter().collect());
+        rest = &rest[cut..];
+    }
+    lines.push(rest.iter().collect());
+    lines
+}
+
 /// Collects a result set into a generic table; `numeric` names right-aligned columns.
 fn table_result(
     rows: crate::oracle::ResultSet<'static, crate::oracle::Row>,
@@ -1097,5 +1192,159 @@ mod tests {
         for t in ObjectType::ALL {
             assert_eq!(ObjectType::from_dictionary(t.dictionary_name()), Some(*t));
         }
+    }
+
+    /// The test statement of #178: 1318 characters, over four lines.
+    fn long_statement() -> String {
+        let words = ('a'..='z')
+            .map(|c| c.to_string().repeat(10))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut text = format!(
+            "select /* PYTHIA_XPLAN_LONG */ count(*) from dual where '{words}' is not null"
+        );
+        for _ in 0..3 {
+            text.push_str(&format!("\n  and '{words}' is not null"));
+        }
+        text + "\n  and 'the end of the statement' is not null"
+    }
+
+    /// What Oracle 23's DISPLAY_CURSOR printed for it: SQL_TEXT, its first
+    /// 1000 characters.
+    fn long_report(header: &[&str]) -> Vec<String> {
+        let mut report: Vec<String> = header.iter().map(|l| l.to_string()).collect();
+        report.extend(
+            [
+                "select /* PYTHIA_XPLAN_LONG */ count(*) from dual where 'aaaaaaaaaa ",
+                "bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff gggggggggg ",
+                "hhhhhhhhhh iiiiiiiiii jjjjjjjjjj kkkkkkkkkk llllllllll mmmmmmmmmm ",
+                "nnnnnnnnnn oooooooooo pppppppppp qqqqqqqqqq rrrrrrrrrr ssssssssss ",
+                "tttttttttt uuuuuuuuuu vvvvvvvvvv wwwwwwwwww xxxxxxxxxx yyyyyyyyyy ",
+                "zzzzzzzzzz' is not null   and 'aaaaaaaaaa bbbbbbbbbb cccccccccc ",
+                "dddddddddd eeeeeeeeee ffffffffff gggggggggg hhhhhhhhhh iiiiiiiiii ",
+                "jjjjjjjjjj kkkkkkkkkk llllllllll mmmmmmmmmm nnnnnnnnnn oooooooooo ",
+                "pppppppppp qqqqqqqqqq rrrrrrrrrr ssssssssss tttttttttt uuuuuuuuuu ",
+                "vvvvvvvvvv wwwwwwwwww xxxxxxxxxx yyyyyyyyyy zzzzzzzzzz' is not null   ",
+                "and 'aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd eeeeeeeeee ffffffffff ",
+                "gggggggggg hhhhhhhhhh iiiiiiiiii jjjjjjjjjj kkkkkkkkkk llllllllll ",
+                "mmmmmmmmmm nnnnnnnnnn oooooooooo pppppppppp qqqqqqqqqq rrrrrrrrrr ",
+                "ssssssssss tttttttttt uuuuuuuuuu vvvvvvvvvv wwwwwwwwww xxxxxxxxxx ",
+                "yyyyyyyyyy zzzzzzzzzz' is not null   and 'aaaaaaaaaa bbbbbbbbbb ccc",
+                " ",
+                "Plan hash value: 3910148636",
+                " ",
+                "-----------------------------------------------------------------",
+                "| Id  | Operation        | Name | Rows  | Cost (%CPU)| Time     |",
+            ]
+            .map(String::from),
+        );
+        report
+    }
+
+    /// The statement's lines in `report`, between the underline and the
+    /// blank line before the plan hash value.
+    fn statement_lines(report: &[String], from: usize) -> &[String] {
+        let end = from
+            + report[from..]
+                .iter()
+                .position(|l| l.trim().is_empty())
+                .unwrap();
+        &report[from..end]
+    }
+
+    #[test]
+    fn full_statement_replaces_sql_text() {
+        let text = long_statement();
+        assert_eq!(text.len(), 1318);
+        let header = [
+            "SQL_ID  8v2gh9rhhvjxp, child number 0",
+            "-------------------------------------",
+        ];
+        let report = long_report(&header);
+        let full = full_statement(report.clone(), &text);
+
+        assert_eq!(full[..2], report[..2]);
+        let lines = statement_lines(&full, 2);
+        assert!(lines.iter().all(|l| l.chars().count() <= 72), "{lines:#?}");
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .ends_with("'the end of the statement' is not null"),
+            "{lines:#?}"
+        );
+        // Nothing lost but the line breaks.
+        assert_eq!(lines.concat(), text.replace('\n', " "));
+        assert_eq!(full[full.len() - 5..], report[report.len() - 5..]);
+    }
+
+    #[test]
+    fn full_statement_in_basic_and_every_child() {
+        let text = long_statement();
+        // BASIC has no SQL_ID line.
+        let basic = long_report(&["EXPLAINED SQL STATEMENT:", "------------------------"]);
+        let full = full_statement(basic, &text);
+        assert!(
+            statement_lines(&full, 2)
+                .last()
+                .unwrap()
+                .ends_with("is not null")
+        );
+
+        // DISPLAY_CURSOR with no child: a report per child.
+        let mut two = long_report(&["SQL_ID  8v2gh9rhhvjxp, child number 0", "-----"]);
+        two.extend(long_report(&[
+            "SQL_ID  8v2gh9rhhvjxp, child number 1",
+            "-----",
+        ]));
+        let full = full_statement(two, &text);
+        let second = full
+            .iter()
+            .position(|l| l.ends_with("child number 1"))
+            .unwrap();
+        for from in [2, second + 2] {
+            assert_eq!(
+                statement_lines(&full, from).concat(),
+                text.replace('\n', " ")
+            );
+        }
+    }
+
+    #[test]
+    fn full_statement_keeps_what_is_whole() {
+        let report: Vec<String> = [
+            "SQL_ID  4fz9cx8x0yb7m, child number 0",
+            "-------------------------------------",
+            "select * from dual where 1 = 1   and 2 = 2",
+            " ",
+            "Plan hash value: 272002086",
+        ]
+        .map(String::from)
+        .to_vec();
+        let text = "select * from dual where 1 = 1\n  and 2 = 2";
+        assert_eq!(full_statement(report.clone(), text), report);
+        // Another statement's report.
+        assert_eq!(full_statement(report.clone(), &long_statement()), report);
+        // A cursor DISPLAY_CURSOR doesn't find.
+        let missing = vec![
+            "SQL_ID: 4fz9cx8x0yb7m, child number: 0 cannot be found".to_owned(),
+            " ".to_owned(),
+        ];
+        assert_eq!(full_statement(missing.clone(), text), missing);
+    }
+
+    #[test]
+    fn wraps_like_dbms_xplan() {
+        // A word longer than a line starts one and is cut, as Oracle did.
+        let word = "x".repeat(80);
+        assert_eq!(
+            wrap_statement(&format!("select '{word}' from\tdual\n")),
+            [
+                "select ".to_owned(),
+                format!("'{}", &word[..71]),
+                format!("{}' from dual", &word[71..])
+            ]
+        );
+        assert_eq!(wrap_statement("select 1 from dual"), ["select 1 from dual"]);
     }
 }
