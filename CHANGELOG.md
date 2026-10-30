@@ -6,6 +6,15 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- The misestimate note of an SQL plan says what it means (#177). "⚠
+  Estimate off at 35 INDEX UNIQUE SCAN …: estimated 318 rows (1 per start
+  × 318 starts), got 0 (318× fewer)" now reads "⚠ Row estimate off at
+  plan line 35 (INDEX UNIQUE SCAN …): estimated 1 row per start × 318
+  starts = 318 rows, got none". The 35 is the line's Id in the plan, and
+  no rows are no longer called 318× fewer. The details under the plan
+  tree are headed "Line 35: INDEX UNIQUE SCAN".
+
 ## [0.10.0] - 2026-10-30
 
 ### Added

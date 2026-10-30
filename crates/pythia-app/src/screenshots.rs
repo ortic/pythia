@@ -1538,7 +1538,7 @@ fn monitor_plan_with_actual_rows() {
     h.run_steps(3);
     assert!(h.query_by_label("A-Rows").is_some(), "the tree's columns");
     assert!(
-        h.query_all_by_label_contains("Estimate off at")
+        h.query_all_by_label_contains("Row estimate off at plan line")
             .next()
             .is_some(),
         "the misestimate is named"
