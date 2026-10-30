@@ -40,6 +40,9 @@ All notable changes to Pythia are documented here. The format follows
   definition) or Alt+drag on lines scrolled away from the caret landed
   somewhere else. egui sends these keys as presses of their own since
   0.36; the editor no longer reacts to them.
+- Settings → Keyboard recorded a shortcut's first modifier as the
+  shortcut (#176): pressing Ctrl+Shift+K saved "Ctrl+ControlLeft". It
+  waits for the key after the modifiers now.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later

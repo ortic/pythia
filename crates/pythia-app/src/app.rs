@@ -5308,6 +5308,10 @@ impl PythiaApp {
             .insert("Format".into(), "Alt+Shift+F".into());
     }
 
+    pub fn test_filter_keyboard(&mut self, filter: &str) {
+        self.settings_dialog.filter_keyboard(filter);
+    }
+
     pub fn test_close_settings(&mut self) {
         self.settings_dialog.open = false;
     }

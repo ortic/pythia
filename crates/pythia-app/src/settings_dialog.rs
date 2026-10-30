@@ -207,6 +207,12 @@ impl SettingsDialog {
         self.section = Section::Keyboard;
     }
 
+    /// Lists only the commands and shortcuts matching `filter`.
+    #[cfg(test)]
+    pub fn filter_keyboard(&mut self, filter: &str) {
+        self.keys.filter = filter.to_owned();
+    }
+
     pub fn show_ai(&mut self) {
         self.section = Section::Ai;
     }
@@ -1382,7 +1388,8 @@ fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut KeysState) {
     let current = Keymap::with_overrides(s.keymap, &s.keybindings);
 
     if let Some(command) = st.recording {
-        // The next key press (with modifiers) becomes the shortcut.
+        // The next key press (with modifiers) becomes the shortcut. egui
+        // sends the modifiers as key presses too: those wait (#176).
         let pressed = ui.ctx().input_mut(|i| {
             let found = i.events.iter().find_map(|e| match e {
                 egui::Event::Key {
@@ -1390,7 +1397,7 @@ fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut KeysState) {
                     pressed: true,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } if !pythia_ui::is_modifier(*key) => Some((*key, *modifiers)),
                 _ => None,
             });
             if let Some((key, modifiers)) = found {

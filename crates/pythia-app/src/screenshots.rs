@@ -2558,6 +2558,46 @@ fn settings_keyboard() {
     save(&mut h, "settings-keyboard");
 }
 
+/// Recording a shortcut waits past the modifiers for its key (#176): egui
+/// sends Ctrl and Shift as key presses of their own, and Ctrl became the
+/// shortcut, "Ctrl+ControlLeft".
+#[test]
+fn settings_record_shortcut_with_modifiers() {
+    let mut h = headless_harness();
+    h.state_mut().test_settings_keyboard();
+    h.state_mut().test_filter_keyboard("format code");
+    h.run_steps(3);
+    h.get_by_label("Alt+Shift+F").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_some());
+    // Ctrl+Shift+K as a keyboard sends it: Ctrl, then Shift, then K.
+    let ctrl_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    for (key, modifiers) in [
+        (egui::Key::ControlLeft, egui::Modifiers::COMMAND),
+        (egui::Key::ShiftLeft, ctrl_shift),
+        (egui::Key::K, ctrl_shift),
+    ] {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        h.run_steps(1);
+    }
+    h.run_steps(1);
+    assert_eq!(
+        h.state_mut()
+            .test_settings_mut()
+            .keybindings
+            .get("Format")
+            .map(String::as_str),
+        Some("Ctrl+Shift+K")
+    );
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_none());
+}
+
 /// A font file for code replaces Hack; a bad file is reported, not loaded.
 #[test]
 fn code_font() {
