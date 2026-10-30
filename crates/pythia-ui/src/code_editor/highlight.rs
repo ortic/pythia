@@ -535,13 +535,21 @@ mod tests {
             ]
         );
         assert_eq!(kinds("begin", body).0, vec![(TokenKind::Keyword, "begin")]);
-        // Oracle's directives are no strings.
+        // Oracle's directives are no strings (#171).
         assert_eq!(
             kinds("$$plsql_unit", LineState::Normal),
             (
-                vec![(TokenKind::Error, "$$"), (TokenKind::Ident, "plsql_unit")],
+                vec![(TokenKind::Directive, "$$plsql_unit")],
                 LineState::Normal
             )
+        );
+        assert_eq!(
+            kinds("$IF $$debug $THEN", LineState::Normal).0,
+            vec![
+                (TokenKind::Directive, "$IF"),
+                (TokenKind::Directive, "$$debug"),
+                (TokenKind::Directive, "$THEN"),
+            ]
         );
     }
 

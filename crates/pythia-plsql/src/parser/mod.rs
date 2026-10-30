@@ -33,11 +33,7 @@ pub fn parse_tokens(src: &str, tokens: &[Token]) -> Ast {
     });
     lexer_diagnostics(src, tokens, &mut ast.diagnostics);
 
-    let significant: Vec<Token> = tokens
-        .iter()
-        .filter(|t| !t.kind.is_trivia())
-        .cloned()
-        .collect();
+    let significant = selected_code(src, tokens, &mut ast.diagnostics);
     let statements = splitter::split_with_tokens(src, tokens.to_vec());
     for (i, stmt) in statements.iter().enumerate() {
         let next_start = statements.get(i + 1).map_or(src.len(), |s| s.range.start);
@@ -61,6 +57,74 @@ pub fn parse_tokens(src: &str, tokens: &[Token]) -> Ast {
     }
     finish_spans(&mut ast);
     ast
+}
+
+/// The significant tokens the parser reads. Of Oracle's conditional
+/// compilation that is each `$IF`'s first branch, as if its condition held
+/// (#171): the directives, the conditions, the other branches and `$ERROR …
+/// $END` are left out. Read as code, they make stray IFs, ELSEs and ENDs,
+/// and alternatives that each open a block get unbalanced. Inquiry
+/// directives (`$$name`) are values and stay.
+fn selected_code(src: &str, tokens: &[Token], diagnostics: &mut Vec<Diagnostic>) -> Vec<Token> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Part {
+        /// Between `$IF` and `$THEN`.
+        Condition,
+        /// The first branch.
+        Taken,
+        /// `$ELSIF` and `$ELSE` branches with their conditions.
+        Skipped,
+        /// `$ERROR … $END`.
+        Error,
+    }
+    let mut diag = |span: Span, message: &str| {
+        diagnostics.push(Diagnostic {
+            span,
+            message: message.into(),
+            severity: Severity::Error,
+        })
+    };
+    // Open `$IF`s and `$ERROR`s, where they start.
+    let mut open: Vec<(Part, Span)> = Vec::new();
+    let mut code = Vec::new();
+    for t in tokens.iter().filter(|t| !t.kind.is_trivia()) {
+        let text = &src[t.span.clone()];
+        if t.kind != TokenKind::Directive || text.starts_with("$$") {
+            if open.iter().all(|(part, _)| *part == Part::Taken) {
+                code.push(t.clone());
+            }
+            continue;
+        }
+        let word = text[1..].to_ascii_uppercase();
+        match word.as_str() {
+            "IF" => open.push((Part::Condition, t.span.clone())),
+            "ERROR" => open.push((Part::Error, t.span.clone())),
+            "THEN" => match open.last_mut() {
+                Some((part @ Part::Condition, _)) => *part = Part::Taken,
+                Some((Part::Skipped, _)) => {}
+                _ => diag(t.span.clone(), "$THEN outside of $IF"),
+            },
+            "ELSIF" | "ELSE" => match open.last_mut() {
+                Some((part, span)) if *part != Part::Error => {
+                    if *part == Part::Condition {
+                        diag(span.clone(), "$IF without $THEN");
+                    }
+                    *part = Part::Skipped;
+                }
+                _ => diag(t.span.clone(), &format!("${word} outside of $IF")),
+            },
+            _ => match open.pop() {
+                Some((Part::Condition, span)) => diag(span, "$IF without $THEN"),
+                Some(_) => {}
+                None => diag(t.span.clone(), "$END without matching $IF"),
+            },
+        }
+    }
+    for (part, span) in open {
+        let what = if part == Part::Error { "$ERROR" } else { "$IF" };
+        diag(span, &format!("{what} without $END"));
+    }
+    code
 }
 
 /// A statement's extent ends at its terminator (`;` or `/`) if one follows,

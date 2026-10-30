@@ -7,6 +7,14 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Conditional compilation (`$IF … $THEN … $ELSE … $END`) showed errors
+  that aren't (#171): `$ELSE` as "ELSE outside of IF or CASE", `$END`
+  before an IF as "END IF without matching IF", and the real END IF after
+  it the same. The editor reads each `$IF`'s first branch as the code, as
+  if its condition held, and reports only directives that don't pair up
+  (`$IF` without `$END`, `$END` without `$IF`). Folding no longer closes
+  an IF at `$END`, and the directives, `$$PLSQL_UNIT` too, show as
+  keywords instead of a red `$`.
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later

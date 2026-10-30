@@ -436,6 +436,21 @@ mod tests {
     }
 
     #[test]
+    fn conditional_compilation() {
+        // `$END` and the next line's IF closed the IF above as an END IF
+        // (#171); directives are no words.
+        let src = "begin\n  $IF x $THEN\n  if a then\n    null;\n  end if;\n  $END\n  if b then\n    null;\n  end if;\nend;\n";
+        assert_eq!(
+            spans(src),
+            vec![
+                (0, 9, RegionKind::Block),
+                (2, 4, RegionKind::Block),
+                (6, 8, RegionKind::Block),
+            ]
+        );
+    }
+
+    #[test]
     fn display_map() {
         // 10 lines; fold 2..=4 (hides 3,4) and 6..=8 (hides 7,8).
         let m = DisplayMap::new(10, [(2, 4), (6, 8)]);
