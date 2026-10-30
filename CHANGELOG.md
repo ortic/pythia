@@ -6,6 +6,8 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-30
+
 ### Added
 - A filter for the outline of a program window (#173), for large
   packages. Typing part of a name lists the declarations that contain it,
@@ -1141,7 +1143,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/pythia/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ortic/pythia/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ortic/pythia/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ortic/pythia/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ortic/pythia/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ortic/pythia/compare/v0.6.0...v0.7.0

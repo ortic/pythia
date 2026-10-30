@@ -4526,7 +4526,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pythia-ai"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "pythia-config",
  "serde_json",
@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-app"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-compare"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "egui",
  "egui_extras",
@@ -4587,7 +4587,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-config"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -4600,7 +4600,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-data"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "calamine",
  "chrono",
@@ -4613,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-db"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "futures-util",
  "mysql",
@@ -4638,7 +4638,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-debugger"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "egui",
  "egui_extras",
@@ -4654,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-lsp-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "insta",
  "pythia-plsql",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-monitor"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "egui",
@@ -4677,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-plsql"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "insta",
  "logos",
@@ -4687,7 +4687,7 @@ dependencies = [
 
 [[package]]
 name = "pythia-ui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "egui",
