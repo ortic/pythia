@@ -6,6 +6,12 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- A filter for the outline of a program window (#173), for large
+  packages. Typing part of a name lists the declarations that contain it,
+  with the package or subprogram around them, and says how many match.
+  Enter goes to the first one in the code, Escape clears the filter.
+
 ### Changed
 - The debugger's SQL plan no longer opens by itself (#169). On a
   misestimate it came up beside the code in the middle of stepping and

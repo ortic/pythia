@@ -156,7 +156,7 @@ Custom widget, because egui's `TextEdit` doesn't scale to large files or IDE fea
 - [x] Incremental re-lexing on edit (only dirty lines)
 - [x] Recursive-descent PL/SQL parser producing an AST with error recovery
 - [x] Statement splitting (handles `/`, `;`, PL/SQL blocks, `CREATE ... AS` units)
-- [x] Code outline / structure view (package specs, bodies, procedures, functions, types, cursors, variables)
+- [x] Code outline / structure view (package specs, bodies, procedures, functions, types, cursors, variables), with a name filter for large packages
 - [x] Code completion:
   - [x] Keywords
   - [x] Schema objects (tables, views, packages, synonyms) from metadata cache

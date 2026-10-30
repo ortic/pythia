@@ -4423,6 +4423,85 @@ fn outline_context_menu() {
     assert!(copied, "{:?}", h.output().platform_output.commands);
 }
 
+/// A filter narrows a large package's outline to the names that contain
+/// it, with their parents; Enter goes to the first in the code, Escape
+/// clears it (#173).
+#[test]
+fn outline_filter() {
+    let mut body = String::from("create or replace package body pkg as\n");
+    for i in 0..30 {
+        body +=
+            &format!("  procedure add_to_attr_from_rec_{i}___ is\n  begin\n    null;\n  end;\n");
+    }
+    body += "  procedure refresh_lines2_invoice___ is\n  begin\n    null;\n  end;\n\
+             \x20 procedure do_refresh_lines2_invoice is\n  begin\n    refresh_lines2_invoice___;\n  end;\n\
+             end pkg;";
+    let mut h = harness(true);
+    h.state_mut().test_program_with(
+        ObjectRef {
+            owner: "PYTHIA".into(),
+            name: "PKG".into(),
+            object_type: pythia_db::ObjectType::PackageBody,
+        },
+        "create or replace package pkg as\n  procedure do_refresh_lines2_invoice;\nend pkg;",
+        &body,
+    );
+    h.state_mut().test_program().active = 1;
+    h.run_steps(3);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+
+    let field = |h: &mut Ui| {
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Filter the outline")
+            .focus();
+        h.run_steps(1);
+    };
+    field(&mut h);
+    h.event(egui::Event::Text("Lines2".into()));
+    h.run_steps(2);
+    save(&mut h, "outline-filter");
+    assert!(h.query_by_label("2 matches").is_some());
+    assert!(h.query_by_label("refresh_lines2_invoice___").is_some());
+    assert!(h.query_by_label("do_refresh_lines2_invoice").is_some());
+    assert!(
+        h.query_by_label("pkg").is_some(),
+        "the package, around them"
+    );
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_none());
+
+    // Enter: the first match's name is selected, and typing replaces it.
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    let start = body.find("refresh_lines2_invoice___").unwrap();
+    assert_eq!(
+        editor.selection(),
+        Some(start..start + "refresh_lines2_invoice___".len())
+    );
+    h.event(egui::Event::Text("renamed".into()));
+    h.run_steps(2);
+    let editor = h.state_mut().test_program().active_editor().unwrap();
+    assert!(
+        editor.text().contains("procedure renamed is"),
+        "the code has the focus"
+    );
+    // The outline follows the code once it's analyzed again.
+    for _ in 0..40 {
+        if h.query_by_label("1 match").is_some() {
+            break;
+        }
+        h.step();
+    }
+    assert!(h.query_by_label("1 match").is_some(), "the outline follows");
+
+    // Escape clears it.
+    field(&mut h);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("add_to_attr_from_rec_7___").is_some());
+    assert!(h.query_by_label("1 match").is_none());
+    assert_eq!(h.state_mut().test_program().parts[1].outline_filter, "");
+}
+
 /// Test… and Debug… from the outline of a package body: for the
 /// subprograms its spec declares, disabled for a private one. Test… opens
 /// the block that calls it.

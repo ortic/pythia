@@ -37,6 +37,9 @@ pub struct Part {
     pub errors: Vec<CompileError>,
     #[serde(skip)]
     assist: crate::assist::Assist,
+    /// What the outline is filtered by (#173).
+    #[serde(skip)]
+    pub outline_filter: String,
 }
 
 #[derive(Default)]
@@ -762,7 +765,34 @@ impl ProgramWindow {
                 .resizable(true)
                 .default_size(240.0)
                 .show(ui, |ui| {
+                    // Large packages: names narrow the list (#173).
+                    let field = ui
+                        .horizontal(|ui| {
+                            let icon = ui.add(
+                                pythia_ui::icons::Icon::Filter
+                                    .image(ui)
+                                    .alt_text("Filter the outline"),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut part.outline_filter)
+                                    .hint_text("Filter")
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .labelled_by(icon.id)
+                        })
+                        .inner;
+                    let (enter, escape) = ui.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::Enter),
+                            i.key_pressed(egui::Key::Escape),
+                        )
+                    });
+                    if field.lost_focus() && escape {
+                        part.outline_filter.clear();
+                    }
+                    let needle = part.outline_filter.trim().to_lowercase();
                     let mut outline = Outline {
+                        needle: &needle,
                         object: &self.object,
                         part_type: part.object_type,
                         outline: part.assist.outline(),
@@ -777,6 +807,25 @@ impl ProgramWindow {
                         picked: None,
                         effects: Effects::default(),
                     };
+                    if !needle.is_empty() {
+                        let text = match outline.matches(outline.outline, 0) {
+                            0 => "No match".to_owned(),
+                            1 => "1 match".to_owned(),
+                            n => format!("{n} matches"),
+                        };
+                        ui.label(RichText::new(text).small().weak());
+                    }
+                    // Enter goes to the first match, in the code. The code
+                    // takes the focus this frame: it mustn't see the Enter.
+                    let mut focus = false;
+                    if field.lost_focus()
+                        && enter
+                        && let Some(first) = outline.first_match(outline.outline, 0)
+                    {
+                        outline.picked = Some(Picked::Jump(first.name_span.clone()));
+                        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                        focus = true;
+                    }
                     egui::ScrollArea::vertical()
                         .auto_shrink(false)
                         .show(ui, |ui| {
@@ -788,6 +837,9 @@ impl ProgramWindow {
                             }
                         });
                     effects.extend(outline.effects);
+                    if focus {
+                        part.editor.request_focus();
+                    }
                     match outline.picked {
                         Some(Picked::Jump(range)) => part.editor.select(range),
                         Some(Picked::References(at)) => find_references = Some(at),
@@ -977,6 +1029,7 @@ impl Part {
             saved: String::new(),
             errors: Vec::new(),
             assist: Default::default(),
+            outline_filter: String::new(),
         }
     }
 
@@ -1194,6 +1247,8 @@ pub fn debug_unit(object: &ObjectRef, object_type: ObjectType) -> pythia_debugge
 /// The outline beside the editor: its entries jump to their declaration,
 /// and their context menu tests, debugs, finds and copies.
 struct Outline<'a> {
+    /// The filter, lowercase (empty: none).
+    needle: &'a str,
     object: &'a ObjectRef,
     part_type: ObjectType,
     /// This part's declarations, and those of the package spec (the same
@@ -1207,6 +1262,17 @@ struct Outline<'a> {
     cx: &'a DocContext<'a>,
     picked: Option<Picked>,
     effects: Effects,
+}
+
+/// Variables, blocks and statements of nested scopes, which the outline
+/// leaves out.
+fn noise(item: &pythia_lsp_core::OutlineItem, depth: usize) -> bool {
+    use pythia_lsp_core::OutlineKind as K;
+    depth > 1
+        && matches!(
+            item.kind,
+            K::Variable | K::Constant | K::Statement | K::Block
+        )
 }
 
 /// What was picked in the outline, for the window to carry out.
@@ -1243,22 +1309,19 @@ impl Outline<'_> {
             K::Variable | K::Constant => Icon::Column,
             K::Block | K::Statement => Icon::Text,
         };
-        // Variables of nested scopes would only add noise.
-        if depth > 1
-            && matches!(
-                item.kind,
-                K::Variable | K::Constant | K::Statement | K::Block
-            )
-        {
+        if !self.shown(item, depth) {
             return;
         }
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 14.0);
             ui.spacing_mut().item_spacing.x = 5.0;
             ui.add(icon.sized(ui, IconSize::Small));
-            let mut r = ui.add(
-                egui::Button::new(RichText::new(item.name.to_lowercase()).monospace()).frame(false),
-            );
+            let mut name = RichText::new(item.name.to_lowercase()).monospace();
+            // Shown for a match below it.
+            if !self.needle.is_empty() && !self.matches_name(item) {
+                name = name.weak();
+            }
+            let mut r = ui.add(egui::Button::new(name).frame(false));
             if r.clicked() {
                 self.picked = Some(Picked::Jump(item.name_span.clone()));
             }
@@ -1273,6 +1336,48 @@ impl Outline<'_> {
         for child in &item.children {
             self.item(ui, child, Some(item.kind), depth + 1);
         }
+    }
+
+    /// Whether the entry shows: not noise, and with a filter, it or an
+    /// entry below it matches.
+    fn shown(&self, item: &pythia_lsp_core::OutlineItem, depth: usize) -> bool {
+        !noise(item, depth)
+            && (self.needle.is_empty()
+                || self.matches_name(item)
+                || item.children.iter().any(|c| self.shown(c, depth + 1)))
+    }
+
+    /// The filter is part of the entry's name (blocks and statements have
+    /// none).
+    fn matches_name(&self, item: &pythia_lsp_core::OutlineItem) -> bool {
+        use pythia_lsp_core::OutlineKind as K;
+        !self.needle.is_empty()
+            && !matches!(item.kind, K::Block | K::Statement)
+            && item.name.to_lowercase().contains(self.needle)
+    }
+
+    /// Entries shown that match the filter, at `depth` and below.
+    fn matches(&self, items: &[pythia_lsp_core::OutlineItem], depth: usize) -> usize {
+        items
+            .iter()
+            .filter(|i| !noise(i, depth))
+            .map(|i| usize::from(self.matches_name(i)) + self.matches(&i.children, depth + 1))
+            .sum()
+    }
+
+    /// The first entry from the top that matches the filter.
+    fn first_match<'i>(
+        &self,
+        items: &'i [pythia_lsp_core::OutlineItem],
+        depth: usize,
+    ) -> Option<&'i pythia_lsp_core::OutlineItem> {
+        items.iter().filter(|i| !noise(i, depth)).find_map(|i| {
+            if self.matches_name(i) {
+                Some(i)
+            } else {
+                self.first_match(&i.children, depth + 1)
+            }
+        })
     }
 
     fn menu(
