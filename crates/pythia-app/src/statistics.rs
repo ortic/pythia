@@ -144,13 +144,8 @@ fn actual_plan(
         ),
         &[&format!("%{marker}%")],
     )?;
-    let lines = conn.query_as::<Option<String>>(
-        "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, 'ALLSTATS LAST +COST +PREDICATE'))",
-        &[&sql_id, &child],
-    )?;
-    let lines: Vec<String> = lines
-        .map(|l| l.map(Option::unwrap_or_default))
-        .collect::<Result<_, _>>()?;
+    let lines =
+        pythia_db::display_cursor(conn, &sql_id, Some(child), "ALLSTATS LAST +COST +PREDICATE")?;
     let rows = match pythia_db::cursor_plan(conn, &sql_id, child)? {
         pythia_db::MetaResult::Table { columns, rows } => pythia_ui::plan::rows(&columns, &rows),
         _ => Vec::new(),

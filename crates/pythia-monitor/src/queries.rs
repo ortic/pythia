@@ -1576,12 +1576,7 @@ fn cursor_plan(
     } else {
         "TYPICAL +PEEKED_BINDS"
     };
-    let text = query(
-        conn,
-        "select plan_table_output from table(dbms_xplan.display_cursor(:1, :2, :3))",
-        &[&sql_id, &child, &format],
-        |r| Ok(get::<Option<String>>(r, 0)?.unwrap_or_default()),
-    )?;
+    let text = pythia_db::display_cursor(conn, sql_id, child, format)?;
     Ok((text, rows))
 }
 
