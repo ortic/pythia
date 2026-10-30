@@ -690,7 +690,7 @@ fn notes(plan: &CursorPlan, statistics: bool) -> Vec<(String, bool)> {
             false,
         )),
         (false, false) => notes.push((
-            "Estimates only: turn on Plan statistics in the debugger toolbar and debug again \
+            "Estimates only: turn on Plan statistics (Settings → Debugger) and debug again \
              for actual rows"
                 .into(),
             false,
@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(
             texts(notes(&plan, false)),
             [
-                "Estimates only: turn on Plan statistics in the debugger toolbar and debug again for actual rows"
+                "Estimates only: turn on Plan statistics (Settings → Debugger) and debug again for actual rows"
             ]
         );
     }

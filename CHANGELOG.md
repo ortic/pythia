@@ -32,6 +32,9 @@ All notable changes to Pythia are documented here. The format follows
   SQL plan, comes without the outline (#170): it took the code's width
   while stepping. *Outline* shows it; a window that was already open
   keeps it as it was.
+- The SQL plan's note without row source statistics said to turn on
+  *Plan statistics* in the debugger toolbar; it is in Settings →
+  Debugger since #162, and the note says so (#174).
 - *View → Variables (SQL window)* did nothing in a SQL window without
   bind (`:name`) or substitution (`&name`) variables, and switched the
   panel off unseen: it then didn't open for variables typed later
