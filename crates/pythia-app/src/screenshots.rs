@@ -6493,6 +6493,134 @@ select id, customer, total, @limit as limit from app_orders where total < @limit
     wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
 }
 
+/// A SQLite database file of its own, on any machine: a script with a
+/// trigger, the change waiting for Commit, Oracle's and the servers' menus
+/// gone, the browser's folders (no users or roles), an object view, and
+/// completion after an alias.
+#[test]
+fn sqlite_connection() {
+    use crate::commands::Command;
+    use pythia_db::ObjectType;
+    let path = std::env::temp_dir().join(format!("pythia-ui-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop.db".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.starts_with("Connected to shop.db (SQLite 3.")),
+        "{:?}",
+        h.state().test_log()
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "create table app_orders (
+  id integer primary key,
+  customer varchar(30) not null,
+  total decimal(8,2),
+  ordered text default current_timestamp
+);
+create table app_audit (order_id integer references app_orders (id), total decimal(8,2));
+create trigger app_orders_audit after insert on app_orders
+begin
+  insert into app_audit values (new.id, new.total);
+end;
+create index app_orders_customer on app_orders (customer);
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+select o.id, o.customer, o.total, a.total as audited
+  from app_orders o join app_audit a on a.order_id = o.id
+ where o.total < 100 order by o.id;
+"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let errors: Vec<&str> = w
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let result = w.state.results.last().expect("a result");
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "customer", "total", "audited"]);
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        h.state().test_transaction_state(),
+        Ok(()),
+        "the insert waits for commit"
+    );
+    save(&mut h, "sqlite-sql-window");
+    h.state_mut().test_command(Command::Commit);
+    wait_until(&mut h, "commit", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+
+    // No debugger, reports or monitor for a file.
+    for menu in ["Debug", "Reports", "Monitor"] {
+        assert!(h.query_by_label(menu).is_none(), "{menu}");
+    }
+
+    h.state_mut()
+        .test_expand_browser(&[ObjectType::Table, ObjectType::Index, ObjectType::Trigger]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    save(&mut h, "sqlite-browser");
+    for folder in pythia_db::Dialect::SQLITE.browser_types() {
+        assert!(h.query_by_label(folder.plural()).is_some(), "{folder:?}");
+    }
+    for absent in ["Packages", "Users", "Roles"] {
+        assert!(h.query_by_label(absent).is_none(), "{absent}");
+    }
+    assert!(h.query_by_label_contains("app_orders_audit").is_some());
+    assert!(h.query_by_label_contains("app_orders_customer").is_some());
+
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: "shop.db".into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "app_orders".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "object view", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 4);
+    assert!(h.query_by_label("Constraints").is_some());
+    assert!(h.query_by_label("Grants").is_none());
+    save(&mut h, "sqlite-object-view");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "select o\n  from app_orders o".into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut().test_sql_window().editor.select(8..8);
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("customer"))
+    });
+    save(&mut h, "sqlite-completion");
+    drop(h);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The SQL Server dashboard (`PYTHIA_TEST_MSSQL_DBA`, a login with VIEW
 /// SERVER STATE): server KPIs, trends, waits and storage on the
 /// connection's own session.
@@ -6988,6 +7116,126 @@ commit;",
         );
     }
     run_script(&mut h, connection, "drop table pythia_mt_orders;");
+}
+
+/// A harness connected to a new SQLite file in the temp directory, named
+/// `connection`; the file is removed on drop of the returned guard.
+fn sqlite_file(connection: &str) -> (Ui, SqliteFile) {
+    let file = SqliteFile(std::env::temp_dir().join(format!(
+        "pythia-ui-{}-{}.db",
+        std::process::id(),
+        connection.replace('.', "-")
+    )));
+    let _ = std::fs::remove_file(&file.0);
+    let profile = ConnectionProfile {
+        name: connection.into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", file.0.display()),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    (h, file)
+}
+
+struct SqliteFile(PathBuf);
+
+impl Drop for SqliteFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Maintenance of a SQLite table: its rows, pages and missing statistics,
+/// then ANALYZE (after which it has them), REINDEX and the integrity check.
+#[test]
+fn maintenance_sqlite() {
+    use crate::maintenance::Task;
+    use pythia_db::{Dialect, ObjectType};
+    let connection = "maintenance.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table orders (id integer primary key, note text);
+create index orders_note on orders (note);
+insert into orders values (1, 'one'), (2, 'two'), (3, 'three');
+commit;",
+    );
+    let table = ObjectRef {
+        owner: "main".into(),
+        name: "orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(maintenance_fact(&mut h, "Rows"), Some(("3".into(), false)));
+    assert!(maintenance_fact(&mut h, "Data").is_some());
+    assert!(maintenance_fact(&mut h, "Indexes").is_some());
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("never gathered".into(), true))
+    );
+    for task in [Task::Analyze, Task::Reindex, Task::Check] {
+        let (text, ok, messages) = run_maintenance(&mut h, Dialect::SQLITE, task, |_| {});
+        assert!(ok, "{task:?}: {text}");
+        if task == Task::Check {
+            assert!(
+                messages[0].iter().any(|m| m.contains("ok")),
+                "{task:?}: {messages:?}"
+            );
+        }
+    }
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("gathered (ANALYZE)".into(), false))
+    );
+    assert_eq!(
+        maintenance_fact(&mut h, "Rows (statistics)"),
+        Some(("3".into(), false))
+    );
+}
+
+/// The maintenance scan of a SQLite database: free pages after a large
+/// delete (with the line lowered for a small file) and an indexed table
+/// without statistics; the batch vacuums and analyzes, and the scan after
+/// finds neither.
+#[test]
+fn maintenance_scan_sqlite() {
+    let connection = "scan.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table big (id integer primary key, pad text);
+create index big_pad on big (pad);
+insert into big
+  with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000)
+  select i, printf('%.500c', 'x') from n;
+delete from big where id > 10;
+commit;",
+    );
+    let everything = crate::maintenance::Limits {
+        free_bytes: 0.0,
+        free_share: 0.0,
+        ..Default::default()
+    };
+    open_scan(&mut h, Some(everything));
+    save(&mut h, "maintenance-scan-sqlite");
+    let mut found = scan_findings(&mut h, "");
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("database main".into(), "Reclaimable space".into(), true),
+            ("main.big".into(), "No statistics".into(), true),
+        ]
+    );
+    assert!(scan_note(&mut h, "File").is_some());
+    let (text, ok, statuses) = run_scan(&mut h, "", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert!(scan_findings(&mut h, "").is_empty());
 }
 
 /// Maintenance of a SQL Server table (#144): statistics with a full scan,

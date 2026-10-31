@@ -195,6 +195,10 @@ pub fn load(client: &mut dyn Client, target: &EditTarget) -> Result<Loaded, DbEr
         DbKind::Postgres => postgres::load(client, name, role),
         DbKind::SqlServer => sqlserver::load(client, name, role),
         DbKind::Oracle => Err(DbError::new("Oracle's users have a form of their own")),
+        DbKind::Sqlite => Err(DbError::unsupported(
+            "Users and roles",
+            pythia_db::Dialect::SQLITE,
+        )),
     }
 }
 
@@ -214,7 +218,7 @@ pub fn objects(client: &mut dyn Client, container: &str) -> Result<Vec<String>, 
             "select o.name from sys.objects o where o.schema_id = schema_id(@P1) \
                and o.type in ('U', 'V', 'P', 'FN', 'IF', 'TF', 'SO', 'SN') order by o.name"
         }
-        DbKind::Oracle => return Ok(Vec::new()),
+        DbKind::Oracle | DbKind::Sqlite => return Ok(Vec::new()),
     };
     texts(client, sql, &[container])
 }
@@ -227,7 +231,7 @@ pub fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Vec<Strin
         DbKind::MySql => mysql::statements(original, def),
         DbKind::Postgres => postgres::statements(original, def),
         DbKind::SqlServer => sqlserver::statements(original, def),
-        DbKind::Oracle => Ok(Vec::new()),
+        DbKind::Oracle | DbKind::Sqlite => Ok(Vec::new()),
     }
 }
 
@@ -391,7 +395,7 @@ pub fn ui(ui: &mut Ui, def: &mut UserDef, original: Option<&UserDef>, lists: &mu
             DbKind::MySql => mysql::ui(ui, def, original),
             DbKind::Postgres => postgres::ui(ui, def, original),
             DbKind::SqlServer => sqlserver::ui(ui, def, original, &choices),
-            DbKind::Oracle => {}
+            DbKind::Oracle | DbKind::Sqlite => {}
         }
         for (label, value) in &def.info {
             form_row(ui, label, |ui| {

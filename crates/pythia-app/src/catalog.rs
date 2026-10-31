@@ -55,7 +55,7 @@ pub fn request(id: u64, request: CatalogRequest, dialect: Dialect) -> DbRequest 
             id,
             task: task(request),
         },
-        DbKind::MySql | DbKind::Postgres | DbKind::SqlServer => DbRequest::Run {
+        DbKind::MySql | DbKind::Postgres | DbKind::SqlServer | DbKind::Sqlite => DbRequest::Run {
             id,
             task: Box::new(move |client| {
                 let answer = dictionary::fetch(client, request)?;
@@ -65,12 +65,12 @@ pub fn request(id: u64, request: CatalogRequest, dialect: Dialect) -> DbRequest 
     }
 }
 
-/// The dictionaries of MySQL, PostgreSQL and SQL Server. Code assistance
-/// asks with uppercase names (Oracle's rule for unquoted ones); these
-/// databases keep their case (PostgreSQL folds unquoted names to
+/// The dictionaries of MySQL, PostgreSQL, SQL Server and SQLite. Code
+/// assistance asks with uppercase names (Oracle's rule for unquoted ones);
+/// these databases keep their case (PostgreSQL folds unquoted names to
 /// lowercase), so names are compared without it and answered as stored.
 mod dictionary {
-    use pythia_db::{Cell, Client, DbError, DbKind};
+    use pythia_db::{Cell, Client, DbError, DbKind, MetaQuery, MetaResult, ObjectType};
     use pythia_lsp_core::{CatalogColumn, CatalogObject, CatalogRequest};
 
     use super::Answer;
@@ -190,6 +190,9 @@ mod dictionary {
         client: &mut dyn Client,
         request: CatalogRequest,
     ) -> Result<Answer, DbError> {
+        if client.dialect().kind() == DbKind::Sqlite {
+            return sqlite(client, request);
+        }
         let sql = Sql::of(client.dialect().kind());
         Ok(match request {
             CatalogRequest::Schemas => {
@@ -244,6 +247,80 @@ mod dictionary {
                 Answer::Columns(owner, name, columns)
             }
             // Routines stand alone: no packages with members.
+            CatalogRequest::Members { owner, name } => Answer::Members(owner, name, Vec::new()),
+        })
+    }
+
+    /// SQLite: each attached database has a dictionary of its own, so the
+    /// session's dictionary lookups answer.
+    fn sqlite(client: &mut dyn Client, request: CatalogRequest) -> Result<Answer, DbError> {
+        let tables =
+            |client: &mut dyn Client, owner: &str| -> Result<Vec<CatalogObject>, DbError> {
+                let mut out = Vec::new();
+                for object_type in [ObjectType::Table, ObjectType::View] {
+                    let found = client.meta(&MetaQuery::Objects {
+                        owner: owner.to_owned(),
+                        object_type,
+                        filter: None,
+                    })?;
+                    if let MetaResult::Objects(objects) = found {
+                        out.extend(objects.into_iter().map(|o| CatalogObject {
+                            owner: o.owner,
+                            name: o.name,
+                            object_type: o.object_type.dictionary_name().to_owned(),
+                        }));
+                    }
+                }
+                Ok(out)
+            };
+        Ok(match request {
+            CatalogRequest::Schemas => match client.meta(&MetaQuery::Schemas)? {
+                MetaResult::Schemas(schemas) => Answer::Schemas(schemas),
+                _ => Answer::Schemas(Vec::new()),
+            },
+            CatalogRequest::Objects { schema } => {
+                let objects = tables(client, schema.as_deref().unwrap_or("main"))?;
+                Answer::Objects(schema, objects)
+            }
+            CatalogRequest::Resolve { schema, name } => {
+                // Unqualified: `temp` hides `main`, as SQLite looks there first.
+                let owners: Vec<String> = match &schema {
+                    Some(schema) => vec![schema.clone()],
+                    None => vec!["temp".into(), "main".into()],
+                };
+                let mut object = None;
+                for owner in owners {
+                    let mut found = tables(client, &owner)?;
+                    found.retain(|o| o.name.eq_ignore_ascii_case(&name));
+                    // An exact match first, then tables before views.
+                    found.sort_by_key(|o| (o.name != name, o.object_type != "TABLE"));
+                    if let Some(first) = found.into_iter().next() {
+                        object = Some(first);
+                        break;
+                    }
+                }
+                Answer::Resolved(schema, name, object)
+            }
+            CatalogRequest::Columns { owner, name } => {
+                let found = client.meta(&MetaQuery::Columns {
+                    owner: owner.clone(),
+                    table: name.clone(),
+                    keys: false,
+                })?;
+                let columns = match found {
+                    MetaResult::Columns(columns) => columns
+                        .into_iter()
+                        .map(|c| CatalogColumn {
+                            name: c.name,
+                            data_type: c.data_type,
+                            nullable: c.nullable,
+                            comment: None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Answer::Columns(owner, name, columns)
+            }
             CatalogRequest::Members { owner, name } => Answer::Members(owner, name, Vec::new()),
         })
     }

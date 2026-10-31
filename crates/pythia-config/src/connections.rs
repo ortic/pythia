@@ -9,14 +9,16 @@ pub enum DbKind {
     MySql,
     Postgres,
     SqlServer,
+    Sqlite,
 }
 
 impl DbKind {
-    pub const ALL: [DbKind; 4] = [
+    pub const ALL: [DbKind; 5] = [
         DbKind::Oracle,
         DbKind::MySql,
         DbKind::Postgres,
         DbKind::SqlServer,
+        DbKind::Sqlite,
     ];
 
     pub fn label(self) -> &'static str {
@@ -25,6 +27,7 @@ impl DbKind {
             DbKind::MySql => "MySQL",
             DbKind::Postgres => "PostgreSQL",
             DbKind::SqlServer => "SQL Server",
+            DbKind::Sqlite => "SQLite",
         }
     }
 }
@@ -88,7 +91,8 @@ pub struct ConnectionProfile {
     pub kind: DbKind,
     pub username: String,
     /// Oracle: TNS alias, EZConnect (`host:port/service`) or a full
-    /// descriptor. MySQL: `host[:port][/database]`.
+    /// descriptor. MySQL: `host[:port][/database]`. SQLite: the database
+    /// file.
     pub connect_string: String,
     pub privilege: Privilege,
     /// Production connections get a red marker and extra confirmations.
@@ -109,12 +113,15 @@ pub struct ConnectionProfile {
 }
 
 impl ConnectionProfile {
-    /// `user@connect_string`, the way PL/SQL Developer shows connections.
+    /// `user@connect_string`, the way PL/SQL Developer shows connections;
+    /// a database without users (SQLite) by its file.
     pub fn display_name(&self) -> String {
-        if self.name.is_empty() {
-            format!("{}@{}", self.username, self.connect_string)
-        } else {
+        if !self.name.is_empty() {
             self.name.clone()
+        } else if self.username.is_empty() {
+            self.connect_string.clone()
+        } else {
+            format!("{}@{}", self.username, self.connect_string)
         }
     }
 }
@@ -161,6 +168,7 @@ mod tests {
         for (kind, name) in [
             (DbKind::Postgres, "postgres"),
             (DbKind::SqlServer, "sqlserver"),
+            (DbKind::Sqlite, "sqlite"),
         ] {
             let profile = ConnectionProfile {
                 kind,

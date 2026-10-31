@@ -465,6 +465,7 @@ pub fn literal(dialect: Dialect, col: &Column, value: Option<&str>) -> String {
         DbKind::MySql => mysql_literal(col, value),
         DbKind::Postgres => postgres_literal(col, value),
         DbKind::SqlServer => sqlserver_literal(col, value),
+        DbKind::Sqlite => sqlite_literal(col, value),
     }
 }
 
@@ -538,6 +539,29 @@ fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
             " + ",
         ),
     }
+}
+
+/// SQLite: a blob as the `X'…'` of the hex it is shown as, text quoted
+/// (no backslash escapes), a `&` apart as `char(38)` since Pythia's SQL
+/// windows read `&name` as a substitution variable even in a literal
+/// (#159).
+fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
+    let Some(v) = value else {
+        return "NULL".into();
+    };
+    if is_number(col, v) {
+        return v.to_owned();
+    }
+    let hex = !v.is_empty() && v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
+    if hex && col.type_name.contains("BLOB") {
+        return format!("X'{v}'");
+    }
+    apart_from_ampersands(
+        v,
+        |p| format!("'{}'", p.replace('\'', "''")),
+        "char(38)",
+        " || ",
+    )
 }
 
 fn inserts(
@@ -795,6 +819,10 @@ mod tests {
             literal(Dialect::SQLSERVER, &col("nvarchar"), Some("H&L")),
             "N'H' + NCHAR(38) + N'L'"
         );
+        assert_eq!(
+            literal(Dialect::SQLITE, &col("TEXT"), Some("H&L")),
+            "'H' || char(38) || 'L'"
+        );
     }
 
     #[test]
@@ -816,6 +844,12 @@ mod tests {
             ),
             "'2026-01-02 03:04:05+01'"
         );
+        let lite = |c: &Column, v| literal(Dialect::SQLITE, c, v);
+        assert_eq!(lite(&col("INTEGER", true), Some("7")), "7");
+        assert_eq!(lite(&col("BLOB", false), Some("00FF")), "X'00FF'");
+        assert_eq!(lite(&col("TEXT", false), Some("00FF")), "'00FF'");
+        assert_eq!(lite(&col("TEXT", false), Some(r"it's \n")), r"'it''s \n'");
+        assert_eq!(lite(&col("DATE", false), None), "NULL");
         let ms = |c: &Column, v| literal(Dialect::SQLSERVER, c, v);
         assert_eq!(
             ms(&col("nvarchar", false), Some("grüße 'x'")),

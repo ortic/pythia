@@ -47,6 +47,7 @@ impl Task {
             Task::Analyze => "ANALYZE",
             Task::Reindex => "REINDEX",
             Task::Optimize => "OPTIMIZE TABLE",
+            Task::Check if dialect.kind() == DbKind::Sqlite => "Integrity check",
             Task::Check => "CHECK TABLE",
             Task::UpdateStatistics => "Update statistics",
             Task::RebuildIndexes => "Rebuild indexes",
@@ -74,9 +75,18 @@ impl Task {
             }
             (Task::Shrink, _) => "Give space freed by deleted rows back, keeping the segment",
             (Task::Move, _) => "Rewrite the table compactly, or into another tablespace",
+            (Task::Vacuum, DbKind::Sqlite) => {
+                "Rewrite the database file compactly, giving its free pages back"
+            }
             (Task::Vacuum, _) => "Reclaim dead rows for reuse, update the visibility map",
             (Task::Analyze, DbKind::MySql) => "Update the index statistics (key distribution)",
+            (Task::Analyze, DbKind::Sqlite) => {
+                "Statistics of the indexes for the query planner (sqlite_stat1)"
+            }
             (Task::Analyze, _) => "Fresh planner statistics from a sample of rows",
+            (Task::Reindex, DbKind::Sqlite) => {
+                "Rebuild the indexes, e.g. after a collation changed"
+            }
             (Task::Reindex, _) => "Rebuild the table's indexes, e.g. invalid or bloated ones",
             (Task::Optimize, _) => {
                 "Rebuild the table and its indexes, giving reclaimable space back"
@@ -119,6 +129,8 @@ pub fn tasks(dialect: Dialect, object_type: ObjectType) -> &'static [Task] {
         (DbKind::SqlServer, ObjectType::Table) => {
             &[UpdateStatistics, RebuildIndexes, ReorganizeIndexes]
         }
+        (DbKind::Sqlite, ObjectType::Table) => &[Analyze, Reindex, Check],
+        (DbKind::Sqlite, ObjectType::Index) => &[Analyze, Reindex],
         _ => &[],
     }
 }
@@ -330,6 +342,10 @@ pub fn statements(
             }
             out
         }
+        // The whole file: `object` names the database.
+        Task::Vacuum if dialect.kind() == DbKind::Sqlite => {
+            vec![format!("vacuum {}", dialect.quote_ident(&object.owner))]
+        }
         Task::Vacuum => {
             let mut flags = Vec::new();
             if options.full {
@@ -355,6 +371,7 @@ pub fn statements(
             let verbose = if options.verbose { "verbose " } else { "" };
             vec![format!("analyze {verbose}{name}")]
         }
+        Task::Reindex if dialect.kind() == DbKind::Sqlite => vec![format!("reindex {name}")],
         Task::Reindex => {
             let concurrently = if options.concurrently && concurrently_possible(facts) {
                 "concurrently "
@@ -364,6 +381,12 @@ pub fn statements(
             vec![format!("reindex table {concurrently}{name}")]
         }
         Task::Optimize => vec![format!("optimize table {name}")],
+        // Rows that say what is wrong, or `ok`.
+        Task::Check if dialect.kind() == DbKind::Sqlite => vec![format!(
+            "pragma {}.integrity_check({})",
+            dialect.quote_ident(&object.owner),
+            dialect.quote_ident(&object.name)
+        )],
         Task::Check => vec![format!("check table {name}")],
         Task::UpdateStatistics => {
             let fullscan = if options.fullscan {

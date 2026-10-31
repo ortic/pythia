@@ -80,6 +80,7 @@ impl Dialect {
     pub const MYSQL: Dialect = Dialect(DbKind::MySql);
     pub const POSTGRES: Dialect = Dialect(DbKind::Postgres);
     pub const SQLSERVER: Dialect = Dialect(DbKind::SqlServer);
+    pub const SQLITE: Dialect = Dialect(DbKind::Sqlite);
 
     pub fn kind(self) -> DbKind {
         self.0
@@ -117,6 +118,8 @@ impl Dialect {
                     | Feature::Sessions
                     | Feature::AccountEditors
             ),
+            // A file: no server to monitor, no accounts, nothing to tunnel.
+            DbKind::Sqlite => matches!(feature, Feature::ExplainPlan | Feature::Completion),
         }
     }
 
@@ -126,6 +129,7 @@ impl Dialect {
             DbKind::Oracle | DbKind::MySql => Syntax::Oracle,
             DbKind::Postgres => Syntax::Postgres,
             DbKind::SqlServer => Syntax::TSql,
+            DbKind::Sqlite => Syntax::Sqlite,
         }
     }
 
@@ -142,6 +146,7 @@ impl Dialect {
             DbKind::MySql | DbKind::Postgres | DbKind::SqlServer => {
                 &[ObjectType::User, ObjectType::Role]
             }
+            DbKind::Sqlite => &[],
         }
     }
 
@@ -174,6 +179,12 @@ impl Dialect {
                 ObjectType::Sequence,
                 ObjectType::Synonym,
             ],
+            DbKind::Sqlite => &[
+                ObjectType::Table,
+                ObjectType::View,
+                ObjectType::Index,
+                ObjectType::Trigger,
+            ],
         }
     }
 
@@ -190,6 +201,15 @@ impl Dialect {
             (_, ObjectType::DatabaseLink) => Detail::LINK,
             (DbKind::Oracle, ObjectType::Table) => Detail::TABLE,
             (DbKind::Oracle, _) => Detail::CODE,
+            // No privileges in a file.
+            (DbKind::Sqlite, ObjectType::Table) => &[
+                Detail::Indexes,
+                Detail::Constraints,
+                Detail::Triggers,
+                Detail::UsedBy,
+            ],
+            (DbKind::Sqlite, ObjectType::View) => &[Detail::Uses, Detail::UsedBy],
+            (DbKind::Sqlite, _) => &[],
             (_, ObjectType::Table) => TABLE,
             (DbKind::MySql, ObjectType::View) => &[Detail::Uses],
             (DbKind::MySql, _) => &[],
@@ -208,11 +228,13 @@ impl Dialect {
     }
 
     /// Quotes an identifier only if the database would need it. Oracle folds
-    /// unquoted names to uppercase, PostgreSQL to lowercase; MySQL and SQL
-    /// Server keep their case.
+    /// unquoted names to uppercase, PostgreSQL to lowercase; MySQL, SQL
+    /// Server and SQLite keep their case.
     pub fn quote_ident(self, name: &str) -> String {
         let reserved = match self.0 {
-            DbKind::Postgres | DbKind::SqlServer => pythia_plsql::is_reserved(name, self.syntax()),
+            DbKind::Postgres | DbKind::SqlServer | DbKind::Sqlite => {
+                pythia_plsql::is_reserved(name, self.syntax())
+            }
             DbKind::Oracle | DbKind::MySql => pythia_plsql::is_keyword(name),
         };
         let plain = |start: fn(char) -> bool, rest: fn(char) -> bool| {
@@ -249,6 +271,16 @@ impl Dialect {
                     format!("\"{}\"", name.replace('"', "\"\""))
                 }
             }
+            DbKind::Sqlite => {
+                if plain(
+                    |c| c.is_ascii_alphabetic() || c == '_',
+                    |c| c.is_ascii_alphanumeric() || "_$".contains(c),
+                ) {
+                    name.to_owned()
+                } else {
+                    format!("\"{}\"", name.replace('"', "\"\""))
+                }
+            }
             DbKind::SqlServer => {
                 if plain(
                     |c| c.is_ascii_alphabetic() || "_@#".contains(c),
@@ -268,13 +300,13 @@ impl Dialect {
     }
 
     /// How the dictionary stores an unquoted name the user typed: Oracle
-    /// folds it to uppercase, PostgreSQL to lowercase; MySQL and SQL Server
-    /// keep it (and compare names without case where it matters).
+    /// folds it to uppercase, PostgreSQL to lowercase; MySQL, SQL Server and
+    /// SQLite keep it (and compare names without case where it matters).
     pub fn dictionary_name(self, name: &str) -> String {
         match self.0 {
             DbKind::Oracle => name.to_uppercase(),
             DbKind::Postgres => name.to_lowercase(),
-            DbKind::MySql | DbKind::SqlServer => name.to_owned(),
+            DbKind::MySql | DbKind::SqlServer | DbKind::Sqlite => name.to_owned(),
         }
     }
 }
@@ -320,6 +352,20 @@ mod tests {
             assert!(dialect.supports(Feature::Sessions));
             assert!(dialect.supports(Feature::SshTunnel));
         }
+        // A file: SQL windows, explain plan and completion.
+        let sqlite = Dialect::SQLITE;
+        assert!(sqlite.supports(Feature::ExplainPlan));
+        assert!(sqlite.supports(Feature::Completion));
+        for feature in [
+            Feature::SshTunnel,
+            Feature::Dashboard,
+            Feature::Sessions,
+            Feature::AccountEditors,
+            Feature::PlSql,
+        ] {
+            assert!(!sqlite.supports(feature));
+        }
+        assert!(sqlite.account_types().is_empty());
         assert_eq!(Dialect::default(), Dialect::ORACLE);
     }
 
@@ -347,5 +393,13 @@ mod tests {
         assert_eq!(sqlserver.quote_ident("#tmp"), "#tmp");
         assert_eq!(sqlserver.quote_ident("order"), "[order]");
         assert_eq!(sqlserver.qualified("dbo", "my]table"), "dbo.[my]]table]");
+        let sqlite = Dialect::SQLITE;
+        assert_eq!(sqlite.quote_ident("Emp_2"), "Emp_2");
+        assert_eq!(sqlite.quote_ident("key"), "key");
+        assert_eq!(sqlite.quote_ident("order"), "\"order\"");
+        assert_eq!(
+            sqlite.qualified("main", "my \"table\""),
+            "main.\"my \"\"table\"\"\""
+        );
     }
 }

@@ -351,6 +351,33 @@ for Linux, Windows and macOS.
   fork of [tiberius](https://github.com/ortic/tiberius) (branch `pythia`),
   which passes those messages on.
 
+**SQLite (experimental)**
+- *Type: SQLite* with the database file's path (*…* picks one, *New…*
+  makes one). SQLite is built in: nothing to install. A path that doesn't
+  exist fails instead of leaving an empty database behind; `?create` makes
+  the file, `?ro` opens it read-only, `:memory:` is one in-memory database
+  for all windows, and a `file:` URI works as SQLite takes it.
+- SQL windows with results, fetching on demand, Break, explain plan
+  (`EXPLAIN QUERY PLAN`) and completion. Each window has its own
+  connection to the file, and transactions work as with Oracle: changes
+  wait for Commit, and DDL outside a transaction is committed at once.
+  While one window has uncommitted changes, another one that writes waits
+  up to five seconds for the file's lock, then says which window to commit
+  in. Foreign keys are checked (`pragma foreign_keys = off` in the login
+  script turns that off).
+- The object browser lists tables, views, indexes and triggers, with the
+  attached databases as schemas (`attach database` in the login script
+  attaches one for every window). Object views show columns, indexes,
+  constraints, triggers, what uses a table and what a view uses, and the
+  DDL as written, a table's with its indexes. *Edit* opens a view or
+  trigger as a script that drops and creates it again.
+- Scripts end each statement at `;`; a trigger's `BEGIN … END` keeps its
+  own.
+- *Maintenance* of a table or index: `ANALYZE`, `REINDEX` and an integrity
+  check, after its rows, size and whether it has statistics. The
+  *Maintenance Scan* finds free pages that `VACUUM` gives back and indexed
+  tables without statistics.
+
 ## Installing
 
 Download Pythia from [its website](https://ortic.github.io/pythia/#download).
@@ -468,6 +495,9 @@ of a run takes a lock (`pythia-test-databases.lock` in the temp
 directory) that the test process keeps, so a second run, e.g. in another
 worktree, waits for it instead of failing on the same objects.
 
+The SQLite tests need no server and always run: each makes its database
+files in the temp directory.
+
 | Variable | Used by |
 |---|---|
 | `PYTHIA_TEST_DB` | integration tests (app user) |
@@ -500,7 +530,7 @@ fresh Oracle Free container.
 |---|---|
 | `pythia-app` | the application: documents, docking, commands, dialogs |
 | `pythia-ui` | code editor, data grid, icon set |
-| `pythia-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
+| `pythia-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server, SQLite), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
 | `pythia-plsql` | lexer, statement splitter, error-tolerant parser |
 | `pythia-lsp-core` | completion, hover, navigation, outline, diagnostics |
 | `pythia-data` | export and import |

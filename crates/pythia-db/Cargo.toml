@@ -18,6 +18,7 @@ oracledb.workspace = true
 pythia-config.workspace = true
 pythia-plsql.workspace = true
 russh.workspace = true
+rusqlite.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true

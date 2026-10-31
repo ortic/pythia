@@ -6,6 +6,20 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- SQLite (experimental): *Type: SQLite* with the database file (*…* picks
+  one, *New…* makes one), built in, so there's nothing to install. SQL
+  windows with results, fetching on demand, Break, explain plan
+  (`EXPLAIN QUERY PLAN`) and completion; transactions as with Oracle, each
+  window on its own connection to the file. The object browser lists
+  tables, views, indexes and triggers, attached databases as schemas, and
+  object views show columns, indexes, constraints, triggers, dependencies
+  and the DDL. Scripts end statements at `;` and keep a trigger's
+  `BEGIN … END` whole. Maintenance runs `ANALYZE`, `REINDEX` and integrity
+  checks; the scan finds free pages for `VACUUM` and indexed tables
+  without statistics. A path that doesn't exist fails rather than making
+  an empty database (`?create` makes one, `?ro` opens it read-only).
+
 ### Changed
 - The misestimate note of an SQL plan says what it means (#177). "⚠
   Estimate off at 35 INDEX UNIQUE SCAN …: estimated 318 rows (1 per start

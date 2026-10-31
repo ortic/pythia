@@ -547,7 +547,8 @@ impl Builder {
     }
 
     /// A dictionary name as it is written: Oracle's and PostgreSQL's in the
-    /// case the user types unless quoted, MySQL's and SQL Server's as stored.
+    /// case the user types unless quoted, MySQL's, SQL Server's and SQLite's
+    /// as stored.
     fn name_text(&self, name: &str) -> String {
         match self.names {
             NameStyle::Upper | NameStyle::Lower if self.quoted || self.needs_quotes(name) => {
@@ -560,7 +561,10 @@ impl Builder {
             NameStyle::Brackets if needs_brackets(name) => {
                 format!("[{}]", name.replace(']', "]]"))
             }
-            NameStyle::Backticks | NameStyle::Brackets => name.to_owned(),
+            NameStyle::AsWritten if needs_sqlite_quotes(name) => {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+            NameStyle::Backticks | NameStyle::Brackets | NameStyle::AsWritten => name.to_owned(),
         }
     }
 
@@ -630,7 +634,7 @@ impl Builder {
         let label = match self.names {
             NameStyle::Upper | NameStyle::Lower if self.needs_quotes(name) => text.clone(),
             NameStyle::Upper | NameStyle::Lower => self.cased(name),
-            NameStyle::Backticks | NameStyle::Brackets => name.to_owned(),
+            NameStyle::Backticks | NameStyle::Brackets | NameStyle::AsWritten => name.to_owned(),
         };
         self.push(label, kind, detail, text, None, priority)
     }
@@ -743,6 +747,18 @@ fn needs_brackets(name: &str) -> bool {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'));
     !(ok_start && ok_rest) || pythia_plsql::is_reserved(name, pythia_plsql::Syntax::TSql)
+}
+
+/// Whether a SQLite name must be written in double quotes.
+fn needs_sqlite_quotes(name: &str) -> bool {
+    let ok_start = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let ok_rest = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'));
+    !(ok_start && ok_rest) || pythia_plsql::is_reserved(name, pythia_plsql::Syntax::Sqlite)
 }
 
 /// Whether a PostgreSQL name (unquoted ones are stored in lowercase) must be
@@ -1241,5 +1257,8 @@ mod tests {
         assert_eq!(text(NameStyle::Brackets, "a]b"), "[a]]b]");
         assert_eq!(text(NameStyle::Brackets, "Emp"), "Emp");
         assert_eq!(text(NameStyle::Backticks, "order"), "`order`");
+        assert_eq!(text(NameStyle::AsWritten, "Emp"), "Emp");
+        assert_eq!(text(NameStyle::AsWritten, "order"), "\"order\"");
+        assert_eq!(text(NameStyle::AsWritten, "my \"t\""), "\"my \"\"t\"\"\"");
     }
 }
