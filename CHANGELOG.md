@@ -6,12 +6,30 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- PostgreSQL and SQL Server: results can be edited in place, as on MySQL.
+  *Edit* adds the table's primary key (or a unique key on NOT NULL
+  columns) to the end of the result, read-only, also when the query
+  doesn't select it. The key is that of the table the query read, found by
+  the search path or the default schema, with quoted names (`"My Table"`,
+  `[dbo].[x]`) and, on SQL Server, `db.dbo.x` and `db..x`; a table of the
+  same name in another schema isn't taken for it. Views and tables without
+  such a key stay read-only and say why. Applying checks the values that
+  were fetched, each type the way it can be compared: on PostgreSQL json,
+  xml, points, arrays and floats as the text that was shown (also when
+  `extra_float_digits` rounds it); on SQL Server `text`, `ntext` and `xml`
+  as `nvarchar(max)`, `image` and CLR types (`geometry`, `hierarchyid`) as
+  their bytes, and a `real` as a real. A `sql_variant` isn't checked, and
+  isn't used as a key. The database fills in an identity or serial left
+  empty in a new row. On SQL Server, rows affected are the statement's own
+  also with `SET NOCOUNT ON` or a trigger that changes other rows.
+
 ### Changed
 - On SQL Server, ASCII text for a `varchar` or `char` column is written
-  as `'…'` instead of `N'…'` in INSERT exports. Compared with `N'…'`,
-  SQL Server converts the column, and under a SQL collation (the default
-  on US English servers) a key lookup then scans the index instead of
-  seeking. Other text keeps the `N`.
+  as `'…'` instead of `N'…'`, in INSERT exports and when results are
+  edited. Compared with `N'…'`, SQL Server converts the column, and
+  under a SQL collation (the default on US English servers) a key lookup
+  then scans the index instead of seeking. Other text keeps the `N`.
 - The misestimate note of an SQL plan says what it means (#177). "⚠
   Estimate off at 35 INDEX UNIQUE SCAN …: estimated 318 rows (1 per start
   × 318 starts), got 0 (318× fewer)" now reads "⚠ Row estimate off at

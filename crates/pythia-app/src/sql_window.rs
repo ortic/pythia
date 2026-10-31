@@ -136,8 +136,8 @@ pub struct PendingStatement {
 /// Statements Pythia generates for data editing.
 #[derive(Debug, Clone)]
 pub enum Internal {
-    /// Looking up the key of `table` (MySQL) before the query that makes
-    /// result `replaces` editable.
+    /// Looking up the key of `table` (all but Oracle) before the query that
+    /// makes result `replaces` editable.
     EditKey {
         table: String,
         source: String,
@@ -890,7 +890,7 @@ impl SqlWindow {
     }
 
     /// Re-runs result `index` with what identifies its rows (ROWIDs on
-    /// Oracle, the table's key on MySQL) so it can be edited in place.
+    /// Oracle, the table's key elsewhere) so it can be edited in place.
     pub fn start_editing(&mut self, index: usize, cx: &DocContext) -> Effects {
         if cx.read_only {
             self.info(READ_ONLY_EDIT);
@@ -914,7 +914,7 @@ impl SqlWindow {
                 source,
                 key: crate::data_edit::RowKey::Rowid,
             };
-            self.queue_edit_query(edit, Some(replaces));
+            self.queue_edit_query(edit, Some(replaces), cx);
         } else {
             self.state.queue.push_back(PendingStatement {
                 origin: None,
@@ -931,8 +931,13 @@ impl SqlWindow {
         self.run_next(cx)
     }
 
-    fn queue_edit_query(&mut self, edit: crate::data_edit::Editable, replaces: Option<u64>) {
-        let Some(sql) = crate::data_edit::edit_query(&edit) else {
+    fn queue_edit_query(
+        &mut self,
+        edit: crate::data_edit::Editable,
+        replaces: Option<u64>,
+        cx: &DocContext,
+    ) {
+        let Some(sql) = crate::data_edit::edit_query(cx.dialect, &edit) else {
             self.warn("Only results of a single-table query can be edited");
             return;
         };
@@ -984,7 +989,7 @@ impl SqlWindow {
                 }),
             });
         }
-        self.queue_edit_query(edit, replaces);
+        self.queue_edit_query(edit, replaces, cx);
         self.run_next(cx)
     }
 
@@ -1455,7 +1460,7 @@ impl SqlWindow {
                             source,
                             key: crate::data_edit::RowKey::Columns(key),
                         };
-                        self.queue_edit_query(edit, Some(replaces));
+                        self.queue_edit_query(edit, Some(replaces), cx);
                         effects.extend(self.run_next(cx));
                     }
                     Err(e) => {

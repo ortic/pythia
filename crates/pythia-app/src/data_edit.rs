@@ -3,10 +3,11 @@
 //!
 //! On Oracle, rows are identified by ROWID, fetched by wrapping the user's
 //! query: `select q.*, q.rowid as pythia$rowid from (<query>) q` — Oracle
-//! itself rejects shapes that aren't key-preserved (ORA-01446). MySQL has no
-//! ROWID: there the table's primary key (or a unique key on NOT NULL
-//! columns) identifies a row, its columns added to the select list as
-//! `pythia$<column>`. Nothing is locked while editing; instead every
+//! itself rejects shapes that aren't key-preserved (ORA-01446). MySQL,
+//! PostgreSQL and SQL Server have no ROWID that lasts (PostgreSQL's `ctid`
+//! moves with every update): there the table's primary key (or a unique key
+//! on NOT NULL columns) identifies a row, its columns added to the select
+//! list as `pythia$<column>`. Nothing is locked while editing; instead every
 //! UPDATE/DELETE re-checks the values that were fetched (optimistic
 //! concurrency), so a row changed by another session is reported as a
 //! conflict rather than silently overwritten.
@@ -82,12 +83,11 @@ pub fn editable_query(sql: &str) -> String {
     )
 }
 
-/// Adds the key columns to a query's select list (MySQL), as
-/// `pythia$<column>`. `None` unless [`can_edit`].
-pub fn keyed_query(sql: &str, key: &[String]) -> Option<String> {
+/// Adds the key columns to a query's select list, as `pythia$<column>`
+/// quoted the way of `dialect`. `None` unless [`can_edit`].
+pub fn keyed_query(dialect: Dialect, sql: &str, key: &[String]) -> Option<String> {
     let sql = sql.trim().trim_end_matches(';');
     let query = parse(sql).filter(|q| !q.grouped)?;
-    let dialect = Dialect::MYSQL;
     let columns: Vec<String> = key
         .iter()
         .map(|k| {
@@ -106,11 +106,12 @@ pub fn keyed_query(sql: &str, key: &[String]) -> Option<String> {
     ))
 }
 
-/// The query fetching the rows of `edit` with what identifies them.
-pub fn edit_query(edit: &Editable) -> Option<String> {
+/// The query fetching the rows of `edit` with what identifies them, in
+/// `dialect`'s SQL.
+pub fn edit_query(dialect: Dialect, edit: &Editable) -> Option<String> {
     match &edit.key {
         RowKey::Rowid => Some(editable_query(&edit.source)),
-        RowKey::Columns(key) => keyed_query(&edit.source, key),
+        RowKey::Columns(key) => keyed_query(dialect, &edit.source, key),
     }
 }
 
@@ -125,8 +126,66 @@ struct Query {
     grouped: bool,
 }
 
+/// `sql` with its quoted names the way the lexer reads them, each where it
+/// is in `sql` so that spans still hold: SQL Server's `[name]` as
+/// `"name"`, and a doubled `""` inside a name as `__` (the lexer ends a
+/// name at the next `"`). A quote or line break inside brackets becomes
+/// `_` too.
+fn quoted_names(sql: &str) -> std::borrow::Cow<'_, str> {
+    if !sql.contains(['[', '"']) {
+        return sql.into();
+    }
+    let mut bytes = sql.as_bytes().to_vec();
+    // Where what starts at `i` closes with `close` (doubled, it stands for
+    // itself).
+    let end = |bytes: &[u8], i: usize, close: &[u8], doubled: bool| {
+        let mut j = i;
+        while j < bytes.len() {
+            if bytes[j..].starts_with(close) {
+                if doubled && bytes.get(j + 1) == Some(&close[0]) {
+                    j += 2;
+                    continue;
+                }
+                return Some(j);
+            }
+            j += 1;
+        }
+        None
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let next = match bytes[i] {
+            b'\'' => end(&bytes, i + 1, b"'", true),
+            b'`' => end(&bytes, i + 1, b"`", true),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => end(&bytes, i, b"\n", false),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => end(&bytes, i + 2, b"*/", false),
+            open @ (b'"' | b'[') => {
+                let close = if open == b'[' { b"]" } else { b"\"" };
+                let found = end(&bytes, i + 1, close, true);
+                if let Some(end) = found {
+                    for b in &mut bytes[i + 1..end] {
+                        if matches!(*b, b'"' | b'\n') {
+                            *b = b'_';
+                        }
+                    }
+                    bytes[i] = b'"';
+                    bytes[end] = b'"';
+                }
+                found
+            }
+            _ => Some(i),
+        };
+        let Some(next) = next else { break };
+        i = next + 1;
+    }
+    String::from_utf8(bytes)
+        .expect("ASCII replaced by ASCII")
+        .into()
+}
+
 fn parse(sql: &str) -> Option<Query> {
-    let tokens: Vec<_> = tokenize(sql)
+    let lexed = quoted_names(sql);
+    let tokens: Vec<_> = tokenize(&lexed)
         .into_iter()
         .filter(|t| !t.kind.is_trivia())
         .collect();
@@ -180,12 +239,25 @@ fn parse(sql: &str) -> Option<Query> {
     if !ident(i) {
         return None;
     }
-    let (table, mut next) =
-        if tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Dot) && ident(i + 2) {
-            (format!("{}.{}", text(i), text(i + 2)), i + 3)
-        } else {
-            (text(i).to_owned(), i + 1)
+    // `table`, `schema.table` or `database.schema.table`, also SQL
+    // Server's `database..table` (the default schema). A name of four
+    // parts (a linked server) isn't one to edit.
+    let mut table = text(i).to_owned();
+    let mut parts = 1;
+    let mut next = i + 1;
+    loop {
+        let separator = match kind(next) {
+            Some(TokenKind::Dot) => ".",
+            Some(TokenKind::Operator) if text(next) == ".." => "..",
+            _ => break,
         };
+        parts += separator.len();
+        if !ident(next + 1) || parts > 3 {
+            return None;
+        }
+        table = format!("{table}{separator}{}", text(next + 1));
+        next += 2;
+    }
     // Optional alias.
     if ident(next) {
         next += 1;
@@ -238,10 +310,45 @@ pub fn can_edit(sql: &str) -> bool {
     parse(sql).is_some_and(|q| !q.grouped)
 }
 
-/// The columns that identify a row of `table` (as written in a query, on
-/// MySQL): its primary key, or else a unique key on NOT NULL columns.
-/// Empty if it has neither (or isn't a table).
+/// The columns that identify a row of `table` (as written in a query):
+/// its primary key, or else a unique key on NOT NULL columns. Empty if it
+/// has neither, or isn't a table (a view's indexes don't count).
 pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbError> {
+    let keys = match client.dialect().kind() {
+        // Rows are found by ROWID.
+        DbKind::Oracle => Vec::new(),
+        DbKind::MySql => mysql_keys(client, table)?,
+        DbKind::Postgres => postgres_keys(client, table)?,
+        DbKind::SqlServer => sqlserver_keys(client, table)?,
+    };
+    Ok(keys
+        .into_iter()
+        .find_map(|(_, columns)| columns.into_iter().collect::<Option<Vec<_>>>())
+        .unwrap_or_default())
+}
+
+/// A table's unique keys, the one to prefer first, each with its columns
+/// in key order. A part that can't find a row is `None`: an expression, a
+/// nullable column, or one that can't be compared.
+type Keys = Vec<(String, Vec<Option<String>>)>;
+
+/// Keys from (index, column) pairs in key order.
+fn keys(parts: impl IntoIterator<Item = (String, Option<String>)>) -> Keys {
+    let mut keys: Keys = Vec::new();
+    for (index, column) in parts {
+        match keys.last_mut() {
+            Some((name, columns)) if *name == index => columns.push(column),
+            _ => keys.push((index, vec![column])),
+        }
+    }
+    keys
+}
+
+fn value(row: &[Cell], i: usize) -> Option<String> {
+    row.get(i).cloned().flatten()
+}
+
+fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
     let names = unquote(table);
     let (schema, name) = match names.as_slice() {
         [schema, name] => (Some(schema.as_str()), name.as_str()),
@@ -265,39 +372,105 @@ pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbEr
                    s.index_name, s.seq_in_index"
     );
     let rows = client.query(&sql, &params)?;
-    let value = |row: &Vec<Cell>, i: usize| row.get(i).cloned().flatten();
     let Some(table) = rows.first().and_then(|r| value(r, 0)) else {
         return Ok(Vec::new());
     };
-    let mut indexes: Vec<(String, Vec<Option<String>>)> = Vec::new();
-    for row in rows.iter().filter(|r| value(r, 0).as_ref() == Some(&table)) {
-        let index = value(row, 1).unwrap_or_default();
-        // Functional key parts have no column; nullable ones don't
-        // identify a row.
-        let column = value(row, 2).filter(|_| value(row, 3).as_deref() != Some("YES"));
-        match indexes.last_mut() {
-            Some((name, columns)) if *name == index => columns.push(column),
-            _ => indexes.push((index, vec![column])),
-        }
-    }
-    Ok(indexes
-        .into_iter()
-        .find_map(|(_, columns)| columns.into_iter().collect::<Option<Vec<_>>>())
-        .unwrap_or_default())
+    Ok(keys(
+        rows.iter()
+            .filter(|r| value(r, 0).as_ref() == Some(&table))
+            .map(|row| {
+                // Functional key parts have no column; nullable ones don't
+                // identify a row.
+                let column = value(row, 2).filter(|_| value(row, 3).as_deref() != Some("YES"));
+                (value(row, 1).unwrap_or_default(), column)
+            }),
+    ))
 }
 
-/// The names in `schema.table` (or `table`) without their quotes.
+/// PostgreSQL: `to_regclass` finds the table the way the query did, by
+/// the search path, quotes and folding unquoted names to lowercase. Only
+/// tables (partitioned too) count, and unique indexes that are valid and
+/// cover every row (not partial); INCLUDE columns aren't part of the key.
+fn postgres_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
+    let rows = client.query(
+        "select c.relname, a.attname, a.attnotnull \
+           from pg_index i \
+           join pg_class t on t.oid = i.indrelid \
+           join pg_class c on c.oid = i.indexrelid \
+          cross join lateral unnest(i.indkey) with ordinality as k(attnum, n) \
+           left join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum \
+          where i.indrelid = to_regclass($1) \
+            and t.relkind in ('r', 'p') \
+            and i.indisunique and i.indisvalid and i.indpred is null \
+            and k.n <= i.indnkeyatts \
+          order by i.indisprimary desc, c.relname, k.n",
+        &[table],
+    )?;
+    Ok(keys(rows.iter().map(|row| {
+        // An expression has no column (attnum 0).
+        let column = value(row, 1).filter(|_| value(row, 2).as_deref() == Some("t"));
+        (value(row, 0).unwrap_or_default(), column)
+    })))
+}
+
+/// SQL Server: `object_id` finds the table the way the query did, by the
+/// default schema and the database's collation; in another database
+/// (`db.schema.table`) its catalog has the indexes. Only tables count (an
+/// indexed view's unique index doesn't), and unique indexes that are
+/// enabled and not filtered. A `sql_variant` key can't be compared with
+/// what was fetched: a value is compared as its base type's.
+fn sqlserver_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
+    let catalog = match unquote(table).as_slice() {
+        [database, _, _] => format!("{}.", Dialect::SQLSERVER.quote_ident(database)),
+        _ => String::new(),
+    };
+    let sql = format!(
+        "select i.name, c.name, c.is_nullable, c.system_type_id \
+           from {catalog}sys.indexes i \
+           join {catalog}sys.objects o on o.object_id = i.object_id \
+           join {catalog}sys.index_columns ic \
+             on ic.object_id = i.object_id and ic.index_id = i.index_id \
+           join {catalog}sys.columns c \
+             on c.object_id = ic.object_id and c.column_id = ic.column_id \
+          where i.object_id = object_id(@P1) \
+            and o.type = 'U' \
+            and i.is_unique = 1 and i.has_filter = 0 \
+            and i.is_disabled = 0 and i.is_hypothetical = 0 \
+            and ic.key_ordinal > 0 \
+          order by i.is_primary_key desc, i.name, ic.key_ordinal"
+    );
+    const SQL_VARIANT: &str = "98";
+    let rows = client.query(&sql, &[table])?;
+    Ok(keys(rows.iter().map(|row| {
+        let column = value(row, 1).filter(|_| {
+            value(row, 2).as_deref() == Some("0") && value(row, 3).as_deref() != Some(SQL_VARIANT)
+        });
+        (value(row, 0).unwrap_or_default(), column)
+    })))
+}
+
+/// The names in `table`, `schema.table` or `database.schema.table`
+/// without their quotes (`"…"`, `` `…` `` or `[…]`). SQL Server's
+/// `database..table` has an empty schema.
 fn unquote(name: &str) -> Vec<String> {
-    tokenize(name)
+    let lexed = quoted_names(name);
+    // Inside the quotes, a doubled closing quote stands for one.
+    let inner = |text: &str| {
+        let close = match text.chars().next()? {
+            '[' => ']',
+            quote => quote,
+        };
+        let body = text[1..].strip_suffix(close).unwrap_or(&text[1..]);
+        Some(body.replace(&format!("{close}{close}"), &close.to_string()))
+    };
+    tokenize(&lexed)
         .into_iter()
         .filter_map(|t| {
             let text = &name[t.span];
             match t.kind {
-                TokenKind::QuotedIdent if text.starts_with('`') => {
-                    Some(text.trim_matches('`').replace("``", "`"))
-                }
-                TokenKind::QuotedIdent => Some(text.trim_matches('"').replace("\"\"", "\"")),
+                TokenKind::QuotedIdent => inner(text),
                 TokenKind::Ident | TokenKind::Keyword => Some(text.to_owned()),
+                TokenKind::Operator if text == ".." => Some(String::new()),
                 _ => None,
             }
         })
@@ -313,24 +486,93 @@ pub struct Dml {
     pub what: String,
 }
 
-/// SQL that holds while column `name` (of type `col`) still has `value`.
-fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> String {
+/// PostgreSQL types compared with `=`: their text reads back as the value
+/// shown. Others compare as text (see [`same`]).
+const POSTGRES_EQUAL: &[&str] = &[
+    "smallint",
+    "integer",
+    "bigint",
+    "numeric",
+    "oid",
+    "money",
+    "boolean",
+    "text",
+    "character varying",
+    "character",
+    "name",
+    "char",
+    "bytea",
+    "date",
+    "time",
+    "time with time zone",
+    "timestamp",
+    "timestamp with time zone",
+    "interval",
+    "uuid",
+    "inet",
+    "cidr",
+    "macaddr",
+    "macaddr8",
+    "bit",
+    "varbit",
+    "jsonb",
+];
+
+/// SQL that holds while column `name` (of type `col`) still has `value`;
+/// `None` if the column can't be compared with what was fetched.
+fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Option<String> {
     let name = dialect.quote_ident(name);
     let lit = literal(dialect, col, value);
     if dialect.kind() == DbKind::Oracle {
         // DECODE treats NULL = NULL.
-        return format!("decode({name}, {lit}, 1, 0) = 1");
+        return Some(format!("decode({name}, {lit}, 1, 0) = 1"));
     }
-    match value {
-        None => format!("{name} is null"),
+    let Some(v) = value else {
+        return Some(format!("{name} is null"));
+    };
+    let text = |type_name: &str| {
+        let col = Column {
+            name: String::new(),
+            type_name: type_name.into(),
+            numeric: false,
+        };
+        literal(dialect, &col, Some(v))
+    };
+    Some(match (dialect.kind(), col.type_name.as_str()) {
         // FLOAT is shown with six significant digits, rounded.
-        Some(v) if col.type_name == "FLOAT" && v.parse::<f64>().is_ok_and(f64::is_finite) => {
+        (DbKind::MySql, "FLOAT") if v.parse::<f64>().is_ok_and(f64::is_finite) => {
             format!("abs({name} - {v}) <= abs({v}) * 0.00001")
         }
         // A string compares with JSON as a JSON string.
-        Some(_) if col.type_name == "JSON" => format!("{name} = cast({lit} as json)"),
-        Some(_) => format!("{name} = {lit}"),
-    }
+        (DbKind::MySql, "JSON") => format!("{name} = cast({lit} as json)"),
+        (DbKind::Postgres, t) if POSTGRES_EQUAL.contains(&t) => format!("{name} = {lit}"),
+        // The others compare as the text that was shown: json, xml and
+        // points have no `=`, a real compared with a number is widened to
+        // double precision (where 0.1 isn't 0.1), arrays compare their
+        // elements so, and the text also holds for floats shown rounded
+        // (extra_float_digits below 1).
+        (DbKind::Postgres, _) => format!("{name}::text = {}", text("text")),
+        // A value compares as its base type's: as text, a date isn't one.
+        (DbKind::SqlServer, "sql_variant") => return None,
+        // text, ntext and xml can't be compared, their nvarchar(max) can.
+        (DbKind::SqlServer, "text" | "ntext" | "xml") => {
+            format!("cast({name} as nvarchar(max)) = {}", text("nvarchar"))
+        }
+        // The bytes, also those of CLR types (geometry, hierarchyid).
+        (DbKind::SqlServer, "image" | "udt") => {
+            let hex = v
+                .strip_prefix("0x")
+                .is_some_and(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
+            if !hex {
+                return None;
+            }
+            format!("cast({name} as varbinary(max)) = {v}")
+        }
+        // 0.1 is a decimal, which a real takes as the real 0.1; as a float
+        // (1E-1) the real would be widened instead.
+        (DbKind::SqlServer, "real") => format!("{name} = cast({lit} as real)"),
+        _ => format!("{name} = {lit}"),
+    })
 }
 
 /// Generates the DML for `changes` to the rows of `edit`, in `dialect`'s
@@ -345,9 +587,9 @@ pub fn dml(
     let mut out = Vec::new();
     let table = &edit.table;
     let key_start = columns.len().saturating_sub(edit.key.width());
-    let value = |row: &[Cell], c: usize| row.get(c).cloned().flatten();
     let editable = |c: usize| c < key_start;
-    // Where the row is the one fetched; `None` without its key.
+    // Where the row is the one fetched; `None` without its key (the key
+    // [`row_key`] picks can always be compared).
     let row_is = |row: &[Cell]| match &edit.key {
         RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
         RowKey::Columns(key) => {
@@ -356,7 +598,7 @@ pub fn dml(
                 .enumerate()
                 .map(|(i, name)| {
                     let v = value(row, key_start + i)?;
-                    Some(same(dialect, name, &columns[key_start + i], Some(&v)))
+                    same(dialect, name, &columns[key_start + i], Some(&v))
                 })
                 .collect();
             checks.map(|c| c.join(" and "))
@@ -396,9 +638,9 @@ pub fn dml(
                 )
             })
             .collect();
-        let checks: Vec<String> = cells
-            .iter()
-            .map(|(c, _)| {
+        // A column that can't be compared is left out of the check.
+        let checks: Vec<String> = std::iter::once(found)
+            .chain(cells.iter().filter_map(|(c, _)| {
                 let col = &columns[**c];
                 same(
                     dialect,
@@ -406,11 +648,11 @@ pub fn dml(
                     col,
                     row.get(**c).and_then(|v| v.as_deref()),
                 )
-            })
+            }))
             .collect();
         out.push(Dml {
             sql: format!(
-                "update {table} set {} where {found} and {}",
+                "update {table} set {} where {}",
                 sets.join(", "),
                 checks.join(" and ")
             ),
@@ -450,6 +692,9 @@ pub fn dml(
 }
 
 #[cfg(test)]
+mod live;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -478,8 +723,41 @@ mod tests {
             None
         );
         assert_eq!(single_table("select * from emp, dept"), None);
+        // A doubled quote is part of the name, not the start of an alias.
+        assert_eq!(
+            single_table("select * from s.\"a\"\"b\" x"),
+            Some("s.\"a\"\"b\"".into())
+        );
         assert_eq!(single_table("select * from emp straight_join dept"), None);
         assert_eq!(single_table("update emp set x = 1"), None);
+    }
+
+    /// SQL Server's bracketed names, and names of a table in another
+    /// database.
+    #[test]
+    fn single_tables_on_sql_server() {
+        assert_eq!(
+            single_table("select [order], t.[x y] from [dbo].[a]]b] t where n = ']'"),
+            Some("[dbo].[a]]b]".into())
+        );
+        assert_eq!(
+            single_table("select top 10 * from shop.dbo.orders with (nolock)"),
+            Some("shop.dbo.orders".into())
+        );
+        assert_eq!(
+            single_table("select * from shop..orders"),
+            Some("shop..orders".into())
+        );
+        assert_eq!(
+            single_table("select * from [it's \"odd\"] -- [x]"),
+            Some("[it's \"odd\"]".into())
+        );
+        // A linked server's table, a name cut short.
+        assert_eq!(single_table("select * from srv.shop.dbo.orders"), None);
+        assert_eq!(single_table("select * from dbo."), None);
+        // PostgreSQL's arrays aren't names.
+        assert_eq!(single_table("select a[1], b[2:3] from t"), Some("t".into()));
+        assert!(can_edit("select a[1] from t"));
     }
 
     #[test]
@@ -510,11 +788,17 @@ mod tests {
     fn keyed_queries() {
         let key = |k: &[&str]| k.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            keyed_query("select * from emp where x = 1;", &key(&["id"])).as_deref(),
+            keyed_query(
+                Dialect::MYSQL,
+                "select * from emp where x = 1;",
+                &key(&["id"])
+            )
+            .as_deref(),
             Some("select *, id as pythia$id from emp where x = 1")
         );
         assert_eq!(
             keyed_query(
+                Dialect::MYSQL,
                 "select e.name -- the name\n  from `order` e",
                 &key(&["order id", "line"])
             )
@@ -524,7 +808,29 @@ mod tests {
                  -- the name\n  from `order` e"
             )
         );
-        assert_eq!(keyed_query("select count(*) from emp", &key(&["id"])), None);
+        assert_eq!(
+            keyed_query(Dialect::MYSQL, "select count(*) from emp", &key(&["id"])),
+            None
+        );
+        // Each database quotes its own way.
+        assert_eq!(
+            keyed_query(
+                Dialect::POSTGRES,
+                "select * from \"Order\" o",
+                &key(&["Id", "line"])
+            )
+            .as_deref(),
+            Some("select *, \"Id\" as \"pythia$Id\", line as pythia$line from \"Order\" o")
+        );
+        assert_eq!(
+            keyed_query(
+                Dialect::SQLSERVER,
+                "select top 5 name from [dbo].[Order Lines]",
+                &key(&["order id"])
+            )
+            .as_deref(),
+            Some("select top 5 name, [order id] as [pythia$order id] from [dbo].[Order Lines]")
+        );
     }
 
     #[test]
@@ -532,6 +838,11 @@ mod tests {
         assert_eq!(unquote("emp"), ["emp"]);
         assert_eq!(unquote("`my db`.`a``b`"), ["my db", "a`b"]);
         assert_eq!(unquote("\"Mixed\".x"), ["Mixed", "x"]);
+        assert_eq!(unquote("\"a\"\"b\""), ["a\"b"]);
+        assert_eq!(unquote("[dbo].[a]]b]"), ["dbo", "a]b"]);
+        assert_eq!(unquote("[it's \"x\"]"), ["it's \"x\""]);
+        assert_eq!(unquote("shop..orders"), ["shop", "", "orders"]);
+        assert_eq!(unquote("shop.[dbo].orders"), ["shop", "dbo", "orders"]);
     }
 
     fn col(n: &str, t: &str, numeric: bool) -> Column {
@@ -641,6 +952,163 @@ mod tests {
         assert_eq!(
             dml(Dialect::MYSQL, &edit, &columns, &rows, &deletes)[0].sql,
             "delete from `order` where id = 2 and line = 1"
+        );
+    }
+
+    /// Changes in `dialect`'s SQL: the new value of every editable column
+    /// but the first and a delete, for a row whose columns are `row`.
+    fn dml_for(
+        dialect: Dialect,
+        columns: &[Column],
+        row: Vec<Cell>,
+        values: &[&str],
+    ) -> Vec<String> {
+        let edit = Editable {
+            table: "t".into(),
+            source: "select * from t".into(),
+            key: RowKey::Columns(vec!["id".into()]),
+        };
+        let updates = values
+            .iter()
+            .enumerate()
+            .map(|(c, v)| (c + 1, Some((*v).to_owned())))
+            .collect();
+        let changes = Changes {
+            updates: BTreeMap::from([(0, updates)]),
+            ..Changes::default()
+        };
+        let rows = vec![row];
+        let mut sql: Vec<String> = dml(dialect, &edit, columns, &rows, &changes)
+            .into_iter()
+            .map(|d| d.sql)
+            .collect();
+        let deletes = Changes {
+            deletes: [0].into(),
+            ..Changes::default()
+        };
+        sql.extend(
+            dml(dialect, &edit, columns, &rows, &deletes)
+                .into_iter()
+                .map(|d| d.sql),
+        );
+        sql
+    }
+
+    #[test]
+    fn generates_postgres_dml() {
+        let columns = vec![
+            col("id", "integer", true),
+            col("Note", "text", false),
+            col("r", "real", true),
+            col("doc", "json", false),
+            col("x", "xml", false),
+            col("tags", "text[]", false),
+            col("ok", "boolean", false),
+            col("at", "timestamp with time zone", false),
+            col("pythia$id", "integer", true),
+        ];
+        let row = [
+            "7",
+            r"C:\temp",
+            "0.1",
+            r#"{"a": 1}"#,
+            "<a/>",
+            "{x,y}",
+            "t",
+            "2026-01-02 03:04:05.123456+01",
+            "7",
+        ]
+        .map(|v| Some(v.to_owned()))
+        .to_vec();
+        let sql = dml_for(
+            Dialect::POSTGRES,
+            &columns,
+            row,
+            &[
+                "it's",
+                "2.5",
+                "[]",
+                "<b/>",
+                "{z}",
+                "f",
+                "2026-01-03 00:00:00+01",
+            ],
+        );
+        assert_eq!(
+            sql,
+            [
+                "update t set \"Note\" = 'it''s', r = 2.5, doc = '[]', x = '<b/>', tags = '{z}', \
+                 ok = 'f', at = '2026-01-03 00:00:00+01' where id = 7 \
+                 and \"Note\" = E'C:\\\\temp' and r::text = '0.1' \
+                 and doc::text = '{\"a\": 1}' and x::text = '<a/>' and tags::text = '{x,y}' \
+                 and ok = 't' and at = '2026-01-02 03:04:05.123456+01'",
+                "delete from t where id = 7",
+            ]
+        );
+    }
+
+    #[test]
+    fn generates_sqlserver_dml() {
+        let columns = vec![
+            col("id", "int", true),
+            col("name", "nvarchar", false),
+            col("code", "varchar", false),
+            col("r", "real", true),
+            col("f", "float", true),
+            col("memo", "ntext", false),
+            col("x", "xml", false),
+            col("v", "sql_variant", false),
+            col("img", "image", false),
+            col("shape", "udt", false),
+            col("at", "datetime", false),
+            col("pythia$id", "int", true),
+        ];
+        let row = [
+            "7",
+            "grüße",
+            "A-1",
+            "0.1",
+            "1e300",
+            "memo",
+            "<a/>",
+            "5",
+            "0x00FF",
+            "0x0101",
+            "2026-01-02 03:04:05.003",
+            "7",
+        ]
+        .map(|v| Some(v.to_owned()))
+        .to_vec();
+        let sql = dml_for(
+            Dialect::SQLSERVER,
+            &columns,
+            row,
+            &[
+                "née",
+                "B-2",
+                "2.5",
+                "3",
+                "new",
+                "<b/>",
+                "6",
+                "0x01",
+                "0x02",
+                "2026-01-03 00:00:00.000",
+            ],
+        );
+        assert_eq!(
+            sql,
+            [
+                "update t set name = N'née', code = 'B-2', r = 2.5, f = 3, memo = N'new', \
+                 x = N'<b/>', v = N'6', img = 0x01, shape = 0x02, at = '2026-01-03T00:00:00.000' \
+                 where id = 7 and name = N'grüße' and code = 'A-1' and r = cast(0.1 as real) \
+                 and f = 1e300 and cast(memo as nvarchar(max)) = N'memo' \
+                 and cast(x as nvarchar(max)) = N'<a/>' \
+                 and cast(img as varbinary(max)) = 0x00FF \
+                 and cast(shape as varbinary(max)) = 0x0101 \
+                 and at = '2026-01-02T03:04:05.003'",
+                "delete from t where id = 7",
+            ]
         );
     }
 }
