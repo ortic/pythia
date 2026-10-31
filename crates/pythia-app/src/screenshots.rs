@@ -5845,9 +5845,17 @@ fn sessions(h: &mut Harness<'_, PythiaApp>, tag: &str) {
     use crate::commands::Command;
     h.state_mut().test_command(Command::MonitorSessions);
     // The header counts sessions before the list is in: wait for the
-    // table (#137).
+    // table (#137). Until the tab is drawn, the dashboard's running and
+    // top statements, there when other sessions are busy, have a
+    // Statement column too.
     let start = Instant::now();
-    while h.query_by_label("Statement").is_none() {
+    loop {
+        h.step();
+        if h.state().test_focused_title().as_deref() == Some("Sessions")
+            && h.query_all_by_label("Statement").next().is_some()
+        {
+            break;
+        }
         assert!(
             h.query_by_label_contains("Sessions are not available")
                 .is_none(),
@@ -5857,7 +5865,6 @@ fn sessions(h: &mut Harness<'_, PythiaApp>, tag: &str) {
             start.elapsed() < Duration::from_secs(60),
             "timed out waiting for the sessions"
         );
-        h.step();
         std::thread::sleep(Duration::from_millis(15));
     }
     h.run_steps(3);
