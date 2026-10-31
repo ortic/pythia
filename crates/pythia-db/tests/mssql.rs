@@ -357,6 +357,46 @@ fn transactions_and_autocommit() {
     h.ok("drop table tx_t");
 }
 
+/// Rows affected are the statement's own, as `@@ROWCOUNT` has them: also
+/// with `SET NOCOUNT ON`, which leaves out the counts the driver would
+/// read, and with a trigger that changes rows of its own. Editing a result
+/// relies on it to tell a conflict.
+#[test]
+fn updates_count_their_own_rows() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists count_t, count_log");
+    h.ok("create table count_t (id int primary key, x int)");
+    h.ok("create table count_log (n int)");
+    h.ok(
+        "create trigger count_tr on count_t after update, delete as \
+         begin set nocount on; update count_log set n = n + 1; end",
+    );
+    h.ok("insert into count_t values (1, 10), (2, 20)");
+    h.ok("insert into count_log values (1), (2), (3)");
+    let affected = |h: &mut Harness, sql: &str| {
+        let DbEvent::Executed { summary, .. } = h.run(1, sql) else {
+            panic!("{sql}: expected Executed")
+        };
+        h.settle();
+        summary.rows_affected
+    };
+    // In the transaction a change opens, as editing runs.
+    let matched = affected(&mut h, "update count_t set x = x where id = 1");
+    assert_eq!(matched, Some(1));
+    let none = affected(&mut h, "update count_t set x = 5 where id = 3");
+    assert_eq!(none, Some(0));
+    h.ok("set nocount on");
+    assert_eq!(affected(&mut h, "update count_t set x = x"), Some(2));
+    let deleted = affected(&mut h, "delete from count_t where id = 2");
+    assert_eq!(deleted, Some(1));
+    h.ok("set nocount off");
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    h.ok("drop table count_t, count_log");
+}
+
 /// Like Oracle's: a query neither keeps a transaction open nor holds locks.
 #[test]
 fn queries_see_commits_and_lock_nothing() {

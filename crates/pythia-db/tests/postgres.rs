@@ -355,6 +355,46 @@ fn transactions_and_autocommit() {
     h.ok("drop table tx_t");
 }
 
+/// Rows affected are the rows the statement matched, also when it sets a
+/// value a row already has, and not those a trigger changes; inside a
+/// transaction (after the statement's savepoint) too. Editing a result
+/// relies on it to tell a conflict.
+#[test]
+fn updates_count_their_own_rows() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists count_t, count_log");
+    h.ok("create table count_t (id int primary key, x int)");
+    h.ok("create table count_log (n int)");
+    h.ok(
+        "create function count_f() returns trigger language plpgsql as \
+         $$ begin update count_log set n = n + 1; return null; end $$",
+    );
+    h.ok("create trigger count_tr after update on count_t for each row execute function count_f()");
+    h.ok("insert into count_t values (1, 10), (2, 20)");
+    h.ok("insert into count_log values (1), (2), (3)");
+    let affected = |h: &mut Harness, sql: &str| {
+        let DbEvent::Executed { summary, .. } = h.run(1, sql) else {
+            panic!("{sql}: expected Executed")
+        };
+        h.settle();
+        summary.rows_affected
+    };
+    let matched = affected(&mut h, "update count_t set x = x where id = 1");
+    assert_eq!(matched, Some(1));
+    // Now in a transaction: the next ones run after a savepoint.
+    let none = affected(&mut h, "update count_t set x = 5 where id = 3");
+    assert_eq!(none, Some(0));
+    assert_eq!(affected(&mut h, "update count_t set x = x"), Some(2));
+    let deleted = affected(&mut h, "delete from count_t where id = 2");
+    assert_eq!(deleted, Some(1));
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    h.ok("drop table count_t, count_log");
+    h.ok("drop function count_f");
+}
+
 /// Like Oracle's: a query neither keeps a transaction open nor holds locks.
 #[test]
 fn queries_see_commits_and_lock_nothing() {

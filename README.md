@@ -307,8 +307,14 @@ for Linux, Windows and macOS.
   role memberships and permissions granted, grantable or denied.
   Transactions work as with
   Oracle; on PostgreSQL a failing statement doesn't abort the transaction,
-  and notices (`RAISE NOTICE`) show as messages. Results can't be edited
-  in place yet.
+  and notices (`RAISE NOTICE`) show as messages.
+- *Edit* on a result of one table changes its rows in place, as on
+  MySQL: rows are found by the table's primary key (or a unique key on
+  NOT NULL columns), which Pythia adds to the result if the query doesn't
+  select it; views and tables without such a key stay read-only. Applying
+  checks the values as they were shown, also json, xml, arrays and
+  floats on PostgreSQL and `text`, `xml` and CLR types (`geometry`,
+  `hierarchyid`) on SQL Server; a `sql_variant` isn't checked.
 - PostgreSQL's monitoring dashboard (Monitor → Dashboard): findings first
   (who blocks whom, sessions idle in transaction, connections near the
   limit, cache hit ratio, deadlocks, replication lag and inactive slots,

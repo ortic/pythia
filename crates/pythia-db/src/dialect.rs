@@ -109,7 +109,6 @@ impl Dialect {
                     | Feature::AccountEditors
                     | Feature::ExecuteToFile
             ),
-            // Rows found by key: MySQL's way, not yet theirs (#101).
             DbKind::Postgres | DbKind::SqlServer => matches!(
                 feature,
                 Feature::ExplainPlan
@@ -117,6 +116,7 @@ impl Dialect {
                     | Feature::SshTunnel
                     | Feature::Dashboard
                     | Feature::Sessions
+                    | Feature::EditResults
                     | Feature::AccountEditors
                     | Feature::ExecuteToFile
             ),
@@ -341,10 +341,6 @@ mod tests {
         ] {
             assert!(Dialect::MYSQL.supports(feature));
         }
-        // Rows found by key: MySQL's way, not yet theirs (#101).
-        for dialect in [Dialect::POSTGRES, Dialect::SQLSERVER] {
-            assert!(!dialect.supports(Feature::EditResults));
-        }
         // Execute to file streams any database's result (the window fetches
         // it batch by batch).
         for dialect in [
@@ -362,8 +358,10 @@ mod tests {
             assert!(!dialect.supports(Feature::ServerOutput));
             assert!(!dialect.supports(Feature::Monitor));
         }
-        // A dashboard (#92), SSH tunnels (#97), sessions (#131).
+        // A dashboard (#92), SSH tunnels (#97), sessions (#131), results
+        // edited in place, rows found by key as on MySQL.
         for dialect in [Dialect::POSTGRES, Dialect::SQLSERVER] {
+            assert!(dialect.supports(Feature::EditResults));
             assert!(dialect.supports(Feature::Dashboard));
             assert!(dialect.supports(Feature::Sessions));
             assert!(dialect.supports(Feature::SshTunnel));
