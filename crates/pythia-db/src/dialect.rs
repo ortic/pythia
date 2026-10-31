@@ -107,6 +107,7 @@ impl Dialect {
                     | Feature::Sessions
                     | Feature::EditResults
                     | Feature::AccountEditors
+                    | Feature::ExecuteToFile
             ),
             // Rows found by key: MySQL's way, not yet theirs (#101).
             DbKind::Postgres | DbKind::SqlServer => matches!(
@@ -117,9 +118,13 @@ impl Dialect {
                     | Feature::Dashboard
                     | Feature::Sessions
                     | Feature::AccountEditors
+                    | Feature::ExecuteToFile
             ),
             // A file: no server to monitor, no accounts, nothing to tunnel.
-            DbKind::Sqlite => matches!(feature, Feature::ExplainPlan | Feature::Completion),
+            DbKind::Sqlite => matches!(
+                feature,
+                Feature::ExplainPlan | Feature::Completion | Feature::ExecuteToFile
+            ),
         }
     }
 
@@ -339,6 +344,17 @@ mod tests {
         // Rows found by key: MySQL's way, not yet theirs (#101).
         for dialect in [Dialect::POSTGRES, Dialect::SQLSERVER] {
             assert!(!dialect.supports(Feature::EditResults));
+        }
+        // Execute to file streams any database's result (the window fetches
+        // it batch by batch).
+        for dialect in [
+            Dialect::ORACLE,
+            Dialect::MYSQL,
+            Dialect::POSTGRES,
+            Dialect::SQLSERVER,
+            Dialect::SQLITE,
+        ] {
+            assert!(dialect.supports(Feature::ExecuteToFile));
         }
         for dialect in [Dialect::MYSQL, Dialect::POSTGRES, Dialect::SQLSERVER] {
             assert!(dialect.supports(Feature::ExplainPlan));

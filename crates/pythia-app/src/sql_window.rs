@@ -555,11 +555,40 @@ impl SqlWindow {
         self.state.to_file_pick = Some((crate::to_file::pick_file(), sql));
     }
 
-    /// Starts writing once the file was chosen; shows progress.
-    fn poll_to_file(&mut self, ui: &mut Ui) -> Effects {
+    /// Starts writing once the file was chosen; shows progress. Oracle's
+    /// rows are written by a task on the session; other databases' come as
+    /// results the window fetches batch by batch (see `export_event`).
+    fn poll_to_file(&mut self, ui: &mut Ui, dialect: pythia_db::Dialect) -> Effects {
         let mut effects = Effects::default();
         if let Some((rx, sql)) = &self.state.to_file_pick {
             match rx.try_recv() {
+                Ok(Some(path)) if dialect != pythia_db::Dialect::ORACLE => {
+                    let sql = sql.clone();
+                    self.state.to_file_pick = None;
+                    match crate::to_file::Sink::create(&path, &sql, dialect) {
+                        Ok(sink) => {
+                            let id = request_id();
+                            self.state.to_file = Some(crate::to_file::ToFile {
+                                id,
+                                path,
+                                sql: sql.clone(),
+                                rows: Default::default(),
+                                started: std::time::Instant::now(),
+                                sink: Some(sink),
+                            });
+                            effects.request(
+                                Target::Own,
+                                DbRequest::Execute {
+                                    id,
+                                    sql,
+                                    max_rows: crate::to_file::BATCH,
+                                    binds: Vec::new(),
+                                },
+                            );
+                        }
+                        Err(e) => self.export_failed(&e.text()),
+                    }
+                }
                 Ok(Some(path)) => {
                     let sql = sql.clone();
                     self.state.to_file_pick = None;
@@ -577,6 +606,7 @@ impl SqlWindow {
                         sql,
                         rows,
                         started: std::time::Instant::now(),
+                        sink: None,
                     });
                     effects.request(Target::Own, DbRequest::Task { id, task });
                 }
@@ -592,6 +622,80 @@ impl SqlWindow {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
         effects
+    }
+
+    fn export_failed(&mut self, error: &str) {
+        self.state.messages.push(Message {
+            level: Level::Error,
+            text: format!("Execute to file failed: {error}"),
+            jump: None,
+            stack: Vec::new(),
+        });
+        self.state.bottom = BottomTab::Messages;
+    }
+
+    /// Whether `id` is the query the window streams into a file.
+    fn streams_to_file(&self, id: u64) -> bool {
+        self.state
+            .to_file
+            .as_ref()
+            .is_some_and(|job| job.id == id && job.sink.is_some())
+    }
+
+    /// The events of the query streamed into a file: its columns are the
+    /// file's header, each batch of rows is written and the next fetched,
+    /// until the last. A failure (or Break) removes the file.
+    fn export_event(&mut self, event: DbEvent, effects: &mut Effects) {
+        let Some(job) = self.state.to_file.as_mut() else {
+            return;
+        };
+        let id = job.id;
+        let Some(sink) = job.sink.as_mut() else {
+            return;
+        };
+        let failed = match event {
+            DbEvent::QueryStarted { columns, .. } => sink.columns(&columns).err(),
+            DbEvent::Rows { rows, more, .. } => match sink.rows(&rows) {
+                Ok(written) => {
+                    job.rows
+                        .store(written, std::sync::atomic::Ordering::Relaxed);
+                    if more {
+                        effects.request(
+                            Target::Own,
+                            DbRequest::FetchMore {
+                                id,
+                                max_rows: crate::to_file::BATCH,
+                            },
+                        );
+                        return;
+                    }
+                    let job = self.state.to_file.take().expect("the running export");
+                    match job.sink.map(crate::to_file::Sink::finish) {
+                        Some(Err(e)) => self.export_failed(&e.text()),
+                        _ => {
+                            effects.executed.push(job.sql);
+                            self.info(format!(
+                                "{written} rows written to {} in {}",
+                                job.path.display(),
+                                fmt_duration(job.started.elapsed())
+                            ));
+                            self.state.bottom = BottomTab::Messages;
+                        }
+                    }
+                    return;
+                }
+                Err(e) => Some(e),
+            },
+            DbEvent::Failed { error, .. } => Some(error),
+            DbEvent::Executed { .. } => Some(pythia_db::DbError::new("It isn't a query")),
+            _ => return,
+        };
+        if let Some(error) = failed {
+            if let Some(sink) = self.state.to_file.take().and_then(|job| job.sink) {
+                sink.abandon();
+            }
+            self.export_failed(&error.text());
+        }
     }
 
     /// Stops the run: a read-only connection only runs queries.
@@ -1324,6 +1428,17 @@ impl SqlWindow {
 
     fn handle_event(&mut self, event: DbEvent, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
+        let streamed = match &event {
+            DbEvent::QueryStarted { id, .. }
+            | DbEvent::Rows { id, .. }
+            | DbEvent::Executed { id, .. }
+            | DbEvent::Failed { id, .. } => self.streams_to_file(*id),
+            _ => false,
+        };
+        if streamed {
+            self.export_event(event, &mut effects);
+            return effects;
+        }
         match event {
             DbEvent::QueryStarted { id, columns } => {
                 let running = self.state.running.as_ref();
@@ -1755,7 +1870,7 @@ impl SqlWindow {
     }
 
     fn bottom_ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
-        let mut effects = self.poll_to_file(ui);
+        let mut effects = self.poll_to_file(ui, cx.dialect);
         let mut edit_action = None;
         let variables = self.variables().len();
         let show_variables = &mut self.show_variables;

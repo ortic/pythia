@@ -19,6 +19,10 @@ All notable changes to Pythia are documented here. The format follows
   checks; the scan finds free pages for `VACUUM` and indexed tables
   without statistics. A path that doesn't exist fails rather than making
   an empty database (`?create` makes one, `?ro` opens it read-only).
+- *Execute to file* on MySQL, PostgreSQL, SQL Server and SQLite: the
+  window fetches the result batch by batch into the file, as on Oracle
+  with the row count while it runs and Break, which removes the
+  incomplete file. INSERT statements are written in the database's SQL.
 
 ### Changed
 - The misestimate note of an SQL plan says what it means (#177). "⚠

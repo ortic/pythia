@@ -2360,6 +2360,151 @@ fn execute_to_file() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// "Execute to file" on a database other than Oracle (here a SQLite file,
+/// so it runs everywhere): the window fetches the result batch by batch
+/// into the file, INSERTs in SQLite's SQL; Break removes the incomplete
+/// file, and a statement that isn't a query writes nothing.
+#[test]
+fn execute_to_file_sqlite() {
+    let connection = "export.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let dir = std::env::temp_dir().join(format!("pythia-to-file-sqlite-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let start_export = |h: &mut Harness<'_, PythiaApp>, sql: &str, path: &std::path::Path| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.to_owned())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+    };
+    let last_message = |h: &mut Harness<'_, PythiaApp>| {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default()
+    };
+    let series = |n: u32| {
+        format!(
+            "with recursive s(id) as (select 1 union all select id + 1 from s where id < {n}) \
+             select id, 'item ' || id as name from s"
+        )
+    };
+
+    let path = dir.join("rows.json");
+    start_export(&mut h, &series(5000), &path);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 5000);
+    assert_eq!(json[4999]["id"], 5000);
+    let message = last_message(&mut h);
+    assert!(message.starts_with("5000 rows written to"), "{message}");
+
+    // INSERT statements in SQLite's SQL, into the table the query reads.
+    run_script(
+        &mut h,
+        connection,
+        "create table notes (id integer primary key, note text);
+insert into notes values (1, 'it''s'), (2, null);
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let path = dir.join("notes.sql");
+    start_export(&mut h, "select * from notes order by id", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into notes (id, note) values (1, 'it''s');\n\
+         insert into notes (id, note) values (2, NULL);\n"
+    );
+
+    // Break: the incomplete file is removed.
+    let path = dir.join("huge.csv");
+    start_export(&mut h, &series(100_000_000), &path);
+    wait_until(&mut h, "rows", |app| {
+        app.test_sql_window_ref()
+            .and_then(|w| w.state.to_file.as_ref())
+            .is_some_and(|t| t.rows.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    });
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "cancel", |app| !app.test_focused_busy());
+    let message = last_message(&mut h);
+    assert_eq!(message, "Execute to file failed: Cancelled");
+    assert!(!path.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Execute to file" on MySQL, PostgreSQL and SQL Server, those of their
+/// variables that are set: 5000 rows fetched batch by batch into a JSON
+/// file.
+#[test]
+fn execute_to_file_servers() {
+    use pythia_config::DbKind;
+    // 5000 numbered rows in each database's SQL.
+    let databases = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "select a.n + b.n * 100 + 1 as id from \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 99) \
+                select n from s) a, \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 49) \
+                select n from s) b order by 1",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select id from generate_series(1, 5000) id",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "with s(id) as (select 1 union all select id + 1 from s where id < 5000) \
+             select id from s option (maxrecursion 0)",
+        ),
+    ];
+    for (env, kind, sql) in databases {
+        let connection = format!("export@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let path = std::env::temp_dir().join(format!(
+            "pythia-to-file-{}-{}.json",
+            std::process::id(),
+            kind.label().replace(' ', "")
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.clone())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+        wait_until(&mut h, "export", |app| !app.test_focused_busy());
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap_or_default())
+                .unwrap_or_else(|e| panic!("{env}: {e}"));
+        let rows = json.as_array().map(Vec::len);
+        assert_eq!(rows, Some(5000), "{env}");
+        assert_eq!(json[4999]["id"], 5000, "{env}");
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
 /// Tables in the browser show their indexes, constraints and triggers.
 #[test]
 fn browser_table_parts() {

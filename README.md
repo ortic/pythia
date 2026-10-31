@@ -44,7 +44,8 @@ for Linux, Windows and macOS.
   against the fetched values when applied, so concurrent modifications are
   reported instead of overwritten. "Show SQL" previews the DML.
 - **Execute to file** streams a query of any size into CSV, TSV, JSON,
-  INSERT statements or Markdown, with live row count and cancel.
+  INSERT statements or Markdown, with live row count and cancel, on every
+  database.
 - Explain plan (F5), DBMS_OUTPUT, statement history (Ctrl+E).
 - **Errors lead to the code**: each line of a PL/SQL error stack
   (`ORA-06512`) is a link to its package, procedure or trigger at the line,
@@ -256,8 +257,9 @@ for Linux, Windows and macOS.
   or Windows' OpenSSH agent). Host keys come from `~/.ssh/known_hosts`; an
   unknown one is shown with its fingerprint to trust once.
 - SQL windows with results, fetching on demand, Break, explain plan,
-  completion with columns and comments, and transactions that work as with
-  Oracle: queries see what others committed, changes wait for Commit.
+  *Execute to file*, completion with columns and comments, and
+  transactions that work as with Oracle: queries see what others
+  committed, changes wait for Commit.
   Warnings show as messages.
 - *Edit* on a result of one table changes its rows in place, as on
   Oracle. Rows are found by the table's primary key (or a unique key on
@@ -358,13 +360,13 @@ for Linux, Windows and macOS.
   the file, `?ro` opens it read-only, `:memory:` is one in-memory database
   for all windows, and a `file:` URI works as SQLite takes it.
 - SQL windows with results, fetching on demand, Break, explain plan
-  (`EXPLAIN QUERY PLAN`) and completion. Each window has its own
-  connection to the file, and transactions work as with Oracle: changes
-  wait for Commit, and DDL outside a transaction is committed at once.
-  While one window has uncommitted changes, another one that writes waits
-  up to five seconds for the file's lock, then says which window to commit
-  in. Foreign keys are checked (`pragma foreign_keys = off` in the login
-  script turns that off).
+  (`EXPLAIN QUERY PLAN`), *Execute to file* and completion. Each window
+  has its own connection to the file, and transactions work as with
+  Oracle: changes wait for Commit, and DDL outside a transaction is
+  committed at once. While one window has uncommitted changes, another one
+  that writes waits up to five seconds for the file's lock, then asks to
+  commit or roll back in the other one. Foreign keys are checked (`pragma
+  foreign_keys = off` in the login script turns that off).
 - The object browser lists tables, views, indexes and triggers, with the
   attached databases as schemas (`attach database` in the login script
   attaches one for every window). Object views show columns, indexes,
