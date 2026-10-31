@@ -14,8 +14,9 @@ All notable changes to Pythia are documented here. The format follows
   window on its own connection to the file. The object browser lists
   tables, views, indexes and triggers, attached databases as schemas, and
   object views show columns, indexes, constraints, triggers, dependencies
-  and the DDL. Scripts end statements at `;` and keep a trigger's
-  `BEGIN … END` whole. Maintenance runs `ANALYZE`, `REINDEX` and integrity
+  and the DDL. Results of one table can be edited in place, rows found by
+  the primary key, a unique index on NOT NULL columns or the `rowid`.
+  Scripts end statements at `;` and keep a trigger's `BEGIN … END` whole. Maintenance runs `ANALYZE`, `REINDEX` and integrity
   checks; the scan finds free pages for `VACUUM` and indexed tables
   without statistics. A path that doesn't exist fails rather than making
   an empty database (`?create` makes one, `?ro` opens it read-only).

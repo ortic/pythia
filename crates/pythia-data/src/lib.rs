@@ -559,18 +559,30 @@ fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
     }
 }
 
-/// SQLite: a blob as the `X'…'` of the hex it is shown as, text quoted
-/// (no backslash escapes), a `&` apart as `char(38)` since Pythia's SQL
-/// windows read `&name` as a substitution variable even in a literal
-/// (#159).
+/// Whether SQLite would write a number as `text`: `7`, `-12`, `1.5`, not
+/// `007` or `1.50`. Such a number goes into SQLite as one: a column without
+/// a type keeps what it is given, and one with a type converts it as it
+/// needs.
+pub fn sqlite_number(text: &str) -> bool {
+    text.parse::<i64>().is_ok_and(|i| i.to_string() == text)
+        || text
+            .parse::<f64>()
+            .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
+}
+
+/// SQLite: numbers as SQLite writes them unquoted (see [`sqlite_number`]),
+/// a blob as the `X'…'` of the hex it is shown as, text quoted (no
+/// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
+/// read `&name` as a substitution variable even in a literal (#159).
 fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
-    if is_number(col, v) {
+    if is_number(col, v) || sqlite_number(v) {
         return v.to_owned();
     }
-    let hex = !v.is_empty() && v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
+    // An empty blob is shown empty too.
+    let hex = v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
     if hex && col.type_name.contains("BLOB") {
         return format!("X'{v}'");
     }
@@ -866,6 +878,10 @@ mod tests {
         assert_eq!(lite(&col("INTEGER", true), Some("7")), "7");
         assert_eq!(lite(&col("BLOB", false), Some("00FF")), "X'00FF'");
         assert_eq!(lite(&col("TEXT", false), Some("00FF")), "'00FF'");
+        // Numbers as SQLite writes them go in as numbers, others as text.
+        assert_eq!(lite(&col("", false), Some("7")), "7");
+        assert_eq!(lite(&col("TEXT", false), Some("007")), "'007'");
+        assert_eq!(lite(&col("TEXT", false), Some("1.50")), "'1.50'");
         assert_eq!(lite(&col("TEXT", false), Some(r"it's \n")), r"'it''s \n'");
         assert_eq!(lite(&col("DATE", false), None), "NULL");
         let ms = |c: &Column, v| literal(Dialect::SQLSERVER, c, v);

@@ -379,6 +379,11 @@ for Linux, Windows and macOS.
   constraints, triggers, what uses a table and what a view uses, and the
   DDL as written, a table's with its indexes. *Edit* opens a view or
   trigger as a script that drops and creates it again.
+- *Edit* on a result of one table changes its rows in place, as on the
+  other databases. Rows are found by the table's primary key, a unique
+  index on NOT NULL columns, or else its `rowid`, so every table can be
+  edited (a view can't). Applying checks the values that were fetched; a
+  number is found whether the column holds it as a number or as text.
 - Scripts end each statement at `;`; a trigger's `BEGIN … END` keeps its
   own.
 - *Maintenance* of a table or index: `ANALYZE`, `REINDEX` and an integrity

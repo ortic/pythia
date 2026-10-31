@@ -320,8 +320,7 @@ pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbEr
         DbKind::MySql => mysql_keys(client, table)?,
         DbKind::Postgres => postgres_keys(client, table)?,
         DbKind::SqlServer => sqlserver_keys(client, table)?,
-        // Not offered yet (Feature::EditResults).
-        DbKind::Sqlite => Vec::new(),
+        DbKind::Sqlite => sqlite_keys(client, table)?,
     };
     Ok(keys
         .into_iter()
@@ -413,6 +412,118 @@ fn postgres_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> 
         let column = value(row, 1).filter(|_| value(row, 2).as_deref() == Some("t"));
         (value(row, 0).unwrap_or_default(), column)
     })))
+}
+
+/// SQLite: the table the query read, in the database it names or else the
+/// first that has it (`temp`, `main`, then those attached), as SQLite looks
+/// it up; a view has no key. Its primary key, its unique indexes on NOT
+/// NULL columns (not partial ones), and last its `rowid`: every table but
+/// one `WITHOUT ROWID` (which has a primary key) has one. A primary key
+/// column that isn't NOT NULL may hold NULLs in a rowid table, an old
+/// SQLite quirk, unless it is the rowid itself (`INTEGER PRIMARY KEY`).
+fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
+    let names = unquote(table);
+    let (schema, name) = match names.as_slice() {
+        [schema, name] => (Some(schema.clone()), name.clone()),
+        [name] => (None, name.clone()),
+        _ => return Ok(Vec::new()),
+    };
+    let schemas: Vec<String> = match schema {
+        Some(schema) => vec![schema],
+        None => client
+            .query(
+                "select name from pragma_database_list \
+                  order by case name when 'temp' then 0 when 'main' then 1 else 2 end, seq",
+                &[],
+            )?
+            .iter()
+            .filter_map(|r| value(r, 0))
+            .collect(),
+    };
+    let dialect = Dialect::SQLITE;
+    let mut found = None;
+    for schema in schemas {
+        let rows = client.query(
+            &format!(
+                "select type, name, sql from {}.sqlite_schema \
+                  where name = ? collate nocase and type in ('table', 'view')",
+                dialect.quote_ident(&schema)
+            ),
+            &[&name],
+        )?;
+        if let Some(row) = rows.first() {
+            found = Some((schema, row.clone()));
+            break;
+        }
+    }
+    let Some((schema, row)) = found else {
+        return Ok(Vec::new());
+    };
+    if value(&row, 0).as_deref() != Some("table") {
+        return Ok(Vec::new());
+    }
+    let table = value(&row, 1).unwrap_or(name);
+    let sql = value(&row, 2).unwrap_or_default().to_uppercase();
+    let rowid_table = !(sql.contains("WITHOUT") && sql.contains("ROWID"));
+    let columns = client.query(
+        "select name, \"notnull\", pk, upper(type) from pragma_table_info(?, ?) order by cid",
+        &[&table, &schema],
+    )?;
+    // (position, name, NOT NULL, type) of the primary key's columns.
+    let mut pk: Vec<(i64, Option<String>, bool, String)> = columns
+        .iter()
+        .filter_map(|c| {
+            let position = value(c, 2)?.parse::<i64>().ok().filter(|p| *p > 0)?;
+            let not_null = value(c, 1).as_deref() == Some("1");
+            Some((
+                position,
+                value(c, 0),
+                not_null,
+                value(c, 3).unwrap_or_default(),
+            ))
+        })
+        .collect();
+    pk.sort_by_key(|(position, ..)| *position);
+    // NULL-free: the rowid itself, a WITHOUT ROWID table's key, or NOT NULL.
+    let rowid_alias = rowid_table && pk.len() == 1 && pk[0].3 == "INTEGER";
+    let not_null: std::collections::BTreeSet<String> = columns
+        .iter()
+        .filter(|c| value(c, 1).as_deref() == Some("1"))
+        .filter_map(|c| value(c, 0))
+        .map(|n| n.to_lowercase())
+        .collect();
+    let mut parts: Vec<(String, Option<String>)> = pk
+        .into_iter()
+        .map(|(_, column, not_null, _)| {
+            let usable = not_null || rowid_alias || !rowid_table;
+            ("primary key".to_owned(), column.filter(|_| usable))
+        })
+        .collect();
+    let unique = client.query(
+        "select il.name, ii.name from pragma_index_list(?1, ?2) il, \
+                pragma_index_info(il.name, ?2) ii \
+          where il.\"unique\" = 1 and il.partial = 0 and il.origin <> 'pk' \
+          order by il.name, ii.seqno",
+        &[&table, &schema],
+    )?;
+    parts.extend(unique.iter().map(|row| {
+        // An expression has no column; a nullable one doesn't find a row.
+        let column = value(row, 1).filter(|c| not_null.contains(&c.to_lowercase()));
+        (value(row, 0).unwrap_or_default(), column)
+    }));
+    // Its names, unless a column has taken them.
+    let names: Vec<String> = columns
+        .iter()
+        .filter_map(|c| value(c, 0))
+        .map(|n| n.to_lowercase())
+        .collect();
+    let rowid = ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|r| !names.iter().any(|n| n == r));
+    if rowid_table && let Some(rowid) = rowid {
+        parts.push(("rowid".to_owned(), Some(rowid.to_owned())));
+    }
+    Ok(keys(parts))
 }
 
 /// SQL Server: `object_id` finds the table the way the query did, by the
@@ -573,6 +684,19 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         // 0.1 is a decimal, which a real takes as the real 0.1; as a float
         // (1E-1) the real would be widened instead.
         (DbKind::SqlServer, "real") => format!("{name} = cast({lit} as real)"),
+        // A long blob is shown cut short (`… (5000 bytes)`).
+        (DbKind::Sqlite, t) if t.contains("BLOB") && v.contains("… (") => return None,
+        // A blob is shown as its hex, which text could be too.
+        (DbKind::Sqlite, t)
+            if t.contains("BLOB")
+                && v.len() % 2 == 0
+                && v.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            format!("{name} in (X'{v}', '{v}')")
+        }
+        // A column without a type holds `7` as a number or as text, which
+        // look the same.
+        (DbKind::Sqlite, _) if pythia_data::sqlite_number(v) => format!("{name} in ({v}, '{v}')"),
         _ => format!("{name} = {lit}"),
     })
 }
@@ -1045,6 +1169,39 @@ mod tests {
                  and doc::text = '{\"a\": 1}' and x::text = '<a/>' and tags::text = '{x,y}' \
                  and ok = 't' and at = '2026-01-02 03:04:05.123456+01'",
                 "delete from t where id = 7",
+            ]
+        );
+    }
+
+    /// SQLite: names keep their case unquoted, numbers that may be stored
+    /// either way are found either way, a blob as blob or text, text
+    /// without escapes; a long blob shown cut short isn't checked.
+    #[test]
+    fn generates_sqlite_dml() {
+        let columns = vec![
+            col("id", "INTEGER", true),
+            col("Note", "TEXT", false),
+            col("n", "TEXT", false),
+            col("b", "BLOB", false),
+            col("big", "BLOB", false),
+            col("pythia$id", "INTEGER", true),
+        ];
+        let row = ["7", r"C:\temp", "42", "00FF", "0000… (5000 bytes)", "7"]
+            .map(|v| Some(v.to_owned()))
+            .to_vec();
+        let sql = dml_for(
+            Dialect::SQLITE,
+            &columns,
+            row,
+            &["it's & co", "042", "CAFE", "0000… (5000 bytes)"],
+        );
+        assert_eq!(
+            sql,
+            [
+                "update t set Note = 'it''s ' || char(38) || ' co', n = '042', b = X'CAFE', \
+                 big = '0000… (5000 bytes)' where id in (7, '7') and Note = 'C:\\temp' \
+                 and n in (42, '42') and b in (X'00FF', '00FF')",
+                "delete from t where id in (7, '7')",
             ]
         );
     }

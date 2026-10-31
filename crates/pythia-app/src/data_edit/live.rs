@@ -1,8 +1,8 @@
 //! Editing results against the databases: the key comes from the table the
 //! query read, and every value of every type is found again by the check an
-//! edit makes and written back the way it was shown. Skipped unless
-//! `PYTHIA_TEST_POSTGRES` or `PYTHIA_TEST_MSSQL` is set
-//! (`user/password@host:port/db`).
+//! edit makes and written back the way it was shown. PostgreSQL and SQL
+//! Server are skipped unless `PYTHIA_TEST_POSTGRES` or `PYTHIA_TEST_MSSQL`
+//! is set (`user/password@host:port/db`); SQLite runs on a file of its own.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -34,6 +34,20 @@ impl Live {
         let spec = std::env::var(env).ok()?;
         let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
         let (username, password) = credentials.split_once('/').unwrap();
+        Some(Self::open(env, kind, username, password, connect_string))
+    }
+
+    /// A new SQLite database in the temp directory (removed first).
+    fn sqlite(name: &str) -> (Self, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("pythia-live-{}-{name}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let connect_string = format!("{}?create", path.display());
+        let live = Self::open(name, DbKind::Sqlite, "", "", &connect_string);
+        (live, path)
+    }
+
+    fn open(env: &str, kind: DbKind, username: &str, password: &str, connect_string: &str) -> Self {
         let (tx, wake) = mpsc::channel();
         let session = Session::connect(
             ConnectParams {
@@ -60,7 +74,7 @@ impl Live {
             _ => panic!("{env}: not connected"),
         }
         live.session.send(DbRequest::SetAutocommit(true));
-        Some(live)
+        live
     }
 
     fn next(&mut self) -> DbEvent {
@@ -474,4 +488,99 @@ fn sqlserver_values_find_their_rows() {
     assert!(db.rewrite_all("pythia_live_floats", "id", &[]).is_empty());
     assert!(db.rewrite_all("pythia_live_h", "v", &[]).is_empty());
     db.script(&["drop table pythia_live_types, pythia_live_floats, pythia_live_h"]);
+}
+
+#[test]
+fn sqlite_keys() {
+    let (mut db, path) = Live::sqlite("keys");
+    let attached = path.with_extension("other.db");
+    let _ = std::fs::remove_file(&attached);
+    db.script(&[
+        "create table k (id text not null primary key, code text not null unique)",
+        "create table \"Mixed Case\" (\"the id\" integer primary key, v)",
+        "create table composite (a integer not null, b text not null, v, primary key (a, b))",
+        "create table nullable_pk (p text primary key, u integer not null, v)",
+        "create unique index nullable_pk_u on nullable_pk (u)",
+        "create table loose (n integer unique, e text, v)",
+        "create unique index loose_e on loose (upper(e))",
+        "create unique index loose_partial on loose (v) where v > 0",
+        "create table wr (a text, b integer, primary key (b, a)) without rowid",
+        "create table shadow (rowid text, v)",
+        "create view k_view as select * from k",
+        "create temp table temp_first (t integer primary key)",
+        "create table temp_first (m text primary key not null)",
+        &format!("attach database '{}' as other", attached.display()),
+        "create table other.k (other_id integer primary key)",
+    ]);
+    assert_eq!(db.key("k"), ["id"]);
+    assert_eq!(db.key("K"), ["id"]);
+    // The rowid itself, quoted names.
+    assert_eq!(db.key("\"Mixed Case\""), ["the id"]);
+    assert_eq!(db.key("composite"), ["a", "b"]);
+    // A primary key that may hold NULLs (an old quirk of rowid tables)
+    // gives way to a unique index on NOT NULL columns.
+    assert_eq!(db.key("nullable_pk"), ["u"]);
+    // Neither a nullable column, an expression nor a partial index: the
+    // rowid.
+    assert_eq!(db.key("loose"), ["rowid"]);
+    assert_eq!(db.key("wr"), ["b", "a"]);
+    // A column took the name `rowid`.
+    assert_eq!(db.key("shadow"), ["_rowid_"]);
+    // As SQLite looks names up: `temp` first, a schema when named.
+    assert_eq!(db.key("temp_first"), ["t"]);
+    assert_eq!(db.key("main.temp_first"), ["m"]);
+    assert_eq!(db.key("other.k"), ["other_id"]);
+    assert!(db.key("k_view").is_empty());
+    assert!(db.key("missing").is_empty());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&attached);
+}
+
+/// Every kind of value SQLite stores, in columns of each affinity and none,
+/// and random floats, found by the checks and written back as shown; a
+/// table keyed by its rowid, too.
+#[test]
+fn sqlite_values_find_their_rows() {
+    let (mut db, path) = Live::sqlite("values");
+    db.script(&[
+        // A file thrown away after: no syncing for each statement.
+        "pragma synchronous = off",
+        "create table types (id integer primary key, i integer, r real, d decimal(10,2), \
+           t text, vc varchar(20), b blob, dt date, ts timestamp, j json, n, bo boolean)",
+        "insert into types values (1, -9223372036854775808, 0.1, 12.5, \
+           'C:\\x ''q'' & é' || char(10) || 'new line', 'it''s', x'00ff10', \
+           '2026-10-31', '2026-10-31 12:34:56.789', '{\"a\":  [1, 2.50]}', 'text', 1)",
+        "insert into types values (2, 9223372036854775807, 1e300, 99, '', ' ', x'', \
+           '2026-11-01', null, '[]', 7, 0)",
+        "insert into types values (3, 0, -2.2250738585072014e-308, 0.333, 'x', 'y', \
+           zeroblob(5000), null, null, null, 1.5, null)",
+        "insert into types (id) values (4)",
+        "create table floats (id integer primary key, d double, r real)",
+        "create table plain (v text, n)",
+        "insert into plain values ('one', 1), ('two', 2.5), (null, 'three')",
+    ]);
+    let floats = random_floats(200);
+    for chunk in floats.chunks(50) {
+        let values: Vec<String> = chunk
+            .iter()
+            .map(|(d, r)| format!("({d:e}, {:e})", f64::from(*r)))
+            .collect();
+        db.ok(&format!(
+            "insert into floats (d, r) values {}",
+            values.join(", ")
+        ));
+    }
+    // A blob shown cut short isn't checked; everything else is.
+    assert_eq!(db.rewrite_all("types", "id", &["b"]), Vec::<String>::new());
+    assert!(db.rewrite_all("floats", "id", &[]).is_empty());
+    assert!(db.rewrite_all("plain", "rowid", &[]).is_empty());
+    db.checks_find_rows("types", "id");
+    // The long blob: left out of the check, not compared as text.
+    let (_, columns, rows) = db.editable("types", "id");
+    let b = columns.iter().position(|c| c.name == "b").unwrap();
+    assert!(same(db.dialect, "b", &columns[b], rows[2][b].as_deref()).is_none());
+    assert!(same(db.dialect, "b", &columns[b], rows[0][b].as_deref()).is_some());
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }

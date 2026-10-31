@@ -123,7 +123,10 @@ impl Dialect {
             // A file: no server to monitor, no accounts, nothing to tunnel.
             DbKind::Sqlite => matches!(
                 feature,
-                Feature::ExplainPlan | Feature::Completion | Feature::ExecuteToFile
+                Feature::ExplainPlan
+                    | Feature::Completion
+                    | Feature::ExecuteToFile
+                    | Feature::EditResults
             ),
         }
     }
@@ -370,6 +373,7 @@ mod tests {
         let sqlite = Dialect::SQLITE;
         assert!(sqlite.supports(Feature::ExplainPlan));
         assert!(sqlite.supports(Feature::Completion));
+        assert!(sqlite.supports(Feature::EditResults));
         for feature in [
             Feature::SshTunnel,
             Feature::Dashboard,

@@ -832,8 +832,13 @@ fn keyed_data_editing(db: &Keyed) {
         connect_string: connect_string.into(),
         ..Default::default()
     };
+    keyed_data_editing_on(db, profile, password.into());
+}
+
+/// [`keyed_data_editing`] on the connection `profile` (named `shop`).
+fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: String) {
     let mut h = harness(true);
-    h.state_mut().test_connect(profile, password.into());
+    h.state_mut().test_connect(profile, password);
     wait_until(&mut h, "connection", |app| app.test_connected());
     let run = |h: &mut Harness<'_, PythiaApp>, sql: &str| {
         h.state_mut().test_open(OpenRequest::Sql {
@@ -1040,6 +1045,51 @@ fn postgres_data_editing() {
         ],
         screenshot: "postgres-editing",
     });
+}
+
+/// Edits SQLite results, on a file of its own: the key from the table (a
+/// view has none), text with a backslash, a quote and `&`, and reals.
+#[test]
+fn sqlite_data_editing() {
+    let path = std::env::temp_dir().join(format!("pythia-editing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        ..Default::default()
+    };
+    keyed_data_editing_on(
+        &Keyed {
+            env: "",
+            kind: pythia_config::DbKind::Sqlite,
+            // AUTOINCREMENT: a deleted row's id isn't given out again.
+            create: "create table pythia_edit_t (id integer primary key autoincrement, \
+                       name text, born timestamp, doc json, price real);\n\
+                     insert into pythia_edit_t (name, born, doc, price) values \
+                       ('one', '2020-01-01 00:00:00', '{\"a\":  1}', 123456.79), \
+                       ('two', null, null, 0.1);\n\
+                     create table pythia_edit_k (a int not null, b varchar(5) not null, v int, \
+                       unique (a, b));\n\
+                     insert into pythia_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                     create view pythia_edit_n as select 1 as x;\n\
+                     commit;\n",
+            drop: "drop view if exists pythia_edit_n;\n\
+                   drop table if exists pythia_edit_t;\n\
+                   drop table if exists pythia_edit_k;",
+            edits: &[
+                (0, 0, r"C:\new 'one' & more", r"C:\new 'one' & more"),
+                (0, 2, r#"{"a": [1, "é"]}"#, r#"{"a": [1, "é"]}"#),
+                (0, 3, "2.5", "2.5"),
+                (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06"),
+                (1, 3, "0.3", "0.3"),
+            ],
+            screenshot: "sqlite-editing",
+        },
+        profile,
+        String::new(),
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Edits SQL Server results (`PYTHIA_TEST_MSSQL`): Unicode as N'…', xml

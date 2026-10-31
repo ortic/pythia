@@ -788,8 +788,9 @@ impl From<rusqlite::Error> for DbError {
                 let mut db = Self::new(message(error, msg));
                 if error.code == ErrorCode::DatabaseBusy {
                     db.message.push_str(
-                        "\nAnother session has uncommitted changes, e.g. another window: commit \
-                         or roll back there.",
+                        "\nAnother window holds the file: it has uncommitted changes (commit or \
+                         roll back there), or a result with rows left to fetch (fetch them all, \
+                         or close it) while this one writes.",
                     );
                 }
                 db
