@@ -515,22 +515,40 @@ fn postgres_literal(col: &Column, value: Option<&str>) -> String {
     }
 }
 
-/// SQL Server: Unicode text as `N'…'`, binary as the `0x…` it is shown
-/// as. `datetime` text with a `T` (ISO 8601) is read the same under every
-/// `DATEFORMAT`; with a space, `dmy` swaps month and day.
+/// SQL Server: Unicode text as `N'…'`, binary (also CLR types such as
+/// `geometry`) as the `0x…` it is shown as. `datetime` text with a `T` (ISO
+/// 8601) is read the same under every `DATEFORMAT`; with a space, `dmy`
+/// swaps month and day.
+///
+/// ASCII text for a `varchar` or `char` column goes without the `N`: it
+/// means the same in every code page, and compared with `N'…'` SQL Server
+/// converts the column, which under a SQL collation scans its index
+/// instead of seeking. A number past the 38 digits of a decimal literal (a
+/// `float` like 1e300, shown in full) is written with an exponent.
 fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
     if is_number(col, v) {
+        if v.chars().filter(char::is_ascii_digit).count() > 38
+            && let Ok(n) = v.parse::<f64>()
+        {
+            return format!("{n:e}");
+        }
         return v.to_owned();
     }
     let hex = v
         .strip_prefix("0x")
         .is_some_and(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
     match col.type_name.as_str() {
-        "binary" | "varbinary" | "image" if hex => v.to_owned(),
+        "binary" | "varbinary" | "image" | "udt" if hex => v.to_owned(),
         "datetime" | "smalldatetime" => format!("'{}'", v.replacen(' ', "T", 1)),
+        "varchar" | "char" if v.is_ascii() => apart_from_ampersands(
+            v,
+            |p| format!("'{}'", p.replace('\'', "''")),
+            "CHAR(38)",
+            " + ",
+        ),
         _ => apart_from_ampersands(
             v,
             |p| format!("N'{}'", p.replace('\'', "''")),
@@ -831,6 +849,17 @@ mod tests {
             "'2026-01-02T03:04:05.123'"
         );
         assert_eq!(ms(&col("date", false), Some("2026-01-02")), "N'2026-01-02'");
+        // ASCII needs no N for varchar, which keeps an index on it usable.
+        assert_eq!(ms(&col("varchar", false), Some("it's")), "'it''s'");
+        assert_eq!(ms(&col("char", false), Some("H&L")), "'H' + CHAR(38) + 'L'");
+        assert_eq!(ms(&col("varchar", false), Some("grüße")), "N'grüße'");
+        assert_eq!(ms(&col("udt", false), Some("0x0101")), "0x0101");
+        // Past a decimal literal's 38 digits, a float takes an exponent.
+        let big = format!("1{}", "0".repeat(300));
+        assert_eq!(ms(&col("float", true), Some(&big)), "1e300");
+        let tiny = format!("0.{}25", "0".repeat(40));
+        assert_eq!(ms(&col("float", true), Some(&tiny)), "2.5e-41");
+        assert_eq!(ms(&col("float", true), Some("0.1")), "0.1");
         // Oracle too: a name isn't a number.
         assert_eq!(
             sql_literal(&col("BINARY_DOUBLE", true), Some("Inf")),

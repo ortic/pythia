@@ -7,6 +7,11 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- On SQL Server, ASCII text for a `varchar` or `char` column is written
+  as `'…'` instead of `N'…'` in INSERT exports. Compared with `N'…'`,
+  SQL Server converts the column, and under a SQL collation (the default
+  on US English servers) a key lookup then scans the index instead of
+  seeking. Other text keeps the `N`.
 - The misestimate note of an SQL plan says what it means (#177). "⚠
   Estimate off at 35 INDEX UNIQUE SCAN …: estimated 318 rows (1 per start
   × 318 starts), got 0 (318× fewer)" now reads "⚠ Row estimate off at
@@ -14,6 +19,13 @@ All notable changes to Pythia are documented here. The format follows
   starts = 318 rows, got none". The 35 is the line's Id in the plan, and
   no rows are no longer called 318× fewer. The details under the plan
   tree are headed "Line 35: INDEX UNIQUE SCAN".
+
+### Fixed
+- INSERT exports on SQL Server wrote a `float` like 1e300 out in full,
+  301 digits, which SQL Server can't read (a decimal literal has at most
+  38 digits), and a `geometry` or `hierarchyid` value as text. Such a
+  float now has an exponent, and CLR types are written as the `0x…` they
+  are shown as.
 
 ## [0.10.0] - 2026-10-30
 
