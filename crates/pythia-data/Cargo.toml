@@ -10,5 +10,6 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1"
 pythia-db.workspace = true
 rust_xlsxwriter = "0.101"
-serde_json = "1"
+# Numbers go into JSON with every digit, as raw values (#267).
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror.workspace = true

@@ -508,6 +508,16 @@ All notable changes to Pythia are documented here. The format follows
   of a fetched row failed the same way, and a text column's NULL was
   replaced by `''`. *Set NULL* and the value editor's *Apply* work as
   before.
+- The JSON and Excel exports keep every digit of a number (#267).
+  18446744073709551615 went into JSON as `1.8446744073709552e+19` and
+  9223372036854775807 into Excel as 9223372036854775808. JSON now has
+  the number as the database shows it (`.5` as `0.5`): a reader that
+  takes JSON numbers for doubles gets the nearest one as before, one that
+  reads them exactly gets all the digits. Excel holds 15 significant
+  digits, so a number whose whole part has more, as
+  9223372036854775807, goes in as text with all of them; a longer
+  fraction rounds as Excel's own numbers do, so an average stays a
+  number.
 
 ## [0.10.0] - 2026-10-30
 

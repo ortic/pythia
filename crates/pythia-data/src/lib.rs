@@ -2,16 +2,19 @@
 //! Markdown and HTML.
 //!
 //! Cell values arrive as text (see `pythia_db::Cell`); column types decide how
-//! they are written: numbers stay numbers in JSON/XLSX/INSERT, INSERT scripts
+//! they are written: numbers stay numbers in JSON/XLSX/INSERT (in XLSX
+//! while their whole part fits the 15 digits Excel holds), INSERT scripts
 //! write values as literals of the database they came from (`TO_DATE` on
 //! Oracle, `X'…'` binary on MySQL, …).
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::io::Write;
 
 pub mod import;
 
 use pythia_db::{Cell, Column, DbKind, Dialect};
+use serde_json::value::{RawValue, to_raw_value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
@@ -265,7 +268,7 @@ impl<W: Write> StreamWriter<W> {
                     } else {
                         ",\n"
                     };
-                    let object = json_object(&self.columns, row, self.options.dialect);
+                    let object = json_object(&self.columns, row, self.options.dialect)?;
                     let object = serde_json::to_string_pretty(&object)?;
                     write!(self.out, "{sep}{}", indent(&object))?;
                 }
@@ -331,32 +334,37 @@ fn json(
     dialect: Dialect,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let array: Vec<serde_json::Value> = rows
+    let array = rows
         .iter()
         .map(|row| json_object(columns, row, dialect))
-        .collect();
+        .collect::<serde_json::Result<Vec<_>>>()?;
     serde_json::to_writer_pretty(&mut *out, &array)?;
     writeln!(out)?;
     Ok(())
 }
 
-fn json_object(columns: &[Column], row: &[Cell], dialect: Dialect) -> serde_json::Value {
-    let object = columns
+/// A row as a JSON object, its keys sorted as a `serde_json::Value` has
+/// them. Numbers go in as raw JSON, every digit (#267): as an i64 or a
+/// double, 18446744073709551615 was written 1.8446744073709552e+19.
+fn json_object(
+    columns: &[Column],
+    row: &[Cell],
+    dialect: Dialect,
+) -> serde_json::Result<BTreeMap<String, Box<RawValue>>> {
+    columns
         .iter()
         .zip(row)
         .map(|(col, cell)| {
-            let value = match cell {
-                None => serde_json::Value::Null,
-                Some(v) if col.numeric => number(v).map_or_else(|| v.clone().into(), Into::into),
-                Some(v) if is_boolean(dialect, col) => {
-                    boolean(v).map_or_else(|| v.clone().into(), Into::into)
-                }
-                Some(v) => v.clone().into(),
+            let typed = match cell {
+                Some(v) if col.numeric => json_number(v).map(RawValue::from_string),
+                Some(v) if is_boolean(dialect, col) => boolean(v).map(|b| to_raw_value(&b)),
+                _ => None,
             };
-            (col.name.clone(), value)
+            // NULL as null, the rest as strings.
+            let value = typed.unwrap_or_else(|| to_raw_value(cell))?;
+            Ok((col.name.clone(), value))
         })
-        .collect();
-    serde_json::Value::Object(object)
+        .collect()
 }
 
 /// Columns of booleans (#217): PostgreSQL's and Oracle's `boolean`, SQL
@@ -379,14 +387,60 @@ fn boolean(text: &str) -> Option<bool> {
     }
 }
 
-/// Parses a number for typed output, keeping integers exact.
-fn number(text: &str) -> Option<serde_json::Number> {
-    if let Ok(i) = text.parse::<i64>() {
-        return Some(i.into());
+/// A number as JSON writes it, every digit kept (#267): without a `+`,
+/// with a 0 before a leading `.` (`-.5` as `-0.5`) and none before other
+/// digits. `None` for what isn't a decimal number (`NaN`, `Infinity`).
+fn json_number(text: &str) -> Option<String> {
+    let (sign, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => unsigned.split_at(at),
+        None => (unsigned, ""),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let power = exponent.get(1..).unwrap_or_default();
+    let power = power.strip_prefix(['+', '-']).unwrap_or(power);
+    if (whole.is_empty() && fraction.is_empty())
+        || !digits(whole)
+        || !digits(fraction)
+        || (!exponent.is_empty() && (power.is_empty() || !digits(power)))
+    {
+        return None;
     }
-    text.parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let point = if fraction.is_empty() { "" } else { "." };
+    Some(format!("{sign}{whole}{point}{fraction}{exponent}"))
+}
+
+/// The significant digits of the whole part of a number written in
+/// decimal, from its first to its last that isn't 0: 19 in
+/// `9223372036854775807`, 1 in `1e20`, none in `0.333…`.
+fn whole_digits(text: &str) -> usize {
+    let (mantissa, exponent) = text.split_once(['e', 'E']).unwrap_or((text, "0"));
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits: String = whole
+        .chars()
+        .chain(fraction.chars())
+        .filter(char::is_ascii_digit)
+        .collect();
+    let shift = exponent.parse::<i64>().unwrap_or(0);
+    let len = whole.chars().filter(char::is_ascii_digit).count() as i64 + shift;
+    let len = len.clamp(0, digits.len() as i64) as usize;
+    digits[..len].trim_matches('0').len()
+}
+
+/// A number for an Excel cell, unless Excel can't hold its whole part:
+/// Excel keeps 15 significant digits, so a number whose whole part has
+/// more stays text with all of them (#267); 9223372036854775807 would be
+/// 9223372036854775808. A fraction rounds as Excel's own numbers do, so
+/// an average of 40 digits stays a number.
+fn excel_number(text: &str) -> Option<f64> {
+    let n = text.parse::<f64>().ok()?;
+    (whole_digits(text) <= 15).then_some(n)
 }
 
 fn xlsx(
@@ -421,9 +475,9 @@ fn xlsx(
                 None
             };
             match (col.numeric, as_date) {
-                (true, _) => match value.parse::<f64>() {
-                    Ok(n) => sheet.write_number(r, c, n)?,
-                    Err(_) => sheet.write_string(r, c, value)?,
+                (true, _) => match excel_number(value) {
+                    Some(n) => sheet.write_number(r, c, n)?,
+                    None => sheet.write_string(r, c, value)?,
                 },
                 (
                     false,
@@ -1386,6 +1440,71 @@ mod tests {
         assert_eq!(v[0]["ID"], 1);
         assert_eq!(v[1]["ID"], 2.5);
         assert_eq!(v[1]["NAME"], serde_json::Value::Null);
+    }
+
+    /// JSON writes a number with every digit the database shows, past an
+    /// i64 and a double, streamed too; `.5` as `0.5`, as JSON has it.
+    /// Excel keeps 15 significant digits: a number whose whole part has
+    /// more is text, all of it; a longer fraction rounds.
+    #[test]
+    fn numbers_keep_every_digit() {
+        use calamine::{Data, Reader};
+        let columns = [Column {
+            name: "N".into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        }];
+        let cases = [
+            ("9223372036854775807", "9223372036854775807", false),
+            ("18446744073709551615", "18446744073709551615", false),
+            ("12345678901234567890123", "12345678901234567890123", false),
+            ("1234567890123456.5", "1234567890123456.5", false),
+            ("1.2345678901234567E+20", "1.2345678901234567E+20", false),
+            ("-0.123456789012345678", "-0.123456789012345678", true),
+            ("0.33333333333333333333", "0.33333333333333333333", true),
+            ("123456789012345.678", "123456789012345.678", true),
+            ("123456789012345", "123456789012345", true),
+            ("100000000000000000000", "100000000000000000000", true),
+            ("0.00000000000000000002", "0.00000000000000000002", true),
+            ("2.5", "2.5", true),
+            (".5", "0.5", true),
+            ("-.5", "-0.5", true),
+            ("1.5E-7", "1.5E-7", true),
+        ];
+        let rows: Vec<Vec<Cell>> = cases
+            .iter()
+            .map(|(v, _, _)| vec![Some(v.to_string())])
+            .collect();
+        let options = Options::default();
+        let json = export_to_vec(Format::Json, &columns, &rows, &options).unwrap();
+        let mut stream =
+            StreamWriter::new(Format::Json, columns.to_vec(), options.clone(), Vec::new()).unwrap();
+        stream.write(&rows).unwrap();
+        let streamed = stream.finish().unwrap();
+        for bytes in [json, streamed] {
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+                "{text}"
+            );
+            let written: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("\"N\": "))
+                .collect();
+            let expected: Vec<&str> = cases.iter().map(|(_, j, _)| *j).collect();
+            assert_eq!(written, expected);
+        }
+        let bytes = export_to_vec(Format::Xlsx, &columns, &rows, &options).unwrap();
+        let mut book = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(bytes)).unwrap();
+        let sheet = book.worksheet_range("Result").unwrap();
+        for (i, (value, _, number)) in cases.iter().enumerate() {
+            let cell = sheet.get((i + 1, 0)).unwrap();
+            if *number {
+                assert_eq!(cell, &Data::Float(value.parse().unwrap()), "{value}");
+            } else {
+                assert_eq!(cell, &Data::String(value.to_string()), "{value}");
+            }
+        }
     }
 
     /// Booleans are JSON's true and false, not the text shown (#217): a
