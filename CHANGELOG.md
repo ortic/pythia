@@ -542,6 +542,15 @@ All notable changes to Pythia are documented here. The format follows
   b`; they now read `name(5)` and `a DESC, b`, and an expression part
   ``(lower(`name`)) DESC``. MariaDB's prefixes read the same way; it
   keeps DESC from 10.8.
+- MySQL: a view's DDL names the tables of other databases with their
+  database, and those of its own without it, whatever the session's
+  database (#285). `SHOW CREATE VIEW` left out the session's database
+  instead: *Edit* of a view of another database that reads one of its
+  tables failed with "Table … doesn't exist", as the script runs in
+  the view's database, and on MariaDB a view that reads another
+  database named its own, so that a copy run elsewhere read the
+  original's tables. The view is named without its database, as a
+  table is.
 
 ## [0.10.0] - 2026-10-30
 

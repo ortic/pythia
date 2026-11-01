@@ -1421,6 +1421,95 @@ fn column_defaults_read_as_sql() {
     h.ok("drop table r41_df");
 }
 
+/// A view's DDL names the tables of other databases with their database,
+/// and those of its own without it, whatever the session's database (as a
+/// DBA, `PYTHIA_TEST_MYSQL_DBA`, to make the databases): run in another
+/// database, the copy reads that database's tables, and the other
+/// databases' as the view does.
+#[test]
+fn view_ddl_names_other_databases_only() {
+    let Some(params) = std::env::var("PYTHIA_TEST_MYSQL_DBA")
+        .ok()
+        .and_then(|spec| mysql_params(&spec))
+    else {
+        return;
+    };
+    let mut h = Harness::with(params);
+    let schema = h.schema.clone();
+    for sql in [
+        "drop database if exists r53_other".to_owned(),
+        "drop database if exists r53_copy".to_owned(),
+        "drop view if exists r53_v".to_owned(),
+        "drop table if exists r53_t".to_owned(),
+        "create database r53_other".to_owned(),
+        "create database r53_copy".to_owned(),
+        "create table r53_t (id int, a varchar(10))".to_owned(),
+        "insert into r53_t values (1, 'own')".to_owned(),
+        "create table r53_other.r53_u (id int, b varchar(10))".to_owned(),
+        "insert into r53_other.r53_u values (1, 'other')".to_owned(),
+        "create table r53_copy.r53_t (id int, a varchar(10))".to_owned(),
+        "create table r53_copy.r53_u (id int, b varchar(10))".to_owned(),
+        "insert into r53_copy.r53_t values (1, 'copy')".to_owned(),
+        "insert into r53_copy.r53_u values (1, 'copy')".to_owned(),
+        "create view r53_v as select t.a, u.b from r53_t t join r53_other.r53_u u on u.id = t.id"
+            .to_owned(),
+        format!(
+            "create view r53_other.r53_w as \
+             select u.b, t.a from r53_other.r53_u u join `{schema}`.r53_t t on t.id = u.id"
+        ),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = |h: &mut Harness, owner: &str, name: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: owner.into(),
+            name: name.into(),
+            object_type: ObjectType::View,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let v = ddl(&mut h, &schema, "r53_v");
+    let w = ddl(&mut h, "r53_other", "r53_w");
+    assert!(
+        v.contains(" VIEW `r53_v` AS select `t`.`a` AS `a`,`u`.`b` AS `b` from (`r53_t` `t` join `r53_other`.`r53_u` `u` on("),
+        "{v}"
+    );
+    assert!(
+        w.contains(&format!(
+            " VIEW `r53_w` AS select `u`.`b` AS `b`,`t`.`a` AS `a` from (`r53_u` `u` join `{schema}`.`r53_t` `t` on("
+        )),
+        "{w}"
+    );
+    // The same from another database.
+    h.ok("use r53_other");
+    assert_eq!(ddl(&mut h, &schema, "r53_v"), v);
+    assert_eq!(ddl(&mut h, "r53_other", "r53_w"), w);
+    h.ok("use r53_copy");
+    h.ok(&v);
+    h.ok(&w);
+    assert_eq!(
+        h.scalar("select concat(a, ' ', b) from r53_copy.r53_v")
+            .as_deref(),
+        Some("copy other")
+    );
+    assert_eq!(
+        h.scalar("select concat(b, ' ', a) from r53_copy.r53_w")
+            .as_deref(),
+        Some("copy own")
+    );
+    h.ok(&format!("use `{schema}`"));
+    for sql in [
+        "drop database r53_other",
+        "drop database r53_copy",
+        "drop view r53_v",
+        "drop table r53_t",
+    ] {
+        h.ok(sql);
+    }
+}
+
 /// MariaDB's sequences are sequences, not tables: listed and found as
 /// such, with their DDL, which creates them again.
 #[test]
