@@ -1230,6 +1230,354 @@ create index aux.r4_i on r4_t (n);",
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// *Edit* leaves the object as it was when its new version fails (#286). On
+/// SQLite and for a PostgreSQL materialized view the script dropped it
+/// first, and the drop stayed: the object was gone. A transaction pending
+/// in the window is neither committed nor rolled back. PostgreSQL's
+/// routines, triggers and views are replaced in place.
+#[test]
+fn edit_keeps_what_fails_on_sqlite_and_postgres() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Runs the Edit script of `object` with `old` made `new` in its window,
+    // after `before` there; gives the messages once the window has settled
+    // with its transaction `pending` or not.
+    let edit = |h: &mut Ui,
+                connection: &str,
+                object: &ObjectRef,
+                (old, new): (&str, &str),
+                before: Option<&str>,
+                pending: bool|
+     -> Vec<String> {
+        h.state_mut()
+            .test_object_action(connection, ObjectAction::Edit(object.clone()));
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(&object.name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        assert!(script.contains(old), "{script}");
+        if let Some(sql) = before {
+            h.state_mut()
+                .test_sql_window()
+                .editor
+                .set_text(sql.to_owned());
+            h.state_mut().test_execute_focused();
+            wait_until(h, sql, |app| {
+                !app.test_focused_busy() && app.test_pending_tx()
+            });
+        }
+        let edited = script.replacen(old, new, 1);
+        h.state_mut().test_sql_window().editor.set_text(edited);
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the script to run", |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let object = |owner: &str, name: &str, object_type| ObjectRef {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    };
+    let first = |rows: Vec<Vec<pythia_db::Cell>>| rows.first().and_then(|r| r[0].clone());
+
+    // SQLite: a view, a trigger and an index.
+    let connection = "r55-edit.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r55_et (n);
+create view r55_ev as select n, 1 as m from r55_et;
+create trigger r55_eg after insert on r55_et begin select 1; end;
+create index r55_ei on r55_et (n);",
+    );
+    let path = file.0.display().to_string();
+    let lite = |sql: &str| {
+        let sql = sql.to_owned();
+        first(crate::test_db::run_with(
+            DbKind::Sqlite,
+            "",
+            "",
+            &path,
+            move |c| c.query(&sql, &[]).unwrap(),
+        ))
+    };
+    let sql_of = |name: &str| {
+        lite(&format!(
+            "select sql from sqlite_master where name = '{name}'"
+        ))
+    };
+    for (object_type, name, old, failing, new) in [
+        (ObjectType::View, "r55_ev", "1 as m", "1 as m,", "2 as m"),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (ObjectType::Index, "r55_ei", "(n)", "(nx)", "(n desc)"),
+    ] {
+        let o = object("main", name, object_type);
+        let was = sql_of(name);
+        let messages = edit(&mut h, connection, &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("no such column")),
+            "{messages:?}"
+        );
+        assert_eq!(sql_of(name), was, "{name} as it was");
+        let messages = edit(&mut h, connection, &o, (old, new), None, false);
+        h.state_mut().test_close_focused();
+        let now = sql_of(name);
+        assert!(
+            now.as_deref().is_some_and(|s| s.contains(new)),
+            "{now:?} {messages:?}"
+        );
+    }
+    // A change pending in the window: the script doesn't take it in.
+    let trigger = object("main", "r55_eg", ObjectType::Trigger);
+    let insert = "insert into r55_et values (7)";
+    let messages = edit(
+        &mut h,
+        connection,
+        &trigger,
+        ("select 2", "select 3"),
+        Some(insert),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("within a transaction")),
+        "{messages:?}"
+    );
+    assert_eq!(lite("select count(*) from r55_et").as_deref(), Some("0"));
+    assert!(sql_of("r55_eg").is_some_and(|s| s.contains("select 2")));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    // PostgreSQL: a materialized view; a view, function, procedure and
+    // trigger, which are replaced in place.
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r55-edit", DbKind::Postgres) else {
+        return;
+    };
+    let drops = [
+        "drop table if exists r55_et cascade",
+        "drop function if exists r55_ef()",
+        "drop procedure if exists r55_ep()",
+        "drop function if exists r55_etf()",
+    ];
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+        for sql in [
+            "create table r55_et (n int)",
+            "create materialized view r55_emv as select n, 1 as m from r55_et",
+            "create view r55_ev as select n, 1 as m from r55_et",
+            "create function r55_ef() returns int language sql as $$select 1$$",
+            "create procedure r55_ep() language plpgsql as $$begin perform 1; end$$",
+            "create function r55_etf() returns trigger language plpgsql \
+             as $$begin return new; end$$",
+            "create trigger r55_eg before insert on r55_et \
+             for each row execute function r55_etf()",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    let pg_first = |sql: String| {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            first(c.query(&sql, &[]).unwrap())
+        })
+        .flatten()
+    };
+    let definition = |o: &ObjectRef| {
+        pg_first(match o.object_type {
+            ObjectType::View | ObjectType::MaterializedView => format!(
+                "select pg_get_viewdef(c.oid) from pg_class c where c.relname = '{}'",
+                o.name
+            ),
+            ObjectType::Trigger => format!(
+                "select pg_get_triggerdef(t.oid) from pg_trigger t where t.tgname = '{}'",
+                o.name
+            ),
+            _ => format!(
+                "select pg_get_functiondef(p.oid) from pg_proc p where p.proname = '{}'",
+                o.name
+            ),
+        })
+    };
+    for (object_type, name, old, failing, new) in [
+        (
+            ObjectType::MaterializedView,
+            "r55_emv",
+            "1 AS m",
+            "1 AS m,",
+            "2 AS m",
+        ),
+        (ObjectType::View, "r55_ev", "1 AS m", "1 AS m,", "2 AS m"),
+        (
+            ObjectType::Function,
+            "r55_ef",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (
+            ObjectType::Procedure,
+            "r55_ep",
+            "perform 1",
+            "perfxrm 1",
+            "perform 2",
+        ),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "r55_etf()",
+            "r55_etfx()",
+            "INSERT OR UPDATE",
+        ),
+    ] {
+        let o = object("public", name, object_type);
+        let was = definition(&o);
+        assert!(was.is_some(), "{name}");
+        let messages = edit(&mut h, "r55-edit", &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("does not exist")),
+            "{name}: {messages:?}"
+        );
+        assert_eq!(definition(&o), was, "{name} as it was");
+        // The materialized view's new version waits for Commit.
+        let block = object_type == ObjectType::MaterializedView;
+        let new = if object_type == ObjectType::Trigger {
+            ("INSERT", new)
+        } else {
+            (old, new)
+        };
+        edit(&mut h, "r55-edit", &o, new, None, block);
+        if block {
+            h.state_mut().test_commit();
+            wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        let now = definition(&o);
+        assert!(now.as_deref().is_some_and(|d| d.contains(new.1)), "{now:?}");
+    }
+    // A change pending in the window: neither committed nor rolled back.
+    let view = object("public", "r55_emv", ObjectType::MaterializedView);
+    let was = definition(&view);
+    let messages = edit(
+        &mut h,
+        "r55-edit",
+        &view,
+        ("2 AS m", "2 AS m,"),
+        Some("insert into r55_et values (7)"),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("syntax error")),
+        "{messages:?}"
+    );
+    assert_eq!(definition(&view), was);
+    let rows = pg_first("select count(*) from r55_et".into());
+    assert_eq!(rows.as_deref(), Some("0"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+    });
+}
+
+/// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
+/// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
+/// changes before stay pending.
+#[test]
+fn whenever_sqlerror_exit_rollback() {
+    use pythia_config::DbKind;
+
+    // Runs the script after `whenever`; gives whether a change is pending
+    // and the rows of r55_w seen in the window.
+    let run = |h: &mut Ui, connection: &str, whenever: &str| -> (bool, String) {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: format!(
+                "insert into r55_w values (1);\n{whenever}\n\
+                 insert into r55_nosuch values (1);\ninsert into r55_w values (2);"
+            ),
+            run: true,
+        });
+        let pending = whenever.ends_with("exit");
+        wait_until(h, whenever, |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let messages: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("1 remaining")),
+            "{messages:?}"
+        );
+        let w = h.state_mut().test_sql_window();
+        w.editor.set_text("select count(*) from r55_w".to_owned());
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the count", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let count = w.state.results[0].rows[0][0].clone().unwrap_or_default();
+        if pending {
+            h.state_mut().test_rollback();
+            wait_until(h, "the rollback", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        (pending, count)
+    };
+    let check = |h: &mut Ui, connection: &str| {
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit rollback"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit"),
+            (true, "1".into())
+        );
+    };
+
+    let connection = "r55-whenever.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(&mut h, connection, "create table r55_w (n)");
+    check(&mut h, connection);
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-whenever", DbKind::Oracle) {
+        run_script(&mut h, "r55-whenever", "create table r55_w (n number)");
+        check(&mut h, "r55-whenever");
+        run_script(&mut h, "r55-whenever", "drop table r55_w purge");
+    }
+}
+
 /// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote
 /// the value it had found out again to check it, so a value of more than
 /// half of max_allowed_packet made a statement the driver refused, which

@@ -70,6 +70,9 @@ pub struct RunState {
     pub done: usize,
     /// `WHENEVER SQLERROR CONTINUE`: keep going after errors.
     pub continue_on_error: bool,
+    /// `WHENEVER SQLERROR EXIT … ROLLBACK`: roll back on an error that
+    /// stops the run.
+    pub rollback_on_error: bool,
     /// The statement currently running.
     pub running: Option<Running>,
     /// Request id of a "fetch more" in flight.
@@ -475,6 +478,7 @@ impl SqlWindow {
         self.state.total = statements.len();
         self.state.done = 0;
         self.state.continue_on_error = false;
+        self.state.rollback_on_error = false;
         self.state.queue = statements.into();
         self.run_next(cx)
     }
@@ -1320,6 +1324,12 @@ impl SqlWindow {
                     .collect();
                 if words.first().is_some_and(|w| w == "SQLERROR") {
                     self.state.continue_on_error = words.get(1).is_some_and(|w| w == "CONTINUE");
+                    // As in SQL*Plus; Edit's SQLite script undoes its drop
+                    // so when the create fails (#286).
+                    self.state.rollback_on_error = !self.state.continue_on_error
+                        && words
+                            .last()
+                            .is_some_and(|w| w.trim_end_matches(';') == "ROLLBACK");
                 }
                 SqlPlus::Done
             }
@@ -1855,6 +1865,10 @@ impl SqlWindow {
                 self.info(format!("Failed after {}", fmt_duration(elapsed)));
                 if dropped > 0 {
                     self.info(format!("{dropped} remaining statement(s) skipped"));
+                }
+                if self.state.rollback_on_error && !applying {
+                    self.info("Rolling back (WHENEVER SQLERROR EXIT ROLLBACK)");
+                    effects.request(Target::Own, DbRequest::Rollback);
                 }
                 if applying {
                     effects.extend(self.run_next(cx));

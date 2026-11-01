@@ -386,7 +386,9 @@ for Linux, Windows and macOS.
   attaches one for every window). Object views show columns, indexes,
   constraints, triggers, what uses a table and what a view uses, and the
   DDL as written, a table's with its indexes. *Edit* opens a view or
-  trigger as a script that drops and creates it again.
+  trigger as a script that drops and creates it again in a transaction of
+  its own, which a failing create rolls back (`WHENEVER SQLERROR EXIT
+  ROLLBACK`), so the object stays as it was.
 - *Edit* on a result of one table changes its rows in place, as on the
   other databases. Rows are found by the table's primary key, a unique
   index on NOT NULL columns, or else its `rowid`, so every table can be

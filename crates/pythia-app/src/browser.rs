@@ -2080,9 +2080,13 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
 /// says. A routine or trigger ends with `/` like a PL/SQL unit so the
 /// body's `;` stay in it. PostgreSQL's routines and views come with
 /// `CREATE OR REPLACE`, its triggers get it; SQL Server's get `CREATE OR
-/// ALTER`. SQLite has neither: drop, then create, a trigger's body keeping
-/// its `;` without a `/`, and the `;` after a line comment on a line of its
-/// own (#206).
+/// ALTER`. SQLite has neither, nor has PostgreSQL for a materialized view,
+/// but their DDL is transactional: the drop and the create go in one
+/// transaction that a failing create undoes (#286). SQLite's script begins
+/// one (which fails before anything is changed when the window has one
+/// pending) and rolls it back on an error; PostgreSQL's runs both in one
+/// `DO` block. A SQLite trigger's body keeps its `;` without a `/`, and the
+/// `;` after a line comment goes on a line of its own (#206).
 ///
 /// The object is created where it was, whatever the current database or
 /// schema (#248): MySQL's DDL leaves out the database, so the script
@@ -2117,7 +2121,17 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             format!("{}\n", create_or(ddl, "or replace", "TRIGGER"))
         }
         (pythia_db::DbKind::Postgres, ObjectType::MaterializedView) => {
-            format!("drop materialized view if exists {qualified};\n\n{ddl}\n")
+            let ddl = pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Postgres);
+            let mut tag = "$pythia$".to_owned();
+            while ddl.contains(&tag) {
+                tag.insert(tag.len() - 1, '_');
+            }
+            // A column named `found` is the view's, not PL/pgSQL's FOUND.
+            format!(
+                "-- One block: if the create fails, the {kind} stays as it was.\n\
+                 do {tag}\n#variable_conflict use_column\nbegin\n\
+                 drop {kind} if exists {qualified};\n\n{ddl}\nend\n{tag};\n"
+            )
         }
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => {
@@ -2131,7 +2145,10 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
                 in_schema(dialect, ddl, &o.owner)
             };
             format!(
-                "drop {kind} if exists {qualified};\n\n{}\n",
+                "-- A transaction of its own: if the create fails, the {kind} stays\n\
+                 -- as it was.\n\
+                 begin;\nwhenever sqlerror exit rollback\n\n\
+                 drop {kind} if exists {qualified};\n\n{}\n\ncommit;\n",
                 pythia_plsql::terminated(&ddl, pythia_plsql::Syntax::Sqlite)
             )
         }
@@ -3130,6 +3147,35 @@ mod tests {
             ),
             "CREATE or replace TRIGGER t BEFORE INSERT ON app.x FOR EACH ROW EXECUTE FUNCTION app.f();\n"
         );
+        // A materialized view: dropped and created in one block (#286).
+        let view = "create materialized view app.\"Mv\" as\n SELECT 1 AS found;";
+        let script = replace_script(
+            Dialect::POSTGRES,
+            &o("Mv", ObjectType::MaterializedView),
+            view,
+            false,
+        );
+        assert_eq!(
+            script,
+            format!(
+                "-- One block: if the create fails, the materialized view stays as it was.\n\
+                 do $pythia$\n#variable_conflict use_column\nbegin\n\
+                 drop materialized view if exists app.\"Mv\";\n\n{view}\nend\n$pythia$;\n"
+            )
+        );
+        assert_eq!(
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Postgres).len(),
+            1
+        );
+        let tagged = "create materialized view app.v as\n SELECT '$pythia$'::text AS t";
+        let script = replace_script(
+            Dialect::POSTGRES,
+            &o("v", ObjectType::MaterializedView),
+            tagged,
+            false,
+        );
+        assert!(script.contains("do $pythia_$\n"), "{script}");
+        assert!(script.ends_with("AS t;\nend\n$pythia_$;\n"), "{script}");
         let drop = drop_sql(Dialect::POSTGRES, &o("t", ObjectType::Trigger));
         assert!(drop.contains("g.tgname = 't'"), "{drop}");
         assert_eq!(
@@ -3190,6 +3236,14 @@ mod tests {
             name: name.into(),
             object_type,
         };
+        // In a transaction of its own that an error rolls back (#286).
+        let replaced = |kind: &str, drop: &str, create: &str| {
+            format!(
+                "-- A transaction of its own: if the create fails, the {kind} stays\n\
+                 -- as it was.\n\
+                 begin;\nwhenever sqlerror exit rollback\n\n{drop};\n\n{create}\n\ncommit;\n"
+            )
+        };
         let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;\n";
         let script = replace_script(
             Dialect::SQLITE,
@@ -3199,12 +3253,26 @@ mod tests {
         );
         assert_eq!(
             script,
-            "drop trigger if exists main.t;\n\nCREATE TRIGGER t AFTER INSERT ON x BEGIN\n  \
-             update x set n = 1;\nEND;\n"
+            replaced(
+                "trigger",
+                "drop trigger if exists main.t",
+                trigger.trim_end()
+            )
         );
+        let statements: Vec<&str> =
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite)
+                .iter()
+                .map(|s| s.text(&script))
+                .collect();
         assert_eq!(
-            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
-            2
+            statements,
+            [
+                "begin",
+                "whenever sqlerror exit rollback",
+                "drop trigger if exists main.t",
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND",
+                "commit"
+            ]
         );
         // A view as written, a line comment at its end: the `;` goes on a
         // line of its own (#206).
@@ -3212,13 +3280,12 @@ mod tests {
         let script = replace_script(Dialect::SQLITE, &lite("v", ObjectType::View), view, false);
         assert_eq!(
             script,
-            "drop view if exists main.v;\n\nCREATE VIEW v AS select 'foo' as a\nwhere 1\n    \
-             -- and 0; really\n;\n"
+            replaced("view", "drop view if exists main.v", &format!("{view}\n;"))
         );
         let script = format!("{script}select 1;");
         assert_eq!(
             pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
-            3
+            6
         );
         assert_eq!(
             drop_sql(Dialect::SQLITE, &lite("order", ObjectType::Table)),
@@ -3237,8 +3304,11 @@ mod tests {
                 trigger,
                 false
             ),
-            "drop trigger if exists aux.t;\n\nCREATE TRIGGER aux.t AFTER INSERT ON x BEGIN\n  \
-             update x set n = 1;\nEND;\n"
+            replaced(
+                "trigger",
+                "drop trigger if exists aux.t",
+                "CREATE TRIGGER aux.t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;"
+            )
         );
         assert_eq!(
             replace_script(
@@ -3247,7 +3317,11 @@ mod tests {
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"i\" ON x (n)",
                 false
             ),
-            "drop index if exists aux.i;\n\nCREATE UNIQUE INDEX IF NOT EXISTS aux.\"i\" ON x (n);\n"
+            replaced(
+                "index",
+                "drop index if exists aux.i",
+                "CREATE UNIQUE INDEX IF NOT EXISTS aux.\"i\" ON x (n);"
+            )
         );
     }
 }

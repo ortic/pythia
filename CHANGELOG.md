@@ -63,6 +63,10 @@ All notable changes to Pythia are documented here. The format follows
   starts = 318 rows, got none". The 35 is the line's Id in the plan, and
   no rows are no longer called 318× fewer. The details under the plan
   tree are headed "Line 35: INDEX UNIQUE SCAN".
+- `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails,
+  as in SQL\*Plus (#286), on every database: the SQL window stopped the
+  script and left its changes pending. `WHENEVER SQLERROR EXIT` without
+  `ROLLBACK` still stops without ending the transaction.
 
 ### Fixed
 - INSERT exports on SQL Server wrote a `float` like 1e300 out in full
@@ -533,6 +537,14 @@ All notable changes to Pythia are documented here. The format follows
   (`main.""`). It showed as its icon and a button without a name, 16
   pixels wide, and its tab had no title. A name of spaces only shows
   quoted as well (`" "`).
+- *Edit* of a SQLite trigger, view or index, and of a PostgreSQL
+  materialized view, no longer leaves the object dropped when its new
+  version fails (#286). The script dropped it, then created it, and the
+  drop was committed: a typo in the new version made the object go.
+  SQLite's script now runs in a transaction of its own that a failing
+  statement rolls back; with a transaction pending in the window it
+  stops at its `begin`, before anything changed. PostgreSQL's drops and
+  creates the view in one `DO` block, which waits for Commit.
 
 ## [0.10.0] - 2026-10-30
 
