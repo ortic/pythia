@@ -635,6 +635,42 @@ All notable changes to Pythia are documented here. The format follows
   statement rolls back; with a transaction pending in the window it
   stops at its `begin`, before anything changed. PostgreSQL's drops and
   creates the view in one `DO` block, which waits for Commit.
+- The JSON and Excel exports keep every digit of a number (#267).
+  18446744073709551615 went into JSON as `1.8446744073709552e+19` and
+  9223372036854775807 into Excel as 9223372036854775808. JSON now has
+  the number as the database shows it (`.5` as `0.5`): a reader that
+  takes JSON numbers for doubles gets the nearest one as before, one that
+  reads them exactly gets all the digits. Excel holds 15 significant
+  digits, so a number whose whole part has more, as
+  9223372036854775807, goes in as text with all of them; a longer
+  fraction rounds as Excel's own numbers do, so an average stays a
+  number.
+- Oracle: a binary value typed into a result as the grid shows it,
+  `0x…`, is stored as those bytes (#271), as on the other databases
+  (#256). In a RAW, and in the RAW, BLOB or LONG RAW of a new row,
+  `0x171066e1` failed on *Apply* with ORA-01465 "invalid hex number".
+- Oracle: INSERT statements name a column or a table called like a
+  reserved word in quotes (#274), `"LEVEL"` or `"SIZE"`. *Copy as*, the
+  grid's *Export*, *Execute to file* and *Export tables* wrote
+  `insert into t (id, level, size)`, which fails with ORA-03050.
+  `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` and `SUCCESSFUL` weren't
+  known as reserved words: they are now, also in the SQL that result
+  editing and the object editors write.
+- *Export tables* and *Export schema to folder* write each object into a
+  file of its own (#280). The file was the name in lowercase, so `FOO`,
+  `"Foo"` and `"foo"` shared one and only the last was left, `"A/B"`
+  went into a folder `a`, and `"A:B"` was no file name on Windows. A
+  name Oracle reads unquoted keeps its file (`foo.sql`); in others a `^`
+  marks each run of letters of the other case (`"Foo"` → `f^oo.sql`,
+  `"foo"` → `^foo.sql`), which keeps them apart also where `Foo.sql` and
+  `foo.sql` are one file, and a character a file name can't hold is
+  written as `%` and its hex (`"A/B"` → `a%2Fb.sql`). Comparing such a
+  file with the database finds its object again.
+- Pythia builds with tokio 1.54.1 and clipboard-win 5.4.3 (#288): 1.54.0
+  and 5.4.1 were yanked, tokio's for RUSTSEC-2026-0384, a race in its
+  timers that can corrupt memory. rsa, which the SSH tunnels use, still
+  has RUSTSEC-2023-0071 (a timing side channel), for which there is no
+  fixed version yet.
 
 ## [0.10.0] - 2026-10-30
 

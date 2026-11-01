@@ -943,3 +943,85 @@ fn binary_values_typed_as_shown() {
         }
     }
 }
+
+/// On Oracle too: `0x171066e1` typed into a RAW is its four bytes, and so
+/// into the RAW, BLOB and LONG RAW of a new row. Oracle's `hextoraw`
+/// failed on the `0x` with ORA-01465.
+#[test]
+fn oracle_binary_values_typed_as_shown() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let tables = ["r54_typed", "r54_typed_long"];
+    for table in tables {
+        let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+    }
+    for sql in [
+        "create table r54_typed (id number primary key, r raw(16), b blob)",
+        "insert into r54_typed (id) values (1)",
+        "create table r54_typed_long (id number primary key, l long raw)",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    // The rows as the session shows them, with their ROWID.
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let apply = |table: &str, changes: &Changes| {
+        let edit = Editable {
+            table: table.into(),
+            source: format!("select * from {table} order by id"),
+            key: RowKey::Rowid,
+        };
+        let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, changes) {
+            let ran = conn
+                .execute(&statement.sql, &[])
+                .and_then(|s| s.row_count());
+            assert!(matches!(ran, Ok(1)), "{ran:?}\n{}", statement.sql);
+        }
+    };
+    let typed = || Some("0x171066e1".to_owned());
+    let typed_row = |columns: usize| {
+        let mut row = vec![Some("2".to_owned())];
+        row.resize_with(columns, typed);
+        row
+    };
+    apply(
+        "r54_typed",
+        &Changes {
+            updates: BTreeMap::from([(0, BTreeMap::from([(1, typed())]))]),
+            inserts: vec![typed_row(3)],
+            ..Changes::default()
+        },
+    );
+    let (_, rows) = fetch("select id, r, b, dbms_lob.getlength(b) from r54_typed order by id");
+    let hex = Some("171066E1".to_owned());
+    assert_eq!(
+        rows,
+        [
+            vec![Some("1".to_owned()), hex.clone(), None, None],
+            vec![Some("2".into()), hex.clone(), hex.clone(), Some("4".into())],
+        ]
+    );
+    apply(
+        "r54_typed_long",
+        &Changes {
+            inserts: vec![typed_row(2)],
+            ..Changes::default()
+        },
+    );
+    let (_, rows) = fetch("select l from r54_typed_long");
+    assert_eq!(rows, [[hex]]);
+    for table in tables {
+        conn.execute(&format!("drop table {table} purge"), &[])
+            .unwrap();
+    }
+}

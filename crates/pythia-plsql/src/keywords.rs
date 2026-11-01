@@ -229,6 +229,121 @@ const KEYWORDS: &[&str] = &[
     "WORK",
 ];
 
+/// Oracle's reserved words: those of `v$reserved_words` (Oracle 23ai)
+/// that can't name a column without quotes (ORA-03050). KEYWORDS has
+/// most of them, not all (#274). Sorted, uppercase.
+const ORACLE_RESERVED: &[&str] = &[
+    "ACCESS",
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "AS",
+    "ASC",
+    "AUDIT",
+    "BETWEEN",
+    "BY",
+    "CHAR",
+    "CHECK",
+    "CLUSTER",
+    "COLUMN",
+    "COMMENT",
+    "COMPRESS",
+    "CONNECT",
+    "CREATE",
+    "CURRENT",
+    "DATE",
+    "DECIMAL",
+    "DEFAULT",
+    "DELETE",
+    "DESC",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "EXCEPT",
+    "EXCLUSIVE",
+    "EXISTS",
+    "FILE",
+    "FLOAT",
+    "FOR",
+    "FROM",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "IDENTIFIED",
+    "IMMEDIATE",
+    "IN",
+    "INCREMENT",
+    "INDEX",
+    "INITIAL",
+    "INSERT",
+    "INTEGER",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "LEVEL",
+    "LIKE",
+    "LOCK",
+    "LONG",
+    "MAXEXTENTS",
+    "MINUS",
+    "MLSLABEL",
+    "MODE",
+    "MODIFY",
+    "NOAUDIT",
+    "NOCOMPRESS",
+    "NOT",
+    "NOWAIT",
+    "NULL",
+    "NUMBER",
+    "OF",
+    "OFFLINE",
+    "ON",
+    "ONLINE",
+    "OPTION",
+    "OR",
+    "ORDER",
+    "PCTFREE",
+    "PRIOR",
+    "PUBLIC",
+    "RAW",
+    "RENAME",
+    "RESOURCE",
+    "REVOKE",
+    "ROW",
+    "ROWID",
+    "ROWNUM",
+    "ROWS",
+    "SELECT",
+    "SESSION",
+    "SET",
+    "SHARE",
+    "SIZE",
+    "SMALLINT",
+    "START",
+    "SUCCESSFUL",
+    "SYNONYM",
+    "SYSDATE",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRIGGER",
+    "UID",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USER",
+    "VALIDATE",
+    "VALUES",
+    "VARCHAR",
+    "VARCHAR2",
+    "VIEW",
+    "WHENEVER",
+    "WHERE",
+    "WITH",
+];
+
 /// MySQL's reserved words (`information_schema.keywords` of MySQL 9.4):
 /// an identifier spelled like one needs backticks (#233). Sorted,
 /// uppercase.
@@ -867,11 +982,11 @@ pub fn is_keyword(word: &str) -> bool {
 }
 
 /// Whether an identifier spelled `word` needs quotes on a database with
-/// `syntax` (Oracle's list is the highlighter's, which errs on the side of
-/// quoting; MySQL's has it too).
+/// `syntax` (Oracle's reserved words and the highlighter's list, which
+/// errs on the side of quoting; MySQL's has it too).
 pub fn is_reserved(word: &str, syntax: crate::Syntax) -> bool {
     match syntax {
-        crate::Syntax::Oracle => is_keyword(word),
+        crate::Syntax::Oracle => contains(ORACLE_RESERVED, word) || is_keyword(word),
         crate::Syntax::MySql => contains(MYSQL_RESERVED, word) || is_keyword(word),
         crate::Syntax::Postgres => contains(POSTGRES_RESERVED, word),
         crate::Syntax::TSql => contains(TSQL_RESERVED, word),
@@ -901,6 +1016,7 @@ mod tests {
     fn sorted() {
         for list in [
             KEYWORDS,
+            ORACLE_RESERVED,
             MYSQL_RESERVED,
             POSTGRES_RESERVED,
             TSQL_RESERVED,
@@ -912,6 +1028,9 @@ mod tests {
                 list.windows(2).find(|w| w[0] >= w[1])
             );
         }
+        assert!(is_reserved("Resource", crate::Syntax::Oracle));
+        assert!(is_reserved("level", crate::Syntax::Oracle));
+        assert!(!is_reserved("name", crate::Syntax::Oracle));
         assert!(is_reserved("Rank", crate::Syntax::MySql));
         assert!(is_reserved("order", crate::Syntax::MySql));
         assert!(!is_reserved("status", crate::Syntax::MySql));

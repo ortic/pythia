@@ -240,10 +240,7 @@ impl Dialect {
     /// unquoted names to uppercase, PostgreSQL to lowercase; MySQL, SQL
     /// Server and SQLite keep their case.
     pub fn quote_ident(self, name: &str) -> String {
-        let reserved = match self.0 {
-            DbKind::Oracle => pythia_plsql::is_keyword(name),
-            _ => pythia_plsql::is_reserved(name, self.syntax()),
-        };
+        let reserved = pythia_plsql::is_reserved(name, self.syntax());
         let plain = |start: fn(char) -> bool, rest: fn(char) -> bool| {
             name.chars().next().is_some_and(start) && name.chars().all(rest) && !reserved
         };
