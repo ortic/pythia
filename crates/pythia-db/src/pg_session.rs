@@ -45,7 +45,8 @@ use crate::sql_text::{
 };
 use crate::ssh::Tunnel;
 use crate::types::{
-    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
+    NameContext, ServerInfo,
 };
 
 type Connection =
@@ -98,10 +99,12 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         release: (0, 0),
         autocommit: false,
         tx: Transaction::default(),
+        context: NameContext::default(),
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
             worker.release = server.release;
+            worker.context = server.context.clone();
             worker.events.send(DbEvent::Connected(server));
             for notice in failed {
                 worker.events.send(DbEvent::Notice(notice));
@@ -159,7 +162,8 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
             }),
             DbRequest::Run { id, task } => {
                 let started = Instant::now();
-                let result = task(&mut PgClient(worker.pg()));
+                let pending = worker.tx.pending;
+                let result = task(&mut PgClient(worker.pg(), pending));
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -248,6 +252,8 @@ struct Worker {
     release: Release,
     autocommit: bool,
     tx: Transaction,
+    /// The search path last reported (#320).
+    context: NameContext,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -318,8 +324,36 @@ impl Worker {
             banner: values.next().unwrap_or(full),
             version,
             current_schema: values.next().unwrap_or_default(),
+            context: self.context()?,
         };
         Ok((server, failed))
+    }
+
+    /// The schemas of the search path that exist, in its order (#320).
+    fn context(&self) -> Result<NameContext, DbError> {
+        let rows = self.pg().rows(
+            "select s from unnest(current_schemas(false)) with ordinality as p (s, n) order by n",
+            &[],
+        )?;
+        Ok(NameContext {
+            schemas: rows
+                .into_iter()
+                .filter_map(|r| r.into_iter().next().flatten())
+                .collect(),
+            ..NameContext::default()
+        })
+    }
+
+    /// Reports the search path when it changed (#320).
+    fn report_context(&mut self) {
+        match self.context() {
+            Ok(context) if context != self.context => {
+                self.events.send(DbEvent::Context(context.clone()));
+                self.context = context;
+            }
+            Ok(_) => {}
+            Err(e) => warn!("reading the search path: {e}"),
+        }
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
@@ -435,6 +469,9 @@ impl Worker {
                 let _ = self.pg().execute(&format!("release savepoint {SAVEPOINT}"));
             }
             self.tx.after(effect);
+        }
+        if changes_path(&sql) {
+            self.report_context();
         }
         self.report_notices();
         self.report_transaction();
@@ -719,6 +756,8 @@ impl Worker {
                 self.events.send(DbEvent::Error(e));
             }
         }
+        // A SET LOCAL ends with the transaction.
+        self.report_context();
         self.report_notices();
         self.report_transaction();
     }
@@ -735,6 +774,21 @@ impl Worker {
             self.events.send(DbEvent::Notice(notice));
         }
     }
+}
+
+/// Whether `sql` may change the schemas of the search path (#320): SET
+/// and RESET, a transaction's end (SET LOCAL), DISCARD, a DO block or CALL
+/// that sets it, a schema made, dropped or renamed.
+fn changes_path(sql: &str) -> bool {
+    let words = leading_words(sql);
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    matches!(
+        words[..],
+        [
+            "SET" | "RESET" | "DISCARD" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "DO" | "CALL",
+            ..
+        ] | ["CREATE" | "DROP" | "ALTER", "SCHEMA"]
+    )
 }
 
 /// What [`Worker::fetch`] reads.
@@ -793,7 +847,8 @@ impl Pg<'_> {
 }
 
 /// A PostgreSQL connection as a [`Client`].
-struct PgClient<'a>(Pg<'a>);
+/// The session's connection, and whether it has a transaction open.
+struct PgClient<'a>(Pg<'a>, bool);
 
 impl Client for PgClient<'_> {
     fn dialect(&self) -> Dialect {
@@ -806,6 +861,10 @@ impl Client for PgClient<'_> {
 
     fn meta(&mut self, query: &MetaQuery) -> Result<MetaResult, DbError> {
         crate::pg_meta::run(&self.0, query)
+    }
+
+    fn aborts_transaction(&self) -> bool {
+        self.1
     }
 }
 

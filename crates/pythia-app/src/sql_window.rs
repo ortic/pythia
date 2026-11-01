@@ -1006,6 +1006,17 @@ impl SqlWindow {
                 .any(|r| replaces(&r.internal))
     }
 
+    /// Whether code assistance can look up what only the window's session
+    /// sees there now (#320): it isn't busy, and has no result with rows
+    /// left, whose query a lookup would end where the session reads one
+    /// result at a time (all but Oracle).
+    pub fn takes_lookups(&self) -> bool {
+        !self.session_busy()
+            && self.state.prompt.is_none()
+            && (self.state.syntax == Syntax::Oracle
+                || !self.state.results.iter().any(|r| r.more && !r.ended))
+    }
+
     /// Whether the window's session is busy with a statement, a fetch or a
     /// tool of the window.
     fn session_busy(&self) -> bool {
@@ -1084,6 +1095,30 @@ impl SqlWindow {
             && self.state.ahead.len() < AHEAD
             && (!cx.read_only || is_query(&stmt.sql))
             && !self.needs_values(&stmt.sql)
+    }
+
+    /// A statement of the script failed after the rows that ended it
+    /// (#347): the session stopped the script with it, the statements sent
+    /// after it too, unless it goes on after errors.
+    fn script_failed(&mut self, elapsed: Duration) -> Effects {
+        let mut effects = Effects::default();
+        if self.state.continue_on_error {
+            self.info(format!(
+                "Failed after {} — continuing (WHENEVER SQLERROR CONTINUE)",
+                fmt_duration(elapsed)
+            ));
+            return effects;
+        }
+        let dropped = self.drop_ahead() + std::mem::take(&mut self.state.queue).len();
+        self.info(format!("Failed after {}", fmt_duration(elapsed)));
+        if dropped > 0 {
+            self.info(format!("{dropped} remaining statement(s) skipped"));
+        }
+        if self.state.rollback_on_error {
+            self.info("Rolling back (WHENEVER SQLERROR EXIT ROLLBACK)");
+            effects.request(Target::Own, DbRequest::Rollback);
+        }
+        effects
     }
 
     /// The statement that ended; the one sent after it runs now.
@@ -2159,6 +2194,19 @@ impl SqlWindow {
                 if self.state.fetching == Some(id) {
                     self.state.fetching = None;
                     self.error(&error);
+                    return effects;
+                }
+                // The statement's last rows came first, which ended it: Break
+                // while SQL Server fetched them, an error after a result of
+                // a statement with several. It isn't the one running now,
+                // which a script sent after it (#347), nor any, after a fetch
+                // of its result.
+                if self.state.running.as_ref().is_none_or(|r| r.id != id) {
+                    self.error(&error);
+                    let ours = self.state.results.iter().any(|r| r.id == id);
+                    if ours && (self.state.running.is_some() || !self.state.queue.is_empty()) {
+                        effects.extend(self.script_failed(elapsed));
+                    }
                     return effects;
                 }
                 self.error(&error);
@@ -4282,6 +4330,76 @@ mod tests {
                 .iter()
                 .any(|m| m.text.starts_with("Result 1 shows the 100 rows fetched")),
         );
+    }
+
+    /// A query's failure after its last rows is its own (#347): with a
+    /// script's next statements sent ahead, the first of them was taken
+    /// for the one that failed, and after a fetch of a result the failure
+    /// counted as a statement's, which WHENEVER SQLERROR EXIT ROLLBACK
+    /// rolled back for.
+    #[test]
+    fn failures_after_the_last_rows() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let messages = |w: &SqlWindow| -> Vec<String> {
+            w.state.messages.iter().map(|m| m.text.clone()).collect()
+        };
+        let rows = |w: &mut SqlWindow, id, more| {
+            w.on_event(
+                DbEvent::Rows {
+                    id,
+                    rows: vec![Vec::new(); 2],
+                    more,
+                    elapsed: Duration::ZERO,
+                },
+                &cx,
+            )
+        };
+        let failed = |w: &mut SqlWindow, id| {
+            w.on_event(
+                DbEvent::Failed {
+                    id,
+                    error: pythia_db::DbError::new("Cancelled while fetching"),
+                    elapsed: Duration::ZERO,
+                },
+                &cx,
+            )
+        };
+        let started = |w: &mut SqlWindow, id| {
+            let columns = Vec::new();
+            w.on_event(DbEvent::QueryStarted { id, columns }, &cx);
+        };
+
+        let mut w = SqlWindow::new("t".into(), "select 1;\nselect 2;\nselect 3".into());
+        let ids: Vec<u64> = sent(&w.execute(false, &cx)).iter().map(|s| s.0).collect();
+        assert_eq!(ids.len(), 3, "sent ahead");
+        started(&mut w, ids[0]);
+        rows(&mut w, ids[0], false);
+        assert_eq!(w.state.running.as_ref().map(|r| r.id), Some(ids[1]));
+        failed(&mut w, ids[0]);
+        let said = messages(&w);
+        assert_eq!(
+            said[said.len() - 2..],
+            ["Failed after 0 ms", "2 remaining statement(s) skipped"],
+            "{said:?}"
+        );
+        assert!(w.state.running.is_none() && w.state.ahead.is_empty());
+        assert_eq!(w.state.done, 1);
+
+        let mut w = SqlWindow::new("t".into(), "select 1".into());
+        let id = sent(&w.execute(false, &cx))[0].0;
+        w.state.rollback_on_error = true;
+        started(&mut w, id);
+        rows(&mut w, id, true);
+        let before = messages(&w);
+        w.state.fetching = Some(id);
+        rows(&mut w, id, false);
+        let effects = failed(&mut w, id);
+        assert!(effects.requests.is_empty(), "no rollback");
+        let said = messages(&w);
+        assert_eq!(said[..before.len()], before[..]);
+        assert_eq!(said[before.len()..], ["Cancelled while fetching"]);
+        assert_eq!(w.state.done, 1);
     }
 
     /// A result whose query the session closed with rows left keeps its

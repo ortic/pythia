@@ -65,6 +65,12 @@ pub trait Client {
     fn execute(&mut self, sql: &str) -> Result<(), DbError> {
         self.query(sql, &[]).map(|_| ())
     }
+    /// Whether a statement that fails would abort the session's open
+    /// transaction (PostgreSQL's, in one): what may fail then runs after a
+    /// savepoint (#320).
+    fn aborts_transaction(&self) -> bool {
+        false
+    }
 }
 
 /// A closure run on the session's worker thread with its [`Client`].
@@ -220,6 +226,10 @@ pub enum DbEvent {
     /// time_zone` takes it: when it connects, and after a statement that
     /// changed it. INSERT statements of its results set it (#213).
     TimeZone(String),
+    /// What the session's unqualified names refer to, after a statement
+    /// that may have changed it (#320); [`ServerInfo::context`] when it
+    /// connects.
+    Context(NameContext),
     Notice(String),
     Error(DbError),
     Disconnected,
@@ -233,6 +243,43 @@ pub struct ServerInfo {
     pub release: crate::compat::Release,
     pub banner: String,
     pub current_schema: String,
+    /// What its unqualified names refer to once it ran the login script.
+    pub context: NameContext,
+}
+
+/// What a session's unqualified names refer to (#320): Oracle's current
+/// schema, MySQL's database, PostgreSQL's search path, SQL Server's
+/// database and default schema, SQLite's attached databases. Code
+/// assistance looks a SQL window's names up in its window's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct NameContext {
+    /// SQL Server's database; empty elsewhere.
+    pub database: String,
+    /// The schemas unqualified names are looked up in, in order: Oracle's
+    /// current schema, MySQL's database (none without one), the schemas of
+    /// PostgreSQL's search path that exist, SQL Server's default schema.
+    pub schemas: Vec<String>,
+    /// SQLite's attached databases as `(name, file)`, without `main` and
+    /// `temp`.
+    pub attached: Vec<(String, String)>,
+}
+
+impl NameContext {
+    /// The context of `schema` alone (of none when it is empty).
+    pub fn schema(schema: &str) -> Self {
+        Self {
+            schemas: (!schema.is_empty())
+                .then(|| schema.to_owned())
+                .into_iter()
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The schema unqualified names are looked up in first.
+    pub fn current(&self) -> Option<&str> {
+        self.schemas.first().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone)]

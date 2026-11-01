@@ -152,6 +152,19 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
             last.span.end = span.end;
             continue;
         }
+        // T-SQL's temporary tables: `#name`, `##name` (#320).
+        if syntax == Syntax::TSql
+            && matches!(kind, TokenKind::Ident | TokenKind::Keyword)
+            && let Some(last) = tokens.last_mut().filter(|t: &&mut Token| {
+                t.kind == TokenKind::Error
+                    && t.span.end == span.start
+                    && is_temporary_prefix(&src[t.span.clone()])
+            })
+        {
+            last.kind = TokenKind::Ident;
+            last.span.end = span.end;
+            continue;
+        }
         // Merge consecutive error bytes into one token.
         if kind == TokenKind::Error
             && let Some(last) = tokens
@@ -164,6 +177,13 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
         tokens.push(Token { kind, span });
     }
     tokens
+}
+
+/// What starts the name of a T-SQL temporary table: `#` or `##`, and the
+/// underscores after it.
+fn is_temporary_prefix(text: &str) -> bool {
+    let after = text.trim_start_matches('#');
+    (1..=2).contains(&(text.len() - after.len())) && after.bytes().all(|b| b == b'_')
 }
 
 /// The texts of the first `n` tokens of a statement that aren't comments,
@@ -663,6 +683,39 @@ mod tests {
         assert_eq!(normalize_ident("`a``b`"), ("a`b".into(), true));
         assert_eq!(normalize_ident("\"My\"\"T\""), ("My\"T".into(), true));
         assert_eq!(normalize_ident("emp"), ("EMP".into(), false));
+    }
+
+    #[test]
+    fn tsql_temporary_tables() {
+        // `#name` and `##name` are names on SQL Server (#320), `#` alone
+        // isn't, and elsewhere `#` is no name's start.
+        let src = "select * from #t, ##g, #_x, #table, ###no # t";
+        let words = |syntax| -> Vec<(TokenKind, &str)> {
+            tokenize_in(src, syntax)
+                .into_iter()
+                .filter(|t| !t.kind.is_trivia())
+                .skip(3)
+                .map(|t| (t.kind, &src[t.span]))
+                .collect()
+        };
+        assert_eq!(
+            words(Syntax::TSql),
+            vec![
+                (TokenKind::Ident, "#t"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Ident, "##g"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Ident, "#_x"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Ident, "#table"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Error, "###"),
+                (TokenKind::Ident, "no"),
+                (TokenKind::Error, "#"),
+                (TokenKind::Ident, "t"),
+            ]
+        );
+        assert_eq!(words(Syntax::Sqlite)[0], (TokenKind::Error, "#"));
     }
 
     fn postgres_kinds(src: &str) -> Vec<(TokenKind, &str)> {

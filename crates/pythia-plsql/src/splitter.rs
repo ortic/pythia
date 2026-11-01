@@ -354,6 +354,15 @@ impl<'a> Splitter<'a> {
         0
     }
 
+    /// Whether the statement at token `start` is `CREATE [OR REPLACE] RULE`.
+    fn is_rule(&self, start: usize) -> bool {
+        let mut words = self.significant_from(start);
+        words.next().is_some_and(|t| self.word_eq(t, &["CREATE"]))
+            && words
+                .find(|t| !self.word_eq(t, &["OR", "REPLACE"]))
+                .is_some_and(|t| self.word_eq(t, &["RULE"]))
+    }
+
     fn significant_from(&self, idx: usize) -> impl Iterator<Item = &Token> {
         self.tokens[idx..].iter().filter(|t| !t.kind.is_trivia())
     }
@@ -534,26 +543,51 @@ impl<'a> Splitter<'a> {
             } else {
                 self.depth_change(start, 0).max(0) as usize
             };
+            // A PostgreSQL rule's actions in parentheses keep their `;`
+            // (#346): `do also (select 1; select 2)`. Where they aren't
+            // closed by the end of the script, as while they are typed, it
+            // ends at the first of them as other statements do, and those
+            // after it stay apart: that one, and the last token before it.
+            let rule = self.syntax == Syntax::Postgres && self.is_rule(start);
+            let mut parens = 0usize;
+            let mut inner: Option<(usize, usize)> = None;
+            let mut ended = false;
             i += 1;
             while i < self.tokens.len() {
                 let t = &self.tokens[i];
                 match kind {
                     StatementKind::SqlPlus if t.kind == TokenKind::Newline => break,
                     StatementKind::Sql if t.kind == TokenKind::Semicolon && depth == 0 => {
-                        i += 1;
-                        break;
+                        if parens == 0 {
+                            i += 1;
+                            ended = true;
+                            break;
+                        }
+                        inner.get_or_insert((i, last));
                     }
                     StatementKind::Sql | StatementKind::PlSql if self.is_terminator_line(i) => {
                         i = self.line_end(i);
+                        ended = true;
                         break;
                     }
                     _ => {}
                 }
                 depth = depth.saturating_add_signed(self.depth_change(i, depth));
+                if rule {
+                    match t.kind {
+                        TokenKind::LParen => parens += 1,
+                        TokenKind::RParen => parens = parens.saturating_sub(1),
+                        _ => {}
+                    }
+                }
                 if !t.kind.is_trivia() {
                     last = i;
                 }
                 i += 1;
+            }
+            if !ended && let Some((semicolon, before)) = inner {
+                i = semicolon + 1;
+                last = before;
             }
             self.push(kind, start, last);
         }
@@ -764,6 +798,47 @@ mod tests {
                 (StatementKind::Sql, "show work_mem"),
             ]
         );
+    }
+
+    #[test]
+    fn postgres_rules() {
+        // A rule's actions in parentheses keep their `;` (#346).
+        let src = "create rule r as on insert to t do also (select 1; insert into u values (2));\n\
+                   create or replace rule s as on delete to t do instead (delete from u; );\n\
+                   select (1; 2);\nselect 3";
+        assert_eq!(
+            split_in(src, Syntax::Postgres),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "create rule r as on insert to t do also (select 1; insert into u values (2))"
+                ),
+                (
+                    StatementKind::Sql,
+                    "create or replace rule s as on delete to t do instead (delete from u; )"
+                ),
+                // Elsewhere a `;` ends the statement, parentheses or not.
+                (StatementKind::Sql, "select (1"),
+                (StatementKind::Sql, "2)"),
+                (StatementKind::Sql, "select 3"),
+            ]
+        );
+        // One whose parenthesis isn't closed, as while it is typed, ends at
+        // its first `;`, so that the statements after it stay apart.
+        let src = "create rule r as on insert to t do also (select 1;\nselect 2;\nselect (3);";
+        assert_eq!(
+            split_in(src, Syntax::Postgres),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "create rule r as on insert to t do also (select 1"
+                ),
+                (StatementKind::Sql, "select 2"),
+                (StatementKind::Sql, "select (3)"),
+            ]
+        );
+        // Not on the databases without rules.
+        assert_eq!(split_in("create rule r (a; b);", Syntax::Sqlite).len(), 2);
     }
 
     #[test]

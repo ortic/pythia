@@ -1078,6 +1078,40 @@ All notable changes to Pythia are documented here. The format follows
   applied again, and an update stayed on the row's old value or was
   dropped with "… was changed by another session". The result is now
   fetched again, and the messages say auto-commit committed it.
+- Completion in a SQL window knows what the window's statements did to
+  its names (#320): after `alter session set current_schema` (Oracle),
+  `use db` (MySQL), `set search_path` (PostgreSQL), `use db` or `execute
+  as` (SQL Server) and `attach` (SQLite) it offers the tables and
+  columns those name, where it offered the connection's, also those of a
+  table of the same name there. Names are still looked up on the
+  connection's main session, by what the window's session reports, and
+  windows that share that share the answers. The window's temporary
+  tables complete too: SQLite's, PostgreSQL's, MySQL's and MariaDB's,
+  SQL Server's `#tables` and Oracle's private temporary tables, which
+  only its session sees, so they are looked up there while it is idle,
+  its transaction left as it was (on PostgreSQL after a savepoint, so
+  that a lookup that fails doesn't abort it). With a result of the
+  window open, completion goes on without them
+  rather than end the result's query (on Oracle, which keeps it open,
+  with them). SQL Server finds unqualified names in `dbo` after the
+  default schema, PostgreSQL in each schema of the search path.
+- PostgreSQL: a rule whose actions are in parentheses, `create rule …
+  do also (select 1; select 2)`, runs as one statement (#346). The
+  script ended it at the first `;` inside the parentheses, which failed
+  with "syntax error at end of input", and ran the rest on its own. A
+  rule whose parenthesis is still open at the end of the script, as
+  while it is typed, ends at that `;` as before, so the statements
+  after it stay apart.
+- SQL Server: Break while a result's rows are read fails that result's
+  statement (#347). The session sends the rows it read, which end the
+  statement, before the failure, which the window counted against the
+  statement running then: the next one of a script, which was sent
+  ahead (#291), counted as failed rather than skipped; after the window
+  fetched more of a result, a statement failing ("Failed after …"), for
+  which `WHENEVER SQLERROR EXIT ROLLBACK` rolled back. The failure is now
+  the statement's, or the fetch's, as one without rows first is. An error
+  after a result of a statement with several, which comes the same way
+  on MySQL, PostgreSQL and SQL Server, is too.
 
 ## [0.10.0] - 2026-10-30
 

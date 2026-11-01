@@ -8014,6 +8014,144 @@ fn mysql_statements_show_every_result() {
     run_in_window(&mut h, "drop procedure r51_p");
 }
 
+/// Break while SQL Server fetches a result's rows fails that result's
+/// statement (#347). The session sends the rows it read, which end the
+/// statement, and then the failure: the window took it for the failure of
+/// the statement a script sent after it (counted as failed, not skipped:
+/// 1 of the 2 skipped), and when it fetched more of a result later for a
+/// statement's failing ("Failed after"), which WHENEVER SQLERROR EXIT
+/// ROLLBACK rolled back for, as it doesn't for a failure while fetching.
+#[test]
+fn break_while_fetching_fails_the_result() {
+    use crate::commands::Command;
+    let connection = "r75@SQL Server";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MSSQL",
+        connection,
+        pythia_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // A batch whose result's rows are read before it waits: the server
+    // sends them then (WITH NOWAIT).
+    let slow = |values: &str| {
+        format!(
+            "declare @n int = 1;\nselect n from (values {values}) v (n);\n\
+             raiserror('r75', 0, 1) with nowait;\nwaitfor delay '00:01:00';\nselect 2 as m"
+        )
+    };
+    let messages = |h: &Ui| -> Vec<String> {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let cancelled = |h: &mut Ui| {
+        // The session is in the batch's wait.
+        std::thread::sleep(Duration::from_millis(500));
+        h.state_mut().test_command(Command::Cancel);
+        wait_until(h, "Break", |app| {
+            !app.test_focused_busy()
+                && app.test_sql_window_ref().is_some_and(|w| {
+                    w.state
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "Cancelled while fetching")
+                })
+        });
+    };
+
+    let script = format!("{}\nGO\nselect 2\nGO\nselect 3", slow("(1)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the first result", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| !w.state.results.is_empty())
+    });
+    cancelled(&mut h);
+    let said = messages(&h);
+    assert!(
+        said.iter().any(|m| m == "2 remaining statement(s) skipped"),
+        "{said:?}"
+    );
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        1
+    );
+
+    // Its first rows, fewer than the grid shows: it fetches the next ones.
+    h.state_mut().test_settings_mut().fetch_size = 2;
+    let script = format!("whenever sqlerror exit rollback\n{}", slow("(1), (2), (3)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the next rows", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.running.is_none() && w.state.fetching.is_some())
+    });
+    let before = messages(&h).len();
+    cancelled(&mut h);
+    h.run_steps(5);
+    h.state_mut().test_settings_mut().fetch_size = pythia_config::Settings::default().fetch_size;
+    let said = messages(&h);
+    assert!(
+        !said[before..]
+            .iter()
+            .any(|m| m.starts_with("Failed after") || m.starts_with("Rolling back")),
+        "{said:?}"
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    assert_eq!(w.state.results[0].rows.len(), 3, "{said:?}");
+}
+
+/// PostgreSQL: a rule whose actions are in parentheses is one statement
+/// (#346). The script ended it at their first `;` and sent `create rule …
+/// do also (select 1 as a`, which failed with "syntax error at end of
+/// input"; the rest went as a statement of its own.
+#[test]
+fn postgres_rules_with_several_actions() {
+    let connection = "r75@PostgreSQL";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_POSTGRES",
+        connection,
+        pythia_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "drop table if exists r75_r;\ncreate table r75_r (id int);\n\
+         create rule r75_a as on insert to r75_r do also (select 1 as a; select 2 as b);\n\
+         commit",
+    );
+    run_in_window(&mut h, "insert into r75_r values (1)");
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["a = 1", "b = 2"]);
+    run_in_window(&mut h, "rollback;\ndrop table r75_r;\ncommit");
+}
+
 /// On SQL Server and PostgreSQL a statement with several results shows
 /// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
 /// DECLAREs, a procedure's result sets, the SELECTs rules add to an
@@ -8395,6 +8533,326 @@ fn closed_case(h: &mut Ui, connection: &str, rows: &str, oracle: bool) {
     }
     h.state_mut().test_close_focused();
     h.run_steps(2);
+}
+
+/// Completion in a SQL window looks names up in what its statements made
+/// them refer to (#320), on the connection's main session: its current
+/// schema, database, search path or attached databases; another window
+/// completes those of the connection. Only its temporary tables are looked
+/// up in its own session, while it is idle: with a result open (rows left)
+/// completion goes without them, rather than ending the result or waiting,
+/// except on Oracle, which keeps a query open meanwhile. Before, the
+/// windows completed the main session's names, and no temporary table's.
+/// SQLite, and the servers whose test databases are set.
+#[test]
+fn completion_in_the_windows_context() {
+    use pythia_config::DbKind;
+    let (mut h, _file) = sqlite_file("r75_context.db");
+    let other = SqliteFile(
+        std::env::temp_dir().join(format!("pythia-ui-{}-r75-other.db", std::process::id())),
+    );
+    let _ = std::fs::remove_file(&other.0);
+    rusqlite::Connection::open(&other.0)
+        .unwrap()
+        .execute_batch("create table r75_only (id integer primary key, in_context text);")
+        .unwrap();
+    context_case(
+        &mut h,
+        "r75_context.db",
+        &ContextCase {
+            setup: "create table r75_t (id integer primary key, in_default text)".into(),
+            change: format!("attach '{}' as r75_o", other.0.display()),
+            undo: None,
+            table: "r75_only",
+            temporary: "create temp table r75_tmp (id integer primary key, note text)",
+            temporary_name: "r75_tmp",
+            one: "select 1",
+            rows: "with recursive n(n) as (select 1 union all select n + 1 from n where n < 1000) \
+                   select n from n",
+            cleanup: "drop table r75_t".into(),
+            oracle: false,
+        },
+    );
+    drop(h);
+    let mysql = |env| {
+        (
+            env,
+            DbKind::MySql,
+            ContextCase {
+                setup: "drop database if exists r75_db;\ncreate database r75_db;\n\
+                        create table r75_db.r75_t (id int primary key, in_context int);\n\
+                        drop table if exists r75_t;\n\
+                        create table r75_t (id int primary key, in_default int)"
+                    .into(),
+                change: "use r75_db".into(),
+                undo: None,
+                table: "r75_t",
+                temporary: "create temporary table r75_tmp (id int primary key, note varchar(10))",
+                temporary_name: "r75_tmp",
+                one: "select 1",
+                rows: "with recursive n (n) as \
+                       (select 1 union all select n + 1 from n where n < 1000) select n from n",
+                cleanup: "drop database r75_db;\ndrop table r75_t".into(),
+                oracle: false,
+            },
+        )
+    };
+    let servers = [
+        mysql("PYTHIA_TEST_MYSQL_DBA"),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            ContextCase {
+                setup: "drop schema if exists r75_s cascade;\ncreate schema r75_s;\n\
+                        create table r75_s.r75_t (id int, in_context int);\n\
+                        drop table if exists r75_t;\ncreate table r75_t (id int, in_default int);\n\
+                        commit"
+                    .into(),
+                change: "set search_path to r75_s".into(),
+                undo: None,
+                table: "r75_t",
+                temporary: "create temp table r75_tmp (id int, note text)",
+                temporary_name: "r75_tmp",
+                one: "select 1",
+                rows: "select generate_series(1, 1000) as n",
+                cleanup: "drop schema r75_s cascade;\ndrop table r75_t;\ncommit".into(),
+                oracle: false,
+            },
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            ContextCase {
+                setup: "drop table if exists r75_s.r75_t;\ndrop table if exists dbo.r75_t;\n\
+                        drop user if exists r75_u;\ndrop schema if exists r75_s;\n\
+                        create schema r75_s;\n\
+                        create table r75_s.r75_t (id int, in_context int);\n\
+                        create table dbo.r75_t (id int, in_default int);\n\
+                        create user r75_u without login with default_schema = r75_s;\n\
+                        grant select on schema::r75_s to r75_u;\n\
+                        grant select on schema::dbo to r75_u"
+                    .into(),
+                change: "execute as user = 'r75_u'".into(),
+                undo: Some("revert"),
+                table: "r75_t",
+                temporary: "create table #r75_tmp (id int primary key, note varchar(10))",
+                temporary_name: "#r75_tmp",
+                one: "select 1",
+                rows: "select top 1000 row_number() over (order by (select null)) as n \
+                       from sys.all_objects a cross join sys.all_objects b",
+                cleanup: "drop table r75_s.r75_t;\ndrop table dbo.r75_t;\ndrop user r75_u;\n\
+                          drop schema r75_s"
+                    .into(),
+                oracle: false,
+            },
+        ),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("r75@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        context_case(&mut h, &connection, &case);
+    }
+    // Oracle: the current schema, and a private temporary table.
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    crate::test_db::as_dba(&[
+        "begin execute immediate 'drop table system.r75_t purge'; \
+         exception when others then null; end;",
+        "create table system.r75_t (id number, in_context number)",
+        "grant select on system.r75_t to {user}",
+    ]);
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    context_case(
+        &mut h,
+        &connection,
+        &ContextCase {
+            setup: "begin execute immediate 'drop table r75_t purge'; \
+                    exception when others then null; end;\n/\n\
+                    create table r75_t (id number, in_default number)"
+                .into(),
+            change: "alter session set current_schema = system".into(),
+            undo: None,
+            table: "r75_t",
+            temporary: "create private temporary table ora$ptt_r75 \
+                        (id number, note varchar2(10)) on commit preserve definition",
+            temporary_name: "ora$ptt_r75",
+            one: "select 1 from dual",
+            rows: "select level as n from dual connect by level <= 1000",
+            cleanup: "drop table r75_t purge".into(),
+            oracle: true,
+        },
+    );
+    drop(h);
+    crate::test_db::as_dba(&["drop table system.r75_t purge"]);
+}
+
+/// What [`context_case`] makes and runs: a table `r75_t` with a column
+/// `in_default` where the connection's names are, the context's table with
+/// `in_context`, and a temporary table with `note`.
+struct ContextCase {
+    setup: String,
+    /// Changes what the window's names refer to, and changes it back
+    /// where closing the window doesn't.
+    change: String,
+    undo: Option<&'static str>,
+    /// The context's table: `r75_t`, or SQLite's of the attached file only.
+    table: &'static str,
+    /// Makes the temporary table, which is named `temporary_name`.
+    temporary: &'static str,
+    temporary_name: &'static str,
+    /// A query of a row.
+    one: &'static str,
+    /// A query of 1,000 rows.
+    rows: &'static str,
+    cleanup: String,
+    /// The session keeps a query open over other requests.
+    oracle: bool,
+}
+
+/// The case on `connection`: a window whose context changed, another in the
+/// connection's, a temporary table with a result open and without.
+fn context_case(h: &mut Ui, connection: &str, case: &ContextCase) {
+    let open = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        h.state().test_focused()
+    };
+    let close = |h: &mut Ui, id| {
+        h.state_mut().test_focus(id);
+        h.run_steps(1);
+        if h.state().test_window_pending_tx(id) {
+            h.state_mut().test_rollback();
+            wait_until(h, "rollback", |app| !app.test_window_pending_tx(id));
+        }
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    };
+    let changed = open(h);
+    run_in_window(h, &case.setup);
+    run_in_window(h, &case.change);
+    let table = format!("select * from {} c where c", case.table);
+    let labels = completed_with(h, &table, "in_context");
+    assert!(
+        !labels.iter().any(|l| l == "in_default"),
+        "{connection}: {labels:?}"
+    );
+    if let Some(undo) = case.undo {
+        run_in_window(h, undo);
+    }
+    close(h, changed);
+
+    let default = open(h);
+    run_in_window(h, case.one);
+    let labels = completed_with(h, "select * from r75_t c where c", "in_default");
+    assert!(
+        !labels.iter().any(|l| l == "in_context"),
+        "{connection}: {labels:?}"
+    );
+    if case.table != "r75_t" {
+        let labels = completed(h, &table);
+        assert!(labels.is_empty(), "{connection}: {labels:?}");
+    }
+    close(h, default);
+
+    // Its rows, its +, whether its query ended.
+    let first = |h: &Ui| {
+        let r = &h.state().test_sql_window_ref().unwrap().state.results[0];
+        (r.rows.len(), r.more, r.ended)
+    };
+    let temporary_window = open(h);
+    run_in_window(h, case.temporary);
+    run_in_window(h, case.rows);
+    assert_eq!(first(h), (500, true, false), "{connection}");
+    completed_with(h, "select * from r75_t c where c", "in_default");
+    let temporary = format!("select * from {} c where c", case.temporary_name);
+    let labels = completed(h, &temporary);
+    assert_eq!(
+        labels.iter().any(|l| l == "note"),
+        case.oracle,
+        "{connection}: {labels:?}"
+    );
+    assert_eq!(first(h), (500, true, false), "{connection}");
+    assert!(fetch_all(h, 0), "{connection}");
+    assert_eq!(first(h), (1000, false, false), "{connection}");
+    completed_with(h, &temporary, "note");
+    close(h, temporary_window);
+
+    let cleanup = open(h);
+    run_in_window(h, &case.cleanup);
+    if h.state().test_pending_tx() {
+        h.state_mut().test_commit();
+        wait_until(h, "commit", |app| !app.test_pending_tx());
+    }
+    close(h, cleanup);
+}
+
+/// Types `.` after `text` in the focused SQL window, as the editor's
+/// whole text.
+fn type_dot(h: &mut Ui, text: &str) {
+    h.state_mut().test_sql_window().editor.set_text(text);
+    h.run_steps(2);
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .select(text.len()..text.len());
+    h.run_steps(2);
+    h.event(egui::Event::Text(".".into()));
+}
+
+/// What completion offers, and closes it.
+fn completion_closed(h: &mut Ui) -> Vec<String> {
+    let w = h.state().test_sql_window_ref().unwrap();
+    let labels = w
+        .editor
+        .completion_labels()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    labels
+}
+
+/// Completion after `text` and a `.` once it offers `label`: what it offers.
+fn completed_with(h: &mut Ui, text: &str, label: &str) -> Vec<String> {
+    type_dot(h, text);
+    wait_until(h, &format!("{label} after {text}."), |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with(label))
+    });
+    completion_closed(h)
+}
+
+/// What completion after `text` and a `.` offers once it looked up all it
+/// needed.
+fn completed(h: &mut Ui, text: &str) -> Vec<String> {
+    type_dot(h, text);
+    let mut settled = 0;
+    let start = Instant::now();
+    while settled < 10 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "timed out completing {text}."
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(15));
+        settled = if h.state().test_catalog_settled() {
+            settled + 1
+        } else {
+            0
+        };
+    }
+    completion_closed(h)
 }
 
 /// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
