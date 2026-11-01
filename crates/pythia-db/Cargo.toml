@@ -13,6 +13,7 @@ thick = ["dep:oracle"]
 [dependencies]
 futures-util.workspace = true
 mysql.workspace = true
+mysql_common.workspace = true
 oracle = { workspace = true, optional = true }
 oracledb.workspace = true
 pythia-config.workspace = true

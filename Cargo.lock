@@ -4596,6 +4596,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "skrifa",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
@@ -4650,6 +4651,7 @@ version = "0.10.0"
 dependencies = [
  "futures-util",
  "mysql",
+ "mysql_common",
  "oracle",
  "oracledb",
  "pythia-config",

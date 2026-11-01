@@ -3314,6 +3314,22 @@ impl PythiaApp {
         }
     }
 
+    /// Keeps a connection's passwords in the keychain.
+    fn save_passwords(&mut self, name: &str, passwords: &Passwords) {
+        let saved = secrets::store(name, &passwords.database)
+            .and_then(|()| secrets::store_ssh(name, &passwords.ssh));
+        self.passwords_saved(name, saved);
+    }
+
+    /// Says so when passwords couldn't be saved, in the log and the connect
+    /// dialog: the next connect asks for them again (#214).
+    fn passwords_saved(&mut self, name: &str, saved: Result<(), String>) {
+        if let Err(why) = &saved {
+            self.log(format!("The password of {name} wasn't saved: {why}"));
+        }
+        self.connect_dialog.passwords_saved(saved);
+    }
+
     fn connect(&mut self, profile: ConnectionProfile, passwords: Passwords, save_profile: bool) {
         let name = profile.display_name();
         if self.conns.get(&name).is_some() {
@@ -3324,8 +3340,7 @@ impl PythiaApp {
             self.change_connections(|c| c.upsert(saved));
         }
         if profile.save_password {
-            secrets::store(&name, &passwords.database);
-            secrets::store_ssh(&name, &passwords.ssh);
+            self.save_passwords(&name, &passwords);
         } else {
             secrets::forget(&name);
             secrets::forget_ssh(&name);
@@ -4499,10 +4514,7 @@ impl PythiaApp {
                     secrets::forget_ssh(previous);
                 }
                 match &passwords {
-                    Some(passwords) => {
-                        secrets::store(&name, &passwords.database);
-                        secrets::store_ssh(&name, &passwords.ssh);
-                    }
+                    Some(passwords) => self.save_passwords(&name, passwords),
                     None => {
                         secrets::forget(&name);
                         secrets::forget_ssh(&name);
@@ -5519,6 +5531,11 @@ impl PythiaApp {
 
     pub fn test_connect_dialog_error(&self) -> Option<&str> {
         self.connect_dialog.test_error()
+    }
+
+    /// As if the keychain took a connection's passwords, or not.
+    pub fn test_passwords_saved(&mut self, name: &str, saved: Result<(), String>) {
+        self.passwords_saved(name, saved);
     }
 
     pub fn test_settings_ai(&mut self) {

@@ -9,7 +9,10 @@
 //! (the `ssh` service: `pythia:pythia@localhost:2222` and
 //! `pythia/pythia@mysql:3306/pythia`).
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -503,6 +506,141 @@ fn cancel_interrupts_a_running_statement() {
     h.ok("select 1");
 }
 
+/// A TCP relay to the server that can be frozen: then nothing gets
+/// through, in either direction, on its connections or on new ones, as
+/// when the network goes quiet.
+struct Relay {
+    port: u16,
+    frozen: Arc<AtomicBool>,
+}
+
+impl Relay {
+    fn to(server: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let frozen = Arc::new(AtomicBool::new(false));
+        let server = server.to_owned();
+        let relay = frozen.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let (Ok(client), Ok(upstream)) = (client, TcpStream::connect(&server)) else {
+                    continue;
+                };
+                let back = (upstream.try_clone().unwrap(), client.try_clone().unwrap());
+                for (from, to) in [(client, upstream), back] {
+                    let frozen = relay.clone();
+                    std::thread::spawn(move || pump(from, to, &frozen));
+                }
+            }
+        });
+        Self { port, frozen }
+    }
+
+    fn freeze(&self, frozen: bool) {
+        self.frozen.store(frozen, Ordering::SeqCst);
+    }
+}
+
+fn pump(mut from: TcpStream, mut to: TcpStream, frozen: &AtomicBool) {
+    let thaw = || {
+        while frozen.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        thaw();
+        let n = match from.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        thaw();
+        if to.write_all(&buffer[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Write);
+}
+
+/// Break returns at once while the network is gone (#207): it waited for
+/// KILL QUERY's connection of its own, which waited for the server. Once
+/// the network is back, the kill goes through.
+#[test]
+fn cancel_never_waits_for_the_network() {
+    let Some(params) = params() else {
+        return;
+    };
+    let (server, database) = params.connect_string.split_once('/').unwrap();
+    let relay = Relay::to(server);
+    let mut h = Harness::with(ConnectParams {
+        connect_string: format!("127.0.0.1:{}/{database}", relay.port),
+        ..params.clone()
+    });
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select sleep(5)".into(),
+        max_rows: 10,
+        binds: vec![],
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    relay.freeze(true);
+    let thaw = {
+        let frozen = relay.frozen.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            frozen.store(false, Ordering::SeqCst);
+        })
+    };
+    let started = Instant::now();
+    h.session.cancel();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(100), "Break took {took:?}");
+    thaw.join().unwrap();
+    // A killed SLEEP returns 1.
+    let rows = loop {
+        match h.next_result() {
+            DbEvent::QueryStarted { .. } => {}
+            DbEvent::Rows { rows, .. } => break rows,
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    h.ok("select 1");
+}
+
+/// A statement larger than max_allowed_packet fails, and the session goes
+/// on with its transaction: the driver refuses it before sending (#205).
+#[test]
+fn statements_too_large_keep_the_session() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists fx_packet_t");
+    h.ok("create table fx_packet_t (id int primary key)");
+    let connection = h.scalar("select connection_id()");
+    let max: usize = h
+        .scalar("select @@max_allowed_packet")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(h.ok("insert into fx_packet_t values (1)"));
+    let DbEvent::Failed { error, .. } = h.run(1, &format!("select '{}'", "x".repeat(max))) else {
+        panic!("expected Failed")
+    };
+    assert!(!error.is_connection_lost(), "{error}");
+    assert!(error.message.contains("max_allowed_packet"), "{error}");
+    assert!(h.settle(), "the insert is still pending");
+    assert_eq!(h.scalar("select connection_id()"), connection);
+    assert_eq!(
+        h.scalar("select count(*) from fx_packet_t").as_deref(),
+        Some("1")
+    );
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    h.ok("drop table fx_packet_t");
+}
+
 #[test]
 fn oracle_tasks_are_refused() {
     let Some(mut h) = Harness::connect() else {
@@ -551,6 +689,46 @@ fn warnings_become_notices() {
     h.session.send(DbRequest::Rollback);
     h.settle();
     h.ok("drop table warn_t");
+}
+
+/// A query's warnings show after its rows (#210), with binds too.
+#[test]
+fn query_warnings_become_notices() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let events = |h: &mut Harness, sql: &str, binds: Vec<(String, Option<String>)>| {
+        h.session.send(DbRequest::Execute {
+            id: 1,
+            sql: sql.into(),
+            max_rows: 10,
+            binds,
+        });
+        let mut seen = Vec::new();
+        loop {
+            match h.next() {
+                DbEvent::Rows { .. } => seen.push("(rows)".to_owned()),
+                DbEvent::Notice(n) => seen.push(n),
+                DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                DbEvent::Transaction { .. } => return seen,
+                _ => {}
+            }
+        }
+    };
+    assert_eq!(
+        events(&mut h, "select 1/0", Vec::new()),
+        ["(rows)", "Warning 1365: Division by 0"]
+    );
+    assert_eq!(
+        events(
+            &mut h,
+            "select :a / 0",
+            vec![("a".into(), Some("1".into()))]
+        ),
+        ["(rows)", "Warning 1365: Division by 0"]
+    );
+    // None after a query without them.
+    assert_eq!(events(&mut h, "select 1", Vec::new()), ["(rows)"]);
 }
 
 #[test]
@@ -769,6 +947,32 @@ fn connect_error(params: ConnectParams) -> pythia_db::DbError {
                 .expect("timed out waiting for the connect"),
         }
     }
+}
+
+/// A certificate that isn't trusted (the test server's is self-signed)
+/// says so and how to connect anyway, instead of "Lost connection to the
+/// MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
+/// (#211).
+#[test]
+fn untrusted_certificates_say_so() {
+    let Some(params) = params() else {
+        return;
+    };
+    let with = |options: &str| ConnectParams {
+        connect_string: format!("{}?{options}", params.connect_string),
+        ..params.clone()
+    };
+    let error = connect_error(with("tls"));
+    assert!(
+        error
+            .message
+            .starts_with("The server's certificate isn't trusted (invalid peer certificate: "),
+        "{error}"
+    );
+    assert!(error.message.contains("?tls=skip-verify"), "{error}");
+    assert!(!error.is_connection_lost());
+    let mut h = Harness::with(with("tls=skip-verify"));
+    assert_eq!(h.scalar("select 1").as_deref(), Some("1"));
 }
 
 #[test]

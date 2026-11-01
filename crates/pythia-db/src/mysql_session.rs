@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use mysql::consts::{CapabilityFlags, ColumnFlags, ColumnType};
 use mysql::prelude::{Protocol, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Params, QueryResult, SslOpts, Value};
+use mysql_common::proto::codec::error::PacketCodecError;
 use tracing::{debug, info, warn};
 
 use crate::dialect::Dialect;
@@ -31,6 +32,9 @@ use crate::types::{
 
 const DEFAULT_PORT: u16 = 3306;
 
+/// How long `KILL QUERY` waits for each answer of the server.
+const KILL_WAIT: Duration = Duration::from_secs(10);
+
 pub(crate) fn run(
     params: ConnectParams,
     requests: Receiver<DbRequest>,
@@ -39,7 +43,7 @@ pub(crate) fn run(
 ) {
     info!(?params, "connecting");
     let connected = options(&params).and_then(|opts| {
-        let conn = Conn::new(opts.clone()).map_err(|e| params.explain(e.into()))?;
+        let conn = Conn::new(opts.clone()).map_err(|e| params.explain(connect_error(e)))?;
         Ok((opts, conn))
     });
     let (opts, conn) = match connected {
@@ -151,9 +155,10 @@ struct Worker {
 }
 
 /// How a statement ended: a query's rows were reported as they were
-/// fetched, anything else is summarized.
+/// fetched (`ended` when all of them were read), anything else is
+/// summarized.
 enum Outcome {
-    Query,
+    Query { ended: bool },
     Done { affected: u64, warnings: u16 },
 }
 
@@ -236,6 +241,11 @@ impl Worker {
                     if warnings > 0 {
                         self.report_warnings();
                     }
+                } else if let Outcome::Query { ended: true } = outcome
+                    // A query's are known once all its rows are read (#210).
+                    && self.conn.warnings() > 0
+                {
+                    self.report_warnings();
                 }
             }
             Err(e) => {
@@ -376,7 +386,7 @@ impl Fetch<'_> {
                             error,
                             elapsed: started.elapsed(),
                         });
-                        return Ok(Outcome::Query);
+                        return Ok(Outcome::Query { ended: false });
                     }
                     None => {
                         more = false;
@@ -391,7 +401,7 @@ impl Fetch<'_> {
                 elapsed: started.elapsed(),
             });
             if !more {
-                return Ok(Outcome::Query);
+                return Ok(Outcome::Query { ended: true });
             }
             match self.requests.recv() {
                 Ok(DbRequest::FetchMore {
@@ -406,7 +416,7 @@ impl Fetch<'_> {
                     // all when the result is dropped on return.
                     (self.kill)();
                     *next = Some(other.unwrap_or(DbRequest::Disconnect));
-                    return Ok(Outcome::Query);
+                    return Ok(Outcome::Query { ended: false });
                 }
             }
         }
@@ -557,11 +567,34 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
     })
 }
 
+/// A failed connect, with what to do about a certificate that isn't
+/// trusted (#211): it read "Lost connection to the MySQL server: IO error:
+/// `invalid peer certificate: UnknownIssuer'".
+fn connect_error(e: mysql::Error) -> DbError {
+    let certificate = match &e {
+        mysql::Error::IoError(io) | mysql::Error::CodecError(PacketCodecError::Io(io)) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .filter(|tls| matches!(tls, rustls::Error::InvalidCertificate(_))),
+        _ => None,
+    };
+    match certificate {
+        Some(certificate) => DbError::new(format!(
+            "The server's certificate isn't trusted ({certificate}). For a self-signed one, \
+             connect with ?tls=skip-verify, like localhost:3306/shop?tls=skip-verify."
+        )),
+        None => e.into(),
+    }
+}
+
 /// Stops the statement running on connection `id` from a connection of its
-/// own (MySQL's way to break into a session).
+/// own (MySQL's way to break into a session). A server that doesn't answer
+/// holds it up for [`KILL_WAIT`] at most (#207).
 fn kill_query(opts: &Opts, id: u32) {
-    let killed =
-        Conn::new(opts.clone()).and_then(|mut conn| conn.query_drop(format!("kill query {id}")));
+    let opts = OptsBuilder::from_opts(opts.clone())
+        .read_timeout(Some(KILL_WAIT))
+        .write_timeout(Some(KILL_WAIT));
+    let killed = Conn::new(opts).and_then(|mut conn| conn.query_drop(format!("kill query {id}")));
     if let Err(e) = killed {
         warn!("cancel failed: {e}");
     }
@@ -817,10 +850,16 @@ impl From<mysql::Error> for DbError {
         match e {
             mysql::Error::MySqlError(e) => Self {
                 code: Some(i32::from(e.code)),
-                // Killed connection, shutdown, idle timeout.
-                lost: matches!(e.code, 1053 | 1927 | 4031),
+                // Killed connection, shutdown, idle timeout; a packet too
+                // large, after which the server closes the connection.
+                lost: matches!(e.code, 1053 | 1153 | 1927 | 4031),
                 ..Self::new(format!("ERROR {} ({}): {}", e.code, e.state, e.message))
             },
+            // The driver refuses to send a statement larger than the
+            // server's max_allowed_packet, which it read at connect: the
+            // connection is as it was (#205).
+            mysql::Error::CodecError(PacketCodecError::PacketTooLarge)
+            | mysql::Error::DriverError(mysql::DriverError::PacketTooLarge) => Self::new(TOO_LARGE),
             mysql::Error::IoError(e) => Self {
                 lost: true,
                 ..Self::new(format!("Lost connection to the MySQL server: {e}"))
@@ -829,10 +868,21 @@ impl From<mysql::Error> for DbError {
                 lost: true,
                 ..Self::new(format!("Lost connection to the MySQL server: {e}"))
             },
+            mysql::Error::DriverError(
+                e @ (mysql::DriverError::PacketOutOfSync | mysql::DriverError::UnexpectedPacket),
+            ) => Self {
+                lost: true,
+                ..Self::new(format!("Lost connection to the MySQL server: {e}"))
+            },
             e => Self::new(e.to_string()),
         }
     }
 }
+
+const TOO_LARGE: &str = "The statement is larger than the server's max_allowed_packet, so it \
+                         wasn't sent: the session and its transaction are as they were. A larger \
+                         max_allowed_packet (set global max_allowed_packet = …, by a DBA) takes \
+                         effect for new connections.";
 
 #[cfg(test)]
 mod tests {
@@ -848,6 +898,36 @@ mod tests {
         }));
         assert_eq!(e.code, Some(1046));
         assert_eq!(e.text(), "ERROR 1046 (3D000): No database selected");
+    }
+
+    /// The driver refuses a statement larger than max_allowed_packet
+    /// before it sends anything: the session goes on (#205). Errors of the
+    /// connection itself lose it.
+    #[test]
+    fn packets_too_large_keep_the_session() {
+        let e = DbError::from(mysql::Error::CodecError(PacketCodecError::PacketTooLarge));
+        assert!(!e.is_connection_lost(), "{e}");
+        assert!(e.message.contains("max_allowed_packet"), "{e}");
+        assert!(!e.message.starts_with("Lost connection"), "{e}");
+        let e = DbError::from(mysql::Error::DriverError(
+            mysql::DriverError::PacketTooLarge,
+        ));
+        assert!(!e.is_connection_lost(), "{e}");
+        for lost in [
+            mysql::Error::CodecError(PacketCodecError::PacketsOutOfSync),
+            mysql::Error::CodecError(PacketCodecError::Io(std::io::ErrorKind::BrokenPipe.into())),
+            mysql::Error::DriverError(mysql::DriverError::PacketOutOfSync),
+            mysql::Error::IoError(std::io::ErrorKind::ConnectionReset.into()),
+        ] {
+            assert!(DbError::from(lost).is_connection_lost());
+        }
+        // The server closes the connection on a packet it won't take.
+        let e = DbError::from(mysql::Error::MySqlError(mysql::MySqlError {
+            state: "08S01".into(),
+            message: "Got a packet bigger than 'max_allowed_packet' bytes".into(),
+            code: 1153,
+        }));
+        assert!(e.is_connection_lost());
     }
 
     #[test]

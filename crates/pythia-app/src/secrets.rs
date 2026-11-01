@@ -29,12 +29,12 @@ pub fn load(connection: &str) -> Option<String> {
     Some(password)
 }
 
-pub fn store(connection: &str, password: &str) {
-    if let Some(entry) = entry(SERVICE, connection)
-        && let Err(e) = entry.set_password(password)
-    {
-        warn!("storing password in keychain: {e}");
-    }
+/// Stores the password; the error says why the keychain doesn't keep it.
+/// That was only logged, and the next connect had no password (#214).
+pub fn store(connection: &str, password: &str) -> Result<(), String> {
+    keyring::Entry::new(SERVICE, connection)
+        .and_then(|entry| entry.set_password(password))
+        .map_err(why)
 }
 
 pub fn forget(connection: &str) {
@@ -50,14 +50,30 @@ pub fn load_ssh(connection: &str) -> Option<String> {
 }
 
 /// Stores the SSH password, or forgets it when it is empty.
-pub fn store_ssh(connection: &str, password: &str) {
-    let Some(entry) = entry(SSH_SERVICE, connection) else {
-        return;
-    };
+pub fn store_ssh(connection: &str, password: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(SSH_SERVICE, connection).map_err(why)?;
     if password.is_empty() {
         let _ = entry.delete_credential();
-    } else if let Err(e) = entry.set_password(password) {
-        warn!("storing SSH password in keychain: {e}");
+        Ok(())
+    } else {
+        entry.set_password(password).map_err(why)
+    }
+}
+
+/// Why passwords can't be saved, if there is no keychain (no Secret
+/// Service on Linux, for one).
+pub fn unavailable() -> Option<String> {
+    keyring::Entry::store_status()
+        .as_ref()
+        .err()
+        .map(|e| format!("there's no keychain ({e})"))
+}
+
+/// Why the keychain didn't take a password.
+fn why(e: keyring::Error) -> String {
+    match (&e, unavailable()) {
+        (keyring::Error::NoDefaultStore, Some(none)) => none,
+        _ => format!("the keychain refused it ({e})"),
     }
 }
 
@@ -80,5 +96,24 @@ pub fn store_api_key(backend: &str, key: &str) -> Result<(), String> {
 pub fn forget_api_key(backend: &str) {
     if let Some(entry) = entry(AI_SERVICE, backend) {
         let _ = entry.delete_credential();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A password the keychain doesn't take says why (#214).
+    #[test]
+    fn refused_passwords_say_why() {
+        let e = keyring::Error::NoStorageAccess("the keychain is locked".into());
+        assert_eq!(
+            super::why(e),
+            "the keychain refused it (Couldn't access platform storage: the keychain is locked)"
+        );
+        // Without a keychain, the reason it couldn't be opened.
+        let none = super::why(keyring::Error::NoDefaultStore);
+        match super::unavailable() {
+            Some(reason) => assert_eq!(none, reason),
+            None => assert!(none.starts_with("the keychain refused it"), "{none}"),
+        }
     }
 }

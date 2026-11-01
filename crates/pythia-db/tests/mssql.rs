@@ -513,6 +513,33 @@ fn cancel_interrupts_a_running_statement() {
     assert_eq!(h.scalar("select 'later'").as_deref(), Some("later"));
 }
 
+/// A statement takes as long as it takes: past 30 s the driver gave up
+/// waiting for the server, and the connection was lost with what wasn't
+/// committed (#199).
+#[test]
+fn long_statements_keep_the_transaction() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists fx_long_t");
+    h.ok("create table fx_long_t (a int)");
+    assert!(h.ok("insert into fx_long_t values (1)"));
+    let event = h.run(1, "waitfor delay '00:00:31'; select 1");
+    assert!(matches!(event, DbEvent::QueryStarted { .. }), "{event:?}");
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    assert!(h.settle(), "the insert is still pending");
+    assert_eq!(
+        h.scalar("select count(*) from fx_long_t").as_deref(),
+        Some("1")
+    );
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    h.ok("drop table fx_long_t");
+}
+
 #[test]
 fn several_result_sets() {
     let Some(mut h) = Harness::connect() else {

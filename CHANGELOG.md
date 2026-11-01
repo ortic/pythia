@@ -125,6 +125,50 @@ All notable changes to Pythia are documented here. The format follows
   (#200). *Drop* in the object browser closes the object's views, and
   *Refresh* in a view whose table was dropped elsewhere says there is no
   such table instead of showing an empty column list.
+- SQL Server: a statement that took longer than 30 seconds failed with
+  "Lost connection to SQL Server: the server did not send the next part
+  of the command result within 30s", and the window's changes that
+  weren't committed were rolled back (#199). Waiting longer for a lock
+  held by another window ended the same way. Statements now run until
+  they end or Break stops them; an ADO.NET connection string can still
+  set `Command Timeout=n` (seconds).
+- MySQL: a statement larger than the server's `max_allowed_packet` was
+  taken for a lost connection (#205): "Lost connection to the MySQL
+  server: Packet is larger than max_allowed_packet", and the window's
+  changes that weren't committed were rolled back, although Pythia
+  hadn't sent it. It now fails alone and says so; the session and its
+  transaction stay. Editing a long value in a result ran into this
+  already with a quarter of `max_allowed_packet` (4 MB of text with a
+  backslash on MariaDB's 16 MB): the UPDATE checked the value fetched by
+  writing it out again. Values longer than 4 KB are now checked by their
+  SHA-256.
+- Break, and closing a window with a statement running, froze Pythia
+  while the network to the server was gone, until it was back (#207):
+  on MySQL, Break connects to the server to send `KILL QUERY`, and the
+  window waited for that. Break now returns at once and the interrupt
+  goes on its own; one that gets no answer gives up after a few seconds
+  (MySQL, PostgreSQL), so Break can be pressed again.
+- MySQL: a query's warnings never showed (#210). `select 1/0` said only
+  "1 row selected"; now "Warning 1365: Division by 0" follows among the
+  messages once the rows are read, as it did for statements without a
+  result.
+- MySQL: connecting with `?tls` to a server whose certificate isn't
+  trusted, such as a self-signed one, failed with "Lost connection to
+  the MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
+  (#211). It now says that the certificate isn't trusted and that
+  `?tls=skip-verify` connects to a self-signed one; the connect
+  dialog's hint mentions it too.
+- *Save password* did nothing on a system without a keychain (such as
+  Linux without a Secret Service, or WSL), and nothing said so (#214):
+  the next connect had no password. The connect dialog now says under
+  *Save password* that passwords aren't saved and why, and the log says
+  so for each connection whose password couldn't be saved.
+- Folders of the object browser could stay "loading" for good after the
+  connection was lost and opened again (#215): what the browser had
+  asked for and the lost session hadn't answered yet was never
+  answered. Those folders now say that the connection was lost before
+  they were loaded, and *Refresh* loads them. The same goes for the
+  other lookups on the connection, such as completion's.
 
 ## [0.10.0] - 2026-10-30
 
