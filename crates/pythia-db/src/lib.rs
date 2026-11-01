@@ -35,6 +35,7 @@ pub use meta::{
 };
 pub use session::{Session, open_connection, stream_query};
 pub use sql_text::{SHOWN_BYTES, cut_size};
+pub use sqlite_session::sqlite_without_create;
 pub use types::{
     Cell, Client, Column, Compiled, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, RunFn,
     ServerInfo, TaskFn, TaskResult,

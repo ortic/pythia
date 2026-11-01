@@ -439,6 +439,13 @@ All notable changes to Pythia are documented here. The format follows
   session's own schema and left its own as it was: Oracle keeps a unit's
   source without its schema. The window now names the unit's schema, and
   a trigger's table's, when the text doesn't.
+- SQLite: a database file made with *New…* is no longer made again,
+  empty, once it's moved or deleted (#255). The connection was saved
+  with `?create`, so connecting again, or a new window while connected,
+  made an empty database in its place without a word. `?create` now
+  makes the file for the connect it's given to: the connection is saved
+  and opens its other sessions without it, and a file that's gone says
+  "There is no database file".
 
 ## [0.10.0] - 2026-10-30
 

@@ -348,6 +348,12 @@ impl Connections {
         };
         let name = profile.display_name();
         let main = Session::connect(params.clone(), notify.callback());
+        // Only the main session makes a missing file (#255).
+        let profile = kept_profile(&profile);
+        let params = ConnectParams {
+            connect_string: profile.connect_string.clone(),
+            ..params
+        };
         self.open.insert(
             name.clone(),
             Connection {
@@ -462,6 +468,18 @@ fn key_file(text: &str) -> Option<PathBuf> {
         Some((rest, home)) => home.join(rest),
         None => PathBuf::from(text),
     })
+}
+
+/// The profile a connection keeps once it connects: a SQLite file's
+/// `?create` is for the connect it is given to (#255), so that the saved
+/// connection and the sessions opened later don't make the file again,
+/// empty, where it was moved or deleted.
+pub fn kept_profile(profile: &ConnectionProfile) -> ConnectionProfile {
+    let mut kept = profile.clone();
+    if kept.kind == DbKind::Sqlite {
+        kept.connect_string = pythia_db::sqlite_without_create(&kept.connect_string);
+    }
+    kept
 }
 
 /// Statements every session of `profile` runs after connecting; `database`
