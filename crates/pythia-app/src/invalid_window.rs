@@ -12,7 +12,7 @@ use pythia_db::oracle::Connection;
 use pythia_db::recompile::{
     InvalidObject, InvalidScope, ObjectId, Progress, RecompileSummary, invalid_objects,
 };
-use pythia_db::{DbEvent, DbRequest, ObjectType};
+use pythia_db::{DbEvent, DbRequest, Dialect, ObjectType};
 use pythia_ui::icons::Icon;
 use serde::{Deserialize, Serialize};
 
@@ -127,7 +127,7 @@ impl InvalidObjectsWindow {
 
     pub fn title(&self) -> String {
         match &self.schema {
-            Some(s) => format!("Invalid objects ({})", s.to_lowercase()),
+            Some(s) => format!("Invalid objects ({})", as_shown(s)),
             None => "Invalid objects".into(),
         }
     }
@@ -256,7 +256,7 @@ impl InvalidObjectsWindow {
                                     .failed
                                     .iter()
                                     .take(3)
-                                    .map(|(id, e)| format!("{} ({e})", id.name.to_lowercase()))
+                                    .map(|(id, e)| format!("{} ({e})", as_shown(&id.name)))
                                     .collect::<Vec<_>>()
                                     .join(", ")
                             ));
@@ -505,13 +505,13 @@ impl InvalidObjectsWindow {
                         ui.add(egui::Label::new(t).truncate().sense(egui::Sense::click()))
                     };
                     row.col(|ui| {
-                        text(ui, &o.id.owner.to_lowercase());
+                        text(ui, &as_shown(&o.id.owner));
                     });
                     row.col(|ui| {
                         text(ui, &o.id.object_type.to_lowercase());
                     });
                     row.col(|ui| {
-                        let r = text(ui, &o.id.name.to_lowercase())
+                        let r = text(ui, &as_shown(&o.id.name))
                             .on_hover_text("Double-click to open it at its first error");
                         if r.double_clicked() {
                             open = Some(o.clone());
@@ -555,6 +555,11 @@ impl InvalidObjectsWindow {
         }
         effects
     }
+}
+
+/// A name as the object browser shows it (#272).
+fn as_shown(name: &str) -> String {
+    crate::browser::shown_name(Dialect::ORACLE, name)
 }
 
 /// Opens an invalid object: its source at the first error, or its view.

@@ -242,10 +242,12 @@ impl ObjectView {
             {
                 ui.add(icon.image(ui));
             }
-            // The names as stored, a blank one quoted (#281).
-            let name = match self.object.name.trim() {
-                "" => self.dialect.quote_ident(&self.object.name),
-                _ => self.object.name.clone(),
+            // The names as stored, a blank one quoted (#281), as is one with
+            // spaces around it (#298).
+            let name = if crate::browser::quoted_to_show(&self.object.name) {
+                self.dialect.quote_ident(&self.object.name)
+            } else {
+                self.object.name.clone()
             };
             ui.label(RichText::new(format!("{}.{name}", self.object.owner)).strong());
             ui.weak(self.object.object_type.dictionary_name().to_lowercase());
@@ -257,7 +259,7 @@ impl ObjectView {
                     effects.extend(self.load());
                     effects.catalog_changed = true;
                 }
-                if self.object.object_type.has_source() {
+                if crate::browser::has_edit(self.dialect, self.object.object_type) {
                     if self.dialect.supports(Feature::PlSql) {
                         if ui.button("Edit").clicked() {
                             effects.open.push(OpenRequest::Program {

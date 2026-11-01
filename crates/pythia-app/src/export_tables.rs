@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use egui::{RichText, Ui};
 use pythia_data::{Format, Options, StreamWriter};
 use pythia_db::oracle::Connection;
-use pythia_db::{DbError, DbEvent, DbRequest, ObjectType};
+use pythia_db::{DbError, DbEvent, DbRequest, Dialect, ObjectType};
 use serde::{Deserialize, Serialize};
 
 use crate::documents::{DocContext, Effects, Target, quote_ident, request_id};
@@ -342,7 +342,11 @@ impl ExportTables {
                                 for t in tables.iter_mut().filter(|t| t.name.contains(&needle)) {
                                     ui.checkbox(
                                         &mut t.selected,
-                                        RichText::new(t.name.to_lowercase()).monospace(),
+                                        RichText::new(crate::browser::shown_name(
+                                            Dialect::ORACLE,
+                                            &t.name,
+                                        ))
+                                        .monospace(),
                                     );
                                     ui.weak(t.rows.map_or_else(|| "?".into(), |r| r.to_string()));
                                     ui.add_enabled(
@@ -438,7 +442,7 @@ impl ExportTables {
                 );
                 ui.weak(format!(
                     "{} · {} rows",
-                    current.to_lowercase(),
+                    crate::browser::shown_name(Dialect::ORACLE, &current),
                     p.rows.load(Ordering::Relaxed)
                 ));
                 if ui.button("Stop").clicked() {

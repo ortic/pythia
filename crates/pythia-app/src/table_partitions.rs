@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use egui::{RichText, Ui};
 use pythia_compare::script::{Phase, SyncStatement};
 use pythia_compare::table::{self, PartitionDef, PartitionMethod, Partitioning};
-use pythia_db::DbError;
 use pythia_db::oracle::Connection;
+use pythia_db::{DbError, Dialect};
 
 use crate::documents::quote_ident;
 use crate::object_editor::{ident, picker};
@@ -60,7 +60,7 @@ impl Existing {
         last.bound.trim().eq_ignore_ascii_case(bound).then(|| {
             format!(
                 "Partition {} ({catch_all}) takes the values a new one would: it has to be split instead (not offered here), or dropped",
-                last.name.to_lowercase()
+                shown(&last.name)
             )
         })
     }
@@ -526,6 +526,11 @@ pub fn new_table_ui(
     add_buttons(ui, method, &mut p.partitions);
 }
 
+/// A name as the object browser shows it (#272).
+fn shown(name: &str) -> String {
+    crate::browser::shown_name(Dialect::ORACLE, name)
+}
+
 /// An existing table's partitions: their bounds, and partitions to add,
 /// truncate or drop.
 pub fn existing_ui(ui: &mut Ui, existing: &mut Existing, tablespaces: &[String]) {
@@ -533,9 +538,8 @@ pub fn existing_ui(ui: &mut Ui, existing: &mut Existing, tablespaces: &[String])
         ui.label(
             RichText::new(format!("Partitioned by {}", existing.kind.to_lowercase())).strong(),
         );
-        ui.label(
-            RichText::new(format!("({})", existing.columns.join(", ").to_lowercase())).monospace(),
-        );
+        let columns: Vec<String> = existing.columns.iter().map(|c| shown(c)).collect();
+        ui.label(RichText::new(format!("({})", columns.join(", "))).monospace());
         if !existing.interval.is_empty() {
             ui.label(RichText::new(format!("interval {}", existing.interval)).monospace());
         }
@@ -557,13 +561,13 @@ pub fn existing_ui(ui: &mut Ui, existing: &mut Existing, tablespaces: &[String])
                     ui.end_row();
                     for (p, by_interval) in &existing.partitions {
                         let action = existing.actions.get(&p.name).copied();
-                        let mut name = RichText::new(p.name.to_lowercase()).monospace();
+                        let mut name = RichText::new(shown(&p.name)).monospace();
                         if action == Some(Action::Drop) {
                             name = name.strikethrough();
                         }
                         ui.label(name);
                         ui.label(RichText::new(&p.bound).monospace());
-                        ui.label(p.tablespace.to_lowercase());
+                        ui.label(shown(&p.tablespace));
                         if *by_interval {
                             ui.weak("added by the interval");
                         } else {

@@ -857,10 +857,9 @@ impl PythiaApp {
                 match existing {
                     Some(id) => self.open_tab(Tab::Doc(id)),
                     None => {
-                        self.add_doc(
-                            Some(connection),
-                            DocKind::MaintenanceScan(crate::maintenance::ScanWindow::new(schema)),
-                        );
+                        let dialect = self.dialect_of(Some(&connection));
+                        let window = crate::maintenance::ScanWindow::new(schema, dialect);
+                        self.add_doc(Some(connection), DocKind::MaintenanceScan(window));
                     }
                 }
             }
@@ -5443,6 +5442,15 @@ impl PythiaApp {
 
     pub fn test_invalid_window(&self) -> Option<&crate::invalid_window::InvalidObjectsWindow> {
         match &self.docs.get(&self.focused?)?.kind {
+            DocKind::Invalid(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub fn test_invalid_window_mut(
+        &mut self,
+    ) -> Option<&mut crate::invalid_window::InvalidObjectsWindow> {
+        match &mut self.docs.get_mut(&self.focused?)?.kind {
             DocKind::Invalid(w) => Some(w),
             _ => None,
         }

@@ -35,6 +35,10 @@ pub struct ScanWindow {
     pub schema: String,
     #[serde(skip)]
     state: State,
+    /// The connection's database, which shows the schema's name; follows
+    /// the connection while the window is shown.
+    #[serde(skip)]
+    dialect: Dialect,
 }
 
 #[derive(Default)]
@@ -127,10 +131,11 @@ impl Default for Limits {
 }
 
 impl ScanWindow {
-    pub fn new(schema: String) -> Self {
+    pub fn new(schema: String, dialect: Dialect) -> Self {
         Self {
             schema,
             state: State::default(),
+            dialect,
         }
     }
 
@@ -138,7 +143,8 @@ impl ScanWindow {
         if self.schema.is_empty() {
             "Maintenance scan".to_owned()
         } else {
-            format!("{} maintenance scan", self.schema.to_lowercase())
+            let schema = crate::browser::shown_name(self.dialect, &self.schema);
+            format!("{schema} maintenance scan")
         }
     }
 
@@ -233,6 +239,7 @@ impl ScanWindow {
     pub fn ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
         let dialect = cx.dialect;
+        self.dialect = dialect;
         if !cx.connected {
             ui.centered_and_justified(|ui| ui.weak("Connect to scan"));
             return effects;
@@ -682,13 +689,10 @@ fn object(owner: &str, name: &str, object_type: ObjectType) -> ObjectRef {
     }
 }
 
-/// `owner.name` as shown: Oracle's in lowercase, as the browser lists them.
+/// `owner.name` as the browser shows them (#272): Oracle's in lowercase
+/// unless a name has lowercase letters, which reads quoted.
 fn shown(dialect: Dialect, owner: &str, name: &str) -> String {
-    if dialect == Dialect::ORACLE {
-        format!("{owner}.{name}").to_lowercase()
-    } else {
-        format!("{owner}.{name}")
-    }
+    crate::browser::shown_qualified(dialect, &object(owner, name, ObjectType::Table))
 }
 
 // ----- Oracle ---------------------------------------------------------------
@@ -699,7 +703,7 @@ const AUTO_STATS: &str = "auto optimizer stats collection";
 fn oracle(c: &mut dyn Client, schema: &str) -> Result<Scan, DbError> {
     let d = Dialect::ORACLE;
     let mut scan = Scan {
-        scope: format!("schema {}", schema.to_lowercase()),
+        scope: format!("schema {}", crate::browser::shown_name(d, schema)),
         ..Scan::default()
     };
     // What changed since the last flush counts for staleness (needs
@@ -756,7 +760,10 @@ fn oracle(c: &mut dyn Client, schema: &str) -> Result<Scan, DbError> {
         let (problem, evidence) = if parts == 0 {
             (
                 "Unusable index".to_owned(),
-                format!("on {}: queries using it fail", table.to_lowercase()),
+                format!(
+                    "on {}: queries using it fail",
+                    crate::browser::shown_name(d, &table)
+                ),
             )
         } else {
             (
@@ -764,7 +771,7 @@ fn oracle(c: &mut dyn Client, schema: &str) -> Result<Scan, DbError> {
                 format!(
                     "{parts} partition{} of the index on {}",
                     if parts == 1 { "" } else { "s" },
-                    table.to_lowercase()
+                    crate::browser::shown_name(d, &table)
                 ),
             )
         };
@@ -1329,17 +1336,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shows_oracle_names_in_lowercase() {
+    fn shows_names_as_the_browser() {
         assert_eq!(shown(Dialect::ORACLE, "APP", "ORDERS"), "app.orders");
+        assert_eq!(shown(Dialect::ORACLE, "APP", "Orders"), "app.\"Orders\"");
         assert_eq!(shown(Dialect::POSTGRES, "app", "Orders"), "app.Orders");
+        assert_eq!(shown(Dialect::MYSQL, "Shop", "orders"), "Shop.orders");
     }
 
     #[test]
     fn titles() {
-        assert_eq!(
-            ScanWindow::new("APP".into()).title(),
-            "app maintenance scan"
-        );
-        assert_eq!(ScanWindow::new(String::new()).title(), "Maintenance scan");
+        let title = |schema: &str, dialect| ScanWindow::new(schema.into(), dialect).title();
+        assert_eq!(title("APP", Dialect::ORACLE), "app maintenance scan");
+        assert_eq!(title("App", Dialect::ORACLE), "\"App\" maintenance scan");
+        assert_eq!(title("Shop", Dialect::MYSQL), "Shop maintenance scan");
+        assert_eq!(title("", Dialect::ORACLE), "Maintenance scan");
     }
 }

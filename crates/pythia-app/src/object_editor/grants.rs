@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use egui::{Color32, RichText, Ui};
 use pythia_db::oracle::Connection;
-use pythia_db::{DbError, ObjectType};
+use pythia_db::{DbError, Dialect, ObjectType};
 
 use super::{Lists, ident, picker};
 use crate::documents::quote_ident;
@@ -237,7 +237,9 @@ pub fn ui(ui: &mut Ui, def: &mut GrantsDef, lists: &Lists) {
                 ui.label("");
                 ui.end_row();
                 for (i, row) in def.rows.iter_mut().enumerate() {
-                    ui.label(RichText::new(row.grantee.to_lowercase()).monospace());
+                    // As the object browser shows users and roles (#272).
+                    let grantee = crate::browser::shown_name(Dialect::ORACLE, &row.grantee);
+                    ui.label(RichText::new(grantee).monospace());
                     for p in &def.privileges {
                         let state = if row.grantable.contains(p) {
                             Cell::GrantOption

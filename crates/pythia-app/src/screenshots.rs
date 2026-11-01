@@ -1582,6 +1582,244 @@ create index r55_ei on r55_et (n);",
     });
 }
 
+/// The object browser offers *Edit* where its script replaces the object:
+/// SQLite's views, indexes and triggers, PostgreSQL's views and
+/// materialized views besides its routines and triggers. It was there for
+/// triggers and routines only, though the README says it opens views.
+#[test]
+fn edit_is_offered_where_it_opens_a_script() {
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    // The script of Edit in the context menu of the entry `name`, chosen if
+    // `open`; None if the menu has no Edit. The menu bar has an Edit too:
+    // the menu's is the one below it.
+    let edit_in_menu = |h: &mut Ui, name: &str, open: bool| -> Option<String> {
+        let bar = h.query_all_by_label("Edit").count();
+        h.get_by_label(name).click_secondary();
+        h.run_steps(3);
+        let offered = h.query_all_by_label("Edit").count() > bar;
+        if !offered || !open {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+            return offered.then(String::new);
+        }
+        h.query_all_by_label("Edit")
+            .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+            .unwrap()
+            .click();
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        h.state_mut().test_close_focused();
+        Some(script)
+    };
+    let connection = "r64-edit.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r64_t (n);
+create view r64_v as select n from r64_t;
+create index r64_i on r64_t (n);
+create trigger r64_g after insert on r64_t begin select 1; end;",
+    );
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::Index,
+        ObjectType::Trigger,
+    ]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_v", true).expect("Edit for a view");
+    assert!(
+        script.contains("drop view if exists main.r64_v;") && script.contains("begin;"),
+        "{script}"
+    );
+    let script = edit_in_menu(&mut h, "r64_i", true).expect("Edit for an index");
+    assert!(
+        script.contains("drop index if exists main.r64_i;"),
+        "{script}"
+    );
+    assert!(edit_in_menu(&mut h, "r64_g", false).is_some(), "a trigger");
+    assert!(
+        edit_in_menu(&mut h, "r64_t", false).is_none(),
+        "not a table"
+    );
+    // The view's own Edit, in its view.
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "r64_v".into(),
+            object_type: ObjectType::View,
+        },
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Edit").count(), 2, "the view's Edit");
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r64-edit", DbKind::Postgres) else {
+        return;
+    };
+    let cleanup = "drop table if exists r64_et cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(cleanup).unwrap();
+        for sql in [
+            "create table r64_et (n int)",
+            "create view r64_ev as select n from r64_et",
+            "create materialized view r64_emv as select n from r64_et",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::MaterializedView,
+    ]);
+    h.state_mut().test_browser().set_filter("R64_E");
+    h.state_mut().test_refresh_browser();
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+    assert!(script.contains("create or replace view"), "{script}");
+    let script = edit_in_menu(&mut h, "r64_emv", true).expect("Edit for a materialized view");
+    assert!(script.contains("do $pythia$"), "{script}");
+    assert!(
+        edit_in_menu(&mut h, "r64_et", false).is_none(),
+        "not a table"
+    );
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(cleanup).unwrap());
+    drop(h);
+
+    // MySQL's and SQL Server's views: CREATE OR REPLACE, CREATE OR ALTER.
+    for (env, kind, words) in [
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql, "or replace"),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer, "or alter"),
+    ] {
+        let Some(mut h) = connect_to(env, "r64-edit", kind) else {
+            continue;
+        };
+        let drops = ["drop view if exists r64_ev", "drop table if exists r64_et"];
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+            c.execute("create table r64_et (n int)").unwrap();
+            c.execute("create view r64_ev as select n from r64_et")
+                .unwrap();
+        });
+        h.state_mut()
+            .test_expand_browser(&[ObjectType::Table, ObjectType::View]);
+        h.state_mut().test_browser().set_filter("R64_E");
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+        assert!(script.to_lowercase().contains(words), "{kind:?}: {script}");
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+        });
+    }
+}
+
+/// *Edit* of a PostgreSQL materialized view keeps its indexes, comments
+/// and grants: its DDL had only the CREATE, so the view the script made
+/// again came without them.
+#[test]
+fn postgres_edit_keeps_a_materialized_views_indexes_grants_and_comments() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let connection = "r64-mv";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let drop = "drop table if exists r64_mt cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(drop).unwrap();
+        for sql in [
+            "create table r64_mt (n int, m int)",
+            "create materialized view r64_mv as select n, m, 1 as k from r64_mt",
+            "create unique index r64_mv_n on r64_mv (n)",
+            "create index r64_mv_m on r64_mv (m) where m > 0",
+            "comment on materialized view r64_mv is 'It''s the view'",
+            "comment on column r64_mv.n is 'the key'",
+            "grant select on r64_mv to public",
+            "grant select on r64_mv to pg_monitor with grant option",
+            "grant select (m) on r64_mv to pg_read_all_stats",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    // What the view has besides its query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select (select string_agg(indexdef, '; ' order by indexname) \
+                           from pg_indexes where tablename = 'r64_mv'), \
+                        obj_description('r64_mv'::regclass, 'pg_class'), \
+                        col_description('r64_mv'::regclass, 1), \
+                        (select string_agg(x.grantee::regrole || ' ' || x.privilege_type \
+                                           || case when x.is_grantable then '*' else '' end, \
+                                           ', ' order by x.grantee::regrole::text) \
+                           from pg_class c, aclexplode(c.relacl) x \
+                          where c.oid = 'r64_mv'::regclass and x.grantee <> c.relowner), \
+                        (select array_to_string(attacl, ',') from pg_attribute \
+                          where attrelid = 'r64_mv'::regclass and attname = 'm'), \
+                        pg_get_viewdef('r64_mv'::regclass)",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert!(
+        was[0].as_deref().is_some_and(|i| i.contains("r64_mv_n")),
+        "{was:?}"
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r64_mv".into(),
+        object_type: ObjectType::MaterializedView,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r64_mv"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| {
+        !app.test_focused_busy() && app.test_pending_tx()
+    });
+    h.state_mut().test_commit();
+    wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[5].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[..5], was[..5], "{script}");
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(drop).unwrap());
+}
+
 /// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
 /// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
 /// changes before stay pending.
@@ -11131,6 +11369,185 @@ fn an_empty_name_shows_as_quotes() {
     h.state_mut().test_browser().test_marks(object);
     h.run_steps(3);
     assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
+}
+
+/// SQLite tables named `" t"` and `"t "` show quoted, so they don't look
+/// like `t`: in the browser, their tabs and views, Favorites and Recent.
+#[test]
+fn names_with_spaces_around_them_show_quoted() {
+    use pythia_db::ObjectType;
+    let connection = "r64-spaces.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \" t\" (a);\ncreate table \"t \" (a, b);\ncreate table t (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    for shown in ["\" t\"", "\"t \"", "t"] {
+        assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+    }
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: "t ".into(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"t \""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"t \"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(
+        h.query_all_by_label("\"t \"").count(),
+        2,
+        "Favorites, Recent"
+    );
+}
+
+/// Oracle's names keep the case that tells them apart outside the browser
+/// too, as #272 shows them there: `R64_CASE` reads `r64_case`, `"R64_Case"`
+/// reads `"R64_Case"`, in the maintenance scan and an index's maintenance,
+/// Export tables, the invalid objects, a table's partitions and the grants
+/// on it. Each read `r64_case` and the like, so the two looked the same.
+#[test]
+fn oracle_names_keep_their_case_beyond_the_browser() {
+    use crate::object_editor::EditTarget;
+    use pythia_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = "pythia@FREEPDB1";
+    // A role with lowercase letters to grant to, made by a DBA.
+    let dba = std::env::var("PYTHIA_TEST_DB_DBA").ok().map(|spec| {
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        pythia_db::oracle::Connection::connect(user, pw, db).unwrap()
+    });
+    if let Some(dba) = &dba {
+        let _ = dba.execute("drop role \"R64_Role\"", &[]);
+        dba.execute("create role \"R64_Role\"", &[]).unwrap();
+    }
+    let drops = "drop view if exists \"R64_Bad\";
+drop table if exists r64_case purge;
+drop table if exists \"R64_Case\" purge;
+drop table if exists r64_part purge;";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    run_script(&mut h, connection, drops);
+    run_script(
+        &mut h,
+        connection,
+        &format!(
+            "create table r64_case (id number);
+create table \"R64_Case\" (\"Id\" number);
+create index \"R64_Case_Ix\" on \"R64_Case\" (\"Id\");
+create table r64_part (\"Day\" number, id number) tablespace users
+  partition by range (\"Day\") (partition \"P_Low\" values less than (10),
+                                partition p_high values less than (maxvalue));
+create force view \"R64_Bad\" as select * from r64_missing;{}",
+            if dba.is_some() {
+                "\ngrant select on \"R64_Case\" to \"R64_Role\";"
+            } else {
+                ""
+            }
+        ),
+    );
+    let object = |name: &str, object_type| ObjectRef {
+        owner: "PYTHIA".into(),
+        name: name.into(),
+        object_type,
+    };
+
+    // The scan: both tables have no statistics.
+    open_scan(&mut h, None);
+    let found = scan_findings(&mut h, "pythia.");
+    let found: Vec<_> = found
+        .iter()
+        .filter(|(name, ..)| name.to_lowercase().contains("r64_case"))
+        .map(|(name, problem, _)| (name.as_str(), problem.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("pythia.r64_case", "No statistics"),
+            ("pythia.\"R64_Case\"", "No statistics")
+        ]
+    );
+    h.state_mut().test_close_focused();
+    open_maintenance(&mut h, connection, object("R64_Case_Ix", ObjectType::Index));
+    assert_eq!(
+        maintenance_fact(&mut h, "Table").map(|(table, _)| table),
+        Some("pythia.\"R64_Case\"".into())
+    );
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_export_tables()
+        .set_tables(&[("R64_CASE", ""), ("R64_Case", "")]);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("r64_case").count(), 1, "Export tables");
+    assert_eq!(h.query_all_by_label("\"R64_Case\"").count(), 1);
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::InvalidObjects {
+        connection: connection.into(),
+        schema: Some("PYTHIA".into()),
+        recompile: false,
+    });
+    wait_until(&mut h, "invalid objects", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && !w.objects().is_empty())
+    });
+    h.state_mut().test_invalid_window_mut().unwrap().filter = "R64".into();
+    h.run_steps(3);
+    assert!(h.query_by_label("\"R64_Bad\"").is_some(), "invalid objects");
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::EditTable {
+        connection: connection.into(),
+        object: object("R64_PART", ObjectType::Table),
+        tab: crate::table_editor::TableTab::Partitions,
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "partitions", |app| !app.test_focused_busy());
+    h.run_steps(3);
+    assert!(h.query_by_label("\"P_Low\"").is_some(), "partitions");
+    assert!(h.query_by_label("p_high").is_some());
+    assert!(h.query_by_label("(\"Day\")").is_some(), "the key");
+    h.state_mut().test_close_focused();
+
+    if dba.is_some() {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: connection.into(),
+            target: EditTarget::Grants(object("R64_Case", ObjectType::Table)),
+        });
+        h.run_steps(2);
+        wait_until(&mut h, "grants", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        assert!(h.query_by_label("\"R64_Role\"").is_some(), "grantee");
+        h.state_mut().test_close_focused();
+    }
+    run_script(&mut h, connection, drops);
+    if let Some(dba) = &dba {
+        dba.execute("drop role \"R64_Role\"", &[]).unwrap();
+    }
 }
 
 /// A name typed after its opening quote is completed and closed (#234):

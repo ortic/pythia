@@ -1,7 +1,7 @@
 //! Indexes, constraints and triggers of a table, for the object browser.
 
-use pythia_db::DbError;
 use pythia_db::oracle::Connection;
+use pythia_db::{DbError, Dialect};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartKind {
@@ -52,7 +52,7 @@ select i.index_name, i.uniqueness, i.status,
                 unique: uniqueness == "UNIQUE",
             },
             name,
-            detail: columns.unwrap_or_default().to_lowercase(),
+            detail: shown_list(&columns.unwrap_or_default()),
             enabled: status != "UNUSABLE",
         });
     }
@@ -99,14 +99,16 @@ select c.constraint_name, c.constraint_type, c.status, c.generated,
         let condition = condition
             .filter(|_| kind == 'C')
             .map(|c| c.chars().take(200).collect());
-        let columns = columns.unwrap_or_default().to_lowercase();
+        let columns = columns.unwrap_or_default();
+        // As stored, which the browser compares with the columns (#295).
         if kind == 'R' {
             parts
                 .fk_columns
-                .extend(columns.split(", ").map(str::to_uppercase));
+                .extend(columns.split(", ").map(str::to_owned));
         }
+        let columns = shown_list(&columns);
         let detail = match (kind, references, condition) {
-            ('R', Some(table), _) => format!("{columns} → {}", table.to_lowercase()),
+            ('R', Some(table), _) => format!("{columns} → {}", shown(&table)),
             ('C', _, Some(condition)) => condition,
             _ => columns,
         };
@@ -132,14 +134,14 @@ select c.constraint_name, c.owner, c.table_name, c.status,
     {
         let (name, child_owner, child, status, columns) = row?;
         let child = if child_owner == owner {
-            child.to_lowercase()
+            shown(&child)
         } else {
-            format!("{}.{}", child_owner.to_lowercase(), child.to_lowercase())
+            format!("{}.{}", shown(&child_owner), shown(&child))
         };
         parts.referenced_by.push(Part {
             kind: PartKind::Constraint { kind: 'R' },
             name,
-            detail: format!("{child} ({})", columns.unwrap_or_default().to_lowercase()),
+            detail: format!("{child} ({})", shown_list(&columns.unwrap_or_default())),
             enabled: status == "ENABLED",
         });
     }
@@ -158,6 +160,19 @@ select trigger_name, lower(trigger_type || ' ' || triggering_event), status
         });
     }
     Ok(parts)
+}
+
+/// A name as the object browser shows it (#272).
+fn shown(name: &str) -> String {
+    crate::browser::shown_name(Dialect::ORACLE, name)
+}
+
+/// Names listed as `A, B`, each [`shown`].
+fn shown_list(names: &str) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    names.split(", ").map(shown).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -218,5 +233,44 @@ mod tests {
             .unwrap();
         conn.execute("drop table pythia_parts_p purge", &[])
             .unwrap();
+    }
+
+    /// Columns and tables read as the browser shows names (#272): `"Id"`
+    /// with its quotes, not as `id`; a foreign key's columns as they are.
+    #[test]
+    fn details_keep_the_case_of_names() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        let drops = [
+            "drop table if exists r64_child purge",
+            "drop table if exists \"R64_Parent\" purge",
+        ];
+        for sql in drops {
+            conn.execute(sql, &[]).unwrap();
+        }
+        for sql in [
+            "create table \"R64_Parent\" (\"Id\" number primary key)",
+            "create table r64_child (id number, \"P_Id\" number \
+               constraint r64_child_fk references \"R64_Parent\")",
+            "create index r64_child_ix on r64_child (\"P_Id\", id)",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        let user = conn
+            .query_row_as::<String>("select user from dual", &[])
+            .unwrap();
+        let parts = load(&conn, &user, "R64_CHILD").unwrap();
+        assert_eq!(parts.indexes[0].detail, "\"P_Id\", id");
+        assert_eq!(parts.constraints[0].detail, "\"P_Id\" → \"R64_Parent\"");
+        assert_eq!(parts.fk_columns, ["P_Id"]);
+        let parent = load(&conn, &user, "R64_Parent").unwrap();
+        assert_eq!(parent.referenced_by[0].detail, "r64_child (\"P_Id\")");
+        for sql in drops {
+            conn.execute(sql, &[]).unwrap();
+        }
     }
 }

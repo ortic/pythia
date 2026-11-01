@@ -273,8 +273,9 @@ for Linux, Windows and macOS.
 - The object browser lists tables, views, procedures, functions and
   triggers, and the server's users (as `user@host`) and roles; object
   views show columns, indexes, constraints, triggers, grants, dependencies
-  and the DDL. *Edit* opens a routine as a script that drops and creates it
-  again. Listing every user and role takes `SELECT` on `mysql.user`;
+  and the DDL. *Edit* opens a routine or trigger as a script that drops
+  and creates it again, a view as `CREATE OR REPLACE`. Listing every user
+  and role takes `SELECT` on `mysql.user`;
   without it the browser shows your own user and the roles you may use.
 - Users and roles have forms (*New user…*, *Edit user…* in the browser):
   host, password, expiry, lock, the roles granted (with admin option, and
@@ -357,8 +358,10 @@ for Linux, Windows and macOS.
   bodies stay whole and `::` casts aren't bind variables; on SQL Server,
   `GO` on a line of its own ends a batch, routines and scripts with
   `DECLARE`d variables run up to the next `GO`, and `BEGIN … END` blocks
-  keep their `;`. *Edit* opens a routine as `CREATE OR REPLACE` (PostgreSQL)
-  or `CREATE OR ALTER` (SQL Server).
+  keep their `;`. *Edit* opens a routine, trigger or view as `CREATE OR
+  REPLACE` (PostgreSQL) or `CREATE OR ALTER` (SQL Server). A PostgreSQL
+  materialized view is dropped and created again, with its indexes,
+  comments and grants, in one block that a failing create undoes.
 - On SQL Server a batch shows its first result set; `PRINT` output and
   informational messages show as messages, in order with it. After Break,
   the connection is opened again: the driver can't go on after a cancel,
@@ -385,9 +388,9 @@ for Linux, Windows and macOS.
   attached databases as schemas (`attach database` in the login script
   attaches one for every window). Object views show columns, indexes,
   constraints, triggers, what uses a table and what a view uses, and the
-  DDL as written, a table's with its indexes. *Edit* opens a view or
-  trigger as a script that drops and creates it again in a transaction of
-  its own, which a failing create rolls back (`WHENEVER SQLERROR EXIT
+  DDL as written, a table's with its indexes. *Edit* opens a view, trigger
+  or index as a script that drops and creates it again in a transaction
+  of its own, which a failing create rolls back (`WHENEVER SQLERROR EXIT
   ROLLBACK`), so the object stays as it was.
 - *Edit* on a result of one table changes its rows in place, as on the
   other databases. Rows are found by the table's primary key, a unique

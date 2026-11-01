@@ -209,7 +209,13 @@ fn oracle_index(conn: &Connection, object: &ObjectRef, f: &mut Facts) -> Result<
     let table_owner: Option<String> = row.get(9)?;
     let table: Option<String> = row.get(10)?;
     if let (Some(owner), Some(table)) = (table_owner, table) {
-        f.add("Table", format!("{owner}.{table}").to_lowercase(), false);
+        let table = ObjectRef {
+            owner,
+            name: table,
+            object_type: ObjectType::Table,
+        };
+        let shown = crate::browser::shown_qualified(pythia_db::Dialect::ORACLE, &table);
+        f.add("Table", shown, false);
     }
     f.add("Type", f.index_type.to_lowercase(), false);
     f.segments = oracle_segments(conn, "i.owner = :owner and i.index_name = :name", &binds)?;

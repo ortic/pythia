@@ -712,6 +712,33 @@ All notable changes to Pythia are documented here. The format follows
   SQLERROR CONTINUE`, and each statement keeps its message and its
   result. The Messages tab lays out only the messages in view: with
   40,000 of them a frame took a quarter of a second.
+- Names show with their case outside the object browser too (#295), as
+  #272 shows them there: Oracle's `FOO` as `foo` and `"Foo"` as
+  `"Foo"`. The maintenance scan, an index's *Maintenance…*, *Export
+  tables*, *Invalid objects*, a table's indexes and constraints in the
+  browser, *Edit table…*'s partitions and *Grants…* showed every name in
+  lowercase, so `"Foo"` read like `FOO`; the scan's tab did so on every
+  database. The program window offers the file *Export schema to folder*
+  writes for the unit (`f^oo.pks` for `"Foo"`), not `foo.pks` for both.
+  A foreign key on a column such as `"P_Id"` marks it in the browser.
+- A name with a space at its start or end shows quoted (#298), `" t"`
+  and `"t "`, in the object browser, *Favorites*, *Recent*, the tabs and
+  the view's heading (`main."t "`). It read like `t`, so on SQLite or
+  PostgreSQL `" t"`, `"t "` and `t` looked the same.
+- PostgreSQL: a materialized view's DDL has its indexes, comments and
+  grants (#301). It had only the `CREATE`, so *Edit*, which drops the
+  view and creates it again from the DDL, made it without them: no
+  index, not even the unique one `REFRESH … CONCURRENTLY` needs, and no
+  privileges for the roles that had them. They now follow the `CREATE`
+  in *Edit*'s block, and in the *DDL* tab; the owner's own privileges
+  come with the view.
+- The object browser offers *Edit* for views, PostgreSQL's materialized
+  views and SQLite's indexes (#300), on the databases without program
+  windows, as it did for routines and triggers; so do the editor's
+  context menu and the object view. The README said *Edit* opens SQLite
+  views, but only their triggers had it, and the scripts that replace a
+  view (`CREATE OR REPLACE`, `CREATE OR ALTER`, SQLite's and
+  PostgreSQL's in a transaction of their own) were out of reach.
 
 ## [0.10.0] - 2026-10-30
 
