@@ -252,6 +252,8 @@ pub struct Browser {
     pub connection: Option<String>,
     /// The connection's database: its folders and what objects offer.
     dialect: Dialect,
+    /// The server is MariaDB, which replaces objects in place.
+    mariadb: bool,
     schema: Option<String>,
     schemas: Option<Loaded<Vec<String>>>,
     filter: String,
@@ -273,11 +275,18 @@ pub struct Browser {
 
 impl Browser {
     /// Shows a (newly connected) connection, starting in its current schema.
-    pub fn attach(&mut self, connection: String, schema: String, dialect: Dialect) -> Effects {
+    pub fn attach(
+        &mut self,
+        connection: String,
+        schema: String,
+        dialect: Dialect,
+        mariadb: bool,
+    ) -> Effects {
         let marks = std::mem::take(&mut self.marks);
         *self = Self {
             connection: Some(connection),
             dialect,
+            mariadb,
             schema: Some(schema),
             marks,
             ..Self::default()
@@ -686,7 +695,7 @@ impl Browser {
                 (Ok(MetaResult::Text(ddl)), Some(connection)) => {
                     effects.open.push(OpenRequest::Sql {
                         connection,
-                        text: replace_script(self.dialect, &object, ddl),
+                        text: replace_script(self.dialect, &object, ddl, self.mariadb),
                         run: false,
                     });
                 }
@@ -2075,17 +2084,40 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
     }
 }
 
-/// A script that replaces a stored object with its (edited) DDL. MySQL has
-/// no `CREATE OR REPLACE` for routines: drop, then create, ended by `/` like
-/// a PL/SQL unit so the body's `;` stay in it. PostgreSQL's routines and
-/// views come with `CREATE OR REPLACE`, its triggers get it; SQL Server's
-/// get `CREATE OR ALTER`. SQLite has neither: drop, then create, a
-/// trigger's body keeping its `;` without a `/`, and the `;` after a line
-/// comment on a line of its own (#206).
-pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
+/// A script that replaces a stored object with its (edited) DDL. MariaDB
+/// has `CREATE OR REPLACE`, MySQL for views only: a new version that fails
+/// leaves the object as it was, a routine with its grants (#240).
+/// MySQL's routines and triggers are dropped, then created, as the script
+/// says. A routine or trigger ends with `/` like a PL/SQL unit so the
+/// body's `;` stay in it. PostgreSQL's routines and views come with
+/// `CREATE OR REPLACE`, its triggers get it; SQL Server's get `CREATE OR
+/// ALTER`. SQLite has neither: drop, then create, a trigger's body keeping
+/// its `;` without a `/`, and the `;` after a line comment on a line of its
+/// own (#206).
+pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool) -> String {
     let ddl = ddl.trim_end();
     let qualified = dialect.qualified(&o.owner, &o.name);
+    let kind = o.object_type.dictionary_name().to_lowercase();
     match (dialect.kind(), o.object_type) {
+        (pythia_db::DbKind::MySql, ObjectType::View) => {
+            format!("{}\n", create_or(ddl, "or replace", ""))
+        }
+        (pythia_db::DbKind::MySql, _) if mariadb => {
+            format!("{}\n/\n", create_or(ddl, "or replace", ""))
+        }
+        (pythia_db::DbKind::MySql, _) => {
+            let warning = match o.object_type {
+                ObjectType::Procedure | ObjectType::Function => format!(
+                    "-- MySQL can't replace a {kind} in place: the drop revokes the grants\n\
+                     -- on it, and if the create fails, the {kind} is gone.\n"
+                ),
+                _ => format!(
+                    "-- MySQL can't replace a {kind} in place: if the create fails, the\n\
+                     -- {kind} is gone.\n"
+                ),
+            };
+            format!("{warning}drop {kind} if exists {qualified};\n\n{ddl}\n/\n")
+        }
         (pythia_db::DbKind::Postgres, ObjectType::Trigger) => {
             format!("{}\n", create_or(ddl, "or replace", "TRIGGER"))
         }
@@ -2095,14 +2127,10 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => format!("{}\n", create_or(ddl, "or alter", "")),
         (pythia_db::DbKind::Sqlite, _) => format!(
-            "drop {} if exists {qualified};\n\n{}\n",
-            o.object_type.dictionary_name().to_lowercase(),
+            "drop {kind} if exists {qualified};\n\n{}\n",
             pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Sqlite)
         ),
-        _ => format!(
-            "drop {} if exists {qualified};\n\n{ddl}\n/\n",
-            o.object_type.dictionary_name().to_lowercase(),
-        ),
+        _ => format!("drop {kind} if exists {qualified};\n\n{ddl}\n/\n"),
     }
 }
 
@@ -2493,7 +2521,7 @@ mod tests {
                 marks,
                 ..Browser::default()
             };
-            let effects = browser.attach("c".into(), current.into(), Dialect::MYSQL);
+            let effects = browser.attach("c".into(), current.into(), Dialect::MYSQL, false);
             let (_, DbRequest::Meta { id, .. }) = &effects.requests[0] else {
                 panic!("no schema request");
             };
@@ -2504,7 +2532,7 @@ mod tests {
         };
 
         let mut browser = Browser::default();
-        browser.attach("c".into(), String::new(), Dialect::MYSQL);
+        browser.attach("c".into(), String::new(), Dialect::MYSQL, false);
         browser.set_schema("shop".into(), &mut Effects::default());
         let marks = browser.marks;
         assert_eq!(marks.databases["c"], "shop");
@@ -2725,20 +2753,65 @@ mod tests {
             drop_sql(Dialect::MYSQL, &routine),
             "drop procedure shop.add_order"
         );
-        let script = replace_script(
-            Dialect::MYSQL,
-            &routine,
-            "CREATE DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\nend\n",
-        );
+        let ddl = "CREATE DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\nend\n";
+        let script = replace_script(Dialect::MYSQL, &routine, ddl, false);
         assert_eq!(
             script,
-            "drop procedure if exists shop.add_order;\n\n\
+            "-- MySQL can't replace a procedure in place: the drop revokes the grants\n\
+             -- on it, and if the create fails, the procedure is gone.\n\
+             drop procedure if exists shop.add_order;\n\n\
              CREATE DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\nend\n/\n"
         );
         // Two statements: the drop, and the whole routine up to the slash.
-        let statements = pythia_plsql::split_statements(&script);
+        let statements = pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
         assert_eq!(statements.len(), 2, "{statements:?}");
         assert!(statements[1].text(&script).ends_with("end"));
+
+        // MariaDB replaces it in place, MySQL a view (#240): one
+        // statement, nothing dropped before.
+        let script = replace_script(Dialect::MYSQL, &routine, ddl, true);
+        assert_eq!(
+            script,
+            "CREATE or replace DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\n\
+             end\n/\n"
+        );
+        let statements = pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
+        assert_eq!(statements.len(), 1, "{statements:?}");
+        let view = ObjectRef {
+            owner: "shop".into(),
+            name: "v".into(),
+            object_type: ObjectType::View,
+        };
+        let ddl = "CREATE ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER VIEW `v` AS \
+                   select 1 AS `a`;";
+        for mariadb in [false, true] {
+            let script = replace_script(Dialect::MYSQL, &view, ddl, mariadb);
+            assert_eq!(
+                script,
+                "CREATE or replace ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER \
+                 VIEW `v` AS select 1 AS `a`;\n"
+            );
+            let statements =
+                pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
+            assert_eq!(statements.len(), 1, "{statements:?}");
+        }
+        let trigger = ObjectRef {
+            owner: "shop".into(),
+            name: "t".into(),
+            object_type: ObjectType::Trigger,
+        };
+        let ddl =
+            "CREATE DEFINER=`app`@`%` TRIGGER t BEFORE INSERT ON x FOR EACH ROW set new.n = 1";
+        assert!(
+            replace_script(Dialect::MYSQL, &trigger, ddl, false).starts_with(
+                "-- MySQL can't replace a trigger in place: if the create fails, the\n\
+                 -- trigger is gone.\ndrop trigger if exists shop.t;\n"
+            )
+        );
+        assert!(
+            replace_script(Dialect::MYSQL, &trigger, ddl, true)
+                .starts_with("CREATE or replace DEFINER=`app`@`%` TRIGGER t ")
+        );
     }
 
     #[test]
@@ -2795,14 +2868,20 @@ mod tests {
         };
         let function = "CREATE OR REPLACE FUNCTION app.f()\n RETURNS integer\n LANGUAGE sql\nAS $function$select 1; $function$\n;";
         assert_eq!(
-            replace_script(Dialect::POSTGRES, &o("f", ObjectType::Function), function),
+            replace_script(
+                Dialect::POSTGRES,
+                &o("f", ObjectType::Function),
+                function,
+                false
+            ),
             format!("{function}\n")
         );
         assert_eq!(
             replace_script(
                 Dialect::POSTGRES,
                 &o("t", ObjectType::Trigger),
-                "CREATE TRIGGER t BEFORE INSERT ON app.x FOR EACH ROW EXECUTE FUNCTION app.f();"
+                "CREATE TRIGGER t BEFORE INSERT ON app.x FOR EACH ROW EXECUTE FUNCTION app.f();",
+                false
             ),
             "CREATE or replace TRIGGER t BEFORE INSERT ON app.x FOR EACH ROW EXECUTE FUNCTION app.f();\n"
         );
@@ -2822,6 +2901,7 @@ mod tests {
             Dialect::SQLSERVER,
             &o("p", ObjectType::Procedure),
             procedure,
+            false,
         );
         assert_eq!(
             script,
@@ -2842,7 +2922,12 @@ mod tests {
             object_type,
         };
         let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;\n";
-        let script = replace_script(Dialect::SQLITE, &lite("t", ObjectType::Trigger), trigger);
+        let script = replace_script(
+            Dialect::SQLITE,
+            &lite("t", ObjectType::Trigger),
+            trigger,
+            false,
+        );
         assert_eq!(
             script,
             "drop trigger if exists main.t;\n\nCREATE TRIGGER t AFTER INSERT ON x BEGIN\n  \
@@ -2855,7 +2940,7 @@ mod tests {
         // A view as written, a line comment at its end: the `;` goes on a
         // line of its own (#206).
         let view = "CREATE VIEW v AS select 'foo' as a\nwhere 1\n    -- and 0; really";
-        let script = replace_script(Dialect::SQLITE, &lite("v", ObjectType::View), view);
+        let script = replace_script(Dialect::SQLITE, &lite("v", ObjectType::View), view, false);
         assert_eq!(
             script,
             "drop view if exists main.v;\n\nCREATE VIEW v AS select 'foo' as a\nwhere 1\n    \
@@ -2933,7 +3018,7 @@ mod marks_tests {
     #[test]
     fn kept_when_disconnecting() {
         let mut browser = Browser::default();
-        browser.attach("db".into(), "HR".into(), Dialect::ORACLE);
+        browser.attach("db".into(), "HR".into(), Dialect::ORACLE, false);
         browser.marks.toggle_favorite("db", object("A"));
         browser.marks.touch("other", object("B"));
         browser.detach("db");

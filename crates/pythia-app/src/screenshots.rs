@@ -452,6 +452,7 @@ fn data_editing() {
             marks: None,
             privilege: None,
             dialect: Default::default(),
+            mariadb: false,
             read_only: false,
             production: false,
         };
@@ -527,6 +528,7 @@ fn data_editing() {
             marks: None,
             privilege: None,
             dialect: Default::default(),
+            mariadb: false,
             read_only: false,
             production: false,
         };
@@ -808,6 +810,194 @@ fn mysql_data_editing() {
         &mut h,
         "drop table pythia_edit_t, pythia_edit_k, pythia_edit_n;",
     );
+}
+
+/// *Edit* of a MySQL object whose new version fails (`PYTHIA_TEST_MYSQL`,
+/// #240): the script dropped it first, so it was gone, and the
+/// drop revoked the grants on a routine. MariaDB replaces routines,
+/// triggers and views in place, MySQL views: the object stays as it was, a
+/// routine with its grant (given with `PYTHIA_TEST_MYSQL_DBA`). MySQL drops
+/// its routines and triggers first still, as their script says.
+#[test]
+fn mysql_edit_keeps_what_fails() {
+    use crate::browser::ObjectAction;
+    use pythia_db::ObjectType;
+
+    let Some(spec) = std::env::var("PYTHIA_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let database = connect_string.split_once('/').unwrap().1.to_owned();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mariadb = crate::test_db::run_on("PYTHIA_TEST_MYSQL", pythia_config::DbKind::MySql, |c| {
+        c.query("select version()", &[]).unwrap()[0][0].clone()
+    })
+    .flatten()
+    .is_some_and(|v| v.contains("MariaDB"));
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, PythiaApp>, sql: &str| -> Vec<String> {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let rows = w
+            .state
+            .results
+            .first()
+            .map(|r| r.rows.clone())
+            .unwrap_or_default();
+        h.state_mut().test_close_focused();
+        rows.iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect()
+    };
+    run(
+        &mut h,
+        "drop view if exists pythia_replace_v;\n\
+         drop procedure if exists pythia_replace_p;\n\
+         drop table if exists pythia_replace_t;\n\
+         create table pythia_replace_t (n int);\n\
+         create view pythia_replace_v as select 1 as a;\n\
+         create procedure pythia_replace_p() select 1;\n\
+         create trigger pythia_replace_g before insert on pythia_replace_t for each row \
+           set new.n = 1;\n",
+    );
+    let grant =
+        format!("grant execute on procedure {database}.pythia_replace_p to pythia_replace_u");
+    let granted = crate::test_db::run_on(
+        "PYTHIA_TEST_MYSQL_DBA",
+        pythia_config::DbKind::MySql,
+        move |c| {
+            let _ = c.execute("drop user if exists pythia_replace_u");
+            c.execute("create user pythia_replace_u identified by 'Pw-replace-1'")
+                .unwrap();
+            c.execute(&grant).unwrap();
+        },
+    )
+    .is_some();
+    let grants = || {
+        crate::test_db::run_on("PYTHIA_TEST_MYSQL_DBA", pythia_config::DbKind::MySql, |c| {
+            let rows = c.query("show grants for pythia_replace_u", &[]).unwrap();
+            rows.iter().any(|r| {
+                r[0].as_deref()
+                    .is_some_and(|g| g.contains("pythia_replace_p"))
+            })
+        })
+    };
+    let exists = |h: &mut Harness<'_, PythiaApp>, object_type: ObjectType, name: &str| {
+        let sql = match object_type {
+            ObjectType::View => {
+                "select count(*) from information_schema.views \
+                 where table_schema = database() and table_name = '{}'"
+            }
+            ObjectType::Procedure => {
+                "select count(*) from information_schema.routines \
+                 where routine_schema = database() and routine_name = '{}'"
+            }
+            _ => {
+                "select count(*) from information_schema.triggers \
+                 where trigger_schema = database() and trigger_name = '{}'"
+            }
+        };
+        run(h, &sql.replace("{}", name)) == ["1"]
+    };
+    let objects = [
+        (
+            ObjectType::View,
+            "pythia_replace_v",
+            "select 1 AS `a`",
+            "select 2 AS `a`",
+        ),
+        (
+            ObjectType::Procedure,
+            "pythia_replace_p",
+            "select 1",
+            "select 2",
+        ),
+        (
+            ObjectType::Trigger,
+            "pythia_replace_g",
+            "set new.n = 1",
+            "set new.n = 2",
+        ),
+    ];
+    for (object_type, name, old, new) in objects {
+        // Creating a trigger takes SUPER where the server logs binary (1419).
+        if !exists(&mut h, object_type, name) {
+            eprintln!("{name} wasn't created: skipped");
+            continue;
+        }
+        let object = ObjectRef {
+            owner: database.clone(),
+            name: name.into(),
+            object_type,
+        };
+        h.state_mut()
+            .test_object_action("shop", ObjectAction::Edit(object));
+        wait_until(&mut h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        let in_place = mariadb || object_type == ObjectType::View;
+        assert_eq!(!script.contains("drop "), in_place, "{script}");
+        assert!(script.contains(old), "{script}");
+        // A version that fails: the object stays as it was where it is
+        // replaced in place.
+        let failing = script.replace(old, &old.replacen("se", "sx", 1));
+        h.state_mut().test_sql_window().editor.set_text(failing);
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "the failing version", |app| {
+            !app.test_focused_busy()
+        });
+        let texts: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(texts.iter().any(|m| m.contains("1064")), "{texts:?}");
+        h.state_mut().test_close_focused();
+        assert_eq!(exists(&mut h, object_type, name), in_place, "{name}");
+        if object_type == ObjectType::Procedure && granted {
+            assert_eq!(grants(), Some(in_place), "{name}");
+        }
+        // The new version that works replaces it.
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: script.replace(old, new),
+            run: true,
+        });
+        wait_until(&mut h, "the new version", |app| !app.test_focused_busy());
+        h.state_mut().test_close_focused();
+        assert!(exists(&mut h, object_type, name), "{name}");
+        if object_type == ObjectType::Procedure && granted {
+            assert_eq!(grants(), Some(in_place), "{name}");
+        }
+    }
+    let rows = run(&mut h, "select * from pythia_replace_v");
+    assert_eq!(rows, ["2"]);
+    run(
+        &mut h,
+        "drop view pythia_replace_v;\ndrop procedure pythia_replace_p;\ndrop table pythia_replace_t;",
+    );
+    crate::test_db::run_on("PYTHIA_TEST_MYSQL_DBA", pythia_config::DbKind::MySql, |c| {
+        let _ = c.execute("drop user if exists pythia_replace_u");
+    });
 }
 
 /// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote

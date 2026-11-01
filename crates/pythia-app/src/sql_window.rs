@@ -3100,6 +3100,7 @@ mod tests {
             marks: None,
             privilege: None,
             dialect: pythia_db::Dialect::MYSQL,
+            mariadb: false,
             read_only,
             production: false,
         };
@@ -3385,6 +3386,7 @@ mod tests {
                 marks: None,
                 privilege: None,
                 dialect: pythia_db::Dialect::ORACLE,
+                mariadb: false,
                 read_only: false,
                 production: false,
             }
@@ -3595,6 +3597,7 @@ mod tests {
             marks: None,
             privilege: None,
             dialect: pythia_db::Dialect::ORACLE,
+            mariadb: false,
             read_only,
             production: false,
         }

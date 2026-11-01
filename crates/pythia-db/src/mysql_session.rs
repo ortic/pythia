@@ -12,6 +12,7 @@
 //! first query's snapshot and its metadata locks until the next commit);
 //! a change opens a transaction of its own instead.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -45,10 +46,8 @@ pub(crate) fn run(
     shared: CancelSlot,
 ) {
     info!(?params, "connecting");
-    let connected = options(&params).and_then(|opts| {
-        let conn = Conn::new(opts.clone()).map_err(|e| params.explain(connect_error(e)))?;
-        Ok((opts, conn))
-    });
+    let connected = options(&params)
+        .and_then(|opts| connect(&opts).map_err(|e| params.explain(connect_error(e))));
     let (opts, conn) = match connected {
         Ok(connected) => connected,
         Err(error) => {
@@ -634,6 +633,63 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
         database: database.map(str::to_owned),
         tls,
     })
+}
+
+/// Connects as `opts` say; returns the options that connected, which
+/// `KILL QUERY` connects with too. The driver tries only the first of the
+/// host's addresses (#239): `localhost` is `::1` first on most
+/// systems, where MySQL often listens on 127.0.0.1 only, so connecting
+/// failed with "Connection refused". When that first address refuses or
+/// doesn't answer, the others are tried in turn: by their IP, or, where TLS
+/// checks the host's name, by the name bound to the address's family, whose
+/// addresses the driver then tries first.
+fn connect(opts: &Opts) -> Result<(Opts, Conn), mysql::Error> {
+    // No TCP connection was made: nothing was sent, no login failed.
+    let unreachable = |e: &mysql::Error| {
+        matches!(
+            e,
+            mysql::Error::DriverError(
+                mysql::DriverError::ConnectTimeout | mysql::DriverError::CouldNotConnect(Some(_))
+            )
+        )
+    };
+    let error = match Conn::new(opts.clone()) {
+        Ok(conn) => return Ok((opts.clone(), conn)),
+        Err(e) => e,
+    };
+    let host = opts.get_ip_or_hostname().into_owned();
+    let addresses: Vec<SocketAddr> = match (host.as_str(), opts.get_tcp_port()).to_socket_addrs() {
+        Ok(addresses) if unreachable(&error) => addresses.collect(),
+        _ => return Err(error),
+    };
+    let by_name = host.parse::<IpAddr>().is_err()
+        && opts
+            .get_ssl_opts()
+            .is_some_and(|tls| !tls.skip_domain_validation());
+    let mut families = Vec::new();
+    for address in addresses.iter().skip(1) {
+        let builder = OptsBuilder::from_opts(opts.clone());
+        let builder = if by_name {
+            let any = match address {
+                SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            };
+            if families.contains(&any) {
+                continue;
+            }
+            families.push(any);
+            builder.bind_address(Some(any))
+        } else {
+            builder.ip_or_hostname(Some(address.ip().to_string()))
+        };
+        let opts = Opts::from(builder);
+        match Conn::new(opts.clone()) {
+            Ok(conn) => return Ok((opts, conn)),
+            Err(e) if unreachable(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(error)
 }
 
 /// A failed connect, with what to do about a certificate that isn't

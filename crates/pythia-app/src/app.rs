@@ -645,7 +645,8 @@ impl PythiaApp {
             .map(|c| c.current_schema())
             .unwrap_or_default();
         let dialect = self.dialect_of(Some(&connection));
-        let effects = self.browser.attach(connection, schema, dialect);
+        let mariadb = self.mariadb_of(Some(&connection));
+        let effects = self.browser.attach(connection, schema, dialect, mariadb);
         self.apply_browser(effects);
     }
 
@@ -677,6 +678,14 @@ impl PythiaApp {
             .is_some_and(|c| c.profile.production)
     }
 
+    /// Whether a connection's server is MariaDB.
+    fn mariadb_of(&self, connection: Option<&str>) -> bool {
+        connection
+            .and_then(|c| self.conns.get(c))
+            .and_then(|c| c.server())
+            .is_some_and(|s| s.version.contains("MariaDB"))
+    }
+
     fn doc_context(&self, id: DocId) -> DocContext<'_> {
         let connected = self
             .docs
@@ -697,6 +706,7 @@ impl PythiaApp {
             marks: None,
             privilege: None,
             dialect: self.dialect_of(self.docs.get(&id).and_then(|d| d.connection.as_deref())),
+            mariadb: self.mariadb_of(self.docs.get(&id).and_then(|d| d.connection.as_deref())),
             read_only: self.read_only_of(self.docs.get(&id).and_then(|d| d.connection.as_deref())),
             production: self
                 .production_of(self.docs.get(&id).and_then(|d| d.connection.as_deref())),
@@ -2472,12 +2482,13 @@ impl PythiaApp {
 
     fn deliver(&mut self, id: DocId, event: DbEvent) {
         let cx = self.doc_context(id);
-        let (settings, connected, fetch_size, connection, dialect, read_only, production) = (
+        let (settings, connected, fetch_size, connection, dialect, mariadb, read_only, production) = (
             cx.settings.clone(),
             cx.connected,
             cx.fetch_size,
             cx.connection.clone(),
             cx.dialect,
+            cx.mariadb,
             cx.read_only,
             cx.production,
         );
@@ -2498,6 +2509,7 @@ impl PythiaApp {
             marks: None,
             privilege: None,
             dialect,
+            mariadb,
             read_only,
             production,
         };
@@ -3089,6 +3101,7 @@ impl PythiaApp {
             .map(|c| c.profile.clone());
         let read_only = profile.as_ref().is_some_and(|p| p.read_only);
         let production = profile.as_ref().is_some_and(|p| p.production);
+        let mariadb = self.mariadb_of(self.docs.get(&id).and_then(|d| d.connection.as_deref()));
         // Production: confirm statements that change something.
         if profile.as_ref().is_some_and(|p| p.production)
             && !std::mem::take(&mut self.production_confirmed)
@@ -3136,6 +3149,7 @@ impl PythiaApp {
             marks: None,
             privilege: None,
             dialect,
+            mariadb,
             read_only,
             production,
         };
@@ -4818,6 +4832,13 @@ impl eframe::App for PythiaApp {
             .iter()
             .map(|(n, c)| (n.clone(), c.dialect()))
             .collect();
+        let mariadb: HashSet<String> = self
+            .conns
+            .open
+            .keys()
+            .filter(|n| self.mariadb_of(Some(n)))
+            .cloned()
+            .collect();
         let read_only: HashSet<String> = self
             .conns
             .open
@@ -4849,6 +4870,7 @@ impl eframe::App for PythiaApp {
             colors: &colors,
             privileges: &privileges,
             dialects: &dialects,
+            mariadb: &mariadb,
             read_only: &read_only,
             production: &production,
             connected: &connected,
@@ -5120,6 +5142,7 @@ impl PythiaApp {
         let dialect = self.dialect_of(connection.as_deref());
         let read_only = self.read_only_of(connection.as_deref());
         let production = self.production_of(connection.as_deref());
+        let mariadb = self.mariadb_of(connection.as_deref());
         let settings = self.settings.clone();
         let cx = DocContext {
             id,
@@ -5134,6 +5157,7 @@ impl PythiaApp {
             marks: None,
             privilege: None,
             dialect,
+            mariadb,
             read_only,
             production,
         };
@@ -5179,6 +5203,7 @@ impl PythiaApp {
             marks: None,
             privilege: None,
             dialect: Dialect::ORACLE,
+            mariadb: false,
             read_only: false,
             production: false,
         };
@@ -5492,6 +5517,12 @@ impl PythiaApp {
         &mut self.browser
     }
 
+    /// Carries out an object action as if chosen in an editor of
+    /// `connection`.
+    pub fn test_object_action(&mut self, connection: &str, action: crate::browser::ObjectAction) {
+        self.object_action(connection.to_owned(), action);
+    }
+
     pub fn test_browser_loading(&self) -> bool {
         self.browser.is_loading()
     }
@@ -5585,6 +5616,8 @@ struct Viewer<'a> {
     colors: &'a HashMap<String, Color32>,
     privileges: &'a HashMap<String, pythia_config::Privilege>,
     dialects: &'a HashMap<String, Dialect>,
+    /// Connections to MariaDB servers.
+    mariadb: &'a HashSet<String>,
     /// Connections whose profile is read-only.
     read_only: &'a HashSet<String>,
     /// Connections whose profile is marked as production.
@@ -5763,6 +5796,10 @@ impl TabViewer for Viewer<'_> {
                         .and_then(|c| self.dialects.get(c))
                         .copied()
                         .unwrap_or_default(),
+                    mariadb: doc
+                        .connection
+                        .as_ref()
+                        .is_some_and(|c| self.mariadb.contains(c)),
                     read_only: doc
                         .connection
                         .as_ref()

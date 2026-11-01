@@ -323,6 +323,9 @@ pub struct DocContext<'a> {
     pub privilege: Option<pythia_config::Privilege>,
     /// The document connection's database: what it can offer.
     pub dialect: pythia_db::Dialect,
+    /// The connection's server is MariaDB, which replaces routines and
+    /// triggers in place where MySQL can't.
+    pub mariadb: bool,
     /// The connection's profile is read-only: nothing that changes data is
     /// offered.
     pub read_only: bool,
