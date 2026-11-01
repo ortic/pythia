@@ -119,6 +119,16 @@ All notable changes to Pythia are documented here. The format follows
   held by another window ended the same way. Statements now run until
   they end or Break stops them; an ADO.NET connection string can still
   set `Command Timeout=n` (seconds).
+- MySQL: a statement larger than the server's `max_allowed_packet` was
+  taken for a lost connection (#205): "Lost connection to the MySQL
+  server: Packet is larger than max_allowed_packet", and the window's
+  changes that weren't committed were rolled back, although Pythia
+  hadn't sent it. It now fails alone and says so; the session and its
+  transaction stay. Editing a long value in a result ran into this
+  already with a quarter of `max_allowed_packet` (4 MB of text with a
+  backslash on MariaDB's 16 MB): the UPDATE checked the value fetched by
+  writing it out again. Values longer than 4 KB are now checked by their
+  SHA-256.
 
 ## [0.10.0] - 2026-10-30
 

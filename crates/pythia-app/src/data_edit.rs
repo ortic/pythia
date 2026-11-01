@@ -631,6 +631,39 @@ const POSTGRES_EQUAL: &[&str] = &[
     "jsonb",
 ];
 
+/// MySQL values longer than this (in bytes) are checked by their digest.
+const LONG_VALUE: usize = 4096;
+
+/// SQL that holds while MySQL column `name` (quoted) still has the long
+/// `value`: its SHA-256, of the bytes a binary value's hex stands for, or
+/// of the text in UTF-8, as it was fetched.
+fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let binary = matches!(
+        type_name,
+        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
+    );
+    let hex =
+        binary && value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit());
+    let digest = if hex {
+        let digit = |b: u8| (b as char).to_digit(16).unwrap_or_default() as u8;
+        let bytes: Vec<u8> = value
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| (digit(pair[0]) << 4) | digit(pair[1]))
+            .collect();
+        Sha256::digest(&bytes)
+    } else {
+        Sha256::digest(value.as_bytes())
+    };
+    let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    if binary {
+        format!("sha2({name}, 256) = '{digest}'")
+    } else {
+        format!("sha2(convert({name} using utf8mb4), 256) = '{digest}'")
+    }
+}
+
 /// SQL that holds while column `name` (of type `col`) still has `value`;
 /// `None` if the column can't be compared with what was fetched.
 fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Option<String> {
@@ -652,6 +685,10 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         literal(dialect, &col, Some(v))
     };
     Some(match (dialect.kind(), col.type_name.as_str()) {
+        // A long value is checked by its digest: written out, it made the
+        // UPDATE twice as long as the value set (four times with a
+        // backslash), longer than max_allowed_packet allows (#205).
+        (DbKind::MySql, t) if v.len() > LONG_VALUE => mysql_digest(&name, t, v),
         // FLOAT is shown with six significant digits, rounded.
         (DbKind::MySql, "FLOAT") if v.parse::<f64>().is_ok_and(f64::is_finite) => {
             format!("abs({name} - {v}) <= abs({v}) * 0.00001")

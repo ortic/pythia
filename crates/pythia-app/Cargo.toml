@@ -35,6 +35,9 @@ pythia-monitor.workspace = true
 pythia-plsql.workspace = true
 pythia-ui.workspace = true
 serde.workspace = true
+# Long MySQL values are checked by their digest when results are edited
+# (data_edit.rs).
+sha2 = "0.11"
 # Windows Firewall settings (firewall.rs).
 serde_json.workspace = true
 toml.workspace = true

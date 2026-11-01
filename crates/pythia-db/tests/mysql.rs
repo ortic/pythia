@@ -503,6 +503,38 @@ fn cancel_interrupts_a_running_statement() {
     h.ok("select 1");
 }
 
+/// A statement larger than max_allowed_packet fails, and the session goes
+/// on with its transaction: the driver refuses it before sending (#205).
+#[test]
+fn statements_too_large_keep_the_session() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists fx_packet_t");
+    h.ok("create table fx_packet_t (id int primary key)");
+    let connection = h.scalar("select connection_id()");
+    let max: usize = h
+        .scalar("select @@max_allowed_packet")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(h.ok("insert into fx_packet_t values (1)"));
+    let DbEvent::Failed { error, .. } = h.run(1, &format!("select '{}'", "x".repeat(max))) else {
+        panic!("expected Failed")
+    };
+    assert!(!error.is_connection_lost(), "{error}");
+    assert!(error.message.contains("max_allowed_packet"), "{error}");
+    assert!(h.settle(), "the insert is still pending");
+    assert_eq!(h.scalar("select connection_id()"), connection);
+    assert_eq!(
+        h.scalar("select count(*) from fx_packet_t").as_deref(),
+        Some("1")
+    );
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    h.ok("drop table fx_packet_t");
+}
+
 #[test]
 fn oracle_tasks_are_refused() {
     let Some(mut h) = Harness::connect() else {

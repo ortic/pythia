@@ -32,6 +32,10 @@ oracle = "0.6"
 oracledb = { git = "https://github.com/ortic/rust-oracledb", rev = "8dde2372336e1c4c9814a00d94f4eb6db7cff90c" }
 # Pure Rust, synchronous like the session workers; rustls on ring as ureq uses.
 mysql = { version = "28", default-features = false, features = ["minimal-rust", "buffer-pool", "rustls-tls-ring"] }
+# The codec errors of mysql's connections, which mysql doesn't re-export
+# without its `derive` feature: a statement too large isn't a lost
+# connection (#205).
+mysql_common = { version = "0.37", default-features = false }
 # SSH tunnels: pure Rust on ring too. Its tokio runtime only carries the
 # tunnels; the session workers stay synchronous.
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }

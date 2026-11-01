@@ -798,6 +798,125 @@ fn mysql_data_editing() {
     );
 }
 
+/// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote
+/// the value it had found out again to check it, so a value of more than
+/// half of max_allowed_packet made a statement the driver refused, which
+/// was taken for a lost connection: the window's session went, with the
+/// changes applied before. A value too long for any statement fails alone.
+#[test]
+fn mysql_long_values() {
+    let Some(spec) = std::env::var("PYTHIA_TEST_MYSQL").ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "long".into(),
+        kind: pythia_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let execute = |h: &mut Harness<'_, PythiaApp>, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the statements", |app| !app.test_focused_busy());
+    };
+    let first_row = |h: &mut Harness<'_, PythiaApp>| -> Vec<Option<String>> {
+        h.state_mut().test_sql_window().state.results[0].rows[0].clone()
+    };
+    let edit = |h: &mut Harness<'_, PythiaApp>, row: usize, col: usize, value: &str| {
+        let r = &mut h.state_mut().test_sql_window().state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, row, col, Some(value.into()));
+    };
+    let apply = |h: &mut Harness<'_, PythiaApp>| -> Vec<String> {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "long".into(),
+        text: String::new(),
+        run: false,
+    });
+    execute(&mut h, "select @@max_allowed_packet, connection_id()");
+    let row = first_row(&mut h);
+    let max: usize = row[0].as_deref().unwrap().parse().unwrap();
+    let connection = row[1].clone();
+    // Lines of 100 bytes, 0.6 of the largest statement in all.
+    let lines = max * 6 / 10 / 100;
+    execute(
+        &mut h,
+        &format!(
+            "drop table if exists fx_long_edit;\n\
+             create table fx_long_edit (id int primary key, n int, texto longtext);\n\
+             insert into fx_long_edit values \
+               (1, 1, repeat(concat(repeat('a', 99), char(10)), {lines})), (2, 2, 'short');\n\
+             commit;"
+        ),
+    );
+    execute(&mut h, "select id, n, texto from fx_long_edit order by id");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+
+    // A change applied first, then the long value.
+    edit(&mut h, 1, 1, "20");
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    let long = format!("{}\n", "b".repeat(99)).repeat(lines);
+    edit(&mut h, 0, 2, &long);
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    {
+        let rows = &h.state_mut().test_sql_window().state.results[0].rows;
+        assert!(rows[0][2].as_deref() == Some(long.as_str()));
+        assert_eq!(rows[1][1].as_deref(), Some("20"));
+    }
+
+    // With its backslashes, written out as hex, too long for a statement.
+    let too_long = format!("{}\\\n", "c".repeat(98)).repeat(lines);
+    edit(&mut h, 0, 2, &too_long);
+    let texts = apply(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("max_allowed_packet")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|m| m.starts_with("Connection lost")),
+        "{texts:?}"
+    );
+    assert!(h.state().test_has_doc_session());
+    h.state_mut().test_sql_window().state.results[0]
+        .grid
+        .clear_changes();
+    execute(
+        &mut h,
+        "select connection_id(), (select n from fx_long_edit where id = 2), \
+                (select left(texto, 1) from fx_long_edit where id = 1)",
+    );
+    assert_eq!(
+        first_row(&mut h),
+        [connection, Some("20".into()), Some("b".into())]
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    execute(&mut h, "drop table fx_long_edit");
+}
+
 /// A database for [`keyed_data_editing`].
 struct Keyed {
     /// The variable with its account (`user/password@connect string`).
