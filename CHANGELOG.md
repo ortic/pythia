@@ -522,6 +522,11 @@ All notable changes to Pythia are documented here. The format follows
   answered `explain (format json) ;` with a syntax error. `&name` is
   replaced only where the window substitutes, as for *Execute*: on MySQL
   a `DEFINE`d name changed `'A &amp; B'` in the plan's statement.
+- Completion offers the columns of a table in another schema also after
+  it listed that schema's objects (#282). On SQL Server, PostgreSQL,
+  MySQL and SQLite, once `select * from r51_s.` had offered `r51_t`,
+  `select t. from r51_s.r51_t t` offered nothing: the table, typed in
+  another case than stored, was taken for one that doesn't exist.
 
 ## [0.10.0] - 2026-10-30
 

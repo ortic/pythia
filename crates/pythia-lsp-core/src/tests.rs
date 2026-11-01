@@ -482,6 +482,45 @@ fn bracketed_names() {
 }
 
 #[test]
+fn names_of_a_completed_schema() {
+    // Completion after `r51_s.` keeps the schema's objects as stored; a
+    // name typed in another case is one of them where the database
+    // compares names without case (#282), the name as written first,
+    // then a table before a view. On Oracle it is another name.
+    for (syntax, names, quoted) in [
+        (Syntax::TSql, NameStyle::Brackets, "[r51_v]"),
+        (Syntax::MySql, NameStyle::Backticks, "`r51_v`"),
+        (Syntax::Sqlite, NameStyle::AsWritten, "\"r51_v\""),
+        (Syntax::Postgres, NameStyle::Lower, "\"r51_v\""),
+    ] {
+        let mut cat = as_written("main", names, &[]);
+        cat.set_objects(
+            Some("R51_S"),
+            vec![
+                obj("r51_s", "r51_v", "VIEW"),
+                obj("r51_s", "R51_v", "TABLE"),
+            ],
+        );
+        cat.set_columns("r51_s", "r51_v", vec![col("of_view", "int", false)]);
+        cat.set_columns("r51_s", "R51_v", vec![col("of_table", "int", false)]);
+        for (src, column) in [
+            ("select t.¦ from r51_s.r51_v t".to_owned(), "of_table"),
+            ("select r51_v.¦ from r51_s.R51_V".to_owned(), "of_table"),
+            (format!("select t.¦ from r51_s.{quoted} t"), "of_view"),
+        ] {
+            let labels = columns_in(&src, syntax, &cat);
+            assert_eq!(labels, [column], "{syntax:?}: {src}");
+        }
+    }
+    let mut cat = hr();
+    cat.set_columns("SCOTT", "EMP", vec![col("EMPNO", "NUMBER", false)]);
+    let labels = columns_in("select e.¦ from scott.emp e", Syntax::Oracle, &cat);
+    assert_eq!(labels, ["empno"]);
+    let labels = columns_in("select e.¦ from scott.\"emp\" e", Syntax::Oracle, &cat);
+    assert_eq!(labels, Vec::<String>::new());
+}
+
+#[test]
 fn names_after_an_opening_quote() {
     // Typed after its opening quote, a name replaces the quote too and
     // comes closed, in the quotes typed; only names are offered.

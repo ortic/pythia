@@ -867,6 +867,12 @@ mod dictionary_live {
         }
 
         fn run(&mut self, sql: &str) {
+            if let Err(error) = self.try_run(sql) {
+                panic!("{sql}: {error}");
+            }
+        }
+
+        fn try_run(&mut self, sql: &str) -> Result<(), pythia_db::DbError> {
             self.session.send(DbRequest::Execute {
                 id: 1,
                 sql: sql.into(),
@@ -875,12 +881,158 @@ mod dictionary_live {
             });
             loop {
                 match self.next() {
-                    DbEvent::Executed { .. } => return,
-                    DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                    DbEvent::Executed { .. } => return Ok(()),
+                    DbEvent::Failed { error, .. } => return Err(error),
                     _ => {}
                 }
             }
         }
+    }
+
+    /// The labels completed at `¦` in `src` with `cache`, which keeps what
+    /// `live` answered.
+    fn labels_at(live: &mut Live, cache: &mut CatalogCache, src: &str) -> Vec<String> {
+        let offset = src.find('¦').expect("a caret");
+        let src = src.replacen('¦', "", 1);
+        let analysis = Analysis::new_in(&src, live.dialect.syntax());
+        for _ in 0..8 {
+            let c = analysis.complete(offset, cache);
+            if c.missing.is_empty() {
+                return c.items.into_iter().map(|i| i.label).collect();
+            }
+            for request in c.missing {
+                live.answer(request).apply(cache);
+            }
+        }
+        panic!("{src}: still missing dictionary data");
+    }
+
+    /// Connects to the database of `env` (`user/password@connect string`).
+    fn connect_live(env: &str, kind: DbKind) -> Option<(Live, String)> {
+        let spec = std::env::var(env).ok()?;
+        let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+        let (username, password) = credentials.split_once('/').unwrap();
+        Some(connect_with(
+            kind,
+            username,
+            password,
+            connect_string,
+            Vec::new(),
+        ))
+    }
+
+    fn connect_with(
+        kind: DbKind,
+        username: &str,
+        password: &str,
+        connect_string: &str,
+        init_sql: Vec<String>,
+    ) -> (Live, String) {
+        let (tx, wake) = mpsc::channel();
+        let session = Session::connect(
+            ConnectParams {
+                kind,
+                username: username.into(),
+                password: password.into(),
+                connect_string: connect_string.into(),
+                privilege: Default::default(),
+                init_sql,
+                ssh: None,
+            },
+            move || {
+                let _ = tx.send(());
+            },
+        );
+        let mut live = Live {
+            session,
+            wake,
+            dialect: kind.into(),
+        };
+        let DbEvent::Connected(server) = live.next() else {
+            panic!("{connect_string}: not connected")
+        };
+        (live, server.current_schema)
+    }
+
+    /// Columns after the alias of a table in another schema, once that
+    /// schema's objects were completed after `r51_s.` (#282): they are
+    /// kept as stored (`r51_t`), and the table, typed without quotes and
+    /// looked up as `R51_T`, wasn't found among them and was taken for one
+    /// that doesn't exist. On SQLite (an attached file), and on SQL
+    /// Server, PostgreSQL and MySQL (a database for a schema) when their
+    /// test databases are set.
+    #[test]
+    fn columns_after_a_schema_was_completed() {
+        let file =
+            std::env::temp_dir().join(format!("pythia-catalog-{}-r51.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        rusqlite::Connection::open(&file)
+            .unwrap()
+            .execute_batch("create table r51_t (id integer primary key, note text);")
+            .unwrap();
+        let attach = vec![format!("attach '{}' as r51_s", file.display())];
+        let mut lives = vec![(
+            connect_with(DbKind::Sqlite, "", "", ":memory:", attach),
+            NameStyle::AsWritten,
+            "",
+        )];
+        let servers = [
+            (
+                "PYTHIA_TEST_MSSQL",
+                DbKind::SqlServer,
+                NameStyle::Brackets,
+                "create schema r51_s",
+                "drop table if exists r51_s.r51_t; drop schema if exists r51_s",
+            ),
+            (
+                "PYTHIA_TEST_POSTGRES",
+                DbKind::Postgres,
+                NameStyle::Lower,
+                "create schema r51_s",
+                "drop schema if exists r51_s cascade",
+            ),
+            (
+                "PYTHIA_TEST_MYSQL_DBA",
+                DbKind::MySql,
+                NameStyle::Backticks,
+                "create database r51_s",
+                "drop database if exists r51_s",
+            ),
+        ];
+        for (env, kind, names, create, drop) in servers {
+            let Some((mut live, schema)) = connect_live(env, kind) else {
+                continue;
+            };
+            for sql in drop.split("; ") {
+                live.run(sql);
+            }
+            live.run(create);
+            live.run("create table r51_s.r51_t (id int primary key, note varchar(20))");
+            live.session.send(DbRequest::Commit);
+            lives.push(((live, schema), names, drop));
+        }
+        for ((live, schema), names, drop) in &mut lives {
+            let mut cache = CatalogCache::new(schema.clone()).with_names(*names);
+            let tables = labels_at(live, &mut cache, "select * from r51_s.¦");
+            assert!(tables.contains(&"r51_t".to_owned()), "{tables:?}");
+            for src in [
+                "select t.¦ from r51_s.r51_t t",
+                "select * from r51_s.r51_t where r51_t.¦",
+            ] {
+                let columns = labels_at(live, &mut cache, src);
+                assert!(
+                    columns.contains(&"note".to_owned()),
+                    "{}: {src}: {columns:?}",
+                    live.dialect.name()
+                );
+            }
+            for sql in drop.split("; ").filter(|s| !s.is_empty()) {
+                live.run(sql);
+            }
+            live.session.send(DbRequest::Commit);
+        }
+        drop(lives);
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Completes the columns of `cat_orders`, written as `table`, after its
