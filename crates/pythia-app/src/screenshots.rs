@@ -13047,3 +13047,362 @@ fn values_save_to_files() {
     h.state_mut().test_close_focused();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A database's table for [`files_round_trip`]: `lob_files` with an `id`
+/// key, a binary column `b` and a long text column `t`, and the row `1`.
+struct FilesTable {
+    connection: &'static str,
+    /// Creates the table and its row, and commits.
+    create: &'static str,
+    drop: &'static str,
+}
+
+/// Loads files into the cells of a fetched row and of a new one, a few
+/// megabytes with every byte value into the binary column and text that
+/// isn't ASCII into the long text column; applies the changes; saves
+/// each value to a file again, fetched whole by its row's key, and
+/// compares the files byte for byte (#293).
+fn files_round_trip(h: &mut Harness<'_, PythiaApp>, db: &FilesTable) {
+    let dir = std::env::temp_dir().join(format!(
+        "pythia-lob-files-{}-{}",
+        std::process::id(),
+        db.connection.replace(['@', '.'], "-")
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes: Vec<u8> = (0..3usize << 20)
+        .map(|i| ((i * 7 + i / 256) % 256) as u8)
+        .collect();
+    let text: String = (0..20_000)
+        .map(|i| format!("Zeile {i}: Grüße aus Zürich, 日本語のテキスト, Ελληνικά, 😀\n"))
+        .collect();
+    let files = [
+        (dir.join("b.bin"), bytes.clone()),
+        (dir.join("t.txt"), text.as_bytes().to_vec()),
+        (dir.join("b2.bin"), bytes.iter().rev().copied().collect()),
+        (
+            dir.join("t2.txt"),
+            text.chars().rev().collect::<String>().into_bytes(),
+        ),
+    ];
+    for (path, content) in &files {
+        std::fs::write(path, content).unwrap();
+    }
+    run_script(h, db.connection, db.drop);
+    run_script(h, db.connection, db.create);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: db.connection.into(),
+        text: "select id, b, t from lob_files order by id".into(),
+        run: true,
+    });
+    wait_until(h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(h, "editing", |app| !app.test_focused_busy());
+    let errors = |h: &mut Harness<'_, PythiaApp>| -> Vec<String> {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect()
+    };
+    assert!(first_result(h).grid.is_editable(), "{:?}", errors(h));
+    // The file as *Load from file…* takes it into a cell.
+    let load = |h: &mut Harness<'_, PythiaApp>, cell: (usize, usize), path: &PathBuf| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_load(&r.columns, cell);
+        let said = file_done(h, before);
+        assert!(said.starts_with("Loaded "), "{}: {said}", db.connection);
+    };
+    load(h, (0, 1), &files[0].0);
+    load(h, (0, 2), &files[1].0);
+    {
+        let r = first_result(h);
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 1, 0, Some("2".into()));
+    }
+    load(h, (1, 1), &files[2].0);
+    load(h, (1, 2), &files[3].0);
+    assert_eq!(
+        first_result(h).grid.changes().map(|c| c.loaded.len()),
+        Some(4)
+    );
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(h, "apply", |app| !app.test_focused_busy());
+    assert!(errors(h).is_empty(), "{}: {:?}", db.connection, errors(h));
+    assert_eq!(first_result(h).rows.len(), 2);
+    // Saved again, each is the file it was loaded from.
+    let cells = [((0, 1), "b"), ((0, 2), "t"), ((1, 1), "b2"), ((1, 2), "t2")];
+    for (((row, col), name), (_, content)) in cells.into_iter().zip(&files) {
+        let path = dir.join(format!("{name}.saved"));
+        let before = message_count(h);
+        let value_files = &mut h.state_mut().test_sql_window().state.value_files;
+        value_files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_save(&r.columns, &r.rows, (row, col));
+        let said = file_done(h, before);
+        assert!(said.starts_with("Saved "), "{}: {said}", db.connection);
+        let saved = std::fs::read(&path).unwrap();
+        assert!(
+            saved == *content,
+            "{}: {name} saved {} bytes, not the {} loaded",
+            db.connection,
+            saved.len(),
+            content.len()
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run_script(h, db.connection, db.drop);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// [`files_round_trip`] on Oracle (`PYTHIA_TEST_DB`): a BLOB and a CLOB.
+#[test]
+fn oracle_files_round_trip() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "pythia@FREEPDB1",
+            create: "create table lob_files (id number primary key, b blob, t clob);\n\
+                     insert into lob_files values (1, hextoraw('CAFE'), 'old');\n\
+                     commit;",
+            drop: "begin execute immediate 'drop table lob_files purge'; \
+                   exception when others then null; end;\n/",
+        },
+    );
+}
+
+/// [`files_round_trip`] on MySQL or MariaDB (`PYTHIA_TEST_MYSQL`): a
+/// LONGBLOB and a LONGTEXT.
+#[test]
+fn mysql_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MYSQL",
+        "lob@mysql",
+        pythia_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@mysql",
+            create: "create table lob_files (id int primary key, b longblob, t longtext);\n\
+                     insert into lob_files values (1, X'CAFE', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on PostgreSQL (`PYTHIA_TEST_POSTGRES`): a bytea
+/// and a text.
+#[test]
+fn postgres_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_POSTGRES",
+        "lob@postgres",
+        pythia_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@postgres",
+            create: "create table lob_files (id int primary key, b bytea, t text);\n\
+                     insert into lob_files values (1, '\\xcafe', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on SQL Server (`PYTHIA_TEST_MSSQL`): a
+/// varbinary(max) and an nvarchar(max).
+#[test]
+fn sqlserver_files_round_trip() {
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MSSQL",
+        "lob@sqlserver",
+        pythia_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob@sqlserver",
+            create: "create table lob_files (id int primary key, b varbinary(max), \
+                       t nvarchar(max));\n\
+                     insert into lob_files values (1, 0xCAFE, N'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// [`files_round_trip`] on SQLite, a file of its own: a BLOB and a TEXT.
+#[test]
+fn sqlite_files_round_trip() {
+    let (mut h, _db) = sqlite_file("lob-files.db");
+    files_round_trip(
+        &mut h,
+        &FilesTable {
+            connection: "lob-files.db",
+            create: "create table lob_files (id integer primary key, b blob, t text);\n\
+                     insert into lob_files values (1, X'CAFE', 'old');\n\
+                     commit;",
+            drop: "drop table if exists lob_files;",
+        },
+    );
+}
+
+/// *Load from file…* (#293), from the context menu and the value editor of
+/// a result being edited, not of one that isn't: the file becomes the
+/// cell's pending change, shown by its size, and Undo takes it back; a
+/// text column takes UTF-8 only; a dialog cancelled changes nothing; Apply
+/// writes the files, as Save to file reads back.
+#[test]
+fn files_load_into_cells() {
+    let (mut h, _db) = sqlite_file("lob-load.db");
+    let dir = std::env::temp_dir().join(format!("pythia-lob-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png: Vec<u8> = [0x89, b'P', b'N', b'G', 13, 10, 0x1A, 10]
+        .into_iter()
+        .chain((0..6000u32).map(|i| (i % 256) as u8))
+        .collect();
+    let (image, latin1, utf8) = (
+        dir.join("image.png"),
+        dir.join("latin1.txt"),
+        dir.join("utf8.txt"),
+    );
+    std::fs::write(&image, &png).unwrap();
+    std::fs::write(&latin1, b"Gr\xFC\xDFe").unwrap();
+    std::fs::write(&utf8, "Grüße, 日本\n".repeat(500)).unwrap();
+    run_script(
+        &mut h,
+        "lob-load.db",
+        "create table lob_doc (id integer primary key, img blob, body text);\n\
+         insert into lob_doc values (1, X'CAFE', 'old');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-load.db".into(),
+        text: "select id, img, body from lob_doc".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    // The menu takes a few frames to settle where it fits.
+    let menu = |h: &mut Harness<'_, PythiaApp>, cell: &str| {
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+    };
+    let choose = |h: &mut Harness<'_, PythiaApp>, path: Option<&PathBuf>| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(path.cloned());
+        before
+    };
+    let cafe = "0xCAFE · 2 bytes";
+    menu(&mut h, cafe);
+    assert!(h.query_by_label("Save to file…").is_some());
+    assert!(h.query_by_label("Load from file…").is_none(), "not edited");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    // Cancelled, the dialog leaves the cell as it was.
+    let before = choose(&mut h, None);
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    wait_until(&mut h, "the dialog", |app| {
+        app.test_sql_window_ref().is_some_and(|w| {
+            w.state.value_files.chosen.is_empty() && !w.state.value_files.is_busy()
+        })
+    });
+    assert_eq!(message_count(&mut h), before);
+    assert_eq!(
+        first_result(&mut h).grid.changes().map(|c| c.count()),
+        Some(0)
+    );
+    // Chosen, the file is the cell's change, shown by its size.
+    let before = choose(&mut h, Some(&image));
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Loaded 6008 bytes from"), "{said}");
+    let loaded = "0x89504E470D0A1A0A… · 5.9 KB";
+    assert!(h.query_by_label(loaded).is_some());
+    // Undo takes it back, and it's loaded again.
+    menu(&mut h, loaded);
+    h.get_by_label("Undo").click();
+    h.run_steps(2);
+    assert!(h.query_by_label(cafe).is_some());
+    let before = choose(&mut h, Some(&image));
+    menu(&mut h, cafe);
+    h.get_by_label("Load from file…").click();
+    file_done(&mut h, before);
+
+    // The value editor loads a file too, as UTF-8 only.
+    menu(&mut h, "old");
+    h.get_by_label("Edit in dialog…").click();
+    h.run_steps(2);
+    let before = choose(&mut h, Some(&latin1));
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.contains("isn't UTF-8 text"), "{said}");
+    h.state_mut().test_sql_window().state.bottom = crate::sql_window::BottomTab::Result(0);
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Edit body — row 1").is_some(),
+        "the editor stays"
+    );
+    let before = choose(&mut h, Some(&utf8));
+    h.get_by_label("Load from file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Loaded 8000 bytes"), "{said}");
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Edit body — row 1").is_none(),
+        "the file replaced its text"
+    );
+    assert!(h.query_by_label("Grüße, 日本… · 7.8 KB").is_some());
+
+    // Applied, the values are the files'.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    for (col, file) in [(1, &image), (2, &utf8)] {
+        let path = dir.join(format!("saved-{col}"));
+        let before = choose(&mut h, Some(&path));
+        let r = first_result(&mut h);
+        r.grid.request_save(&r.columns, &r.rows, (0, col));
+        let said = file_done(&mut h, before);
+        assert!(said.starts_with("Saved"), "{said}");
+        assert!(
+            std::fs::read(&path).unwrap() == std::fs::read(file).unwrap(),
+            "{col}"
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

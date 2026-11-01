@@ -55,6 +55,17 @@ All notable changes to Pythia are documented here. The format follows
   VARBINARY and TEXT; PostgreSQL's bytea and text; SQL Server's binary,
   varbinary, image, varchar, nvarchar, text and ntext; SQLite's blob and
   text columns.
+  *Load from file…*, in the context menu and the value editor of a result
+  being edited, makes a file the cell's pending change: its bytes in a
+  binary column, its text in a text column, which takes UTF-8 only. The
+  cell shows it by its size, Ctrl+Z takes it back, and *Apply* binds it
+  whole rather than writing it as a literal, which Oracle refuses past
+  4000 characters and which is impractical for megabytes anywhere. Files
+  up to 256 MB load. On Oracle, *Apply* also binds a value typed that no
+  literal holds: over 2000 bytes in a BLOB, RAW or LONG RAW (ORA-01704),
+  over 4000 bytes of text in a LONG (ORA-64203), and a CLOB's or NCLOB's
+  over 200,000 characters, near where its literal of parts (#317) fails
+  with ORA-01489.
 
 ### Changed
 - `&name` substitution variables are SQL\*Plus's, so only Oracle's SQL

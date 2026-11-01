@@ -140,12 +140,16 @@ pub fn float_text<F: std::fmt::Debug + std::fmt::Display>(value: F) -> String {
 
 /// The size of a binary value a result holds cut short: the number in
 /// `… (10485760 bytes)` after the hex of its first [`SHOWN_BYTES`] (also
-/// after SQL Server's `0x`). `None` for any other text.
+/// after SQL Server's `0x`, and PostgreSQL's `\x` of a file's bytes the
+/// grid shows so, #293). `None` for any other text.
 pub fn cut_size(value: &str) -> Option<u64> {
     if !value.ends_with(" bytes)") {
         return None;
     }
-    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("\\x"))
+        .unwrap_or(value);
     let (head, tail) = hex.split_at_checked(SHOWN_BYTES * 2)?;
     let size: u64 = tail
         .strip_prefix("… (")?
@@ -253,6 +257,7 @@ mod tests {
         assert_eq!(cut, format!("{}… (10000 bytes)", "AB".repeat(4000)));
         assert_eq!(cut_size(&cut), Some(10_000));
         assert_eq!(cut_size(&format!("0x{cut}")), Some(10_000));
+        assert_eq!(cut_size(&format!("\\x{cut}")), Some(10_000));
         let whole = hex(&big, true);
         assert_eq!(whole, "AB".repeat(10_000));
         assert_eq!(cut_size(&whole), None);

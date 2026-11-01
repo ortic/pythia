@@ -136,7 +136,7 @@ pub struct RunState {
     debuggable: Option<(EditorPosition, bool)>,
     /// Result of a running export (file dialog + write on a helper thread).
     pub export: Option<std::sync::mpsc::Receiver<ExportDone>>,
-    /// Values saved to files (#293).
+    /// Values saved to files and files loaded into cells (#293).
     pub value_files: value_file::ValueFiles,
     pub selection_summary: Option<String>,
     /// Where the connection's scripts end their statements (from the
@@ -187,6 +187,8 @@ pub enum Internal {
         expect_rows: u64,
         what: String,
         change: crate::data_edit::Change,
+        /// The values of files loaded into cells (#293).
+        binds: Vec<(String, pythia_db::Bind)>,
     },
 }
 
@@ -1298,11 +1300,15 @@ impl SqlWindow {
                     }
                     _ => 0,
                 };
+                let binds = match &internal {
+                    Internal::Dml { binds, .. } => binds.clone(),
+                    _ => Vec::new(),
+                };
                 DbRequest::Execute {
                     id,
                     sql: sql.clone(),
                     max_rows: cx.fetch_size.max(rows),
-                    binds: Vec::new(),
+                    binds,
                 }
             }
         };
@@ -1457,6 +1463,7 @@ impl SqlWindow {
                     expect_rows: dml.expect_rows,
                     what: dml.what,
                     change: dml.change,
+                    binds: dml.binds,
                 }),
             });
         }
@@ -1483,10 +1490,30 @@ impl SqlWindow {
             }
             EditAction::ShowSql(i) => {
                 let mut effects = Effects::default();
+                // A value bound is named by the statement (#293).
                 let script: Vec<String> = self
                     .pending_dml(i, cx)
                     .into_iter()
-                    .map(|d| format!("{};", d.sql))
+                    .map(|d| {
+                        let files: Vec<String> = d
+                            .binds
+                            .iter()
+                            .map(|(name, value)| {
+                                let bytes = match value {
+                                    pythia_db::Bind::Bytes(bytes) => bytes.len(),
+                                    pythia_db::Bind::LongText(text) => text.len(),
+                                    pythia_db::Bind::Text(text) => {
+                                        text.as_ref().map_or(0, String::len)
+                                    }
+                                };
+                                format!(":{name} is a value of {bytes} bytes, bound")
+                            })
+                            .collect();
+                        match files.is_empty() {
+                            true => format!("{};", d.sql),
+                            false => format!("-- {}\n{};", files.join(", "), d.sql),
+                        }
+                    })
                     .collect();
                 if let Some(connection) = cx.connection.clone() {
                     effects.open.push(crate::documents::OpenRequest::Sql {
@@ -2078,6 +2105,7 @@ impl SqlWindow {
                     expect_rows,
                     what,
                     change,
+                    ..
                 }) = running.as_ref().and_then(|r| r.internal.clone())
                 {
                     if summary.rows_affected != Some(expect_rows) {

@@ -1,18 +1,24 @@
-//! *Save to file…* of a result's cells (#293). The file dialog and the
-//! file's bytes are on helper threads, as an export's are, so the window
-//! keeps drawing. A value of the result being edited is fetched again
-//! whole, by its row's key: the grid holds a binary value cut short on
-//! most databases.
+//! *Save to file…* and *Load from file…* of a result's cells (#293). The
+//! file dialog and the file's bytes are on helper threads, as an export's
+//! are, so the window keeps drawing. A value of the result being edited is
+//! fetched again whole, by its row's key: the grid holds a binary value cut
+//! short on most databases.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use pythia_db::{DbEvent, DbKind, DbRequest};
-use pythia_ui::{FileRequest, SaveSource, SaveValue};
+use pythia_ui::{FileRequest, Loaded, RowRef, SaveSource, SaveValue};
 
 use super::{BottomTab, Level, Message, SqlWindow};
 use crate::documents::{DocContext, Effects, Target, request_id};
+
+/// The largest file *Load from file…* takes. Apply sends it whole, and the
+/// drivers copy it once or twice on the way: past this, memory runs short
+/// before the databases' own limits do (MySQL's `max_allowed_packet` is
+/// 64 MB by default, MariaDB's 16 MB).
+pub const LARGEST_FILE: u64 = 256 << 20;
 
 /// The files of a window's results in work.
 #[derive(Default)]
@@ -21,7 +27,7 @@ pub struct ValueFiles {
     pick: Option<Pick>,
     /// A value fetched whole for the file chosen.
     fetch: Option<Fetch>,
-    /// Files written on helper threads.
+    /// Files written or read on helper threads.
     io: Vec<Receiver<Done>>,
     /// The files tests choose in place of the dialog, in order (`None`:
     /// cancelled).
@@ -33,7 +39,7 @@ pub struct ValueFiles {
 }
 
 impl ValueFiles {
-    /// A dialog is open, a value is fetched, or a file written.
+    /// A dialog is open, a value is fetched, or a file written or read.
     pub fn is_busy(&self) -> bool {
         self.pick.is_some() || self.fetch.is_some() || !self.io.is_empty()
     }
@@ -54,9 +60,10 @@ impl ValueFiles {
             return;
         }
         let (tx, path) = mpsc::channel();
-        let FileRequest::Save(save) = &request;
         #[cfg(test)]
-        self.suggested.push(save.file_name.clone());
+        if let FileRequest::Save(save) = &request {
+            self.suggested.push(save.file_name.clone());
+        }
         #[cfg(test)]
         if let Some(chosen) = self.chosen.pop_front() {
             let _ = tx.send(chosen);
@@ -67,9 +74,16 @@ impl ValueFiles {
             });
             return;
         }
-        let name = save.file_name.clone();
+        let dialog = match &request {
+            FileRequest::Save(save) => Dialog::Save(save.file_name.clone()),
+            FileRequest::Load { .. } => Dialog::Open,
+        };
         std::thread::spawn(move || {
-            let _ = tx.send(rfd::FileDialog::new().set_file_name(name).save_file());
+            let chosen = match dialog {
+                Dialog::Save(name) => rfd::FileDialog::new().set_file_name(name).save_file(),
+                Dialog::Open => rfd::FileDialog::new().pick_file(),
+            };
+            let _ = tx.send(chosen);
         });
         self.pick = Some(Pick {
             result,
@@ -77,6 +91,12 @@ impl ValueFiles {
             path,
         });
     }
+}
+
+enum Dialog {
+    /// Save, suggesting this name.
+    Save(String),
+    Open,
 }
 
 struct Pick {
@@ -94,7 +114,17 @@ struct Fetch {
 
 /// What a helper thread did.
 enum Done {
-    Saved { path: PathBuf, bytes: usize },
+    Saved {
+        path: PathBuf,
+        bytes: usize,
+    },
+    Loaded {
+        result: u64,
+        row: RowRef,
+        col: usize,
+        loaded: Loaded,
+        path: PathBuf,
+    },
     Failed(String),
 }
 
@@ -119,9 +149,40 @@ fn write_file(
     rx
 }
 
+/// Reads the file at `path` for a cell: bytes for a binary column, UTF-8
+/// text for a text column.
+fn read_file(path: &std::path::Path, binary: bool) -> Result<Loaded, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    if size > LARGEST_FILE {
+        return Err(format!(
+            "{} has {} MB: files up to {} MB load",
+            path.display(),
+            size >> 20,
+            LARGEST_FILE >> 20
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if binary {
+        return Ok(Loaded::Bytes(bytes.into()));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Loaded::Text(text.into())),
+        Err(e) => {
+            let at = e.utf8_error().valid_up_to();
+            Err(format!(
+                "{} isn't UTF-8 text (byte {at} isn't), which the column takes: \
+                 convert it to UTF-8 first",
+                path.display()
+            ))
+        }
+    }
+}
+
 impl SqlWindow {
     /// Goes on with the files in work: the file chosen, then its value
-    /// fetched and written; says what was done.
+    /// fetched, written or read; says what was done.
     pub(super) fn poll_value_files(
         &mut self,
         ctx: &egui::Context,
@@ -157,7 +218,28 @@ impl SqlWindow {
     }
 
     fn file_chosen(&mut self, pick: Pick, path: PathBuf, cx: &DocContext, effects: &mut Effects) {
-        let FileRequest::Save(save) = pick.request;
+        let save = match pick.request {
+            FileRequest::Load { row, col, binary } => {
+                let (tx, rx) = mpsc::channel();
+                let result = pick.result;
+                std::thread::spawn(move || {
+                    let done = match read_file(&path, binary) {
+                        Ok(loaded) => Done::Loaded {
+                            result,
+                            row,
+                            col,
+                            loaded,
+                            path,
+                        },
+                        Err(e) => Done::Failed(format!("Load from file failed: {e}")),
+                    };
+                    let _ = tx.send(done);
+                });
+                self.state.value_files.io.push(rx);
+                return;
+            }
+            FileRequest::Save(save) => save,
+        };
         let SaveValue {
             col,
             binary,
@@ -165,6 +247,7 @@ impl SqlWindow {
             ..
         } = save;
         let rx = match source {
+            SaveSource::Loaded(loaded) => write_file(path, move || Ok(loaded.bytes().to_vec())),
             SaveSource::Held(text) => {
                 write_file(path, move || pythia_ui::value_bytes(&text, binary))
             }
@@ -298,6 +381,32 @@ impl SqlWindow {
         match done {
             Done::Saved { path, bytes } => {
                 self.info(format!("Saved {bytes} bytes to {}", path.display()));
+            }
+            Done::Loaded {
+                result,
+                row,
+                col,
+                loaded,
+                path,
+            } => {
+                let Some(r) = self.state.results.iter_mut().find(|r| r.id == result) else {
+                    self.file_failed(format!(
+                        "Load from file: the result was fetched again; load {} again",
+                        path.display()
+                    ));
+                    return;
+                };
+                let bytes = loaded.len();
+                let name = r
+                    .columns
+                    .get(col)
+                    .map_or("", |c| c.name.as_str())
+                    .to_owned();
+                r.grid.load_value(&r.rows, row, col, loaded);
+                self.info(format!(
+                    "Loaded {bytes} bytes from {} into {name}: Apply sends them",
+                    path.display()
+                ));
             }
             Done::Failed(text) => self.file_failed(text),
         }
