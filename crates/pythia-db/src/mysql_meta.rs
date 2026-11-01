@@ -234,7 +234,8 @@ fn columns(
     };
     let sql = format!(
         "select c.column_name, c.column_type, c.is_nullable, c.column_default, \
-                nullif(c.column_comment, ''), {pk} \
+                nullif(c.column_comment, ''), {pk}, lower(c.data_type), c.extra, \
+                version() like '%MariaDB%' \
            from information_schema.columns c \
           where c.table_schema = ? and c.table_name = ? \
           order by c.ordinal_position"
@@ -246,21 +247,84 @@ fn columns(
         Option<String>,
         Option<String>,
         Option<u32>,
+        String,
+        String,
+        bool,
     );
     let rows: Vec<Row> = conn.exec(sql, (owner, &table))?;
     Ok(rows
         .into_iter()
         .map(
-            |(name, data_type, nullable, default, comment, pk)| TableColumn {
+            |(name, data_type, nullable, default, comment, pk, kind, extra, mariadb)| TableColumn {
                 name,
                 data_type,
                 nullable: nullable == "YES",
-                default,
+                default: default.map(|d| {
+                    if mariadb {
+                        d
+                    } else {
+                        mysql_default(d, &kind, &extra)
+                    }
+                }),
                 comment,
                 pk_position: pk,
             },
         )
         .collect())
+}
+
+/// A MySQL column's default as SQL, as MariaDB gives it and SHOW CREATE
+/// TABLE writes it (#260). MySQL gives a literal's value as it is, so `''`
+/// read as no default, `'NULL'` as NULL and `'CURRENT_TIMESTAMP'` as the
+/// function: the value of a text, ENUM, SET, date or time column is
+/// quoted. Numbers and bits (`b'101'`) stay as they are, and so do
+/// expressions, marked DEFAULT_GENERATED; a CURRENT_TIMESTAMP before MySQL
+/// 8.0.13 isn't marked, but is no date.
+fn mysql_default(value: String, data_type: &str, extra: &str) -> String {
+    let literal = matches!(
+        data_type,
+        "char"
+            | "varchar"
+            | "tinytext"
+            | "text"
+            | "mediumtext"
+            | "longtext"
+            | "enum"
+            | "set"
+            | "date"
+            | "time"
+            | "datetime"
+            | "timestamp"
+    );
+    let now = matches!(data_type, "datetime" | "timestamp")
+        && value.to_ascii_uppercase().starts_with("CURRENT_TIMESTAMP");
+    if !literal || now || extra.contains("DEFAULT_GENERATED") {
+        return value;
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// A key part: its column, or a functional one's expression (MySQL
+/// 8.0.13) in parentheses as the DDL writes it (#258): it has no column.
+/// information_schema escapes the expression's strings once more
+/// (`_utf8mb4\'x\'`); `char(92)` is a backslash whatever
+/// `NO_BACKSLASH_ESCAPES` says, `char(39)` a quote.
+const KEY_PART: &str = "coalesce(column_name, concat('(', \
+     replace(replace(expression, repeat(char(92 using utf8mb4), 2), char(92 using utf8mb4)), \
+             concat(char(92 using utf8mb4), char(39 using utf8mb4)), char(39 using utf8mb4)), \
+     ')'))";
+
+/// A table's indexes, with their key parts as `part` gives them.
+fn indexes_sql(part: &str) -> String {
+    format!(
+        "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
+                if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
+                group_concat({part} order by seq_in_index separator ', ') as COLUMNS \
+           from information_schema.statistics \
+          where table_schema = ? and table_name = ? \
+          group by index_name, index_type, non_unique \
+          order by index_name = 'PRIMARY' desc, index_name"
+    )
 }
 
 fn details(
@@ -269,15 +333,11 @@ fn details(
     name: &str,
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
+    let indexes;
     let sql = match detail {
         Detail::Indexes => {
-            "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
-                    if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
-                    group_concat(column_name order by seq_in_index separator ', ') as COLUMNS \
-               from information_schema.statistics \
-              where table_schema = ? and table_name = ? \
-              group by index_name, index_type, non_unique \
-              order by index_name = 'PRIMARY' desc, index_name"
+            indexes = indexes_sql(KEY_PART);
+            &indexes
         }
         Detail::Constraints => {
             "select t.constraint_name as CONSTRAINT_NAME, \
@@ -343,6 +403,11 @@ fn details(
         // definitions then.
         Err(e) if e.code == Some(1109) && matches!(detail, Detail::Uses | Detail::UsedBy) => {
             table(conn, &view_usage_by_definition(detail), params(), &[])
+        }
+        // No `expression` (MariaDB, MySQL before 8.0.13), so no functional
+        // key parts: the columns then.
+        Err(e) if e.code == Some(1054) && detail == Detail::Indexes => {
+            table(conn, &indexes_sql("column_name"), params(), &[])
         }
         result => result,
     }

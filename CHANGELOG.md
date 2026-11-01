@@ -480,6 +480,34 @@ All notable changes to Pythia are documented here. The format follows
   cut short to `0.0000…`, as if it were 0; *Copy* and the CSV exports
   wrote them so. They now read `2e-20` and `1e-300`, as on SQLite and
   PostgreSQL; values from 1e-4 to 1e16 stay as they were (`2.5`, `100`).
+- MySQL: a BIT value can be edited in a result (#253). `1` typed into a
+  BIT(1), which shows as `00` or `01`, was written as `X'1'`, a syntax
+  error, and on MariaDB every BIT edit was refused ("Truncated incorrect
+  DECIMAL value"), also of a value typed as it is shown. A BIT is now
+  written as the number its hex stands for (`81` as 129), in INSERT
+  exports too.
+- A binary value typed into a result as the grid shows it, `0x…`, is
+  stored as those bytes (#256). On MySQL, PostgreSQL and SQLite
+  `0x171066e1` went in as text, the ten bytes `0x3078313731…`, without
+  a word; SQL Server took it already. An odd number of digits gets a 0
+  in front, as MySQL reads `0x…`. Text columns keep such a value as
+  text.
+- MySQL: a table's *Indexes* show an index on an expression with its
+  expression (#258). An index on `((lower(name)))` showed no columns,
+  and one on `(id, (lower(name)))` read `id`, like an index on `id`
+  alone. Such a key part now reads ``(lower(`name`))``, as in the DDL.
+- MySQL: a column's default reads with its quotes in an object view's
+  *Columns* (#260), as on MariaDB and in the DDL. `DEFAULT ''` read as
+  no default, `DEFAULT 'NULL'` as NULL, `'CURRENT_TIMESTAMP'` as the
+  function, and an ENUM's `'a'` as `a`. Numbers, bits and expressions
+  such as `CURRENT_TIMESTAMP` or `uuid()` read as before.
+- A NULL cell of a result being edited stays NULL when its editor is
+  opened and closed without typing (#262). It became an empty text: a
+  new row's TIMESTAMP opened so failed on *Apply* with "Incorrect
+  datetime value: ''" instead of taking its default, a date or number
+  of a fetched row failed the same way, and a text column's NULL was
+  replaced by `''`. *Set NULL* and the value editor's *Apply* work as
+  before.
 
 ## [0.10.0] - 2026-10-30
 

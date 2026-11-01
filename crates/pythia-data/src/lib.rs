@@ -628,12 +628,25 @@ pub fn literal(dialect: Dialect, col: &Column, value: Option<&str>) -> String {
     }
 }
 
-/// MySQL converts text to dates and times itself; binary values (also BIT
-/// and GEOMETRY) are shown as hex and written as `X'…'`. Text with a
-/// backslash goes as hex too: a quoted `\` means one thing with
-/// `NO_BACKSLASH_ESCAPES` and another without, `_utf8mb4 X'…'` the same
-/// either way. So does text with a `&`, which Pythia's SQL windows read as
-/// a substitution variable even in a literal (#159).
+/// The hex digits of a binary value typed as the grid shows it, `0x…`
+/// (#256); an odd number of them with a 0 in front, as MySQL reads `0x…`.
+fn typed_hex(v: &str) -> Option<String> {
+    let digits = v.strip_prefix("0x")?;
+    if !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let pad = if digits.len() % 2 == 1 { "0" } else { "" };
+    Some(format!("{pad}{digits}"))
+}
+
+/// MySQL converts text to dates and times itself; binary values (also
+/// GEOMETRY) are shown as hex, or typed as `0x…`, and written as `X'…'`.
+/// A BIT, shown as hex too, is written as the number it stands for (#253):
+/// `X'1'` is a syntax error, and MariaDB compares a BIT with `X'…'` as a
+/// decimal. Text with a backslash goes as hex too: a quoted `\` means one
+/// thing with `NO_BACKSLASH_ESCAPES` and another without, `_utf8mb4 X'…'`
+/// the same either way. So does text with a `&`, which Pythia's SQL
+/// windows read as a substitution variable even in a literal (#159).
 fn mysql_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
@@ -645,7 +658,16 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
         col.type_name.as_str(),
         "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
     );
-    if binary && v.chars().all(|c| c.is_ascii_hexdigit()) {
+    let typed = typed_hex(v).filter(|_| binary);
+    let v = typed.as_deref().unwrap_or(v);
+    let hex = v.chars().all(|c| c.is_ascii_hexdigit());
+    if col.type_name == "BIT"
+        && hex
+        && let Ok(n) = u64::from_str_radix(v, 16)
+    {
+        return n.to_string();
+    }
+    if binary && hex {
         format!("X'{v}'")
     } else if v.contains(['\\', '\0', '&']) {
         let hex: String = v.bytes().map(|b| format!("{b:02X}")).collect();
@@ -656,7 +678,8 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
 }
 
 /// PostgreSQL takes back the text it shows (`\x00ff` bytea, `t`, dates) as
-/// a quoted literal. With a backslash, `E'…'` says how to read it whatever
+/// a quoted literal; a bytea typed as `0x…` goes as `\x…`. With a
+/// backslash, `E'…'` says how to read it whatever
 /// `standard_conforming_strings` is; a `&` goes in as `\x26`, as Pythia's
 /// SQL windows read `&name` as a substitution variable even in a literal
 /// (#159).
@@ -667,6 +690,10 @@ fn postgres_literal(col: &Column, value: Option<&str>) -> String {
     if is_number(col, v) {
         return v.to_owned();
     }
+    let typed = typed_hex(v)
+        .filter(|_| col.type_name == "bytea")
+        .map(|hex| format!("\\x{hex}"));
+    let v = typed.as_deref().unwrap_or(v);
     let quoted = v.replace('\'', "''");
     if v.contains(['\\', '&']) {
         format!("E'{}'", quoted.replace('\\', "\\\\").replace('&', "\\x26"))
@@ -786,14 +813,18 @@ impl<'a> PlainDecimal<'a> {
 /// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
 /// read `&name` as a substitution variable even in a literal (#159). The
 /// session types a column of blobs BLOB (#209); there hex is a blob, also
-/// when it is all digits (`x'313233'`).
+/// when it is all digits (`x'313233'`), and so is `0x…` typed.
 fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
+    let blob = col.type_name.contains("BLOB");
+    if let Some(hex) = typed_hex(v).filter(|_| blob) {
+        return format!("X'{hex}'");
+    }
     // An empty blob is shown empty too.
     let hex = v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
-    if hex && col.type_name.contains("BLOB") {
+    if hex && blob {
         return format!("X'{v}'");
     }
     if is_number(col, v) || sqlite_number(v) {
@@ -1042,8 +1073,16 @@ mod tests {
         assert_eq!(my(&col("DATE", false), Some("2026-01-02")), "'2026-01-02'");
         assert_eq!(my(&col("VARBINARY", false), Some("00ff")), "X'00ff'");
         assert_eq!(my(&col("BLOB", false), Some("")), "X''");
-        assert_eq!(my(&col("BIT", false), Some("05")), "X'05'");
         assert_eq!(my(&col("BLOB", false), Some("no hex")), "'no hex'");
+        // A BIT is shown as hex and written as its number (#253): X'1' is
+        // a syntax error, and MariaDB compares X'…' with a BIT as a decimal.
+        let bit = col("BIT", false);
+        assert_eq!(my(&bit, Some("05")), "5");
+        assert_eq!(my(&bit, Some("1")), "1");
+        assert_eq!(my(&bit, Some("00")), "0");
+        assert_eq!(my(&bit, Some("81")), "129");
+        assert_eq!(my(&bit, Some("FFFFFFFFFFFFFFFF")), "18446744073709551615");
+        assert_eq!(my(&bit, Some("2x")), "'2x'");
         // Oracle's stay as they were.
         assert_eq!(
             literal(
@@ -1052,6 +1091,39 @@ mod tests {
                 Some("2026-01-02 00:00:00")
             ),
             "to_date('2026-01-02 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+        );
+    }
+
+    /// The grid shows binary values as `0x…`, and a value typed so is its
+    /// bytes on every database (#256), as on SQL Server; a text column
+    /// keeps it as text. An odd number of digits reads as MySQL's `0x…`
+    /// does, with a 0 in front.
+    #[test]
+    fn binary_values_typed_as_shown() {
+        let col = |t: &str| Column {
+            name: "C".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let typed = |d: Dialect, t: &str, v: &str| literal(d, &col(t), Some(v));
+        let my = |t, v| typed(Dialect::MYSQL, t, v);
+        assert_eq!(my("VARBINARY", "0x171066e1"), "X'171066e1'");
+        assert_eq!(my("BLOB", "0xABC"), "X'0ABC'");
+        assert_eq!(my("BINARY", "0x"), "X''");
+        assert_eq!(my("BIT", "0x81"), "129");
+        assert_eq!(my("VARCHAR", "0x41"), "'0x41'");
+        assert_eq!(my("VARBINARY", "0x4G"), "'0x4G'");
+        let pg = |t, v| typed(Dialect::POSTGRES, t, v);
+        assert_eq!(pg("bytea", "0x171066e1"), r"E'\\x171066e1'");
+        assert_eq!(pg("bytea", "0xabc"), r"E'\\x0abc'");
+        assert_eq!(pg("text", "0x41"), "'0x41'");
+        let lite = |t, v| typed(Dialect::SQLITE, t, v);
+        assert_eq!(lite("BLOB", "0x171066E1"), "X'171066E1'");
+        assert_eq!(lite("BLOB", "0xABC"), "X'0ABC'");
+        assert_eq!(lite("TEXT", "0x41"), "'0x41'");
+        assert_eq!(
+            typed(Dialect::SQLSERVER, "varbinary", "0x171066E1"),
+            "0x171066E1"
         );
     }
 
