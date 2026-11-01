@@ -805,7 +805,7 @@ fn inserts(
 }
 
 /// Lowercase plain identifiers; quote anything that needs it (Oracle).
-fn identifier(name: &str) -> String {
+pub fn identifier(name: &str) -> String {
     let plain = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && name
             .chars()

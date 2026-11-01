@@ -481,6 +481,15 @@ impl ExportTables {
     }
 }
 
+/// How a table's rows are written: INSERTs go into `table`, quoted unless
+/// it is a plain name (#242).
+fn insert_options(settings: &Settings, table: &str) -> Options {
+    Options {
+        table: pythia_data::identifier(table),
+        ..settings.options.clone()
+    }
+}
+
 /// Exports the tables; returns the total number of rows written.
 pub fn export(
     conn: &Connection,
@@ -528,10 +537,7 @@ pub fn export(
         let file = std::fs::File::create(&path).map_err(|e| io(&e))?;
         let mut out = Some(std::io::BufWriter::with_capacity(1 << 20, file));
         let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
-        let options = Options {
-            table: base.clone(),
-            ..settings.options.clone()
-        };
+        let options = insert_options(settings, &job.table);
         let result = pythia_db::stream_query(conn, &sql, 1000, |columns, rows| {
             if progress.stop.load(Ordering::Relaxed) {
                 return Err(DbError::new("stopped"));
@@ -571,6 +577,24 @@ pub fn export(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// INSERTs name the table as Oracle reads it: a name stored other than
+    /// in plain uppercase in quotes (#242).
+    #[test]
+    fn inserts_name_the_table() {
+        let settings = Settings {
+            owner: String::new(),
+            folder: PathBuf::new(),
+            format: Format::Insert,
+            options: Options::default(),
+            include_ddl: false,
+        };
+        let target = |table: &str| insert_options(&settings, table).table;
+        assert_eq!(target("DEMO_EMPLOYEES"), "demo_employees");
+        assert_eq!(target("guidelines-division"), "\"guidelines-division\"");
+        assert_eq!(target("Foo"), "\"Foo\"");
+        assert_eq!(target("MY TABLE"), "\"MY TABLE\"");
+    }
 
     #[test]
     fn exports_tables_with_filters() {
