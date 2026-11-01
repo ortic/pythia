@@ -8269,38 +8269,48 @@ fn a_new_database_file_is_made_once() {
     assert!(file.exists());
     assert_eq!(in_file(), [path.as_str()], "saved without ?create");
 
-    // Gone while connected: a new window doesn't make it again.
-    std::fs::remove_file(&file).unwrap();
-    h.state_mut().test_open(OpenRequest::Sql {
-        connection: "once.db".into(),
-        text: "select count(*) from sqlite_schema".into(),
-        run: true,
-    });
-    wait_until(&mut h, "query", |app| !app.test_focused_busy());
-    let messages: Vec<String> = h
-        .state_mut()
-        .test_sql_window()
-        .state
-        .messages
-        .iter()
-        .map(|m| m.text.clone())
-        .collect();
-    assert!(
-        messages
+    // Gone while connected: a new window doesn't make it again. Windows
+    // doesn't let a file go while it's open.
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(&file).unwrap();
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "once.db".into(),
+            text: "select count(*) from sqlite_schema".into(),
+            run: true,
+        });
+        wait_until(&mut h, "query", |app| !app.test_focused_busy());
+        let messages: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
             .iter()
-            .any(|m| m.contains("There is no database file")),
-        "{messages:?}"
-    );
-    assert!(!file.exists(), "made again by a window");
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("There is no database file")),
+            "{messages:?}"
+        );
+        assert!(!file.exists(), "made again by a window");
 
-    // Nor connecting again from the dialog, which shows the connection.
-    h.state_mut()
-        .test_command(crate::commands::Command::Connect);
-    h.run_steps(2);
-    let error = connect(&mut h);
-    assert!(missing(error.clone()), "{error:?}");
-    assert!(!file.exists(), "made again by Connect");
+        // Nor connecting again from the dialog, which shows the connection.
+        h.state_mut()
+            .test_command(crate::commands::Command::Connect);
+        h.run_steps(2);
+        let error = connect(&mut h);
+        assert!(missing(error.clone()), "{error:?}");
+        assert!(!file.exists(), "made again by Connect");
+    }
     drop(h);
+    // On Windows, once the sessions have closed it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while file.exists() && std::fs::remove_file(&file).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{path} stays open");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     // Nor the saved connection.
     let mut h = start(paths);
