@@ -2782,34 +2782,38 @@ commit;",
 
 /// "Execute to file" on MySQL, PostgreSQL and SQL Server, those of their
 /// variables that are set: 5000 rows fetched batch by batch into a JSON
-/// file.
+/// file. A boolean is JSON's (#217); MySQL has none, its `=` gives 1 or 0.
 #[test]
 fn execute_to_file_servers() {
     use pythia_config::DbKind;
-    // 5000 numbered rows in each database's SQL.
+    use serde_json::json;
+    // 5000 numbered rows in each database's SQL, and whether they are even.
     let databases = [
         (
             "PYTHIA_TEST_MYSQL",
             DbKind::MySql,
-            "select a.n + b.n * 100 + 1 as id from \
+            "select id, id % 2 = 0 as even from (select a.n + b.n * 100 + 1 as id from \
                (with recursive s(n) as (select 0 union all select n + 1 from s where n < 99) \
                 select n from s) a, \
                (with recursive s(n) as (select 0 union all select n + 1 from s where n < 49) \
-                select n from s) b order by 1",
+                select n from s) b) ids order by 1",
+            [json!(0), json!(1)],
         ),
         (
             "PYTHIA_TEST_POSTGRES",
             DbKind::Postgres,
-            "select id from generate_series(1, 5000) id",
+            "select id, id % 2 = 0 as even from generate_series(1, 5000) id",
+            [json!(false), json!(true)],
         ),
         (
             "PYTHIA_TEST_MSSQL",
             DbKind::SqlServer,
             "with s(id) as (select 1 union all select id + 1 from s where id < 5000) \
-             select id from s option (maxrecursion 0)",
+             select id, cast(1 - id % 2 as bit) as even from s option (maxrecursion 0)",
+            [json!(false), json!(true)],
         ),
     ];
-    for (env, kind, sql) in databases {
+    for (env, kind, sql, even) in databases {
         let connection = format!("export@{}", kind.label());
         let Some(mut h) = connect_to(env, &connection, kind) else {
             continue;
@@ -2836,6 +2840,11 @@ fn execute_to_file_servers() {
         let rows = json.as_array().map(Vec::len);
         assert_eq!(rows, Some(5000), "{env}");
         assert_eq!(json[4999]["id"], 5000, "{env}");
+        assert_eq!(
+            [&json[4998]["even"], &json[4999]["even"]],
+            [&even[0], &even[1]],
+            "{env}"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 }

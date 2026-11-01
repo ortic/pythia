@@ -138,6 +138,10 @@ All notable changes to Pythia are documented here. The format follows
   @old_time_zone;`), from *Execute to file* and from the grid. A session
   on the server's zone writes its offset when it has the same one all
   year (`+00:00` on UTC).
+- JSON exports write booleans as JSON's `true` and `false` (#217). A
+  PostgreSQL boolean was the string `"t"` or `"f"`, SQL Server's `bit`
+  `"1"` or `"0"`, Oracle's BOOLEAN `"TRUE"` or `"FALSE"`, and a JSON
+  reader takes each of them for true.
 
 ## [0.10.0] - 2026-10-30
 

@@ -136,7 +136,7 @@ pub fn export(
             out,
         ),
         Format::Tsv => delimited(b'\t', columns, rows, options, out),
-        Format::Json => json(columns, rows, out),
+        Format::Json => json(columns, rows, options.dialect, out),
         Format::Xlsx => xlsx(columns, rows, options, out),
         Format::Insert => {
             let zone = insert_time_zone(columns, options);
@@ -264,7 +264,8 @@ impl<W: Write> StreamWriter<W> {
                     } else {
                         ",\n"
                     };
-                    let object = serde_json::to_string_pretty(&json_object(&self.columns, row))?;
+                    let object = json_object(&self.columns, row, self.options.dialect);
+                    let object = serde_json::to_string_pretty(&object)?;
                     write!(self.out, "{sep}{}", indent(&object))?;
                 }
             }
@@ -323,14 +324,22 @@ fn delimited(
     Ok(())
 }
 
-fn json(columns: &[Column], rows: &[Vec<Cell>], out: &mut dyn Write) -> Result<()> {
-    let array: Vec<serde_json::Value> = rows.iter().map(|row| json_object(columns, row)).collect();
+fn json(
+    columns: &[Column],
+    rows: &[Vec<Cell>],
+    dialect: Dialect,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let array: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| json_object(columns, row, dialect))
+        .collect();
     serde_json::to_writer_pretty(&mut *out, &array)?;
     writeln!(out)?;
     Ok(())
 }
 
-fn json_object(columns: &[Column], row: &[Cell]) -> serde_json::Value {
+fn json_object(columns: &[Column], row: &[Cell], dialect: Dialect) -> serde_json::Value {
     let object = columns
         .iter()
         .zip(row)
@@ -338,12 +347,35 @@ fn json_object(columns: &[Column], row: &[Cell]) -> serde_json::Value {
             let value = match cell {
                 None => serde_json::Value::Null,
                 Some(v) if col.numeric => number(v).map_or_else(|| v.clone().into(), Into::into),
+                Some(v) if is_boolean(dialect, col) => {
+                    boolean(v).map_or_else(|| v.clone().into(), Into::into)
+                }
                 Some(v) => v.clone().into(),
             };
             (col.name.clone(), value)
         })
         .collect();
     serde_json::Value::Object(object)
+}
+
+/// Columns of booleans (#217): PostgreSQL's and Oracle's `boolean`, SQL
+/// Server's `bit` (PostgreSQL's is a string of bits). MySQL has none.
+fn is_boolean(dialect: Dialect, col: &Column) -> bool {
+    let t = col.type_name.as_str();
+    t.eq_ignore_ascii_case("boolean")
+        || t.eq_ignore_ascii_case("bool")
+        || (dialect.kind() == DbKind::SqlServer && t == "bit")
+}
+
+/// A boolean as the sessions show it: `t`/`f`, `TRUE`/`FALSE`, `1`/`0`.
+fn boolean(text: &str) -> Option<bool> {
+    match text {
+        "t" | "1" => Some(true),
+        "f" | "0" => Some(false),
+        _ if text.eq_ignore_ascii_case("true") => Some(true),
+        _ if text.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses a number for typed output, keeping integers exact.
@@ -1203,6 +1235,48 @@ mod tests {
         assert_eq!(v[0]["ID"], 1);
         assert_eq!(v[1]["ID"], 2.5);
         assert_eq!(v[1]["NAME"], serde_json::Value::Null);
+    }
+
+    /// Booleans are JSON's true and false, not the text shown (#217): a
+    /// JSON reader takes "f" (and "FALSE", "0") for true.
+    #[test]
+    fn json_booleans() {
+        let col = |ty: &str| Column {
+            name: "b".into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let json = |dialect, ty: &str, values: &[Option<&str>]| {
+            let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![v.map(Into::into)]).collect();
+            let options = Options {
+                dialect,
+                ..Options::default()
+            };
+            let bytes = export_to_vec(Format::Json, &[col(ty)], &rows, &options).unwrap();
+            let mut stream =
+                StreamWriter::new(Format::Json, vec![col(ty)], options, Vec::new()).unwrap();
+            stream.write(&rows).unwrap();
+            let streamed: serde_json::Value =
+                serde_json::from_slice(&stream.finish().unwrap()).unwrap();
+            let whole: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(whole, streamed);
+            whole
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["b"].clone())
+                .collect::<Vec<_>>()
+        };
+        use serde_json::Value::{Bool, Null, String as Text};
+        let pg = json(Dialect::POSTGRES, "boolean", &[Some("t"), Some("f"), None]);
+        assert_eq!(pg, [Bool(true), Bool(false), Null]);
+        let ora = json(Dialect::ORACLE, "BOOLEAN", &[Some("TRUE"), Some("FALSE")]);
+        assert_eq!(ora, [Bool(true), Bool(false)]);
+        let ms = json(Dialect::SQLSERVER, "bit", &[Some("1"), Some("0")]);
+        assert_eq!(ms, [Bool(true), Bool(false)]);
+        // PostgreSQL's bit is a string of bits.
+        let bits = json(Dialect::POSTGRES, "bit", &[Some("101"), Some("1")]);
+        assert_eq!(bits, [Text("101".into()), Text("1".into())]);
     }
 
     #[test]
