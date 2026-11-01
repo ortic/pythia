@@ -684,6 +684,13 @@ All notable changes to Pythia are documented here. The format follows
   and `"t "`, in the object browser, *Favorites*, *Recent*, the tabs and
   the view's heading (`main."t "`). It read like `t`, so on SQLite or
   PostgreSQL `" t"`, `"t "` and `t` looked the same.
+- PostgreSQL: a materialized view's DDL has its indexes, comments and
+  grants (#301). It had only the `CREATE`, so *Edit*, which drops the
+  view and creates it again from the DDL, made it without them: no
+  index, not even the unique one `REFRESH … CONCURRENTLY` needs, and no
+  privileges for the roles that had them. They now follow the `CREATE`
+  in *Edit*'s block, and in the *DDL* tab; the owner's own privileges
+  come with the view.
 
 ## [0.10.0] - 2026-10-30
 

@@ -1582,6 +1582,95 @@ create index r55_ei on r55_et (n);",
     });
 }
 
+/// *Edit* of a PostgreSQL materialized view keeps its indexes, comments
+/// and grants: its DDL had only the CREATE, so the view the script made
+/// again came without them.
+#[test]
+fn postgres_edit_keeps_a_materialized_views_indexes_grants_and_comments() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let connection = "r64-mv";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let drop = "drop table if exists r64_mt cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(drop).unwrap();
+        for sql in [
+            "create table r64_mt (n int, m int)",
+            "create materialized view r64_mv as select n, m, 1 as k from r64_mt",
+            "create unique index r64_mv_n on r64_mv (n)",
+            "create index r64_mv_m on r64_mv (m) where m > 0",
+            "comment on materialized view r64_mv is 'It''s the view'",
+            "comment on column r64_mv.n is 'the key'",
+            "grant select on r64_mv to public",
+            "grant select on r64_mv to pg_monitor with grant option",
+            "grant select (m) on r64_mv to pg_read_all_stats",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    // What the view has besides its query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select (select string_agg(indexdef, '; ' order by indexname) \
+                           from pg_indexes where tablename = 'r64_mv'), \
+                        obj_description('r64_mv'::regclass, 'pg_class'), \
+                        col_description('r64_mv'::regclass, 1), \
+                        (select string_agg(x.grantee::regrole || ' ' || x.privilege_type \
+                                           || case when x.is_grantable then '*' else '' end, \
+                                           ', ' order by x.grantee::regrole::text) \
+                           from pg_class c, aclexplode(c.relacl) x \
+                          where c.oid = 'r64_mv'::regclass and x.grantee <> c.relowner), \
+                        (select array_to_string(attacl, ',') from pg_attribute \
+                          where attrelid = 'r64_mv'::regclass and attname = 'm'), \
+                        pg_get_viewdef('r64_mv'::regclass)",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert!(
+        was[0].as_deref().is_some_and(|i| i.contains("r64_mv_n")),
+        "{was:?}"
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r64_mv".into(),
+        object_type: ObjectType::MaterializedView,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r64_mv"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| {
+        !app.test_focused_busy() && app.test_pending_tx()
+    });
+    h.state_mut().test_commit();
+    wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[5].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[..5], was[..5], "{script}");
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(drop).unwrap());
+}
+
 /// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
 /// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
 /// changes before stay pending.

@@ -488,25 +488,52 @@ fn ddl(
         ObjectType::Table => on_path(pg, "", || table_ddl(pg, owner, name)),
         ObjectType::View | ObjectType::MaterializedView => {
             let (owner, name) = stored(pg, owner, name)?;
-            let definition = pg
+            let row = pg
                 .first(
-                    "select pg_get_viewdef(c.oid, true) from pg_class c \
+                    "select pg_get_viewdef(c.oid, true), c.oid, \
+                            obj_description(c.oid, 'pg_class') from pg_class c \
                        join pg_namespace n on n.oid = c.relnamespace \
                       where n.nspname = $1 and c.relname = $2",
                     &[&owner, &name],
                 )?
-                .and_then(first)
                 .ok_or_else(missing)?;
+            let mut row = row.into_iter();
+            let definition = row.next().flatten().ok_or_else(missing)?;
+            let oid = row.next().flatten().unwrap_or_default();
+            let comment = row.next().flatten();
+            let qualified = dialect.qualified(&owner, &name);
             let create = if object_type == ObjectType::View {
                 "create or replace view"
             } else {
                 "create materialized view"
             };
-            Ok(format!(
-                "{create} {} as\n{}{end}",
-                dialect.qualified(&owner, &name),
+            let mut ddl = format!(
+                "{create} {qualified} as\n{}",
                 definition.trim_end().trim_end_matches(';')
-            ))
+            );
+            // A view is replaced in place, but Edit drops a materialized
+            // view and creates it again from this: without them the new
+            // one would come without its indexes, comments and grants
+            // (#301).
+            let mut rest = String::new();
+            if object_type == ObjectType::MaterializedView {
+                indexes_and_comments(
+                    pg,
+                    &mut rest,
+                    &oid,
+                    "materialized view",
+                    &qualified,
+                    comment,
+                )?;
+                grants(pg, &mut rest, &oid, &qualified)?;
+            }
+            if rest.is_empty() {
+                ddl.push_str(end);
+            } else {
+                ddl.push(';');
+                ddl.push_str(&rest);
+            }
+            Ok(ddl)
         }
         ObjectType::Function | ObjectType::Procedure => {
             let rows = pg.rows(
@@ -682,6 +709,21 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             Dialect::POSTGRES.quote_ident(column)
         ));
     }
+    indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
+    Ok(ddl)
+}
+
+/// The relation's indexes that no constraint makes, then the comments on
+/// it (a `kind`: `table`, `materialized view`) and on its columns, each
+/// statement with its `;`, appended to `ddl`.
+fn indexes_and_comments(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    kind: &str,
+    qualified: &str,
+    comment: Option<String>,
+) -> Result<(), DbError> {
     let indexes = pg.rows(
         &format!(
             "select pg_get_indexdef(i.indexrelid) from pg_index i \
@@ -697,7 +739,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     }
     if let Some(comment) = comment {
         ddl.push_str(&format!(
-            "\n\ncomment on table {qualified} is {};",
+            "\n\ncomment on {kind} {qualified} is {};",
             literal(&comment)
         ));
     }
@@ -718,7 +760,48 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             ));
         }
     }
-    Ok(ddl)
+    Ok(())
+}
+
+/// The grants on the relation and on its columns, appended to `ddl`: one
+/// `grant` for each grantee and grant option, `grant select, update (m) on
+/// …`. The owner's own privileges come with the object and are left out.
+fn grants(pg: &Pg<'_>, ddl: &mut String, oid: &str, qualified: &str) -> Result<(), DbError> {
+    let rows = pg.rows(
+        &format!(
+            "select case when g.grantee = 0 then 'public' else quote_ident(r.rolname) end, \
+                    g.is_grantable, string_agg(g.privilege, ', ' order by g.attnum, g.privilege) \
+               from (select x.grantee, x.is_grantable, lower(x.privilege_type) as privilege, \
+                            0 as attnum, c.relowner \
+                       from pg_class c cross join aclexplode(c.relacl) x \
+                      where c.oid = {oid} \
+                     union all \
+                     select x.grantee, x.is_grantable, \
+                            lower(x.privilege_type) || ' (' || quote_ident(a.attname) || ')', \
+                            a.attnum, c.relowner \
+                       from pg_class c join pg_attribute a on a.attrelid = c.oid \
+                      cross join aclexplode(a.attacl) x \
+                      where c.oid = {oid} and a.attnum > 0 and not a.attisdropped) g \
+               left join pg_roles r on r.oid = g.grantee \
+              where g.grantee <> g.relowner \
+              group by 1, 2 \
+              order by 1, 2"
+        ),
+        &[],
+    )?;
+    for row in rows {
+        if let [Some(grantee), Some(grantable), Some(privileges)] = row.as_slice() {
+            let option = if grantable == "t" {
+                " with grant option"
+            } else {
+                ""
+            };
+            ddl.push_str(&format!(
+                "\n\ngrant {privileges} on {qualified} to {grantee}{option};"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The plan of `sql` from `EXPLAIN (FORMAT JSON)`. Bind variables become
