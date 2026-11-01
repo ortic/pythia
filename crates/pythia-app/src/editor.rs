@@ -117,6 +117,10 @@ impl Editor {
         self.inner.set_syntax(syntax);
     }
 
+    pub fn syntax(&self) -> pythia_plsql::Syntax {
+        self.inner.syntax()
+    }
+
     pub fn cursor(&self) -> usize {
         self.inner.cursor().min(self.text.len())
     }

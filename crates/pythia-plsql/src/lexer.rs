@@ -40,9 +40,11 @@ pub enum TokenKind {
     /// Unquoted identifier. Keywords are reclassified by [`tokenize`].
     #[regex(r"[\p{L}][\p{L}\p{N}_$#]*")]
     Ident,
-    /// `"Name"`, and MySQL's `` `name` `` (a doubled backtick stands for one).
+    /// `"Name"`, MySQL's `` `name` `` (a doubled backtick stands for one),
+    /// and SQL Server's and SQLite's `[name]`.
     #[regex(r#""[^"\n]*"?"#)]
     #[regex(r"`([^`\n]|``)*`?")]
+    #[token("[", bracket_ident)]
     QuotedIdent,
     #[regex(r":[\p{L}][\p{L}\p{N}_$#]*")]
     #[regex(r":[0-9]+")]
@@ -299,6 +301,29 @@ fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
     true
 }
 
+/// Consumes the rest of SQL Server's and SQLite's `[name]` (#208): up to
+/// its `]` (a doubled one stands for itself), or the end of the line.
+/// Elsewhere `[` stays an error token.
+fn bracket_ident(lex: &mut logos::Lexer<TokenKind>) -> bool {
+    if !matches!(lex.extras, Syntax::TSql | Syntax::Sqlite) {
+        return false;
+    }
+    let rest = lex.remainder().as_bytes();
+    let mut i = 0;
+    while i < rest.len() && rest[i] != b'\n' {
+        match rest[i] {
+            b']' if rest.get(i + 1) == Some(&b']') => i += 2,
+            b']' => {
+                i += 1;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    lex.bump(i);
+    true
+}
+
 /// Consumes a `q'<delim>...<delim>'` body after the `q'` prefix.
 fn q_string(lex: &mut logos::Lexer<TokenKind>) {
     let rest = lex.remainder();
@@ -328,6 +353,7 @@ fn q_string(lex: &mut logos::Lexer<TokenKind>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize_ident;
 
     fn kinds(src: &str) -> Vec<(TokenKind, &str)> {
         tokenize(src)
@@ -523,6 +549,44 @@ mod tests {
                 (TokenKind::Ident, "x$if"),
             ]
         );
+    }
+
+    #[test]
+    fn bracketed_names() {
+        // SQL Server's and SQLite's `[name]` (#208).
+        for syntax in [Syntax::TSql, Syntax::Sqlite] {
+            let src = "select [a b].[x]]y] from [t;1] [open";
+            let kinds: Vec<_> = tokenize_in(src, syntax)
+                .into_iter()
+                .filter(|t| !t.kind.is_trivia())
+                .map(|t| (t.kind, &src[t.span]))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    (TokenKind::Keyword, "select"),
+                    (TokenKind::QuotedIdent, "[a b]"),
+                    (TokenKind::Dot, "."),
+                    (TokenKind::QuotedIdent, "[x]]y]"),
+                    (TokenKind::Keyword, "from"),
+                    (TokenKind::QuotedIdent, "[t;1]"),
+                    (TokenKind::QuotedIdent, "[open"),
+                ],
+                "{syntax:?}"
+            );
+        }
+        assert_eq!(
+            kinds("[a]"),
+            vec![
+                (TokenKind::Error, "["),
+                (TokenKind::Ident, "a"),
+                (TokenKind::Error, "]"),
+            ]
+        );
+        assert_eq!(normalize_ident("[x]]y]"), ("x]y".into(), true));
+        assert_eq!(normalize_ident("`a``b`"), ("a`b".into(), true));
+        assert_eq!(normalize_ident("\"My\"\"T\""), ("My\"T".into(), true));
+        assert_eq!(normalize_ident("emp"), ("EMP".into(), false));
     }
 
     fn postgres_kinds(src: &str) -> Vec<(TokenKind, &str)> {

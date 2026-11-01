@@ -295,6 +295,11 @@ impl CodeEditor {
         }
     }
 
+    /// The syntax of the database the text is for.
+    pub fn syntax(&self) -> pythia_plsql::Syntax {
+        self.state.highlighter.syntax()
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.state.rope.len_bytes()
     }

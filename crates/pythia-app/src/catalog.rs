@@ -875,13 +875,15 @@ mod dictionary_live {
         }
     }
 
-    /// Completes the columns of `cat_orders` after its alias, created by
-    /// `create` on the database of `env`; returns `(label, inserted text)`.
+    /// Completes the columns of `cat_orders`, written as `table`, after its
+    /// alias, created by `create` on the database of `env`; returns
+    /// `(label, inserted text)`.
     fn complete_columns(
         env: &str,
         kind: DbKind,
         names: NameStyle,
         create: &str,
+        table: &str,
     ) -> Option<Vec<(String, String)>> {
         let spec = std::env::var(env).ok()?;
         let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
@@ -913,9 +915,10 @@ mod dictionary_live {
         live.run(create);
 
         let mut cache = CatalogCache::new(server.current_schema).with_names(names);
-        // Code assistance looks names up in uppercase.
-        let src = "select o.\n  from CAT_ORDERS o";
-        let analysis = Analysis::new(src);
+        // Code assistance looks unquoted names up in uppercase, quoted ones
+        // as written, lexed as the database reads them (#208).
+        let src = format!("select o.\n  from {table} o");
+        let analysis = Analysis::new_in(&src, live.dialect.syntax());
         let mut items = Vec::new();
         for _ in 0..8 {
             let c = analysis.complete(9, &cache);
@@ -942,17 +945,20 @@ mod dictionary_live {
 
     #[test]
     fn mysql_columns_after_an_alias() {
-        let Some(items) = complete_columns(
-            "PYTHIA_TEST_MYSQL",
-            DbKind::MySql,
-            NameStyle::Backticks,
-            "create table cat_orders (id int primary key, Customer varchar(30), `order` int)",
-        ) else {
-            return;
-        };
-        // Names as stored; backticks only where MySQL needs them.
-        assert!(has(&items, "Customer", "Customer"), "{items:?}");
-        assert!(has(&items, "order", "`order`"), "{items:?}");
+        for table in ["CAT_ORDERS", "`cat_orders`"] {
+            let Some(items) = complete_columns(
+                "PYTHIA_TEST_MYSQL",
+                DbKind::MySql,
+                NameStyle::Backticks,
+                "create table cat_orders (id int primary key, Customer varchar(30), `order` int)",
+                table,
+            ) else {
+                return;
+            };
+            // Names as stored; backticks only where MySQL needs them.
+            assert!(has(&items, "Customer", "Customer"), "{table}: {items:?}");
+            assert!(has(&items, "order", "`order`"), "{table}: {items:?}");
+        }
     }
 
     #[test]
@@ -962,6 +968,7 @@ mod dictionary_live {
             DbKind::Postgres,
             NameStyle::Lower,
             "create table cat_orders (id int primary key, \"Customer\" varchar(30), \"order\" int)",
+            "CAT_ORDERS",
         ) else {
             return;
         };
@@ -973,16 +980,19 @@ mod dictionary_live {
 
     #[test]
     fn sqlserver_columns_after_an_alias() {
-        let Some(items) = complete_columns(
-            "PYTHIA_TEST_MSSQL",
-            DbKind::SqlServer,
-            NameStyle::Brackets,
-            "create table cat_orders (id int primary key, Customer varchar(30), [order] int)",
-        ) else {
-            return;
-        };
-        // Names as stored; brackets only where SQL Server needs them.
-        assert!(has(&items, "Customer", "Customer"), "{items:?}");
-        assert!(has(&items, "order", "[order]"), "{items:?}");
+        for table in ["CAT_ORDERS", "[cat_orders]", "[dbo].[cat_orders]"] {
+            let Some(items) = complete_columns(
+                "PYTHIA_TEST_MSSQL",
+                DbKind::SqlServer,
+                NameStyle::Brackets,
+                "create table cat_orders (id int primary key, Customer varchar(30), [order] int)",
+                table,
+            ) else {
+                return;
+            };
+            // Names as stored; brackets only where SQL Server needs them.
+            assert!(has(&items, "Customer", "Customer"), "{table}: {items:?}");
+            assert!(has(&items, "order", "[order]"), "{table}: {items:?}");
+        }
     }
 }

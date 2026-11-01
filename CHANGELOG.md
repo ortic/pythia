@@ -134,6 +134,11 @@ All notable changes to Pythia are documented here. The format follows
   comment: *Edit* on such a view dropped the view, and its create ran
   together with the next statement and failed; a table's indexes were
   lost when its DDL ran again.
+- Completion offers the columns after the alias of a table quoted with
+  backticks or brackets (#208). ``select o. from `order` o`` offered
+  nothing on MySQL and SQLite, nor `select t. from [my table] t` on SQL
+  Server and SQLite, though completion writes such names itself where
+  the database needs them.
 
 ## [0.10.0] - 2026-10-30
 
