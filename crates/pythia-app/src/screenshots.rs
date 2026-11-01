@@ -10659,6 +10659,140 @@ fn an_empty_name_shows_as_quotes() {
     assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
 }
 
+/// Oracle's names keep the case that tells them apart outside the browser
+/// too, as #272 shows them there: `R64_CASE` reads `r64_case`, `"R64_Case"`
+/// reads `"R64_Case"`, in the maintenance scan and an index's maintenance,
+/// Export tables, the invalid objects, a table's partitions and the grants
+/// on it. Each read `r64_case` and the like, so the two looked the same.
+#[test]
+fn oracle_names_keep_their_case_beyond_the_browser() {
+    use crate::object_editor::EditTarget;
+    use pythia_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = "pythia@FREEPDB1";
+    // A role with lowercase letters to grant to, made by a DBA.
+    let dba = std::env::var("PYTHIA_TEST_DB_DBA").ok().map(|spec| {
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        pythia_db::oracle::Connection::connect(user, pw, db).unwrap()
+    });
+    if let Some(dba) = &dba {
+        let _ = dba.execute("drop role \"R64_Role\"", &[]);
+        dba.execute("create role \"R64_Role\"", &[]).unwrap();
+    }
+    let drops = "drop view if exists \"R64_Bad\";
+drop table if exists r64_case purge;
+drop table if exists \"R64_Case\" purge;
+drop table if exists r64_part purge;";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    run_script(&mut h, connection, drops);
+    run_script(
+        &mut h,
+        connection,
+        &format!(
+            "create table r64_case (id number);
+create table \"R64_Case\" (\"Id\" number);
+create index \"R64_Case_Ix\" on \"R64_Case\" (\"Id\");
+create table r64_part (\"Day\" number, id number) tablespace users
+  partition by range (\"Day\") (partition \"P_Low\" values less than (10),
+                                partition p_high values less than (maxvalue));
+create force view \"R64_Bad\" as select * from r64_missing;{}",
+            if dba.is_some() {
+                "\ngrant select on \"R64_Case\" to \"R64_Role\";"
+            } else {
+                ""
+            }
+        ),
+    );
+    let object = |name: &str, object_type| ObjectRef {
+        owner: "PYTHIA".into(),
+        name: name.into(),
+        object_type,
+    };
+
+    // The scan: both tables have no statistics.
+    open_scan(&mut h, None);
+    let found = scan_findings(&mut h, "pythia.");
+    let found: Vec<_> = found
+        .iter()
+        .filter(|(name, ..)| name.to_lowercase().contains("r64_case"))
+        .map(|(name, problem, _)| (name.as_str(), problem.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("pythia.r64_case", "No statistics"),
+            ("pythia.\"R64_Case\"", "No statistics")
+        ]
+    );
+    h.state_mut().test_close_focused();
+    open_maintenance(&mut h, connection, object("R64_Case_Ix", ObjectType::Index));
+    assert_eq!(
+        maintenance_fact(&mut h, "Table").map(|(table, _)| table),
+        Some("pythia.\"R64_Case\"".into())
+    );
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_export_tables()
+        .set_tables(&[("R64_CASE", ""), ("R64_Case", "")]);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("r64_case").count(), 1, "Export tables");
+    assert_eq!(h.query_all_by_label("\"R64_Case\"").count(), 1);
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::InvalidObjects {
+        connection: connection.into(),
+        schema: Some("PYTHIA".into()),
+        recompile: false,
+    });
+    wait_until(&mut h, "invalid objects", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && !w.objects().is_empty())
+    });
+    h.state_mut().test_invalid_window_mut().unwrap().filter = "R64".into();
+    h.run_steps(3);
+    assert!(h.query_by_label("\"R64_Bad\"").is_some(), "invalid objects");
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::EditTable {
+        connection: connection.into(),
+        object: object("R64_PART", ObjectType::Table),
+        tab: crate::table_editor::TableTab::Partitions,
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "partitions", |app| !app.test_focused_busy());
+    h.run_steps(3);
+    assert!(h.query_by_label("\"P_Low\"").is_some(), "partitions");
+    assert!(h.query_by_label("p_high").is_some());
+    assert!(h.query_by_label("(\"Day\")").is_some(), "the key");
+    h.state_mut().test_close_focused();
+
+    if dba.is_some() {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: connection.into(),
+            target: EditTarget::Grants(object("R64_Case", ObjectType::Table)),
+        });
+        h.run_steps(2);
+        wait_until(&mut h, "grants", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        assert!(h.query_by_label("\"R64_Role\"").is_some(), "grantee");
+        h.state_mut().test_close_focused();
+    }
+    run_script(&mut h, connection, drops);
+    if let Some(dba) = &dba {
+        dba.execute("drop role \"R64_Role\"", &[]).unwrap();
+    }
+}
+
 /// A name typed after its opening quote is completed and closed (#234):
 /// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
 /// didn't open.

@@ -671,6 +671,15 @@ All notable changes to Pythia are documented here. The format follows
   timers that can corrupt memory. rsa, which the SSH tunnels use, still
   has RUSTSEC-2023-0071 (a timing side channel), for which there is no
   fixed version yet.
+- Names show with their case outside the object browser too (#295), as
+  #272 shows them there: Oracle's `FOO` as `foo` and `"Foo"` as
+  `"Foo"`. The maintenance scan, an index's *Maintenance…*, *Export
+  tables*, *Invalid objects*, a table's indexes and constraints in the
+  browser, *Edit table…*'s partitions and *Grants…* showed every name in
+  lowercase, so `"Foo"` read like `FOO`; the scan's tab did so on every
+  database. The program window offers the file *Export schema to folder*
+  writes for the unit (`f^oo.pks` for `"Foo"`), not `foo.pks` for both.
+  A foreign key on a column such as `"P_Id"` marks it in the browser.
 
 ## [0.10.0] - 2026-10-30
 

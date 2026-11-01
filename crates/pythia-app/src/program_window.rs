@@ -184,7 +184,9 @@ impl ProgramWindow {
         Some((debug_unit(&self.object, part.object_type), line))
     }
 
-    /// File name for saving the active part, e.g. `emp_pkg.pkb`.
+    /// File name for saving the active part, e.g. `emp_pkg.pkb`: the file
+    /// Export schema to folder writes for it, one of its own also for
+    /// `"Emp_Pkg"` (#295).
     pub fn file_name(&self) -> String {
         let ext = match self.parts.get(self.active).map(|p| p.object_type) {
             Some(ObjectType::Package) => "pks",
@@ -196,7 +198,8 @@ impl ProgramWindow {
             Some(ObjectType::Trigger) => "trg",
             _ => "sql",
         };
-        format!("{}.{ext}", self.object.name.to_lowercase())
+        let stem = crate::object_files::file_stem(&self.object.name);
+        format!("{stem}.{ext}")
     }
 
     /// Source of the active part, terminated for SQL*Plus.
@@ -1546,6 +1549,25 @@ mod tests {
     use super::{
         enclosing_subprograms, member_span, qualify_unit, subprogram_at, subprogram_items,
     };
+
+    /// The file offered for a unit is the one Export schema to folder
+    /// writes for it: `FOO` and `"Foo"` get one each, not both `foo.pks`.
+    #[test]
+    fn units_are_offered_a_file_of_their_own() {
+        use pythia_db::ObjectType;
+        let file = |name: &str, object_type| {
+            super::ProgramWindow::new(crate::documents::ObjectRef {
+                owner: "APP".into(),
+                name: name.into(),
+                object_type,
+            })
+            .file_name()
+        };
+        assert_eq!(file("BILLING", ObjectType::Package), "billing.pks");
+        assert_eq!(file("Billing", ObjectType::Package), "b^illing.pks");
+        assert_eq!(file("billing", ObjectType::Procedure), "^billing.prc");
+        assert_eq!(file("A/B", ObjectType::Function), "a%2Fb.fnc");
+    }
 
     /// A unit opened from another schema compiles in that schema, not the
     /// session's (#251): ALL_SOURCE keeps neither CREATE nor the owner.
