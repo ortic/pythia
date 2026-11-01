@@ -20,13 +20,14 @@ use mysql::consts::{CapabilityFlags, ColumnFlags, ColumnType};
 use mysql::prelude::{Protocol, Queryable};
 use mysql::{Conn, Opts, OptsBuilder, Params, QueryResult, SslOpts, Value};
 use mysql_common::proto::codec::error::PacketCodecError;
+use pythia_plsql::Syntax;
 use tracing::{debug, info, warn};
 
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
 use crate::sql_text::{
-    WHOLE_BATCH_BYTES, hex, leading_words, release, replace_binds, row_bytes, statement_kind,
+    WHOLE_BATCH_BYTES, hex, leading_words_in, release, replace_binds, row_bytes, statement_kind_in,
 };
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
@@ -247,7 +248,7 @@ impl Worker {
             Ok(outcome) => {
                 self.tx.after(effect);
                 if let Outcome::Done { affected, warnings } = outcome {
-                    let kind = statement_kind(sql);
+                    let kind = statement_kind_in(sql, Syntax::MySql);
                     let summary = ExecSummary {
                         rows_affected: is_dml(&kind).then_some(affected),
                         kind,
@@ -285,10 +286,13 @@ impl Worker {
             }
         }
         // SET time_zone, or a procedure that sets it: the first words tell,
-        // also of an INSERT of megabytes.
+        // also of an INSERT of megabytes, and of mysqldump's /*!40103 SET
+        // TIME_ZONE='+00:00' */ (#219).
         let head = sql.char_indices().nth(1000).map_or(sql, |(i, _)| &sql[..i]);
         if matches!(
-            leading_words(head).first().map(String::as_str),
+            leading_words_in(head, Syntax::MySql)
+                .first()
+                .map(String::as_str),
             Some("SET" | "CALL")
         ) {
             self.report_time_zone();
@@ -833,8 +837,10 @@ enum TxEffect {
 }
 
 impl TxEffect {
+    /// By the first words, the code in `/*!…*/` too (#219): mysqldump's
+    /// `/*!40000 ALTER TABLE … DISABLE KEYS */` commits.
     fn of(sql: &str) -> Self {
-        let words = leading_words(sql);
+        let words = leading_words_in(sql, Syntax::MySql);
         let first = words.first().map(String::as_str).unwrap_or_default();
         let second = words.get(1).map(String::as_str).unwrap_or_default();
         match first {
@@ -1049,6 +1055,19 @@ mod tests {
             ("create temporary table x (a int)", TxEffect::None),
             ("start transaction", TxEffect::Begins),
             ("commit work", TxEffect::Ends),
+            // The code in `/*!…*/`, which the server runs (#219).
+            ("/*!40000 ALTER TABLE `t` DISABLE KEYS */", TxEffect::Ends),
+            (
+                "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t_bi` \
+                 BEFORE INSERT ON `t` FOR EACH ROW set new.a = 1 */",
+                TxEffect::Ends,
+            ),
+            (
+                "/*!*/ /*!50000 */ insert into t values (1)",
+                TxEffect::Changes,
+            ),
+            ("/*!40000 INSERT INTO t VALUES (1) */", TxEffect::Changes),
+            ("/*!40101 SET NAMES utf8mb4 */", TxEffect::None),
         ];
         for (sql, effect) in cases {
             assert_eq!(TxEffect::of(sql), effect, "{sql}");

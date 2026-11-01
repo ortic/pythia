@@ -3207,6 +3207,17 @@ mod tests {
     }
 
     #[test]
+    fn queries_on_read_only_connections() {
+        assert!(is_query("/* x */ select 1"));
+        assert!(is_query("with a as (select 1) select * from a"));
+        assert!(!is_query("update t set a = 1"));
+        // A `/*!NNNNN …*/` the server's version doesn't run leaves what
+        // follows it: it never makes a query (#219).
+        assert!(!is_query("/*!99999 SELECT 1, */ DELETE FROM t"));
+        assert!(!is_query("/*!40101 SET NAMES utf8mb4 */"));
+    }
+
+    #[test]
     fn client_commands() {
         for local in [
             "@setup",

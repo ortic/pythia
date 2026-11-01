@@ -16,7 +16,7 @@ pub use format::{
 };
 pub use header::{UnitHeader, trigger_body_line, unit_header};
 pub use keywords::{is_keyword, is_reserved};
-pub use lexer::{Token, TokenKind, tokenize, tokenize_in};
+pub use lexer::{Token, TokenKind, leading_tokens, tokenize, tokenize_in};
 pub use parser::{normalize_ident, parse, parse_tokens};
 pub use splitter::{
     Statement, StatementKind, Syntax, split_statements, split_statements_in, statement_at,

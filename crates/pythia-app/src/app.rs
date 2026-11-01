@@ -1291,23 +1291,12 @@ impl PythiaApp {
             s.session.cancel();
         }
         if let Some(name) = &connection {
+            let syntax = self.dialect_of(Some(name)).syntax();
             let (mut ddl, mut plsql) = (false, false);
             for sql in effects.executed {
-                let first = sql
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_uppercase();
-                ddl |= matches!(
-                    first.as_str(),
-                    "CREATE" | "ALTER" | "DROP" | "RENAME" | "COMMENT" | "TRUNCATE"
-                );
-                // Blocks and calls compile and drop objects too
-                // (DBMS_UTILITY.COMPILE_SCHEMA, EXECUTE IMMEDIATE, …).
-                plsql |= matches!(
-                    first.as_str(),
-                    "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE"
-                );
+                let (changes, may_change) = changes_objects(&sql, syntax);
+                ddl |= changes;
+                plsql |= may_change;
                 self.history.add(name, &sql);
             }
             if ddl {
@@ -6310,6 +6299,60 @@ mod rename_tests {
             rename_symbol(&mut e)
                 .unwrap()
                 .starts_with("Rename works for")
+        );
+    }
+}
+
+/// Whether a statement changes objects (DDL), and whether it may: blocks
+/// and calls compile and drop objects too (DBMS_UTILITY.COMPILE_SCHEMA,
+/// EXECUTE IMMEDIATE, …). By its first word, in MySQL's `/*!…*/` too
+/// (#219).
+fn changes_objects(sql: &str, syntax: pythia_plsql::Syntax) -> (bool, bool) {
+    let first = pythia_plsql::leading_tokens(sql, syntax, 1)
+        .first()
+        .map(|w| w.to_ascii_uppercase())
+        .unwrap_or_default();
+    (
+        matches!(
+            first.as_str(),
+            "CREATE" | "ALTER" | "DROP" | "RENAME" | "COMMENT" | "TRUNCATE"
+        ),
+        matches!(
+            first.as_str(),
+            "BEGIN" | "DECLARE" | "CALL" | "EXEC" | "EXECUTE"
+        ),
+    )
+}
+
+#[cfg(test)]
+mod changes_objects_tests {
+    use super::changes_objects;
+    use pythia_plsql::Syntax;
+
+    #[test]
+    fn ddl_and_calls() {
+        assert_eq!(
+            changes_objects("create table t (a int)", Syntax::Oracle),
+            (true, false)
+        );
+        assert_eq!(
+            changes_objects("begin p; end;", Syntax::Oracle),
+            (false, true)
+        );
+        assert_eq!(changes_objects("exec(p)", Syntax::TSql), (false, true));
+        assert_eq!(changes_objects("select 1", Syntax::MySql), (false, false));
+        // MySQL's `/*!…*/` holds code the server runs (#219).
+        let view = "/*!50001 CREATE ALGORITHM=UNDEFINED */\n\
+                    /*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */\n\
+                    /*!50001 VIEW `v` AS select 1 AS `a` */";
+        assert_eq!(changes_objects(view, Syntax::MySql), (true, false));
+        assert_eq!(
+            changes_objects("/*!40000 ALTER TABLE `t` DISABLE KEYS */", Syntax::MySql),
+            (true, false)
+        );
+        assert_eq!(
+            changes_objects("/*!50003 CALL p() */", Syntax::MySql),
+            (false, true)
         );
     }
 }

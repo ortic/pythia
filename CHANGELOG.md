@@ -241,6 +241,13 @@ All notable changes to Pythia are documented here. The format follows
   table's columns as they are (`col`, `t.col`, from `*`) can be edited
   now; renamed columns and expressions are read-only, their headers
   dimmed, as are the key columns.
+- MySQL: a statement in `/*!…*/` is taken for what its code does
+  (#219). `/*!40000 INSERT … */` ran without a transaction, so
+  *Rollback* didn't undo it; after `/*!40000 ALTER TABLE … DISABLE KEYS
+  */`, which commits, the window still showed a transaction to commit;
+  mysqldump's `/*!40103 SET TIME_ZONE='+00:00' */` left TIMESTAMPs
+  shown, and written into INSERTs, in the zone from before; and a view
+  created as mysqldump writes it didn't refresh completion's names.
 
 ## [0.10.0] - 2026-10-30
 
