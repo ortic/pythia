@@ -93,7 +93,8 @@ pub enum DbRequest {
         id: u64,
         query: MetaQuery,
     },
-    /// Fetches more rows of the open result set of query `id`.
+    /// Fetches more rows of the open result set of query `id`; answered
+    /// with [`DbEvent::QueryClosed`] once that is closed.
     FetchMore {
         id: u64,
         max_rows: usize,
@@ -182,6 +183,13 @@ pub enum DbEvent {
     /// several SELECTs, or statements in one text (#290). Another
     /// `QueryStarted` follows, or the error that ended the statement.
     MoreResults {
+        id: u64,
+    },
+    /// The query of statement `id` was closed with rows left, which can't
+    /// be fetched any more: by the next statement, and where the session
+    /// reads one result at a time (all but Oracle) by any other request.
+    /// Also the answer to a `FetchMore` of a query closed before (#312).
+    QueryClosed {
         id: u64,
     },
     Executed {

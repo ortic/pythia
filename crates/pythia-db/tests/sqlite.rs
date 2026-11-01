@@ -289,10 +289,18 @@ fn query_and_fetch_more() {
     assert_eq!(rows[14][1].as_deref(), Some("row 25"));
     h.settle();
 
-    // Another request closes an open result.
+    // Another request closes an open result, and says so; so does a
+    // FetchMore of it after.
     h.execute(2, "select value from json_each('[1,2,3]')", 1);
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::Rollback);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 2 }));
+    h.session.send(DbRequest::FetchMore {
+        id: 2,
+        max_rows: 10,
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 2 }));
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 

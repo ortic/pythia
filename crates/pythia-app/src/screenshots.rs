@@ -7049,6 +7049,151 @@ fn explain_runs_in_the_windows_session() {
     crate::test_db::as_dba(&["drop table system.r51_p purge"]);
 }
 
+/// A result whose query was closed with rows left says so and keeps its
+/// `+` (#312): the next statement of a script closes it, and on MySQL,
+/// PostgreSQL, SQL Server and SQLite, which read one result at a time, so
+/// does a Rollback. Fetch all found nothing more there, and the result
+/// looked complete with 500 of its 1,000 rows; on Oracle it waited for
+/// rows that never came. Oracle keeps a query open over a Rollback: Fetch
+/// all fetches the rest. SQLite, and the servers whose test databases are
+/// set.
+#[test]
+fn closed_queries_say_so() {
+    use pythia_config::DbKind;
+    let (mut h, _file) = sqlite_file("r66_closed.db");
+    closed_case(
+        &mut h,
+        "r66_closed.db",
+        "with recursive n(n) as (select 1 union all select n + 1 from n where n < 1000) \
+         select n from n",
+        false,
+    );
+    drop(h);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "with recursive n (n) as (select 1 union all select n + 1 from n where n < 1000) \
+             select n from n",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select generate_series(1, 1000) as n",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "select top 1000 row_number() over (order by (select null)) as n \
+             from sys.all_objects a cross join sys.all_objects b",
+        ),
+    ];
+    for (env, kind, rows) in servers {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        closed_case(&mut h, &connection, rows, false);
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    closed_case(
+        &mut h,
+        &connection,
+        "select level as n from dual connect by level <= 1000",
+        true,
+    );
+}
+
+/// Result 1 of `rows` and another statement, and of `rows` and a
+/// Rollback, in a window of its own on `connection`.
+fn closed_case(h: &mut Ui, connection: &str, rows: &str, oracle: bool) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // Its rows, its +, whether its query ended.
+    let first = |h: &Ui| {
+        let r = &h.state().test_sql_window_ref().unwrap().state.results[0];
+        (r.rows.len(), r.more, r.ended)
+    };
+    let said = |h: &Ui, text: &str| {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().any(|m| m.text.starts_with(text))
+    };
+    let shows = "Result 1 shows the 500 rows fetched";
+
+    run_in_window(h, &format!("{rows};\nselect 1"));
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        2,
+        "{connection}"
+    );
+    let clicked = fetch_all(h, 0);
+    assert_eq!(first(h), (500, true, true), "{connection}: fetched all");
+    assert!(!clicked && said(h, shows), "{connection}");
+    // A Fetch all on its way meanwhile is answered.
+    let id = h.state().test_sql_window_ref().unwrap().state.results[0].id;
+    h.state_mut().test_on_sql_window(|w, _| {
+        w.state.fetching = Some(id);
+        let mut effects = crate::documents::Effects::default();
+        effects.request(
+            crate::documents::Target::Own,
+            pythia_db::DbRequest::FetchMore {
+                id,
+                max_rows: usize::MAX,
+            },
+        );
+        effects
+    });
+    wait_until(h, "the closed query's answer", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(first(h), (500, true, true), "{connection}: answered");
+
+    run_in_window(h, rows);
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.messages.iter().any(|m| m.text == "Rolled back"))
+    });
+    if oracle {
+        assert_eq!(first(h), (500, true, false), "{connection}: rolled back");
+        assert!(fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (1000, false, false), "{connection}: fetched all");
+    } else {
+        assert!(!fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (500, true, true), "{connection}: rolled back");
+        assert!(said(h, shows), "{connection}");
+    }
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+}
+
+/// Clicks Fetch all on result `index` and waits for its rows; false if the
+/// result doesn't offer it.
+fn fetch_all(h: &mut Ui, index: usize) -> bool {
+    h.state_mut().test_sql_window().state.bottom = crate::sql_window::BottomTab::Result(index);
+    h.run_steps(2);
+    let Some(button) = h
+        .query_by_label("Fetch all")
+        .or_else(|| h.query_by_label("All"))
+    else {
+        return false;
+    };
+    button.click();
+    h.run_steps(1);
+    wait_until(h, "Fetch all", |app| !app.test_focused_busy());
+    true
+}
+
 /// Closing a SQL window, or Pythia, with changes to its results that
 /// weren't applied asks first (#245): a value being typed into a cell, and
 /// the changes waiting for Apply, were dropped without a word.

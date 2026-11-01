@@ -457,27 +457,35 @@ fn closing_an_open_result_stops_the_server() {
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
 
     let started = Instant::now();
-    assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
+    h.execute(3, "select 'next'", 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 3, .. }
+    ));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("next"));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
 
-    // Fetching more of the closed result reports that there is no more.
+    // Fetching more of the closed result says it is closed.
     h.session.send(DbRequest::FetchMore {
         id: 1,
         max_rows: 10,
     });
-    let DbEvent::Rows { id, rows, more, .. } = h.next_result() else {
-        panic!("expected Rows")
-    };
-    assert_eq!((id, rows.len(), more), (1, 0, false));
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
 
     // A small result that is closed early needs no cancel.
     h.execute(2, "select n from generate_series(1, 30) n", 10);
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::Commit);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 2 }));
 
     // The cancel didn't hit a later statement.
     for i in 0..3 {

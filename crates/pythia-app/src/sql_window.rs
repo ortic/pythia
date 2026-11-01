@@ -806,6 +806,11 @@ impl SqlWindow {
             },
             DbEvent::Failed { error, .. } => Some(error),
             DbEvent::Executed { .. } => Some(pythia_db::DbError::new("It isn't a query")),
+            // Another request closed it (MySQL, PostgreSQL, SQL Server,
+            // SQLite): the rows left can't be written.
+            DbEvent::QueryClosed { .. } => Some(pythia_db::DbError::new(
+                "its query was closed by what ran after it, before all rows were written",
+            )),
             _ => return,
         };
         if let Some(error) = failed {
@@ -915,16 +920,10 @@ impl SqlWindow {
         // Their sessions read one result at a time: the plan's query ends
         // the one with rows left, whose FetchMore would then find none.
         if self.state.syntax != Syntax::Oracle
-            && let Some(open) = self.state.results.last_mut().filter(|r| r.more && !r.ended)
+            && let Some(open) = self.state.results.last().filter(|r| r.more && !r.ended)
         {
-            open.ended = true;
-            let text = format!(
-                "{} shows the {} rows fetched: Explain plan ended its query (run it again for \
-                 the rest)",
-                open.title,
-                open.rows.len()
-            );
-            self.info(text);
+            let id = open.id;
+            self.query_closed(id, "Explain plan ended its query");
         }
         let id = request_id();
         self.state.plan = Some(Plan {
@@ -946,6 +945,51 @@ impl SqlWindow {
             },
         );
         effects
+    }
+
+    /// The query of result `id` was closed with rows left (`why`): the
+    /// result keeps its `+`, isn't fetched from any more, and the messages
+    /// say it shows the rows fetched (#269, #312), unless it is fetched
+    /// again in its place.
+    fn query_closed(&mut self, id: u64, why: &str) {
+        let refetched = self.refetched(id);
+        let Some(result) = self
+            .state
+            .results
+            .iter_mut()
+            .rev()
+            .find(|r| r.id == id)
+            .filter(|r| r.more && !r.ended)
+        else {
+            return;
+        };
+        result.ended = true;
+        if refetched {
+            return;
+        }
+        let text = format!(
+            "{} shows the {} rows fetched: {why} (run it again for the rest)",
+            result.title,
+            result.rows.len()
+        );
+        self.info(text);
+    }
+
+    /// Whether result `id` is to be fetched again in its place, made
+    /// editable or after an Apply: the statements doing so close its query.
+    fn refetched(&self, id: u64) -> bool {
+        let replaces = |internal: &Option<Internal>| match internal {
+            Some(Internal::EditKey { replaces, .. }) => *replaces == id,
+            Some(Internal::EditQuery { replaces, .. }) => *replaces == Some(id),
+            _ => false,
+        };
+        self.state.queue.iter().any(|s| replaces(&s.internal))
+            || self
+                .state
+                .running
+                .iter()
+                .chain(&self.state.ahead)
+                .any(|r| replaces(&r.internal))
     }
 
     /// Whether the window's session is busy with a statement, a fetch or a
@@ -1752,6 +1796,7 @@ impl SqlWindow {
         let streamed = match &event {
             DbEvent::QueryStarted { id, .. }
             | DbEvent::Rows { id, .. }
+            | DbEvent::QueryClosed { id }
             | DbEvent::Executed { id, .. }
             | DbEvent::Failed { id, .. } => self.streams_to_file(*id),
             _ => false,
@@ -1951,6 +1996,12 @@ impl SqlWindow {
                 if let Some(running) = self.state.running.as_mut().filter(|r| r.id == id) {
                     running.continues = true;
                 }
+            }
+            DbEvent::QueryClosed { id } => {
+                if self.state.fetching == Some(id) {
+                    self.state.fetching = None;
+                }
+                self.query_closed(id, "its query was closed by what ran after it");
             }
             DbEvent::Rows {
                 id,
@@ -4135,6 +4186,115 @@ mod tests {
                 .iter()
                 .any(|m| m.text.starts_with("Result 1 shows the 100 rows fetched")),
         );
+    }
+
+    /// A result whose query the session closed with rows left keeps its
+    /// `+`, says it shows the rows fetched, and isn't fetched from any more
+    /// (#312); a Fetch all on its way is answered. Execute to file fails
+    /// rather than end the file there.
+    #[test]
+    fn closed_queries_keep_their_plus() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "select * from t".into());
+        let id = sent(&w.execute(false, &cx))[0].0;
+        w.on_event(
+            DbEvent::QueryStarted {
+                id,
+                columns: Vec::new(),
+            },
+            &cx,
+        );
+        w.on_event(
+            DbEvent::Rows {
+                id,
+                rows: vec![Vec::new(); 100],
+                more: true,
+                elapsed: Duration::ZERO,
+            },
+            &cx,
+        );
+        w.state.fetching = Some(id);
+        w.on_event(DbEvent::QueryClosed { id }, &cx);
+        let result = &w.state.results[0];
+        assert!(result.more && result.ended && w.state.fetching.is_none());
+        let said: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some(
+                "Result 1 shows the 100 rows fetched: its query was closed by what ran after it \
+                 (run it again for the rest)"
+            )
+        );
+        // Once only.
+        w.on_event(DbEvent::QueryClosed { id }, &cx);
+        assert_eq!(w.state.messages.len(), said.len());
+
+        // Made editable, the result is fetched again in its place: not a
+        // word of the query its key lookup closes.
+        let mut w = SqlWindow::new("t".into(), "select * from t".into());
+        let mysql = DocContext {
+            dialect: pythia_db::Dialect::MYSQL,
+            ..test_cx(&settings, false)
+        };
+        let id = sent(&w.execute(false, &mysql))[0].0;
+        let columns = vec![Column {
+            name: "ID".into(),
+            type_name: "INT".into(),
+            numeric: true,
+        }];
+        w.on_event(DbEvent::QueryStarted { id, columns }, &mysql);
+        w.on_event(
+            DbEvent::Rows {
+                id,
+                rows: vec![vec![Some("1".into())]; 100],
+                more: true,
+                elapsed: Duration::ZERO,
+            },
+            &mysql,
+        );
+        let before = w.state.messages.len();
+        let lookup = w.start_editing(0, &mysql);
+        assert_eq!(lookup.requests.len(), 1, "the key lookup");
+        w.on_event(DbEvent::QueryClosed { id }, &mysql);
+        assert!(w.state.results[0].ended);
+        assert_eq!(w.state.messages.len(), before);
+
+        let path = std::env::temp_dir().join(format!("pythia-closed-{}.csv", std::process::id()));
+        let sql = "select 1 from t";
+        let sink = crate::to_file::Sink::create(&path, sql, pythia_db::Dialect::MYSQL, None)
+            .expect("the file");
+        w.state.to_file = Some(crate::to_file::ToFile {
+            id: 7,
+            path: path.clone(),
+            sql: sql.into(),
+            rows: Default::default(),
+            started: std::time::Instant::now(),
+            sink: Some(sink),
+        });
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "INT".into(),
+            numeric: true,
+        }];
+        w.on_event(DbEvent::QueryStarted { id: 7, columns }, &cx);
+        let effects = w.on_event(
+            DbEvent::Rows {
+                id: 7,
+                rows: vec![vec![Some("1".into())]],
+                more: true,
+                elapsed: Duration::ZERO,
+            },
+            &cx,
+        );
+        assert_eq!(effects.requests.len(), 1, "the next batch is fetched");
+        w.on_event(DbEvent::QueryClosed { id: 7 }, &cx);
+        assert!(w.state.to_file.is_none() && !path.exists());
+        assert!(w.state.messages.last().is_some_and(|m| {
+            m.level == Level::Error
+                && m.text
+                    .starts_with("Execute to file failed: its query was closed")
+        }));
     }
 
     /// The Messages tab places the messages in view by their measured

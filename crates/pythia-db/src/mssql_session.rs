@@ -132,12 +132,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
                 next = worker.execute(id, &sql, max_rows, &[], &requests, true)
             }
             // Its result was closed by another request in between.
-            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
-                id,
-                rows: Vec::new(),
-                more: false,
-                elapsed: Duration::ZERO,
-            }),
+            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::QueryClosed { id }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
                 let result = crate::mssql_meta::run(&mut worker.ms(), &query);
@@ -663,6 +658,7 @@ impl Worker {
                 }
                 other => {
                     // The driver reads the rest before the next request.
+                    events.send(DbEvent::QueryClosed { id });
                     *next = Some(other.unwrap_or(DbRequest::Disconnect));
                     return Ok(Ran::Outcome(Outcome::Query));
                 }

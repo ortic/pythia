@@ -712,6 +712,15 @@ All notable changes to Pythia are documented here. The format follows
   SQLERROR CONTINUE`, and each statement keeps its message and its
   result. The Messages tab lays out only the messages in view: with
   40,000 of them a frame took a quarter of a second.
+- A result whose query was closed with rows left says so (#312): it
+  keeps its `+`, *Fetch all* and scrolling don't fetch from it, and the
+  messages say it shows the rows fetched. The next statement of a script
+  closes it, and on MySQL, PostgreSQL, SQL Server and SQLite any other
+  request to the window's session, such as a Commit or Rollback. *Fetch
+  all* then found nothing more there, and the result looked complete with
+  rows missing; on Oracle the window waited for rows that never came and
+  could run nothing else. *Execute to file* fails in that case rather than
+  end the file early as if it were complete.
 
 ## [0.10.0] - 2026-10-30
 
