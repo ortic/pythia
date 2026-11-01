@@ -278,6 +278,9 @@ All notable changes to Pythia are documented here. The format follows
   again on each frame: with a million rows selected, a frame took a
   quarter of a second, and scrolling and typing lagged. They are now
   worked out when the selection or the rows change.
+- A tab's ✕ closes the tab only when it is released on the ✕ (#244).
+  Pressed, then released a few points beside it, it closed the tab too,
+  so sliding off the ✕ to back out didn't always work.
 
 ## [0.10.0] - 2026-10-30
 

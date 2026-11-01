@@ -4943,6 +4943,73 @@ create table pythia_ctx_t (id number);",
     run(&mut h, "drop table pythia_ctx_t purge");
 }
 
+/// The ✕ of `tab`, from where the pointer turns into a hand along its tab
+/// bar: its left and right end, and its middle's height.
+fn close_button(h: &mut Ui, tab: crate::app::Tab) -> (f32, f32, f32) {
+    let (bar, index) = h.state().test_tab_bar(tab).expect("tab bar");
+    let y = bar.center().y;
+    let mut buttons: Vec<(f32, f32)> = Vec::new();
+    let mut inside = false;
+    let mut x = bar.min.x;
+    while x < bar.max.x && buttons.len() <= index + 1 {
+        h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+        h.step();
+        let hand = h.output().platform_output.cursor_icon == egui::CursorIcon::PointingHand;
+        if hand && !inside {
+            buttons.push((x, x));
+        } else if hand && let Some(button) = buttons.last_mut() {
+            button.1 = x;
+        }
+        inside = hand;
+        x += 1.0;
+    }
+    let (from, to) = buttons[index];
+    (from, to, y)
+}
+
+/// Presses (or releases) the primary button at `pos`, for a step: held
+/// longer, a press is no click.
+fn press(h: &mut Ui, pos: egui::Pos2, pressed: bool) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+/// A tab's ✕ closes it when it is released on the ✕ (#244): pressed and
+/// released a few points beside it, the tab was closed too.
+#[test]
+fn tab_closes_when_released_on_its_close_button() {
+    let connection = "tabs.db";
+    let (mut h, _file) = sqlite_file(connection);
+    for text in ["select 1", "select 2"] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+    }
+    h.run_steps(3);
+    let tab = crate::app::Tab::Doc(h.state().test_focused());
+    let (from, to, y) = close_button(&mut h, tab);
+    let windows = |h: &Ui| h.state().test_window_connections().len();
+    let open = windows(&h);
+    // Released 4 pt beside it: within egui's distance for a click.
+    press(&mut h, egui::pos2(to - 1.0, y), true);
+    press(&mut h, egui::pos2(to + 3.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open, "released beside the ✕");
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0 + 2.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open - 1, "clicked");
+}
+
 /// Favorites, recently opened objects and the invalid-only filter.
 #[test]
 fn browser_marks() {

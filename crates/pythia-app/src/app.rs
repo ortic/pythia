@@ -4866,6 +4866,7 @@ impl eframe::App for PythiaApp {
             rebind: Vec::new(),
             pending_tx: &pending_tx,
             active: self.active.as_deref(),
+            kept_open: Vec::new(),
         };
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -5437,6 +5438,21 @@ impl PythiaApp {
         Some((path.node_path(), front))
     }
 
+    /// The tab bar `tab` is in, as last drawn, and its place there.
+    pub fn test_tab_bar(&self, tab: Tab) -> Option<(egui::Rect, usize)> {
+        let path = self.dock.find_tab(&tab)?;
+        match &self.dock[path.node_path()] {
+            egui_dock::Node::Leaf(leaf) => Some((
+                egui::Rect::from_min_max(
+                    leaf.rect.min,
+                    egui::pos2(leaf.rect.max.x, leaf.viewport.min.y),
+                ),
+                path.tab.0,
+            )),
+            _ => None,
+        }
+    }
+
     /// Closes `tab` as its close button does, for tabs that need no more.
     pub fn test_close_tab(&mut self, tab: Tab) {
         if let Some(path) = self.dock.find_tab(&tab) {
@@ -5610,6 +5626,8 @@ struct Viewer<'a> {
     pending_tx: &'a HashSet<DocId>,
     /// The active connection.
     active: Option<&'a str>,
+    /// Tabs whose close button was released beside it.
+    kept_open: Vec<Tab>,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -5778,7 +5796,20 @@ impl TabViewer for Viewer<'_> {
         }
     }
 
+    /// egui takes a press released a few points beside a button for a
+    /// click on it: a tab's ✕ closes only when released on it (#244).
+    fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        // egui_dock's id of the tab's close button.
+        let close = response.ctx.read_response(response.id.with("close-button"));
+        if close.is_some_and(|close| close.clicked() && !close.contains_pointer()) {
+            self.kept_open.push(*tab);
+        }
+    }
+
     fn on_close(&mut self, tab: &mut Tab) -> egui_dock::widgets::tab_viewer::OnCloseResponse {
+        if self.kept_open.contains(tab) {
+            return egui_dock::widgets::tab_viewer::OnCloseResponse::Ignore;
+        }
         if let Tab::Doc(id) = tab {
             if self.pending_tx.contains(id) {
                 // Asked first: commit, roll back or keep it.
