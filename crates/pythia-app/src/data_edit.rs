@@ -326,7 +326,15 @@ fn parse(sql: &str) -> Option<Query> {
             .get(i)
             .is_some_and(|t| matches!(t.kind, TokenKind::Ident | TokenKind::QuotedIdent))
     };
-    if !ident(i) {
+    // A part of the table's name may be any word: the lexer's keywords are
+    // Oracle's, and `public` or `session` are plain names elsewhere (#229).
+    // A word before `(` is a function (`table(…)`), `only t` not the table.
+    let part = |i: usize| {
+        (ident(i) || kind(i) == Some(TokenKind::Keyword))
+            && kind(i + 1) != Some(TokenKind::LParen)
+            && !is(i, "ONLY")
+    };
+    if !part(i) {
         return None;
     }
     // `table`, `schema.table` or `database.schema.table`, also SQL
@@ -342,7 +350,7 @@ fn parse(sql: &str) -> Option<Query> {
             _ => break,
         };
         parts += separator.len();
-        if !ident(next + 1) || parts > 3 {
+        if !part(next + 1) || parts > 3 {
             return None;
         }
         table = format!("{table}{separator}{}", text(next + 1));
@@ -1026,6 +1034,49 @@ mod tests {
         );
         assert_eq!(single_table("select * from emp straight_join dept"), None);
         assert_eq!(single_table("update emp set x = 1"), None);
+    }
+
+    /// Names that are words of Oracle's, which other databases have as
+    /// plain names: PostgreSQL's schema public, as *Query data* writes it,
+    /// and tables such as session or comment.
+    #[test]
+    fn single_tables_named_like_keywords() {
+        assert_eq!(
+            single_table("select * from public.\"Orders\""),
+            Some("public.\"Orders\"".into())
+        );
+        assert_eq!(
+            single_table("select * from public.session s where s.id = 1"),
+            Some("public.session".into())
+        );
+        assert_eq!(
+            single_table("select * from comment"),
+            Some("comment".into())
+        );
+        assert_eq!(
+            single_table("select c.* from shop.type c order by 1"),
+            Some("shop.type".into())
+        );
+        assert!(can_edit("select * from public.emp"));
+        assert_eq!(
+            keyed_query(
+                Dialect::POSTGRES,
+                "select * from public.emp",
+                &["id".into()]
+            ),
+            Some("select *, id as pythia$id from public.emp".into())
+        );
+        assert_eq!(
+            plain_columns("select id, level from public.session", 2),
+            [true, true]
+        );
+        // What follows FROM without being a table.
+        assert_eq!(single_table("select * from table(f(1))"), None);
+        assert_eq!(single_table("select * from only emp"), None);
+        assert_eq!(
+            single_table("select * from public.emp join type t on t.id = 1"),
+            None
+        );
     }
 
     /// SQL Server's bracketed names, and names of a table in another

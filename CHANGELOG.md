@@ -288,6 +288,14 @@ All notable changes to Pythia are documented here. The format follows
   that `(code) include (name, n)` looked like an index on `code` alone.
   *Columns* now has the order, collation and operator class, and
   *Include* the INCLUDE columns.
+- Results of *Query data* can be edited on PostgreSQL (#229). *Edit* on
+  `select * from public.orders`, as *Query data* writes it for a table
+  in `public`, said "Only results of a single-table query can be
+  edited", and so it did for tables named `session`, `comment`, `level`,
+  `type` or `mode`, words of Oracle's SQL that the other databases take
+  as names. The INSERT statements of such a result (*Copy as*, *Export*,
+  *Execute to file*) were written for `my_table`; they now name the
+  table.
 
 ## [0.10.0] - 2026-10-30
 
