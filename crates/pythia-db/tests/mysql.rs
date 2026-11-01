@@ -8,9 +8,14 @@
 //! and `PYTHIA_TEST_MYSQL_VIA_SSH`, the database as the SSH server sees it
 //! (the `ssh` service: `pythia:pythia@localhost:2222` and
 //! `pythia/pythia@mysql:3306/pythia`).
+//!
+//! Connecting to a later address of the host takes a name of this machine
+//! that is `::1` first, then 127.0.0.1: `PYTHIA_TEST_LOCALHOST`, by default
+//! `localhost`, which is so on most systems (not where it is 127.0.0.1
+//! only, as on WSL; `localtest.me` is so in public DNS).
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -866,6 +871,52 @@ fn cancel_never_waits_for_the_network() {
     }
     assert!(started.elapsed() < Duration::from_secs(4));
     h.ok("select 1");
+}
+
+/// A server listening on 127.0.0.1 only is reached under a name that is
+/// `::1` first (#239): the driver tried only the first address
+/// and failed with "Connection refused". Break connects as the session
+/// did, so the kill goes through.
+#[test]
+fn connects_to_a_later_address_of_the_host() {
+    let Some(params) = params() else {
+        return;
+    };
+    let name = std::env::var("PYTHIA_TEST_LOCALHOST").unwrap_or_else(|_| "localhost".into());
+    let (server, database) = params.connect_string.split_once('/').unwrap();
+    let relay = Relay::to(server);
+    let addresses: Vec<SocketAddr> = (name.as_str(), relay.port)
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    if !addresses.first().is_some_and(SocketAddr::is_ipv6)
+        || !addresses.iter().any(|a| a.ip() == Ipv4Addr::LOCALHOST)
+    {
+        eprintln!("{name} isn't ::1 first, then 127.0.0.1 ({addresses:?}): skipped");
+        return;
+    }
+    let mut h = Harness::with(ConnectParams {
+        connect_string: format!("{name}:{}/{database}", relay.port),
+        ..params.clone()
+    });
+    assert_eq!(h.scalar("select 1").as_deref(), Some("1"));
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select sleep(5)".into(),
+        max_rows: 10,
+        binds: vec![],
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    h.session.cancel();
+    loop {
+        match h.next_result() {
+            DbEvent::QueryStarted { .. } => {}
+            DbEvent::Rows { .. } | DbEvent::Failed { .. } => break,
+            other => panic!("expected the end of the query, got {other:?}"),
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 /// A statement larger than max_allowed_packet fails, and the session goes

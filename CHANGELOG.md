@@ -267,6 +267,11 @@ All notable changes to Pythia are documented here. The format follows
   (the row is found by its key), and a cut value pasted into a cell is
   no longer written: MySQL and SQLite stored it as text, 8000 hex
   digits and the size.
+- MySQL: connecting to `localhost` no longer fails with "Connection
+  refused" where the server listens on 127.0.0.1 only (#239), as MySQL
+  and MariaDB from Debian's and Ubuntu's packages do: `localhost` is
+  `::1` first on most systems, and only a host's first address was
+  tried. The others are tried now, in turn, for any host name.
 
 ## [0.10.0] - 2026-10-30
 
