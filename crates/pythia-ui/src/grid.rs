@@ -376,6 +376,23 @@ impl GridState {
         self.sync(rows, columns);
     }
 
+    /// Of `columns`, those copies and exports take: not the ones editing
+    /// added to find the rows (the ROWID, a key as `pythia$…`), which the
+    /// table hasn't (#249).
+    fn copied(&self, columns: Vec<usize>) -> Result<Vec<usize>, NotCopied> {
+        let added = self.edit.as_ref().and_then(|e| e.locked);
+        let table: Vec<usize> = columns
+            .iter()
+            .copied()
+            .filter(|&c| added.is_none_or(|a| c < a))
+            .collect();
+        if table.is_empty() && !columns.is_empty() {
+            Err(NotCopied::KeyOnly)
+        } else {
+            Ok(table)
+        }
+    }
+
     /// The selected rows (view order) and columns (in the order shown,
     /// between the anchor's and the cursor's).
     fn selection(&self, count: usize) -> Option<(RangeInclusive<usize>, Vec<usize>)> {
@@ -868,8 +885,7 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
         state.paste(rows, columns.len(), &text);
     }
     if let Some(with_header) = copy {
-        ui.ctx()
-            .copy_text(selection_text(columns, rows, state, with_header));
+        copy_selection(ui, columns, rows, state, with_header);
     }
 }
 
@@ -1676,13 +1692,11 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
         ui.separator();
     }
     if ui.button("Copy").clicked() {
-        ui.ctx()
-            .copy_text(selection_text(columns, rows, state, false));
+        copy_selection(ui, columns, rows, state, false);
         ui.close();
     }
     if ui.button("Copy with header").clicked() {
-        ui.ctx()
-            .copy_text(selection_text(columns, rows, state, true));
+        copy_selection(ui, columns, rows, state, true);
         ui.close();
     }
     ui.menu_button("Copy as", |ui| {
@@ -1691,8 +1705,13 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
             .filter(|f| f.is_text() && **f != Format::Tsv)
         {
             if ui.button(format.label()).clicked() {
-                let (cols, data) = selection_data(columns, rows, state);
-                match pythia_data::export_to_vec(*format, &cols, &data, &state.export_options()) {
+                let copied = selection_data(columns, rows, state)
+                    .map_err(|e| e.to_string())
+                    .and_then(|(cols, data)| {
+                        pythia_data::export_to_vec(*format, &cols, &data, &state.export_options())
+                            .map_err(|e| e.to_string())
+                    });
+                match copied {
                     Ok(bytes) => ui
                         .ctx()
                         .copy_text(String::from_utf8_lossy(&bytes).into_owned()),
@@ -1760,16 +1779,36 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
     }
 }
 
+/// Why a copy or an export of a grid's rows takes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotCopied {
+    /// Only the columns editing added to find the rows are selected or
+    /// shown (#249).
+    KeyOnly,
+}
+
+impl std::fmt::Display for NotCopied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotCopied::KeyOnly => f.write_str(
+                "the selection has only the key columns Pythia added to find the rows, which \
+                 the table hasn't",
+            ),
+        }
+    }
+}
+
 /// The selected block as columns + rows (in view order); everything if
 /// nothing is selected.
 pub fn selection_data(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
-) -> (Vec<Column>, Vec<Vec<Cell>>) {
+) -> Result<(Vec<Column>, Vec<Vec<Cell>>), NotCopied> {
     let Some((r, keep)) = state.selection(columns.len()) else {
         return shown_data(columns, rows, state);
     };
+    let keep = state.copied(keep)?;
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
     let data = r
         .filter_map(|vr| rows.get(state.row_index(vr)))
@@ -1779,17 +1818,18 @@ pub fn selection_data(
                 .collect()
         })
         .collect();
-    (cols, data)
+    Ok((cols, data))
 }
 
 /// The fetched rows as shown, those the filter passes in the order shown
-/// (#243), with the columns shown, in the order shown.
+/// (#243), with the columns shown, in the order shown, but those editing
+/// added (#249).
 pub fn shown_data(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
-) -> (Vec<Column>, Vec<Vec<Cell>>) {
-    let keep = state.visible_columns(columns.len());
+) -> Result<(Vec<Column>, Vec<Vec<Cell>>), NotCopied> {
+    let keep = state.copied(state.visible_columns(columns.len()))?;
     // Also the rows fetched since the grid was drawn.
     let order = state.order_of(rows, columns);
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
@@ -1801,7 +1841,21 @@ pub fn shown_data(
                 .collect()
         })
         .collect();
-    (cols, data)
+    Ok((cols, data))
+}
+
+/// Copies the selection as tab separated text, or says why it can't.
+fn copy_selection(
+    ui: &Ui,
+    columns: &[Column],
+    rows: &[Vec<Cell>],
+    state: &mut GridState,
+    header: bool,
+) {
+    match selection_text(columns, rows, state, header) {
+        Ok(text) => ui.ctx().copy_text(text),
+        Err(e) => state.failed = Some(format!("Copy: {e}")),
+    }
 }
 
 fn selection_text(
@@ -1809,8 +1863,8 @@ fn selection_text(
     rows: &[Vec<Cell>],
     state: &GridState,
     header: bool,
-) -> String {
-    let (cols, data) = selection_data(columns, rows, state);
+) -> Result<String, NotCopied> {
+    let (cols, data) = selection_data(columns, rows, state)?;
     let mut lines = Vec::with_capacity(data.len() + 1);
     if header {
         lines.push(
@@ -1826,7 +1880,7 @@ fn selection_text(
             .collect::<Vec<_>>()
             .join("\t")
     }));
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<String> {
@@ -2576,7 +2630,10 @@ mod tests {
         s.sync(&r, &c);
         s.select((0, 0), false);
         s.select((2, 1), true);
-        assert_eq!(selection_text(&c, &r, &s, true), "A\tB\n10\tx\n\ta\n9\t");
+        assert_eq!(
+            selection_text(&c, &r, &s, true).unwrap(),
+            "A\tB\n10\tx\n\ta\n9\t"
+        );
         assert_eq!(
             summary(&c, &r, &s).unwrap(),
             "Count 4 · Sum 19 · Avg 9.5 · Min 9 · Max 10"
@@ -2665,7 +2722,7 @@ mod tests {
         let rows = vec![vec![Some("1".into()), Some("x".into())]];
         let mut state = GridState::default();
         state.hidden.insert(0);
-        let (c, d) = selection_data(&columns, &rows, &state);
+        let (c, d) = selection_data(&columns, &rows, &state).unwrap();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].name, "B");
         assert_eq!(d, vec![vec![Some("x".to_owned())]]);
@@ -2696,14 +2753,49 @@ mod tests {
             vec![Some("4".to_owned()), Some("grape".to_owned())],
             vec![Some("1".to_owned()), Some("apple".to_owned())],
         ];
-        assert_eq!(shown_data(&columns, &rows, &state).1, shown);
-        assert_eq!(selection_data(&columns, &rows, &state).1, shown);
+        assert_eq!(shown_data(&columns, &rows, &state).unwrap().1, shown);
+        assert_eq!(selection_data(&columns, &rows, &state).unwrap().1, shown);
         // Rows fetched since the grid was last drawn are filtered too.
         let mut more = rows.clone();
         more.push(vec![Some("5".into()), Some("papaya".into())]);
-        assert_eq!(shown_data(&columns, &more, &state).1.len(), 3);
+        assert_eq!(shown_data(&columns, &more, &state).unwrap().1.len(), 3);
         state.set_filter("");
-        assert_eq!(shown_data(&columns, &rows, &state).1.len(), 4);
+        assert_eq!(shown_data(&columns, &rows, &state).unwrap().1.len(), 4);
+    }
+
+    /// The columns editing adds to find the rows (`pythia$id`, the ROWID)
+    /// aren't the table's: copies and exports leave them out (#249).
+    #[test]
+    fn copies_leave_out_the_key_editing_added() {
+        let mut columns = cols();
+        columns.push(Column {
+            name: "pythia$a".into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        });
+        let rows = vec![vec![Some("1".into()), Some("x".into()), Some("1".into())]];
+        let mut state = GridState::default();
+        state.set_editable(Some(2));
+        let names = |c: &[Column]| c.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let (c, d) = shown_data(&columns, &rows, &state).unwrap();
+        assert_eq!(names(&c), ["A", "B"]);
+        assert_eq!(d, vec![vec![Some("1".to_owned()), Some("x".to_owned())]]);
+        let (c, _) = selection_data(&columns, &rows, &state).unwrap();
+        assert_eq!(names(&c), ["A", "B"]);
+        state.select((0, 1), false);
+        state.select((0, 2), true);
+        let (c, _) = selection_data(&columns, &rows, &state).unwrap();
+        assert_eq!(names(&c), ["B"]);
+        assert_eq!(
+            selection_text(&columns, &rows, &state, true).unwrap(),
+            "B\nx"
+        );
+        // Nothing but the key: nothing to copy, and why.
+        state.select((0, 2), false);
+        assert_eq!(
+            selection_data(&columns, &rows, &state).unwrap_err(),
+            NotCopied::KeyOnly
+        );
     }
 
     #[test]
@@ -2816,7 +2908,7 @@ mod tests {
         s.select((0, 2), false);
         s.select((1, 0), true);
         assert_eq!(
-            selection_text(&columns, &rows, &s, true),
+            selection_text(&columns, &rows, &s, true).unwrap(),
             "C\tA\np\t1\nq\t2"
         );
         assert_eq!(
@@ -2827,15 +2919,18 @@ mod tests {
         s.hidden.insert(0);
         s.select((0, 2), false);
         s.select((0, 1), true);
-        assert_eq!(selection_text(&columns, &rows, &s, true), "C\tB\np\tx");
+        assert_eq!(
+            selection_text(&columns, &rows, &s, true).unwrap(),
+            "C\tB\np\tx"
+        );
         // Without a selection: all rows, the columns shown, in order.
         s.anchor = None;
         s.cursor = None;
-        let (c, d) = selection_data(&columns, &rows, &s);
+        let (c, d) = selection_data(&columns, &rows, &s).unwrap();
         let names: Vec<&str> = c.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["C", "B"]);
         assert_eq!(d[1], vec![Some("q".to_owned()), Some("y".to_owned())]);
-        let (shown, all) = shown_data(&columns, &rows, &s);
+        let (shown, all) = shown_data(&columns, &rows, &s).unwrap();
         assert_eq!(shown.len(), c.len());
         assert_eq!(all, d);
         // Pasting goes right in the order shown: A, then B.

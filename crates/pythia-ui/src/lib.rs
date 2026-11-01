@@ -8,7 +8,7 @@ pub mod plan;
 
 pub use editor::{EditorOutput, SqlEditor, SyntaxTheme, highlight};
 pub use grid::{
-    Changes, GridLink, GridOutput, GridState, GridStyle, ResultGrid, selection_data,
+    Changes, GridLink, GridOutput, GridState, GridStyle, NotCopied, ResultGrid, selection_data,
     set_grid_style, shown_data, to_tsv,
 };
 

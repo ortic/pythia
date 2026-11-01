@@ -2121,12 +2121,18 @@ impl SqlWindow {
                         let formats = |ui: &mut Ui| {
                             for format in pythia_data::Format::ALL {
                                 if ui.button(format.label()).clicked() {
-                                    // The selection if there is one, else the rows shown.
-                                    let (columns, rows) =
-                                        selection_data(&result.columns, &result.rows, &result.grid);
-                                    // Before asking for a file that would stay empty.
-                                    match pythia_data::check_whole(&columns, &rows) {
-                                        Ok(()) => {
+                                    // The selection if there is one, else the rows shown;
+                                    // checked before asking for a file that would stay empty.
+                                    let data =
+                                        selection_data(&result.columns, &result.rows, &result.grid)
+                                            .map_err(|e| e.to_string())
+                                            .and_then(|(columns, rows)| {
+                                                pythia_data::check_whole(&columns, &rows)
+                                                    .map(|()| (columns, rows))
+                                                    .map_err(|e| e.to_string())
+                                            });
+                                    match data {
+                                        Ok((columns, rows)) => {
                                             state.export = Some(export_in_background(
                                                 *format,
                                                 columns,
@@ -2162,9 +2168,18 @@ impl SqlWindow {
                         .on_hover_text("Copy the rows shown as tab separated text")
                         .clicked()
                     {
-                        let (columns, rows) =
-                            shown_data(&result.columns, &result.rows, &result.grid);
-                        ui.ctx().copy_text(to_tsv(&columns, &rows));
+                        match shown_data(&result.columns, &result.rows, &result.grid) {
+                            Ok((columns, rows)) => ui.ctx().copy_text(to_tsv(&columns, &rows)),
+                            Err(e) => {
+                                state.messages.push(Message {
+                                    level: Level::Error,
+                                    text: format!("Copy all: {e}"),
+                                    jump: None,
+                                    stack: Vec::new(),
+                                });
+                                state.bottom = BottomTab::Messages;
+                            }
+                        }
                     }
                     let idle = state.fetching.is_none() && state.running.is_none();
                     // Compact as a word: its icon is also the grid's.

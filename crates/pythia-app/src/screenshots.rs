@@ -1448,6 +1448,10 @@ fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: Strin
         );
         let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["name", "born", "doc", "price", "pythia$id"]);
+        // Copies and exports leave that key out (#249).
+        let (copied, _) = pythia_ui::selection_data(&r.columns, &r.rows, &r.grid).unwrap();
+        let copied: Vec<&str> = copied.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(copied, ["name", "born", "doc", "price"]);
         let rows = r.rows.clone();
         for &(row, col, value, _) in db.edits {
             r.grid.edit_cell(&rows, row, col, Some(value.into()));
@@ -5280,7 +5284,7 @@ fn grid_columns() {
     // Copies and exports go by the order shown.
     let w = h.state().test_sql_window_ref().unwrap();
     let r = &w.state.results[0];
-    let (columns, _) = pythia_ui::shown_data(&r.columns, &r.rows, &r.grid);
+    let (columns, _) = pythia_ui::shown_data(&r.columns, &r.rows, &r.grid).unwrap();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["ID", "CREATED", "NAME_COL", "AMOUNT"]);
 }

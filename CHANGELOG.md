@@ -404,6 +404,12 @@ All notable changes to Pythia are documented here. The format follows
   indexes of an attached database, which went to `main`, and on SQL
   Server a routine stored without its schema was created in the default
   one. Both scripts now name the schema.
+- Copies and exports of a result being edited leave out the key column
+  Pythia adds to find its rows (#249). *Copy as*, *Export*, *Copy all*
+  and *Copy* wrote `pythia$id` (Oracle's `PYTHIA$ROWID`) as one of the
+  table's columns, so their INSERT statements failed with "Unknown
+  column 'pythia$id'". A selection of only that column copies nothing
+  and says why.
 
 ## [0.10.0] - 2026-10-30
 
