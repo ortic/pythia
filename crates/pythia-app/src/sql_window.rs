@@ -808,7 +808,15 @@ impl SqlWindow {
             self.state.bottom = BottomTab::Messages;
             return effects;
         }
-        let Some(stmt) = self.statements(true).into_iter().next() else {
+        // A lone `;` is no statement either (#273).
+        let syntax = self.state.syntax;
+        let Some(stmt) = self
+            .statements(true)
+            .into_iter()
+            .find(|s| has_code(&s.sql, syntax))
+        else {
+            self.info("Nothing to explain");
+            self.state.bottom = BottomTab::Messages;
             return effects;
         };
         if stmt.kind != StatementKind::Sql {
@@ -836,7 +844,11 @@ impl SqlWindow {
             view: Default::default(),
         });
         self.state.bottom = BottomTab::Plan;
-        let sql = substitute(&stmt.sql, &self.defines, self.state.syntax);
+        let sql = if self.substitutes() {
+            substitute(&stmt.sql, &self.defines, self.state.syntax)
+        } else {
+            stmt.sql
+        };
         effects.request(
             Target::Own,
             DbRequest::Meta {
@@ -3033,6 +3045,13 @@ fn block_line(debug: &pythia_debugger::ui::DebugSession) -> Option<u32> {
         .then_some(frame.location.line)?
 }
 
+/// Whether `sql` holds more than comments, blank space and `;`.
+fn has_code(sql: &str, syntax: Syntax) -> bool {
+    tokenize_in(sql, syntax)
+        .iter()
+        .any(|t| !t.kind.is_trivia() && t.kind != TokenKind::Semicolon)
+}
+
 /// The debugger runs anonymous blocks, not SQL or stored unit DDL.
 fn is_debuggable(stmt: &PendingStatement) -> bool {
     stmt.kind == StatementKind::PlSql && pythia_plsql::unit_header(&stmt.sql).is_none()
@@ -3861,6 +3880,46 @@ mod tests {
                 .iter()
                 .any(|m| m.text.starts_with("Result 1 shows the 100 rows fetched")),
         );
+    }
+
+    /// Explain plan of a selection without a statement says so, as Execute
+    /// does, and a lone `;` is none (#273). `&name` is replaced only where
+    /// the window substitutes, as for Execute and Profile.
+    #[test]
+    fn explain_needs_a_statement() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        for selected in ["-- just a comment\n", "  \n\t", ";", " ; ", "/* a */ ;"] {
+            let text = format!("select 1 from dual;\n{selected}");
+            let mut w = SqlWindow::new("t".into(), text.clone());
+            w.editor.select(text.len() - selected.len()..text.len());
+            assert_eq!(
+                explained(&w.explain()),
+                Vec::<String>::new(),
+                "{selected:?}"
+            );
+            let said: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+            assert_eq!(said, ["Nothing to explain"], "{selected:?}");
+            assert_eq!(w.state.bottom, BottomTab::Messages, "{selected:?}");
+        }
+        // As Execute says.
+        let mut w = SqlWindow::new("t".into(), "-- just a comment".into());
+        assert_eq!(sent(&w.execute(false, &cx)), []);
+        let said: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(said, ["Nothing to execute"]);
+
+        let sql = "select 'A &amp; B' from t";
+        let mut w = SqlWindow::new("t".into(), sql.into());
+        w.defines.insert("amp".into(), "x".into());
+        w.state.syntax = Syntax::MySql;
+        assert_eq!(explained(&w.explain()), [sql]);
+        w.define = Some(true);
+        assert_eq!(explained(&w.explain()), ["select 'A x; B' from t"]);
+        w.state.syntax = Syntax::Oracle;
+        w.define = Some(false);
+        assert_eq!(explained(&w.explain()), [sql]);
+        w.define = None;
+        assert_eq!(explained(&w.explain()), ["select 'A x; B' from t"]);
     }
 
     /// On a read-only connection only queries reach the server: also the

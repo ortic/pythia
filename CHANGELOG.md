@@ -516,6 +516,12 @@ All notable changes to Pythia are documented here. The format follows
   also when there is no plan. While the window runs a statement, Explain
   says so; on MySQL, PostgreSQL, SQL Server and SQLite it ends the fetch
   of a result with rows left, which then says it shows the rows fetched.
+- *Explain Plan* of a selection without a statement, only a comment or
+  blank space, says "Nothing to explain" (#273); it did nothing and said
+  nothing. A lone `;` is no statement either: it was sent, and PostgreSQL
+  answered `explain (format json) ;` with a syntax error. `&name` is
+  replaced only where the window substitutes, as for *Execute*: on MySQL
+  a `DEFINE`d name changed `'A &amp; B'` in the plan's statement.
 
 ## [0.10.0] - 2026-10-30
 
