@@ -8014,6 +8014,99 @@ fn mysql_statements_show_every_result() {
     run_in_window(&mut h, "drop procedure r51_p");
 }
 
+/// Break while SQL Server fetches a result's rows fails that result's
+/// statement (#347). The session sends the rows it read, which end the
+/// statement, and then the failure: the window took it for the failure of
+/// the statement a script sent after it (counted as failed, not skipped:
+/// 1 of the 2 skipped), and when it fetched more of a result later for a
+/// statement's failing ("Failed after"), which WHENEVER SQLERROR EXIT
+/// ROLLBACK rolled back for, as it doesn't for a failure while fetching.
+#[test]
+fn break_while_fetching_fails_the_result() {
+    use crate::commands::Command;
+    let connection = "r75@SQL Server";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MSSQL",
+        connection,
+        pythia_config::DbKind::SqlServer,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // A batch whose result's rows are read before it waits: the server
+    // sends them then (WITH NOWAIT).
+    let slow = |values: &str| {
+        format!(
+            "declare @n int = 1;\nselect n from (values {values}) v (n);\n\
+             raiserror('r75', 0, 1) with nowait;\nwaitfor delay '00:01:00';\nselect 2 as m"
+        )
+    };
+    let messages = |h: &Ui| -> Vec<String> {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let cancelled = |h: &mut Ui| {
+        // The session is in the batch's wait.
+        std::thread::sleep(Duration::from_millis(500));
+        h.state_mut().test_command(Command::Cancel);
+        wait_until(h, "Break", |app| {
+            !app.test_focused_busy()
+                && app.test_sql_window_ref().is_some_and(|w| {
+                    w.state
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "Cancelled while fetching")
+                })
+        });
+    };
+
+    let script = format!("{}\nGO\nselect 2\nGO\nselect 3", slow("(1)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the first result", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| !w.state.results.is_empty())
+    });
+    cancelled(&mut h);
+    let said = messages(&h);
+    assert!(
+        said.iter().any(|m| m == "2 remaining statement(s) skipped"),
+        "{said:?}"
+    );
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        1
+    );
+
+    // Its first rows, fewer than the grid shows: it fetches the next ones.
+    h.state_mut().test_settings_mut().fetch_size = 2;
+    let script = format!("whenever sqlerror exit rollback\n{}", slow("(1), (2), (3)"));
+    h.state_mut().test_sql_window().editor.set_text(&script);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the next rows", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.running.is_none() && w.state.fetching.is_some())
+    });
+    let before = messages(&h).len();
+    cancelled(&mut h);
+    h.run_steps(5);
+    h.state_mut().test_settings_mut().fetch_size = pythia_config::Settings::default().fetch_size;
+    let said = messages(&h);
+    assert!(
+        !said[before..]
+            .iter()
+            .any(|m| m.starts_with("Failed after") || m.starts_with("Rolling back")),
+        "{said:?}"
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    assert_eq!(w.state.results[0].rows.len(), 3, "{said:?}");
+}
+
 /// PostgreSQL: a rule whose actions are in parentheses is one statement
 /// (#346). The script ended it at their first `;` and sent `create rule …
 /// do also (select 1 as a`, which failed with "syntax error at end of

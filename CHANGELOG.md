@@ -1102,6 +1102,16 @@ All notable changes to Pythia are documented here. The format follows
   rule whose parenthesis is still open at the end of the script, as
   while it is typed, ends at that `;` as before, so the statements
   after it stay apart.
+- SQL Server: Break while a result's rows are read fails that result's
+  statement (#347). The session sends the rows it read, which end the
+  statement, before the failure, which the window counted against the
+  statement running then: the next one of a script, which was sent
+  ahead (#291), counted as failed rather than skipped; after the window
+  fetched more of a result, a statement failing ("Failed after …"), for
+  which `WHENEVER SQLERROR EXIT ROLLBACK` rolled back. The failure is now
+  the statement's, or the fetch's, as one without rows first is. An error
+  after a result of a statement with several, which comes the same way
+  on MySQL, PostgreSQL and SQL Server, is too.
 
 ## [0.10.0] - 2026-10-30
 
