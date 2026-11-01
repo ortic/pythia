@@ -410,6 +410,13 @@ All notable changes to Pythia are documented here. The format follows
   table's columns, so their INSERT statements failed with "Unknown
   column 'pythia$id'". A selection of only that column copies nothing
   and says why.
+- Copies and exports of a result being edited no longer write values
+  other than the grid shows (#250). With changes waiting for *Apply*,
+  *Copy*, *Copy as*, *Export* and *Copy all* wrote the rows as fetched:
+  the old value of a changed cell, rows marked to be deleted, no new
+  rows. Rows with changes not applied now aren't copied until the
+  changes are applied or discarded, and the messages say so; other rows
+  copy as before. *View value…* shows a changed cell as the grid does.
 
 ## [0.10.0] - 2026-10-30
 

@@ -1457,6 +1457,11 @@ fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: Strin
             r.grid.edit_cell(&rows, row, col, Some(value.into()));
         }
         r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
+        // Nothing is copied of rows with changes not applied (#250).
+        assert!(matches!(
+            pythia_ui::shown_data(&r.columns, &r.rows, &r.grid),
+            Err(pythia_ui::NotCopied::Unapplied(_))
+        ));
     }
     save(&mut h, db.screenshot);
     apply(&mut h);

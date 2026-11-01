@@ -393,6 +393,52 @@ impl GridState {
         }
     }
 
+    /// How many of `rows_taken` hold a change in `columns` that isn't
+    /// applied: a value changed or being typed, a new row, a row to be
+    /// deleted (#250).
+    fn unapplied(
+        &self,
+        rows: &[Vec<Cell>],
+        rows_taken: impl IntoIterator<Item = RowRef>,
+        columns: &[usize],
+    ) -> usize {
+        let Some(edit) = &self.edit else {
+            return 0;
+        };
+        let typed = edit
+            .active
+            .as_ref()
+            .filter(|(r, c, text)| {
+                columns.contains(c) && self.value(rows, *r, *c).unwrap_or_default() != text
+            })
+            .map(|(r, ..)| self.row_ref(*r));
+        rows_taken
+            .into_iter()
+            .filter(|&row| {
+                typed == Some(row)
+                    || match row {
+                        RowRef::New(i) => i < edit.changes.inserts.len(),
+                        RowRef::Existing(r) => {
+                            edit.changes.deletes.contains(&r)
+                                || edit
+                                    .changes
+                                    .updates
+                                    .get(&r)
+                                    .is_some_and(|u| columns.iter().any(|c| u.contains_key(c)))
+                        }
+                    }
+            })
+            .count()
+    }
+
+    /// A cell as the grid shows it, for the viewer, and whether that is a
+    /// change not applied, which isn't copied (#250).
+    fn viewed(&self, rows: &[Vec<Cell>], (view_row, col): (usize, usize)) -> (Cell, bool) {
+        let value = self.value(rows, view_row, col).map(str::to_owned);
+        let row = self.row_ref(view_row);
+        (value, self.unapplied(rows, [row], &[col]) > 0)
+    }
+
     /// The selected rows (view order) and columns (in the order shown,
     /// between the anchor's and the cursor's).
     fn selection(&self, count: usize) -> Option<(RangeInclusive<usize>, Vec<usize>)> {
@@ -1785,6 +1831,8 @@ pub enum NotCopied {
     /// Only the columns editing added to find the rows are selected or
     /// shown (#249).
     KeyOnly,
+    /// This many of the rows have changes that aren't applied (#250).
+    Unapplied(usize),
 }
 
 impl std::fmt::Display for NotCopied {
@@ -1794,12 +1842,21 @@ impl std::fmt::Display for NotCopied {
                 "the selection has only the key columns Pythia added to find the rows, which \
                  the table hasn't",
             ),
+            NotCopied::Unapplied(1) => f.write_str(
+                "a row has changes that aren't applied: apply or discard them, then copy it",
+            ),
+            NotCopied::Unapplied(n) => write!(
+                f,
+                "{n} rows have changes that aren't applied: apply or discard them, then copy \
+                 them"
+            ),
         }
     }
 }
 
 /// The selected block as columns + rows (in view order); everything if
-/// nothing is selected.
+/// nothing is selected. Not while those rows hold changes that aren't
+/// applied (#250).
 pub fn selection_data(
     columns: &[Column],
     rows: &[Vec<Cell>],
@@ -1809,6 +1866,10 @@ pub fn selection_data(
         return shown_data(columns, rows, state);
     };
     let keep = state.copied(keep)?;
+    let pending = state.unapplied(rows, r.clone().map(|vr| state.row_ref(vr)), &keep);
+    if pending > 0 {
+        return Err(NotCopied::Unapplied(pending));
+    }
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
     let data = r
         .filter_map(|vr| rows.get(state.row_index(vr)))
@@ -1832,6 +1893,15 @@ pub fn shown_data(
     let keep = state.copied(state.visible_columns(columns.len()))?;
     // Also the rows fetched since the grid was drawn.
     let order = state.order_of(rows, columns);
+    let inserted = state.edit.as_ref().map_or(0, |e| e.changes.inserts.len());
+    let shown = order
+        .iter()
+        .map(|&r| RowRef::Existing(r))
+        .chain((0..inserted).map(RowRef::New));
+    let pending = state.unapplied(rows, shown, &keep);
+    if pending > 0 {
+        return Err(NotCopied::Unapplied(pending));
+    }
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
     let data = order
         .iter()
@@ -2269,11 +2339,7 @@ fn viewer(
     id: egui::Id,
 ) {
     let Some((r, c)) = state.viewer else { return };
-    let value = rows
-        .get(state.row_index(r))
-        .and_then(|row| row.get(c))
-        .cloned()
-        .flatten();
+    let (value, unapplied) = state.viewed(rows, (r, c));
     let name = columns.get(c).map_or("", |col| col.name.as_str());
     let binary = columns
         .get(c)
@@ -2333,8 +2399,14 @@ fn viewer(
                 if pretty.is_some() {
                     ui.weak("· JSON, formatted");
                 }
+                if unapplied {
+                    ui.weak("· changed, not applied");
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Copy").clicked() {
+                    let copy = ui
+                        .add_enabled(!unapplied, egui::Button::new("Copy"))
+                        .on_disabled_hover_text("Apply or discard the change first");
+                    if copy.clicked() {
                         ctx.copy_text(value.clone().unwrap_or_default());
                     }
                 });
@@ -2796,6 +2868,51 @@ mod tests {
             selection_data(&columns, &rows, &state).unwrap_err(),
             NotCopied::KeyOnly
         );
+    }
+
+    /// Changes not applied are in neither the database nor surely what it
+    /// will hold: a copy or export of rows that have one waits until they
+    /// are applied or discarded, and says so; other rows copy as before
+    /// (#250). The viewer shows a cell as the grid does.
+    #[test]
+    fn copies_wait_for_changes_to_be_applied() {
+        let columns = cols();
+        let rows = rows();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        state.edit_cell(&rows, 0, 1, Some("new".into()));
+        let unapplied = |state: &GridState| shown_data(&columns, &rows, state);
+        assert_eq!(unapplied(&state).unwrap_err(), NotCopied::Unapplied(1));
+        // Row 1 and row 0's other column hold no change.
+        state.select((1, 0), false);
+        state.select((1, 1), true);
+        assert_eq!(
+            selection_text(&columns, &rows, &state, false).unwrap(),
+            "\ta"
+        );
+        state.select((0, 0), false);
+        assert_eq!(
+            selection_text(&columns, &rows, &state, false).unwrap(),
+            "10"
+        );
+        state.select((0, 1), false);
+        assert_eq!(
+            selection_data(&columns, &rows, &state).unwrap_err(),
+            NotCopied::Unapplied(1)
+        );
+        assert_eq!(state.viewed(&rows, (0, 1)), (Some("new".to_owned()), true));
+        // A row to be deleted, a new one, a value being typed.
+        state.delete_row(&rows, 2);
+        state.add_row(&rows, 2);
+        state.anchor = None;
+        state.cursor = None;
+        assert_eq!(unapplied(&state).unwrap_err(), NotCopied::Unapplied(3));
+        state.start_edit(&rows, (1, 0), Some("7".into()));
+        assert_eq!(unapplied(&state).unwrap_err(), NotCopied::Unapplied(4));
+        assert_eq!(state.viewed(&rows, (3, 0)), (None, true));
+        state.clear_changes();
+        assert_eq!(unapplied(&state).unwrap().1.len(), 3);
+        assert_eq!(state.viewed(&rows, (0, 1)), (Some("x".to_owned()), false));
     }
 
     #[test]
