@@ -245,6 +245,9 @@ All notable changes to Pythia are documented here. The format follows
   value was laid out whole, wrapped, on every frame the record showed.
   A field now shows its first 10,000 characters and ` …`; *Copy* still
   copies all of it.
+- MariaDB: a TIMESTAMP column's type reads `TIMESTAMP`, no longer
+  `TIMESTAMP UNSIGNED`, and an INET6 column's `CHAR`, not `CHAR
+  UNSIGNED` (#221). MariaDB flags them unsigned; only numbers are.
 
 ## [0.10.0] - 2026-10-30
 

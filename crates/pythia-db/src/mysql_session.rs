@@ -755,7 +755,13 @@ fn type_name(c: &mysql::Column) -> String {
             _ => "UNKNOWN",
         }
     };
-    if flags.contains(ColumnFlags::UNSIGNED_FLAG) && !matches!(name, "BIT" | "YEAR") {
+    // Only numbers are unsigned: MariaDB flags a TIMESTAMP and an INET6
+    // so too, MySQL a YEAR and a BIT (#221).
+    let number = matches!(
+        name,
+        "DECIMAL" | "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "FLOAT" | "DOUBLE"
+    );
+    if flags.contains(ColumnFlags::UNSIGNED_FLAG) && number {
         format!("{name} UNSIGNED")
     } else {
         name.to_owned()
@@ -1076,5 +1082,70 @@ mod tests {
     fn releases() {
         assert_eq!(release("9.4.0"), (9, 4));
         assert_eq!(release("10.11.6-MariaDB-0+deb12u1"), (10, 11));
+    }
+
+    /// Types as DDL names them, with UNSIGNED only on numbers (#221): MariaDB
+    /// flags a TIMESTAMP, an INET6 (a string to the client), a YEAR and a
+    /// BIT unsigned too.
+    #[test]
+    fn type_names() {
+        use ColumnFlags as F;
+        let col = |ty: ColumnType, flags: ColumnFlags, charset: u16| {
+            type_name(
+                &mysql::Column::new(ty)
+                    .with_flags(flags)
+                    .with_character_set(charset),
+            )
+        };
+        let (binary, utf8) = (63, 33);
+        let unsigned_binary = F::UNSIGNED_FLAG | F::BINARY_FLAG;
+        for (ty, flags, charset, name) in [
+            (
+                ColumnType::MYSQL_TYPE_TIMESTAMP,
+                unsigned_binary,
+                binary,
+                "TIMESTAMP",
+            ),
+            (
+                ColumnType::MYSQL_TYPE_TIMESTAMP,
+                F::BINARY_FLAG,
+                binary,
+                "TIMESTAMP",
+            ),
+            (ColumnType::MYSQL_TYPE_STRING, unsigned_binary, utf8, "CHAR"),
+            (
+                ColumnType::MYSQL_TYPE_YEAR,
+                F::UNSIGNED_FLAG | F::ZEROFILL_FLAG,
+                binary,
+                "YEAR",
+            ),
+            (ColumnType::MYSQL_TYPE_BIT, F::UNSIGNED_FLAG, binary, "BIT"),
+            (
+                ColumnType::MYSQL_TYPE_LONG,
+                F::UNSIGNED_FLAG | F::NUM_FLAG,
+                binary,
+                "INT UNSIGNED",
+            ),
+            (
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+                F::UNSIGNED_FLAG,
+                binary,
+                "DECIMAL UNSIGNED",
+            ),
+            (
+                ColumnType::MYSQL_TYPE_DOUBLE,
+                F::UNSIGNED_FLAG,
+                binary,
+                "DOUBLE UNSIGNED",
+            ),
+            (
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                F::NUM_FLAG,
+                binary,
+                "BIGINT",
+            ),
+        ] {
+            assert_eq!(col(ty, flags, charset), name, "{ty:?} {flags:?}");
+        }
     }
 }

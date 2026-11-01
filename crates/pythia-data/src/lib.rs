@@ -755,13 +755,12 @@ fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
 }
 
 /// The zone INSERT statements of `columns` set while they run: in MySQL's
-/// SQL with a TIMESTAMP column (MariaDB's read `TIMESTAMP UNSIGNED`), the
-/// one its values were shown in (#213). A TIMESTAMP is an instant shown in
-/// the session's zone; written as shown, it would move in a session of
-/// another zone.
+/// SQL with a TIMESTAMP column, the one its values were shown in (#213). A
+/// TIMESTAMP is an instant shown in the session's zone; written as shown,
+/// it would move in a session of another zone.
 fn insert_time_zone<'a>(columns: &[Column], options: &'a Options) -> Option<&'a str> {
     let zoned = options.dialect.kind() == DbKind::MySql
-        && columns.iter().any(|c| c.type_name.starts_with("TIMESTAMP"));
+        && columns.iter().any(|c| c.type_name == "TIMESTAMP");
     options.time_zone.as_deref().filter(|_| zoned)
 }
 
