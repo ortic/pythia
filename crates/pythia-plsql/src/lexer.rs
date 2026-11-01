@@ -107,11 +107,11 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     tokenize_in(src, Syntax::Oracle)
 }
 
-/// [`tokenize`] for a script of a database with `syntax`. MySQL lexes three
+/// [`tokenize`] for a script of a database with `syntax`. MySQL lexes four
 /// things its own way: `\` escapes the next character in `'…'` and `"…"`
-/// (#187), `#` starts a line comment (#188), and `--` does only before
-/// whitespace or a control character (#189). Its `"…"` is a string, and it
-/// has no dollar quotes. PostgreSQL's dollar-quoted body may start with a
+/// (#187), `#` starts a line comment (#188), `--` does only before
+/// whitespace or a control character (#189), and `/*!…*/` is code (#216).
+/// Its `"…"` is a string, and it has no dollar quotes. PostgreSQL's dollar-quoted body may start with a
 /// word (#201), and `\` escapes the next character in `E'…'` (#202).
 /// Neither has Oracle's directives.
 pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
@@ -178,6 +178,11 @@ fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenK
             (!after.is_ascii_whitespace() && !after.is_ascii_control())
                 .then_some((TokenKind::Operator, span.start + 1))
         }
+        // An executable comment, `/*!…*/` or `/*!50003 …*/`, is code: the
+        // server reads its version itself (#216). It shows as a hint.
+        // MariaDB's `/*M!…*/` stays one: MySQL doesn't run it, and the
+        // first line of a mariadb-dump is one for its own client.
+        TokenKind::BlockComment if text.starts_with("/*!") => Some((TokenKind::Hint, span.end)),
         TokenKind::Error if text.starts_with('#') => {
             let end = src[span.start..]
                 .find('\n')
@@ -476,6 +481,24 @@ mod tests {
                 TokenKind::Error,
                 TokenKind::LineComment
             ]
+        );
+    }
+
+    #[test]
+    fn mysql_executable_comments() {
+        // `/*!…*/` is code the server reads (#216); MariaDB's `/*M!…*/`
+        // and other comments stay comments.
+        assert_eq!(
+            mysql_kinds("/*!40101 SET x=1 */; /*M!999999 y */ /* z */ /*!*/"),
+            vec![
+                (TokenKind::Hint, "/*!40101 SET x=1 */"),
+                (TokenKind::Semicolon, ";"),
+                (TokenKind::Hint, "/*!*/"),
+            ]
+        );
+        assert_eq!(
+            kinds("/*!40101 SET x=1 */;"),
+            vec![(TokenKind::Semicolon, ";")]
         );
     }
 

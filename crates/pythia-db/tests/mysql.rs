@@ -359,6 +359,76 @@ fn delimiters_as_mysqldump_writes_them() {
     h.ok("drop table fs_dump");
 }
 
+/// A file as mysqldump writes it: its SETs, a table's partitions and its
+/// trigger, written in `/*!NNNNN …*/`, run as the server's code (#216).
+#[test]
+fn executable_comments_as_mysqldump_writes_them() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let script = "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n\
+                  /*!50503 SET NAMES utf8mb4 */;\n\
+                  /*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;\n\
+                  /*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n\
+                  DROP TABLE IF EXISTS `fs_exec`;\n\
+                  /*!40101 SET @saved_cs_client     = @@character_set_client */;\n\
+                  /*!50503 SET character_set_client = utf8mb4 */;\n\
+                  CREATE TABLE `fs_exec` (\n  `a` int DEFAULT NULL,\n  `b` varchar(20) DEFAULT NULL\n\
+                  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4\n\
+                  /*!50100 PARTITION BY HASH (`a`)\nPARTITIONS 2 */;\n\
+                  /*!40101 SET character_set_client = @saved_cs_client */;\n\
+                  /*!50003 SET @saved_sql_mode       = @@sql_mode */ ;\n\
+                  /*!50003 SET sql_mode              = 'STRICT_TRANS_TABLES' */ ;\n\
+                  DELIMITER ;;\n\
+                  /*!50003 CREATE*/ /*!50017 DEFINER=CURRENT_USER*/ /*!50003 TRIGGER `fs_exec_t` \
+                  BEFORE INSERT ON `fs_exec` FOR EACH ROW begin\n  \
+                  set new.b = concat(new.b, ';', new.a * 2);\nend */;;\n\
+                  DELIMITER ;\n\
+                  /*!50003 SET sql_mode              = @saved_sql_mode */ ;\n\
+                  LOCK TABLES `fs_exec` WRITE;\n\
+                  /*!40000 ALTER TABLE `fs_exec` DISABLE KEYS */;\n\
+                  INSERT INTO `fs_exec` VALUES (1,'x'),(2,'y');\n\
+                  /*!40000 ALTER TABLE `fs_exec` ENABLE KEYS */;\n\
+                  UNLOCK TABLES;\n\
+                  /*!40101 SET SQL_MODE=@OLD_SQL_MODE */;\n\
+                  /*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;";
+    let statements: Vec<&str> = pythia_plsql::split_statements_in(script, Dialect::MYSQL.syntax())
+        .iter()
+        .map(|s| s.text(script))
+        .collect();
+    assert_eq!(statements.len(), 20, "{statements:?}");
+    let mut triggered = false;
+    for statement in &statements {
+        if !statement.contains("TRIGGER") {
+            h.ok(statement);
+            continue;
+        }
+        // While the binary log is on, a trigger takes SUPER (1419).
+        triggered = match h.run(0, statement) {
+            DbEvent::Failed { error, .. } if error.to_string().contains("1419") => false,
+            DbEvent::Failed { error, .. } => panic!("{statement}: {error}"),
+            _ => true,
+        };
+        h.settle();
+    }
+    assert!(h.scalar("select @OLD_SQL_MODE").is_some());
+    assert_eq!(
+        h.scalar(
+            "select count(*) from information_schema.partitions \
+              where table_schema = database() and table_name = 'fs_exec' \
+                and partition_name is not null"
+        )
+        .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        h.scalar("select group_concat(b order by a separator '|') from fs_exec")
+            .as_deref(),
+        Some(if triggered { "x;2|y;4" } else { "x|y" })
+    );
+    h.ok("drop table fs_exec");
+}
+
 /// Without a database in the address, the login statements pick it (the
 /// profile's default schema): `Connected` reports the one they leave the
 /// session in, then their failures (#103).

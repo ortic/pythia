@@ -261,8 +261,9 @@ for Linux, Windows and macOS.
   transactions that work as with Oracle: queries see what others
   committed, changes wait for Commit.
 - Scripts are read as MySQL reads them: `\` escapes in strings, `#`
-  comments, and `--` comments only before a space. As on every database
-  but Oracle, `&name` is no substitution variable unless `SET DEFINE ON`
+  comments, `--` comments only before a space, and `/*!…*/` as code (as
+  `mysqldump` writes its SETs and triggers). As on every database but
+  Oracle, `&name` is no substitution variable unless `SET DEFINE ON`
   says so.
   Warnings show as messages.
 - *Edit* on a result of one table changes its rows in place, as on

@@ -139,6 +139,13 @@ All notable changes to Pythia are documented here. The format follows
   nothing on MySQL and SQLite, nor `select t. from [my table] t` on SQL
   Server and SQLite, though completion writes such names itself where
   the database needs them.
+- MySQL scripts send the code in `/*!…*/` comments to the server, which
+  runs it (#216). `mysqldump` writes its SETs (`/*!40101 SET … */;`),
+  partitions and triggers that way: a statement made of such a comment
+  was left out, and its `;` went to the server ("Query was empty") or
+  ran together with the next statement, so the SETs never ran, a dumped
+  trigger was never created and a table lost its partitions. MariaDB's
+  `/*M!…*/` stays a comment.
 
 ## [0.10.0] - 2026-10-30
 

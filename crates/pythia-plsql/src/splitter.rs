@@ -774,6 +774,43 @@ mod tests {
     }
 
     #[test]
+    fn mysql_executable_comments() {
+        // mysqldump's `/*!NNNNN …*/` are code (#216), its `/*M!…*/` aren't.
+        let src = "/*M!999999\\- enable the sandbox mode */ \n\n\
+                   /*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;\n\
+                   /*!50003 SET @saved_cs_client      = @@character_set_client */ ;\n\
+                   CREATE TABLE `t` (\n  `a` int\n) ENGINE=InnoDB\n/*!50100 PARTITION BY HASH (`a`)\nPARTITIONS 2 */;\n\
+                   DELIMITER ;;\n\
+                   /*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t_bi` \
+                   BEFORE INSERT ON `t` FOR EACH ROW begin set new.a = 1; end \n*/;;\n\
+                   DELIMITER ;\n\
+                   /* not this; */ select 1;";
+        assert_eq!(
+            split_in(src, Syntax::MySql),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */"
+                ),
+                (
+                    StatementKind::Sql,
+                    "/*!50003 SET @saved_cs_client      = @@character_set_client */"
+                ),
+                (
+                    StatementKind::Sql,
+                    "CREATE TABLE `t` (\n  `a` int\n) ENGINE=InnoDB\n/*!50100 PARTITION BY HASH (`a`)\nPARTITIONS 2 */"
+                ),
+                (
+                    StatementKind::Sql,
+                    "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t_bi` \
+                     BEFORE INSERT ON `t` FOR EACH ROW begin set new.a = 1; end \n*/"
+                ),
+                (StatementKind::Sql, "select 1"),
+            ]
+        );
+    }
+
+    #[test]
     fn sqlite_scripts() {
         let src = "pragma foreign_keys = on;\n\
                    begin;\n\

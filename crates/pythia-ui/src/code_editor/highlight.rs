@@ -553,6 +553,35 @@ mod tests {
         assert_eq!(mysql("END$$", LineState::Normal).1, LineState::Normal);
     }
 
+    #[test]
+    fn mysql_executable_comments() {
+        // Code the server reads, shown as a hint, across lines too (#216).
+        assert_eq!(
+            mysql(
+                "/*!50003 TRIGGER t BEFORE INSERT ON x FOR EACH ROW begin",
+                LineState::Normal
+            ),
+            (
+                vec![(
+                    TokenKind::Hint,
+                    "/*!50003 TRIGGER t BEFORE INSERT ON x FOR EACH ROW begin"
+                )],
+                LineState::Hint
+            )
+        );
+        assert_eq!(
+            mysql("end */;;", LineState::Hint),
+            (
+                vec![
+                    (TokenKind::Hint, "end */"),
+                    (TokenKind::Semicolon, ";"),
+                    (TokenKind::Semicolon, ";"),
+                ],
+                LineState::Normal
+            )
+        );
+    }
+
     fn postgres(line: &str, state: LineState) -> (Vec<(TokenKind, &str)>, LineState) {
         let (tokens, end) = lex_line_in(line, state, Syntax::Postgres);
         let tokens = tokens
