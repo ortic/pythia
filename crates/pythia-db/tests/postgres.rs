@@ -898,6 +898,101 @@ fn foreign_keys_name_their_schema() {
     h.ok("drop table fk_same_users");
 }
 
+/// A table's indexes of every kind, each with its columns as its definition
+/// has them (order, collation, operator class), INCLUDE columns and
+/// predicate.
+#[test]
+fn indexes_as_defined() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop table if exists idx_kinds");
+    h.ok(
+        "create table idx_kinds (id int primary key, name text, code text, n int, \
+         tags text[], during tsrange, at timestamptz)",
+    );
+    for sql in [
+        "create index idx_kinds_fts on idx_kinds using gin (to_tsvector('portuguese', name))",
+        "create index idx_kinds_tags on idx_kinds using gin (tags)",
+        "create index idx_kinds_during on idx_kinds using gist (during)",
+        "create index idx_kinds_at on idx_kinds using brin (at)",
+        "create index idx_kinds_lower on idx_kinds (lower(code) desc nulls last, n nulls first)",
+        "create index idx_kinds_like on idx_kinds (code collate \"C\" text_pattern_ops)",
+        "create unique index idx_kinds_cover on idx_kinds (code) include (name, n)",
+        "create index idx_kinds_positive on idx_kinds (n desc) where n > 0",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "idx_kinds".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "INDEX_NAME",
+            "INDEX_TYPE",
+            "UNIQUENESS",
+            "COLUMNS",
+            "INCLUDE",
+            "WHERE"
+        ]
+    );
+    let indexes: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| r.iter().map(|v| v.as_deref().unwrap_or("")).collect())
+        .collect();
+    assert_eq!(
+        indexes,
+        [
+            ["idx_kinds_pkey", "btree", "PRIMARY", "id", "", ""],
+            ["idx_kinds_at", "brin", "NONUNIQUE", "at", "", ""],
+            ["idx_kinds_cover", "btree", "UNIQUE", "code", "name, n", ""],
+            ["idx_kinds_during", "gist", "NONUNIQUE", "during", "", ""],
+            [
+                "idx_kinds_fts",
+                "gin",
+                "NONUNIQUE",
+                "to_tsvector('portuguese'::regconfig, name)",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_like",
+                "btree",
+                "NONUNIQUE",
+                "code COLLATE \"C\" text_pattern_ops",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_lower",
+                "btree",
+                "NONUNIQUE",
+                "lower(code) DESC NULLS LAST, n NULLS FIRST",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_positive",
+                "btree",
+                "NONUNIQUE",
+                "n DESC",
+                "",
+                "n > 0"
+            ],
+            ["idx_kinds_tags", "gin", "NONUNIQUE", "tags", "", ""],
+        ]
+    );
+    h.ok("drop table idx_kinds");
+}
+
 /// Generated columns read as declared, PostgreSQL 18's virtual ones too: as
 /// their default, and in DDL that builds the table again.
 #[test]

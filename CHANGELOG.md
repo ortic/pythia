@@ -281,6 +281,13 @@ All notable changes to Pythia are documented here. The format follows
   DDL wrote `twice integer (a * 2)`, which fails (syntax error). It now
   reads `generated always as ((a * 2)) virtual`, as a stored one reads
   `… stored`.
+- PostgreSQL: a table's *Indexes* show each index's columns as it has
+  them (#228). An index on `(lower(code) desc nulls last, n)` read
+  `lower(code), n`, one on `(code collate "C" text_pattern_ops)` read
+  `code`, and the INCLUDE columns of a covering index were left out, so
+  that `(code) include (name, n)` looked like an index on `code` alone.
+  *Columns* now has the order, collation and operator class, and
+  *Include* the INCLUDE columns.
 
 ## [0.10.0] - 2026-10-30
 

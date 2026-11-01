@@ -267,8 +267,7 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
             "select i.relname as \"INDEX_NAME\", am.amname as \"INDEX_TYPE\", \
                     case when x.indisprimary then 'PRIMARY' when x.indisunique then 'UNIQUE' \
                          else 'NONUNIQUE' end as \"UNIQUENESS\", \
-                    (select string_agg(pg_get_indexdef(x.indexrelid, k, true), ', ' order by k) \
-                       from generate_series(1, x.indnkeyatts) k) as \"COLUMNS\", \
+                    pg_get_indexdef(x.indexrelid, 0, true) as \"COLUMNS\", null as \"INCLUDE\", \
                     pg_get_expr(x.indpred, x.indrelid, true) as \"WHERE\" \
                from pg_index x join pg_class i on i.oid = x.indexrelid \
                join pg_am am on am.oid = i.relam {} \
@@ -337,7 +336,16 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
     };
     // Names as seen from the object's schema: others' with their schema.
     let path = Dialect::POSTGRES.quote_ident(owner);
-    let (names, rows) = on_path(pg, &path, || pg.query(&sql, &[owner, name]))?;
+    let (names, mut rows) = on_path(pg, &path, || pg.query(&sql, &[owner, name]))?;
+    if detail == Detail::Indexes {
+        // The index's definition, read for its columns.
+        for row in &mut rows {
+            if let Some((columns, include)) = row[3].as_deref().and_then(index_columns) {
+                row[3] = Some(columns);
+                row[4] = include;
+            }
+        }
+    }
     let columns = names
         .into_iter()
         .map(|name| Column {
@@ -347,6 +355,50 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
         })
         .collect();
     Ok(MetaResult::Table { columns, rows })
+}
+
+/// The key columns of an index and its INCLUDE columns, if any, as its
+/// definition (`… USING btree (code COLLATE "C" text_pattern_ops) INCLUDE
+/// (n)`) writes them. A column's own definition leaves out its collation,
+/// operator class and order (#228).
+fn index_columns(definition: &str) -> Option<(String, Option<String>)> {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(definition, pythia_plsql::Syntax::Postgres)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let is = |i: usize, word: &str| {
+        tokens.get(i).is_some_and(|t| {
+            t.kind.is_word() && definition[t.span.clone()].eq_ignore_ascii_case(word)
+        })
+    };
+    // What the parenthesis at `open` encloses, and the token after it.
+    let group = |open: usize| {
+        if tokens.get(open)?.kind != TokenKind::LParen {
+            return None;
+        }
+        let mut depth = 0;
+        tokens.iter().enumerate().skip(open).find_map(|(i, t)| {
+            match t.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then(|| {
+                let inside = &definition[tokens[open].span.end..t.span.start];
+                (inside.trim().to_owned(), i + 1)
+            })
+        })
+    };
+    // `USING`, the access method, the key columns, `INCLUDE (…)`.
+    let using = (0..tokens.len()).find(|&i| is(i, "USING"))?;
+    let (columns, next) = group(using + 2)?;
+    let include = if is(next, "INCLUDE") {
+        group(next + 1).map(|(include, _)| include)
+    } else {
+        None
+    };
+    Some((columns, include))
 }
 
 /// An object's DDL; `runnable` ends each statement with `;` (a single
@@ -708,6 +760,28 @@ mod tests {
         assert_eq!(steps[3].operation, "Index Scan using dept_pkey");
         assert_eq!(steps[3].object.as_deref(), Some("dept"));
         assert_eq!(steps[3].depth, 2);
+    }
+
+    #[test]
+    fn index_columns_as_defined() {
+        assert_eq!(
+            index_columns(
+                "CREATE UNIQUE INDEX \"Cover (x)\" ON t USING btree (code COLLATE \"C\" \
+                 text_pattern_ops, lower(\"Name\") DESC NULLS LAST) INCLUDE (name, n) \
+                 WHERE (n > 0)"
+            ),
+            Some((
+                "code COLLATE \"C\" text_pattern_ops, lower(\"Name\") DESC NULLS LAST".into(),
+                Some("name, n".into())
+            ))
+        );
+        assert_eq!(
+            index_columns(
+                "CREATE INDEX f ON only t USING gin (to_tsvector('portuguese)'::regconfig, name))"
+            ),
+            Some(("to_tsvector('portuguese)'::regconfig, name)".into(), None))
+        );
+        assert_eq!(index_columns("CREATE INDEX x ON t"), None);
     }
 
     #[test]
