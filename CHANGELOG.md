@@ -445,6 +445,12 @@ All notable changes to Pythia are documented here. The format follows
   DECIMAL value"), also of a value typed as it is shown. A BIT is now
   written as the number its hex stands for (`81` as 129), in INSERT
   exports too.
+- A binary value typed into a result as the grid shows it, `0x…`, is
+  stored as those bytes (#256). On MySQL, PostgreSQL and SQLite
+  `0x171066e1` went in as text, the ten bytes `0x3078313731…`, without
+  a word; SQL Server took it already. An odd number of digits gets a 0
+  in front, as MySQL reads `0x…`. Text columns keep such a value as
+  text.
 
 ## [0.10.0] - 2026-10-30
 

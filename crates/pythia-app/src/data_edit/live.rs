@@ -871,3 +871,75 @@ fn mysql_bits() {
     assert_eq!(rows[0][1..3], [Some("01".into()), Some("05".into())]);
     db.ok("drop table r41_bits");
 }
+
+/// A binary value typed as the grid shows it, `0x171066e1`, is those four
+/// bytes (#256), also the one past 0x7f: MySQL, PostgreSQL and SQLite
+/// stored the text's ten (`0x30783137…`).
+fn binary_typed_as_shown(db: &mut Live, create: &str) {
+    db.script(&[
+        "drop table if exists r41_typed",
+        create,
+        "insert into r41_typed values (1, null)",
+    ]);
+    let (edit, columns, rows) = db.editable("r41_typed", "id");
+    let changes = Changes {
+        updates: BTreeMap::from([(0, BTreeMap::from([(1, Some("0x171066e1".into()))]))]),
+        ..Changes::default()
+    };
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    let (_, _, rows) = db.editable("r41_typed", "id");
+    let shown = rows[0][1].as_deref().unwrap_or_default();
+    let hex = shown.trim_start_matches("0x").trim_start_matches(r"\x");
+    assert!(
+        hex.eq_ignore_ascii_case("171066e1"),
+        "{:?}: {shown}",
+        db.dialect
+    );
+    let length = match db.dialect.kind() {
+        DbKind::SqlServer => "datalength",
+        _ => "length",
+    };
+    let bytes = db.count(&format!("select {length}(b) from r41_typed"));
+    assert_eq!(bytes, "4", "{:?}", db.dialect);
+    db.ok("drop table r41_typed");
+}
+
+#[test]
+fn binary_values_typed_as_shown() {
+    let (mut db, path) = Live::sqlite("typed");
+    binary_typed_as_shown(
+        &mut db,
+        "create table r41_typed (id integer primary key, b blob)",
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "create table r41_typed (id int primary key, b varbinary(16))",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "create table r41_typed (id int primary key, b bytea)",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "create table r41_typed (id int primary key, b varbinary(16))",
+        ),
+    ];
+    for (env, kind, create) in servers {
+        if let Some(mut db) = Live::connect(env, kind) {
+            binary_typed_as_shown(&mut db, create);
+        }
+    }
+}
