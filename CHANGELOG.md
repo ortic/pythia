@@ -1027,6 +1027,14 @@ All notable changes to Pythia are documented here. The format follows
   open kept each one, as did a viewer closed by a filter, by Ctrl+Z or
   with its result, a photo's pixels taking tens of megabytes twice. The
   viewer now lets go of an image once it shows another value or closes.
+- Result editing: with *Auto-commit* on, an Apply whose connection is
+  lost part-way keeps the changes it made before applied (#338). Each
+  of them was committed as it ran, but all of them stayed pending on the
+  rows as they were fetched, and applying again reported "Conflict on
+  row 1: it was changed or deleted by another session". The result is
+  now fetched again, in a new session, with the changes from the one
+  that failed on waiting for Apply. In a transaction, which the lost
+  connection rolled back, all the changes still wait.
 
 ## [0.10.0] - 2026-10-30
 

@@ -2174,17 +2174,25 @@ impl SqlWindow {
                     effects.extend(self.run_next(cx));
                     return effects;
                 }
-                // A lost connection rolled the changes before it back: they
-                // all stay pending, on the rows as they were.
-                let applying = !error.is_connection_lost()
-                    && matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
+                let dml = matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
+                let lost = error.is_connection_lost();
+                let applying = dml && !lost;
                 if applying && let Some(apply) = &mut self.state.apply {
                     apply.failed = true;
                 }
+                // A lost connection rolled the changes before it back: they
+                // all stay pending, on the rows as they were. Without a
+                // transaction open after them, as in auto-commit, they were
+                // committed as they ran: they stay applied, and the result is
+                // fetched again, in a new session (#338).
+                let committed = match &self.state.apply {
+                    Some(apply) if dml && lost && !self.state.in_transaction => apply.applied.len(),
+                    _ => 0,
+                };
                 // The session skips those sent ahead.
                 let ahead = self.drop_ahead();
                 let dropped = ahead
-                    + if applying {
+                    + if applying || committed > 0 {
                         self.stop_applying()
                     } else {
                         std::mem::take(&mut self.state.queue).len()
@@ -2193,11 +2201,16 @@ impl SqlWindow {
                 if dropped > 0 {
                     self.info(format!("{dropped} remaining statement(s) skipped"));
                 }
-                if self.state.rollback_on_error && !applying {
+                if committed > 0 {
+                    self.info(format!(
+                        "Auto-commit committed the {committed} change(s) applied before it"
+                    ));
+                }
+                if self.state.rollback_on_error && !applying && committed == 0 {
                     self.info("Rolling back (WHENEVER SQLERROR EXIT ROLLBACK)");
                     effects.request(Target::Own, DbRequest::Rollback);
                 }
-                if applying {
+                if applying || committed > 0 {
                     effects.extend(self.run_next(cx));
                 }
             }
