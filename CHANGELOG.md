@@ -529,6 +529,16 @@ All notable changes to Pythia are documented here. The format follows
   `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` and `SUCCESSFUL` weren't
   known as reserved words: they are now, also in the SQL that result
   editing and the object editors write.
+- *Export tables* and *Export schema to folder* write each object into a
+  file of its own (#280). The file was the name in lowercase, so `FOO`,
+  `"Foo"` and `"foo"` shared one and only the last was left, `"A/B"`
+  went into a folder `a`, and `"A:B"` was no file name on Windows. A
+  name Oracle reads unquoted keeps its file (`foo.sql`); in others a `^`
+  marks each run of letters of the other case (`"Foo"` → `f^oo.sql`,
+  `"foo"` → `^foo.sql`), which keeps them apart also where `Foo.sql` and
+  `foo.sql` are one file, and a character a file name can't hold is
+  written as `%` and its hex (`"A/B"` → `a%2Fb.sql`). Comparing such a
+  file with the database finds its object again.
 
 ## [0.10.0] - 2026-10-30
 

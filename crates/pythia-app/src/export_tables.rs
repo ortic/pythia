@@ -514,7 +514,8 @@ pub fn export(
             return Err(DbError::new("stopped"));
         }
         *progress.current.lock().expect("current") = job.table.clone();
-        let base = job.table.to_lowercase();
+        // A file of its own for each table, as Export schema writes (#280).
+        let base = crate::object_files::file_stem(&job.table);
         if settings.include_ddl {
             let ddl =
                 crate::object_files::object_text(conn, &owner, &job.table, ObjectType::Table)?;
@@ -643,6 +644,85 @@ mod tests {
         assert_eq!(copies, 2);
         conn.execute("drop table r54_exp_words purge", &[]).unwrap();
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// Tables whose names differ only in case get files of their own, also
+    /// where the file system takes `Foo` and `foo` for one file, and so do
+    /// names with a `/` or a `:`: no sub-folder, nothing Windows refuses.
+    #[test]
+    fn every_table_has_files_of_its_own() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let names = [
+            "R54_EXP_FOO",
+            "R54_EXP_Foo",
+            "r54_exp_foo",
+            "R54_EXP_A/B",
+            "R54_EXP_A:B",
+        ];
+        let quoted = |name: &str| format!("\"{name}\"");
+        for name in names {
+            let _ = conn.execute(&format!("drop table {} purge", quoted(name)), &[]);
+            conn.execute(
+                &format!(
+                    "create table {} as select '{name}' as name from dual",
+                    quoted(name)
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        let folder = std::env::temp_dir().join(format!("pythia-r54-names-{}", std::process::id()));
+        let settings = Settings {
+            owner: String::new(),
+            folder: folder.clone(),
+            format: Format::Csv,
+            options: Options::default(),
+            include_ddl: true,
+        };
+        let jobs: Vec<Job> = names
+            .iter()
+            .map(|name| Job {
+                table: (*name).into(),
+                filter: String::new(),
+            })
+            .collect();
+        let exported = export(&conn, &settings, &jobs, &Progress::default());
+        let mut files: Vec<(String, String)> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    text,
+                )
+            })
+            .collect();
+        files.sort();
+        for name in names {
+            let _ = conn.execute(&format!("drop table {} purge", quoted(name)), &[]);
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(exported.map_err(|e| e.message), Ok(5), "{files:?}");
+        assert_eq!(files.len(), 10, "{files:?}");
+        let lowercase: std::collections::HashSet<String> =
+            files.iter().map(|(f, _)| f.to_lowercase()).collect();
+        assert_eq!(lowercase.len(), 10, "{files:?}");
+        for name in names {
+            let csv = format!("NAME\n{name}\n");
+            let data = files.iter().filter(|(_, text)| *text == csv).count();
+            let ddl = format!("CREATE TABLE {}", quoted(name));
+            let ddls = files.iter().filter(|(_, t)| t.contains(&ddl)).count();
+            assert_eq!((data, ddls), (1, 1), "{name}: {files:?}");
+        }
+        for (file, _) in &files {
+            assert!(
+                !file.contains(['<', '>', ':', '"', '/', '\\', '|', '?', '*']),
+                "{file}"
+            );
+        }
     }
 
     #[test]
