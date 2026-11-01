@@ -1035,6 +1035,36 @@ All notable changes to Pythia are documented here. The format follows
   now fetched again, in a new session, with the changes from the one
   that failed on waiting for Apply. In a transaction, which the lost
   connection rolled back, all the changes still wait.
+- Oracle: BINARY_DOUBLE and BINARY_FLOAT values are written as literals
+  of their type (#339): `1e300d`, `2.5f`, `binary_double_infinity`,
+  `binary_float_nan`. As NUMBERs, values beyond NUMBER's range failed in
+  INSERT statements and on *Apply* of a change with ORA-01426 (`1e300`)
+  or were written as 0 (`2e-300`), and the check of an infinity or NaN
+  fetched compared it as text and reported the row as changed by
+  another session.
+- Oracle: a fetched row's JSON or VECTOR can be changed in a result
+  (#340). *Apply* failed with ORA-40796 or ORA-00932: the UPDATE checked
+  the value fetched with DECODE, which takes neither. A JSON is now
+  checked with `json_equal`, which finds an object with its keys in
+  another order than Pythia shows them; a VECTOR, which SQL can't
+  compare, is left out of the check.
+- Oracle: a VECTOR's float elements keep their exponent (#341), as
+  BINARY_DOUBLE values do since #304, and so do a JSON's binary numbers:
+  `[1e30,0.1]` showed as `[1000000000000000000000000000000,0.1]`,
+  `1e300` as a 1 and 300 zeros. A sparse VECTOR shows as Oracle writes
+  it, `[6,[0,5],[2.5,1e-30]]`; it showed as `SparseVector {…}`, which
+  its INSERT statements wrote and Oracle rejected with ORA-51804.
+- Oracle: a JSON or VECTOR over 4000 bytes can be written (#342), as a
+  CLOB's text since #317: INSERT statements and result editing wrote it
+  as one literal, which holds no more (ORA-01704 from *Execute to file*,
+  *Export tables*, *Copy as* and *Export*, and on *Apply*). A literal of
+  parts now makes each part a CLOB, for CLOBs too: a text with many `&`,
+  such as a JSON of URLs, failed with ORA-01489.
+- Oracle: INSERT statements make each value's literal once (#343).
+  Since #314 every row's literals were made twice, once to see whether
+  the row needed a PL/SQL block, and each BLOB's hex was copied for it:
+  20,000 rows of 2000-byte BLOBs took 1.05 s in a debug build, now
+  78 ms.
 
 ## [0.10.0] - 2026-10-30
 

@@ -1634,8 +1634,9 @@ fn json(v: &JsonValue, out: &mut String) {
         JsonValue::Null => out.push_str("null"),
         JsonValue::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
         JsonValue::Number(n) => out.push_str(&n.to_string()),
-        JsonValue::BinaryDouble(f) => out.push_str(&f.to_string()),
-        JsonValue::BinaryFloat(f) => out.push_str(&f.to_string()),
+        // With an exponent where they are long, as a VECTOR's (#341).
+        JsonValue::BinaryDouble(f) => out.push_str(&crate::float_text(*f)),
+        JsonValue::BinaryFloat(f) => out.push_str(&crate::float_text(*f)),
         JsonValue::String(s) => json_string(s, out),
         JsonValue::Raw(b) | JsonValue::JsonId(b) => json_string(&hex(b), out),
         JsonValue::Timestamp(ts) => json_string(&timestamp(ts, TsKind::Plain, 9), out),
@@ -1685,15 +1686,32 @@ fn json_string(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// A vector as Oracle reads it back (#341): its elements, floats with an
+/// exponent where they are long (`1e30`, as BINARY_DOUBLE values since
+/// #304); a sparse one as `[dimensions,[indices],[elements]]`.
 fn vector(v: &Vector) -> String {
-    let list = |items: Vec<String>| format!("[{}]", items.join(","));
     match v {
-        Vector::Dense(VectorData::Float32(v)) => list(v.iter().map(f32::to_string).collect()),
-        Vector::Dense(VectorData::Float64(v)) => list(v.iter().map(f64::to_string).collect()),
-        Vector::Dense(VectorData::Int8(v)) => list(v.iter().map(i8::to_string).collect()),
-        Vector::Dense(VectorData::Binary(v)) => list(v.iter().map(u8::to_string).collect()),
-        Vector::Sparse(s) => format!("{s:?}"),
+        Vector::Dense(data) => elements(data),
+        Vector::Sparse(s) => {
+            let indices: Vec<String> = s.indices().iter().map(usize::to_string).collect();
+            format!(
+                "[{},[{}],{}]",
+                s.num_dimensions(),
+                indices.join(","),
+                elements(s.values())
+            )
+        }
     }
+}
+
+fn elements(data: &VectorData) -> String {
+    let items: Vec<String> = match data {
+        VectorData::Float32(v) => v.iter().map(|&x| crate::float_text(x)).collect(),
+        VectorData::Float64(v) => v.iter().map(|&x| crate::float_text(x)).collect(),
+        VectorData::Int8(v) => v.iter().map(i8::to_string).collect(),
+        VectorData::Binary(v) => v.iter().map(u8::to_string).collect(),
+    };
+    format!("[{}]", items.join(","))
 }
 
 #[cfg(test)]

@@ -759,8 +759,8 @@ fn written(
 }
 
 /// The parts of 1000 characters of a CLOB's literal (#317) that a value
-/// may have before it is bound: Oracle takes about 250 of them, beyond
-/// which the literal fails with ORA-01489.
+/// may have before it is bound: Oracle parses many slowly, and failed
+/// past about 250 with ORA-01489 until each part was a CLOB (#342).
 const CLOB_LITERAL_PARTS: usize = 200;
 
 /// A value typed into an Oracle cell that no literal holds, bound instead
@@ -768,7 +768,10 @@ const CLOB_LITERAL_PARTS: usize = 200;
 /// LONG RAW, text past 4000 bytes in a LONG (and in a CLOB or NCLOB,
 /// which the pure-Rust driver types LONG), and a CLOB's or NCLOB's text
 /// past [`CLOB_LITERAL_PARTS`]. `None` for any other, and for a binary
-/// value that isn't hex, whose literal fails as it did.
+/// value that isn't hex, whose literal fails as it did. A JSON's or
+/// VECTOR's text stays its literal of parts, of any length (#342): bound
+/// as a LONG, it fails in a VECTOR (ORA-01461), and in a JSON next to
+/// another LONG (ORA-40441).
 fn oracle_bind(col: &Column, value: &str) -> Option<Bind> {
     let t = col.type_name.to_ascii_uppercase();
     if t.starts_with("RAW") || t == "BLOB" || t == "LONG RAW" {
@@ -1021,11 +1024,15 @@ fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
 /// or BLOB is compared with `dbms_lob.compare` (an empty one by its
 /// length, as `''` is NULL), a LONG or LONG RAW is left out of the check.
 /// The pure-Rust driver types LOB columns LONG and LONG RAW, so they are
-/// left out there too.
+/// left out there too. Nor does DECODE take a JSON (ORA-40796) or a VECTOR
+/// (ORA-00932) (#340): a JSON is compared as JSON with `json_equal`, which
+/// takes the keys of an object in any order (Pythia shows them sorted); a
+/// VECTOR, which SQL doesn't compare, is left out.
 fn oracle_same(name: &str, col: &Column, value: Option<&str>, lit: &str) -> Option<String> {
     Some(match (col.type_name.as_str(), value) {
-        ("LONG" | "LONG RAW", _) => return None,
-        ("CLOB" | "NCLOB" | "BLOB", None) => format!("{name} is null"),
+        ("LONG" | "LONG RAW" | "VECTOR", _) => return None,
+        ("JSON", Some(_)) => format!("json_equal({name}, {lit})"),
+        ("CLOB" | "NCLOB" | "BLOB" | "JSON", None) => format!("{name} is null"),
         ("CLOB" | "NCLOB" | "BLOB", Some("")) => format!("dbms_lob.getlength({name}) = 0"),
         ("BLOB", Some(v)) if v.len() > 2 * HEX_LITERAL_BYTES => long_blob_same(name, v)?,
         ("CLOB" | "NCLOB" | "BLOB", Some(_)) => format!("dbms_lob.compare({name}, {lit}) = 0"),

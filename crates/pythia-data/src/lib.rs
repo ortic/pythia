@@ -7,6 +7,7 @@
 //! write values as literals of the database they came from (`TO_DATE` on
 //! Oracle, `X'…'` binary on MySQL, …).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::Write;
@@ -658,11 +659,37 @@ fn is_number(col: &Column, v: &str) -> bool {
     col.numeric && v.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
+/// A BINARY_DOUBLE's or BINARY_FLOAT's value as a literal of its type
+/// (#339): `1e300d`, `2.5f`, `binary_double_infinity`,
+/// `-binary_float_infinity`, `binary_double_nan`. As a NUMBER, 1e300
+/// overflows (ORA-01426) and 2e-300 is 0; as text, `'inf'` goes in but
+/// compares with `Inf` as text. `None` for other columns and for text
+/// that is no number.
+fn binary_float(col: &Column, v: &str) -> Option<String> {
+    let (suffix, name) = match col.type_name.as_str() {
+        "BINARY_DOUBLE" => ('d', "binary_double"),
+        "BINARY_FLOAT" => ('f', "binary_float"),
+        _ => return None,
+    };
+    let number = v.parse::<f64>().ok()?;
+    Some(if number.is_nan() {
+        format!("{name}_nan")
+    } else if number.is_infinite() && !v.bytes().any(|b| b.is_ascii_digit()) {
+        let sign = if number < 0.0 { "-" } else { "" };
+        format!("{sign}{name}_infinity")
+    } else {
+        format!("{v}{suffix}")
+    })
+}
+
 /// Renders a value as a SQL literal for `col` (Oracle's SQL).
 pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
+    if let Some(binary) = binary_float(col, v) {
+        return binary;
+    }
     if is_number(col, v) {
         return v.to_owned();
     }
@@ -685,17 +712,16 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             None => format!("hextoraw({quoted})"),
         },
         // A literal holds 4000 bytes: a CLOB's longer text is a CLOB of
-        // parts (#317). Oracle takes about 250 of them (ORA-01489 beyond),
-        // and parses many slowly: INSERT statements append them in a
+        // parts (#317), each a CLOB of its own: Oracle joins the plain
+        // literals after a CLOB into one VARCHAR2 first, which with many
+        // `&`, each a literal apart, failed with ORA-01489 (#342). Oracle
+        // parses many parts slowly: INSERT statements append them in a
         // PL/SQL block instead (see `oracle_block`).
-        Kind::Text if long_text(col, v) => {
-            let mut parts = text_parts(v).into_iter().map(text_literal);
-            let first = format!("to_clob({})", parts.next().unwrap_or_default());
-            std::iter::once(first)
-                .chain(parts)
-                .collect::<Vec<_>>()
-                .join(" || ")
-        }
+        Kind::Text if long_text(col, v) => text_parts(v)
+            .into_iter()
+            .map(|part| format!("to_clob({})", text_literal(part)))
+            .collect::<Vec<_>>()
+            .join(" || "),
         Kind::Text => text_literal(v),
     }
 }
@@ -719,9 +745,13 @@ const TEXT_LITERAL_BYTES: usize = 4000;
 const TEXT_PART_UNITS: usize = 1000;
 
 /// Whether `v` is a CLOB's, NCLOB's or LONG's text too long for one
-/// literal (#317); the pure-Rust driver types CLOB columns LONG.
+/// literal (#317); the pure-Rust driver types CLOB columns LONG. A JSON's
+/// or VECTOR's too, which Oracle reads from a CLOB (#342).
 fn long_text(col: &Column, v: &str) -> bool {
-    matches!(col.type_name.as_str(), "CLOB" | "NCLOB" | "LONG") && v.len() > TEXT_LITERAL_BYTES
+    matches!(
+        col.type_name.as_str(),
+        "CLOB" | "NCLOB" | "LONG" | "JSON" | "VECTOR"
+    ) && v.len() > TEXT_LITERAL_BYTES
 }
 
 /// `text` in parts of at most [`TEXT_PART_UNITS`] UTF-16 code units.
@@ -1052,12 +1082,22 @@ const BLOCK_CHUNK_BYTES: usize = 1000;
 /// The hex digits of a BLOB's value too long for one `hextoraw` (#314), as
 /// shown or typed as `0x…`; a LONG RAW's too, as the pure-Rust driver
 /// types BLOB columns so. A RAW holds 2000 bytes, unless MAX_STRING_SIZE
-/// is EXTENDED, where a literal takes 32767.
-fn long_binary(col: &Column, value: &str) -> Option<String> {
-    if !matches!(col.type_name.as_str(), "BLOB" | "LONG RAW") {
+/// is EXTENDED, where a literal takes 32767. Its hex is never longer than
+/// the value, so a shorter one isn't looked at, and the value's own digits
+/// aren't copied (#343).
+fn long_binary<'a>(col: &Column, value: &'a str) -> Option<Cow<'a, str>> {
+    if !matches!(col.type_name.as_str(), "BLOB" | "LONG RAW")
+        || value.len() <= 2 * HEX_LITERAL_BYTES
+    {
         return None;
     }
-    let hex = typed_hex(value).unwrap_or_else(|| value.to_owned());
+    // Typed as `0x…`, an odd number of digits with a 0 in front, as
+    // `typed_hex` reads them.
+    let hex = match value.strip_prefix("0x") {
+        Some(digits) if digits.len() % 2 == 1 => Cow::Owned(format!("0{digits}")),
+        Some(digits) => Cow::Borrowed(digits),
+        None => Cow::Borrowed(value),
+    };
     let digits = hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
     (digits && hex.len() > 2 * HEX_LITERAL_BYTES).then_some(hex)
 }
@@ -1068,8 +1108,16 @@ fn long_binary(col: &Column, value: &str) -> Option<String> {
 /// SQL makes a BLOB over 2000 bytes from literals: `to_blob(…) ||
 /// to_blob(…)` is an empty one, `utl_raw.concat` stops at 2000 bytes; a
 /// CLOB's parts compile here in a fraction of the time `||` takes, and
-/// as many as there are. `None` for a row without such a value.
+/// as many as there are. `None` for a row without such a value, which is
+/// left to its INSERT before any literal is made (#343).
 fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> {
+    let long = |(col, cell): (&Column, &Cell)| {
+        cell.as_deref()
+            .is_some_and(|v| long_binary(col, v).is_some() || long_text(col, v))
+    };
+    if !columns.iter().zip(row).any(long) {
+        return None;
+    }
     let mut declare = String::new();
     let mut body = String::new();
     let mut values = Vec::with_capacity(columns.len());
@@ -1090,7 +1138,8 @@ fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> 
                 ));
             }
         } else if let Some(text) = value.filter(|v| long_text(col, v)) {
-            // An NCLOB takes the CLOB (#317).
+            // An NCLOB takes the CLOB (#317), and so do a JSON and a
+            // VECTOR (#342).
             declare.push_str(&format!("  {var} clob;\n"));
             body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
             for part in text_parts(text) {
@@ -1105,9 +1154,6 @@ fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> 
             continue;
         }
         values.push(var);
-    }
-    if declare.is_empty() {
-        return None;
     }
     Some(format!(
         "declare\n{declare}begin\n{body}  {head}{});\nend;\n/\n",
@@ -1195,7 +1241,48 @@ fn html(columns: &[Column], rows: &[Vec<Cell>], out: &mut dyn Write) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell as Counter;
+
     use super::*;
+
+    /// The bytes each thread allocates, for the tests of what a write
+    /// copies.
+    struct Counting;
+
+    thread_local! {
+        static ALLOCATED: Counter<usize> = const { Counter::new(0) };
+    }
+
+    // SAFETY: System's allocator, with the bytes counted.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|a| a.set(a.get() + layout.size()));
+            // SAFETY: as the caller's.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: as the caller's.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|a| a.set(a.get() + size));
+            // SAFETY: as the caller's.
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// The bytes `f` allocates on this thread.
+    fn allocated(f: impl FnOnce()) -> usize {
+        let before = ALLOCATED.with(Counter::get);
+        f();
+        ALLOCATED.with(Counter::get) - before
+    }
 
     fn sample() -> (Vec<Column>, Vec<Vec<Cell>>) {
         let col = |name: &str, ty: &str, numeric| Column {
@@ -1483,9 +1570,54 @@ mod tests {
         assert_eq!(ms(&col("float", true), Some(&tiny)), "2.5e-41");
         assert_eq!(ms(&col("float", true), Some("0.1")), "0.1");
         // Oracle too: a name isn't a number.
+        assert_eq!(sql_literal(&col("NUMBER", true), Some("Inf")), "'Inf'");
+    }
+
+    /// BINARY_DOUBLE and BINARY_FLOAT values are literals of their type
+    /// (#339): as NUMBERs, 1e300 overflowed (ORA-01426), 2e-300 was 0, and
+    /// 'inf' and 'NaN' compared as text with Inf and Nan.
+    #[test]
+    fn oracle_binary_floats_typed() {
+        let col = |t: &str| Column {
+            name: "C".into(),
+            type_name: t.into(),
+            numeric: true,
+        };
+        let double = |v| sql_literal(&col("BINARY_DOUBLE"), Some(v));
+        let float = |v| sql_literal(&col("BINARY_FLOAT"), Some(v));
+        assert_eq!(double("1e300"), "1e300d");
+        assert_eq!(double("-2e-300"), "-2e-300d");
+        assert_eq!(double("0.1"), "0.1d");
+        assert_eq!(double("100"), "100d");
+        assert_eq!(double("inf"), "binary_double_infinity");
+        assert_eq!(double("-inf"), "-binary_double_infinity");
+        assert_eq!(double("NaN"), "binary_double_nan");
+        assert_eq!(float("3.4028235e38"), "3.4028235e38f");
+        assert_eq!(float("1e-40"), "1e-40f");
+        assert_eq!(float("inf"), "binary_float_infinity");
+        assert_eq!(float("-inf"), "-binary_float_infinity");
+        assert_eq!(float("NaN"), "binary_float_nan");
+        // Typed as Oracle writes them, or in a form it reads.
+        assert_eq!(double("-Inf"), "-binary_double_infinity");
+        assert_eq!(float("Nan"), "binary_float_nan");
+        assert_eq!(double(".5E3"), ".5E3d");
+        // Anything else as text, for Oracle to read or reject.
+        assert_eq!(double(" 1.5"), "' 1.5'");
+        assert_eq!(double("1,5"), "'1,5'");
+        assert_eq!(sql_literal(&col("BINARY_DOUBLE"), None), "NULL");
+        // In INSERT statements too.
+        let columns = [col("BINARY_DOUBLE"), col("BINARY_FLOAT")];
+        let rows = vec![vec![Some("1e300".into()), Some("NaN".into())]];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text =
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap();
         assert_eq!(
-            sql_literal(&col("BINARY_DOUBLE", true), Some("Inf")),
-            "'Inf'"
+            text,
+            "insert into t (c, c) values (1e300d, binary_float_nan);\n"
         );
     }
 
@@ -1866,6 +1998,38 @@ mod tests {
         assert_eq!(text, expected);
     }
 
+    /// An Oracle INSERT export looks at a row's values without copying
+    /// them, and leaves a row without a long one to its INSERT before
+    /// making any literal (#343): `oracle_block` copied each BLOB's hex to
+    /// see whether it was long, and made every value's literal, which the
+    /// INSERT then made again.
+    #[test]
+    fn oracle_rows_without_long_values_cost_nothing() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let columns = [col("B", "BLOB"), col("L", "LONG RAW"), col("C", "CLOB")];
+        let row = vec![
+            Some("AB".repeat(2000)),
+            Some(format!("0x{}", "CD".repeat(1999))),
+            Some("x".repeat(4000)),
+        ];
+        let head = "insert into t (b, l, c) values (";
+        let bytes = allocated(|| assert_eq!(oracle_block(head, &columns, &row), None));
+        assert_eq!(bytes, 0);
+        // A long value's hex isn't copied either, unless it needs a 0.
+        let long = "AB".repeat(2001);
+        let bytes = allocated(|| assert!(long_binary(&columns[0], &long).is_some()));
+        assert_eq!(bytes, 0);
+        let typed = format!("0x{}", "A".repeat(4001));
+        assert_eq!(
+            long_binary(&columns[1], &typed).as_deref(),
+            Some(&*format!("0{}", &typed[2..]))
+        );
+    }
+
     /// A CLOB's text over the 4000 bytes a literal holds is a CLOB of
     /// parts of at most 1000 UTF-16 code units, a pair of surrogates kept
     /// whole and each `&` apart (#317); INSERT statements append the parts
@@ -1882,7 +2046,11 @@ mod tests {
         let clob = col("C", "CLOB");
         assert_eq!(
             sql_literal(&clob, Some(&long)),
-            format!("to_clob('{0}') || '{0}' || '{0}' || '{0}' || 'x'", x(1000))
+            format!(
+                "to_clob('{0}') || to_clob('{0}') || to_clob('{0}') || to_clob('{0}') || \
+                 to_clob('x')",
+                x(1000)
+            )
         );
         for ty in ["NCLOB", "LONG"] {
             assert!(sql_literal(&col("C", ty), Some(&long)).starts_with("to_clob('x"));
@@ -1929,6 +2097,50 @@ mod tests {
             x(7)
         );
         assert_eq!(text, expected);
+    }
+
+    /// A JSON's and a VECTOR's text over 4000 bytes is written as a
+    /// CLOB's (#342), which Oracle reads into either; a shorter one stays
+    /// one literal.
+    #[test]
+    fn oracle_long_json_and_vectors() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let (json, vector) = (col("J", "JSON"), col("V", "VECTOR"));
+        let long_json = format!(r#"["{}"]"#, "x".repeat(4000));
+        let long_vector = format!("[{}]", ["0.5"; 1000].join(","));
+        assert!(sql_literal(&json, Some(&long_json)).starts_with(r#"to_clob('["xxx"#));
+        assert!(sql_literal(&vector, Some(&long_vector)).starts_with("to_clob('[0.5,0.5"));
+        assert_eq!(sql_literal(&vector, Some("[1,2]")), "'[1,2]'");
+        // Each part a CLOB of its own, a text with many `&` too, whose
+        // literals in between Oracle joined into one VARCHAR2 (ORA-01489).
+        let amps = format!(r#"["{}"]"#, "a&".repeat(3000));
+        let literal = sql_literal(&json, Some(&amps));
+        assert_eq!(literal.matches("to_clob(").count(), 7);
+        assert!(literal.starts_with(r#"to_clob('["a' || chr(38) || 'a'"#));
+        assert!(literal.contains(") || to_clob("));
+        assert!(literal.ends_with(r#"chr(38) || '"]')"#), "{literal}");
+        let rows = vec![vec![Some(long_json), Some(long_vector)]];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text = String::from_utf8(
+            export_to_vec(Format::Insert, &[json, vector], &rows, &options).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            text.starts_with("declare\n  pythia$1 clob;\n  pythia$2 clob;\nbegin\n"),
+            "{}",
+            &text[..100]
+        );
+        assert!(
+            text.ends_with("  insert into t (j, v) values (pythia$1, pythia$2);\nend;\n/\n"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -420,4 +420,220 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The rows of `sql` written to a file as INSERTs and run back into
+    /// `copy` instead of `table`: how many statements there were.
+    fn insert_into_copy(conn: &Connection, sql: &str, table: &str, copy: &str) -> usize {
+        let path = std::env::temp_dir().join(format!("pythia-{copy}-{}.sql", std::process::id()));
+        run(conn, sql, &path, &AtomicU64::new(0)).unwrap();
+        let script = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let statements = pythia_plsql::split_statements(&script);
+        for statement in &statements {
+            let sql = statement.text(&script).replacen(
+                &format!("insert into {table} "),
+                &format!("insert into {copy} "),
+                1,
+            );
+            conn.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        statements.len()
+    }
+
+    /// The rows of `sql` as the session shows them.
+    fn texts(conn: &Connection, sql: &str) -> Vec<Vec<Cell>> {
+        let mut rows = Vec::new();
+        pythia_db::stream_query(conn, sql, 100, |_, batch| {
+            rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        rows
+    }
+
+    /// The INSERTs of BINARY_DOUBLE and BINARY_FLOAT values beyond
+    /// NUMBER's range, the infinities and NaN (#339), run back into a copy
+    /// of their table, are the same values: 1e300 failed with ORA-01426,
+    /// -2e-300 was written as 0.
+    #[test]
+    fn writes_binary_floats() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_bf", "r76_bf_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, d binary_double, f binary_float)"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        for values in [
+            "1, 1e300d, 3.4028235e38f",
+            "2, -2e-300d, 1e-40f",
+            "3, binary_double_infinity, binary_float_infinity",
+            "4, -binary_double_infinity, -binary_float_infinity",
+            "5, binary_double_nan, binary_float_nan",
+            "6, 0.1d, 0.1f",
+            "7, null, null",
+        ] {
+            conn.execute(&format!("insert into r76_bf values ({values})"), &[])
+                .unwrap();
+        }
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_bf order by id",
+            "r76_bf",
+            "r76_bf_copy",
+        );
+        assert_eq!(n, 7);
+        let rows = texts(&conn, "select * from r76_bf order by id");
+        assert_eq!(rows[0][1].as_deref(), Some("1e300"));
+        assert_eq!(texts(&conn, "select * from r76_bf_copy order by id"), rows);
+        for table in ["r76_bf", "r76_bf_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
+
+    /// `n` random finite, normal doubles and reals of any size (xorshift:
+    /// the same each run), as Rust writes them shortest, with an exponent.
+    fn random_floats(n: usize) -> Vec<(String, String)> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values = Vec::new();
+        while values.len() < n {
+            let (d, r) = (f64::from_bits(next()), f32::from_bits(next() as u32));
+            if d.is_normal() && r.is_normal() {
+                values.push((format!("{d:e}"), format!("{r:e}")));
+            }
+        }
+        values
+    }
+
+    /// The INSERTs of VECTORs (#341), run back into a copy of their table,
+    /// are the same vectors: FLOAT32 and FLOAT64 elements of any size and
+    /// sparse vectors, which were written as `SparseVector {…}`
+    /// (ORA-51804).
+    #[test]
+    fn writes_vectors() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_vec", "r76_vec_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, f vector(6, float32), \
+                       d vector(6, float64), s vector(6, float64, sparse), \
+                       i vector(2, int8), b vector(16, binary))"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        let floats = random_floats(6 * 20);
+        for (id, row) in floats.chunks(6).enumerate() {
+            let (d, f): (Vec<String>, Vec<String>) = row.iter().cloned().unzip();
+            conn.execute(
+                &format!(
+                    "insert into r76_vec values ({id}, '[{}]', '[{}]', '[6,[0,5],[{},{}]]', \
+                       '[-128,127]', '[255,1]')",
+                    f.join(","),
+                    d.join(","),
+                    d[0],
+                    d[1]
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "insert into r76_vec values (100, '[1e30,1e-30,0.1,100,-1.5,3.4028235e38]', \
+               '[1e300,-1e-300,0.1,100,-1.5,1.7976931348623157e308]', '[6,[2],[1e-300]]', \
+               null, null)",
+            &[],
+        )
+        .unwrap();
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_vec order by id",
+            "r76_vec",
+            "r76_vec_copy",
+        );
+        assert_eq!(n, 21);
+        let mut rows = texts(&conn, "select * from r76_vec order by id");
+        let mut copy = texts(&conn, "select * from r76_vec_copy order by id");
+        // Oracle reads the text of a dense FLOAT64 vector a unit in the
+        // last place off for about half of all doubles, its own text
+        // too: those elements are only as close as that.
+        let elements = |row: &mut Vec<Cell>| -> Vec<f64> {
+            let text = row[2].take().unwrap();
+            let list = text.trim_start_matches('[').trim_end_matches(']');
+            list.split(',').map(|x| x.parse().unwrap()).collect()
+        };
+        for (row, copied) in rows.iter_mut().zip(&mut copy) {
+            for (a, b) in elements(row).into_iter().zip(elements(copied)) {
+                assert!((a - b).abs() <= a.abs() * 1e-15, "{a} {b}");
+            }
+        }
+        assert_eq!(copy, rows);
+        for table in ["r76_vec", "r76_vec_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
+
+    /// The INSERTs of a JSON and a VECTOR over the 4000 bytes a literal
+    /// holds (#342), run back into a copy of their table, are the same
+    /// values; they failed with ORA-01704.
+    #[test]
+    fn writes_long_json_and_vectors() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_lj", "r76_lj_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, j json, v vector(*, float32))"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        for sql in [
+            "insert into r76_lj (id, j, v) \
+               select 1, json_arrayagg(json_object('k' value level, 's' value 'it''s & \u{e9}') \
+                        returning json), \
+                      to_vector(json_arrayagg(level / 7 returning clob), *, float32) \
+                 from dual connect by level <= 1000",
+            "insert into r76_lj values (2, '{\"a\":[1,2]}', '[1,2]')",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        let rows = texts(&conn, "select * from r76_lj order by id");
+        assert!(rows[0][1].as_ref().unwrap().len() > 8000);
+        assert!(rows[0][2].as_ref().unwrap().len() > 4000);
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_lj order by id",
+            "r76_lj",
+            "r76_lj_copy",
+        );
+        assert_eq!(n, 2);
+        assert_eq!(texts(&conn, "select * from r76_lj_copy order by id"), rows);
+        for table in ["r76_lj", "r76_lj_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }
