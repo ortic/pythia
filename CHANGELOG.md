@@ -286,6 +286,11 @@ All notable changes to Pythia are documented here. The format follows
   `"guidelines-division"` became `insert into guidelines-division`, a
   syntax error, and `"Foo"` became `foo`, another table. Plain names
   stay in lowercase.
+- MySQL: names that are MySQL's reserved words, such as `rank`,
+  `system`, `groups`, `change` or `read`, are written in backticks
+  (#233). Only Oracle's keywords were, so INSERT exports of a table with
+  such a column failed with ERROR 1064 when they ran, as did editing
+  that column in a result, and completion inserted the name bare.
 
 ## [0.10.0] - 2026-10-30
 
