@@ -2485,14 +2485,18 @@ impl SqlWindow {
             .is_some_and(|p| std::mem::take(&mut p.focus));
         let mut enter = false;
         // One row per variable: name, value, NULL. Names take what the
-        // longest needs, up to 45% of the panel.
+        // longest needs, up to 45% of the panel. Each column is as wide as
+        // what it holds, its header and the NULL box too: a row wider than
+        // the panel widened it, frame after frame (#197).
         let gap = ui.spacing().item_spacing.x;
         let height = ui.spacing().interact_size.y;
-        let null_width = text_width(ui, RichText::new("NULL").small());
+        let null_width = text_width(ui, RichText::new("NULL").small())
+            .max(ui.spacing().icon_width)
+            .max(height);
         let name_width = variables
             .iter()
             .map(|v| text_width(ui, RichText::new(v.label()).monospace()))
-            .fold(0.0, f32::max)
+            .fold(text_width(ui, RichText::new("Name").small()), f32::max)
             .min(ui.available_width() * 0.45);
         let value_width = (ui.available_width() - name_width - null_width - 2.0 * gap).max(40.0);
         let cell = |ui: &mut Ui, width: f32, add: &mut dyn FnMut(&mut Ui)| {
@@ -2512,7 +2516,9 @@ impl SqlWindow {
             cell(ui, value_width, &mut |ui| {
                 ui.label(RichText::new("Value").small().weak());
             });
-            ui.label(RichText::new("NULL").small().weak());
+            cell(ui, null_width, &mut |ui| {
+                ui.label(RichText::new("NULL").small().weak());
+            });
         });
         egui::ScrollArea::vertical()
             .auto_shrink(false)
@@ -2547,11 +2553,14 @@ impl SqlWindow {
                                 if r.changed() {
                                     self.bind_values.insert(key.clone(), Some(text.clone()));
                                 }
-                                if ui
-                                    .checkbox(&mut is_null, "")
-                                    .on_hover_text("NULL")
-                                    .changed()
-                                {
+                                let mut null_changed = false;
+                                cell(ui, null_width, &mut |ui| {
+                                    null_changed = ui
+                                        .checkbox(&mut is_null, "")
+                                        .on_hover_text("NULL")
+                                        .changed();
+                                });
+                                if null_changed {
                                     self.bind_values.insert(key, (!is_null).then_some(text));
                                 }
                                 r

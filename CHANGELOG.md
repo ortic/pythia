@@ -112,6 +112,10 @@ All notable changes to Pythia are documented here. The format follows
   what changed. The open windows are the first Pythia's; one started
   while it runs keeps its own as long as it runs. Two saves at the same
   moment no longer share a temporary file, where one of them failed.
+- The Variables panel of a SQL window no longer widens by itself
+  (#197). With a bind variable such as `:x` it grew on every frame, at
+  each caret blink or mouse move, until the editor was gone: its header
+  and NULL boxes were wider than the columns it laid out.
 
 ## [0.10.0] - 2026-10-30
 

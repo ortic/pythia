@@ -1531,6 +1531,42 @@ fn debugger_session() {
     wait_until(&mut h, "finish", |app| !app.test_debug_running());
 }
 
+/// The Variables panel keeps its width (#197): its header and NULL boxes
+/// were wider than the widths it laid out, the panel took the extra width,
+/// and the next frame laid out from that, until the editor was gone.
+#[test]
+fn variables_panel_keeps_its_width() {
+    for (text, scale) in [
+        ("select :x from dual", 1.0),
+        ("select :x from dual", 1.25),
+        (
+            "select :a_rather_long_bind_name, &some_substitution from dual",
+            1.5,
+        ),
+    ] {
+        let mut h = headless_harness();
+        h.ctx.set_pixels_per_point(scale);
+        h.run_steps(2);
+        h.get_by_label("New SQL").click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(3);
+        let first = h.get_by_label("Value").rect().left();
+        for i in 0..60 {
+            h.event(egui::Event::PointerMoved(egui::pos2(
+                400.0 + i as f32,
+                300.0,
+            )));
+            h.run_steps(1);
+        }
+        let last = h.get_by_label("Value").rect().left();
+        assert!(
+            (first - last).abs() < 1.0,
+            "{text} at {scale}: {first} → {last}"
+        );
+    }
+}
+
 /// *New SQL* puts the keyboard focus into the new window's editor: typing
 /// right away goes there, from the toolbar button and from Ctrl+N (#157).
 #[test]
