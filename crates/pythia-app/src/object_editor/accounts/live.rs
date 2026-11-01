@@ -64,7 +64,7 @@ impl Live {
                 return event;
             }
             self.wake
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(Duration::from_secs(60))
                 .expect("timed out");
         }
     }

@@ -1,4 +1,5 @@
-//! Shared setup: two differing schemas PYTHIA_CMP_A (source) and PYTHIA_CMP_B (target).
+//! Shared setup: two differing schemas PYTHIA_CMP_A (source) and PYTHIA_CMP_B (target),
+//! or a checkout's own.
 #![allow(dead_code)]
 
 use pythia_db::oracle::Connection;
@@ -103,8 +104,28 @@ insert into dept values (40, 'Ops', null);
 commit;
 ";
 
+/// The schemas the screenshots show.
+pub const SCHEMAS: [&str; 2] = ["PYTHIA_CMP_A", "PYTHIA_CMP_B"];
+
+/// A source and a target schema of this checkout's own (PYTHIA_CMP_A_5F3A):
+/// runs from two checkouts at once that don't share the lock on the test
+/// databases (#100), as with a temp directory of their own or from another
+/// system, then don't drop each other's, and a checkout's next run drops
+/// what its last one left.
+pub fn own_schemas() -> [String; 2] {
+    let checkout = env!("CARGO_MANIFEST_DIR")
+        .bytes()
+        .fold(0u32, |hash, b| hash.wrapping_mul(31).wrapping_add(b.into()));
+    SCHEMAS.map(|schema| format!("{schema}_{:04X}", checkout & 0xffff))
+}
+
 pub fn setup(conn: &Connection) {
-    for schema in ["PYTHIA_CMP_A", "PYTHIA_CMP_B"] {
+    setup_schemas(conn, SCHEMAS);
+}
+
+/// Makes `source` and `target` afresh, with their objects.
+pub fn setup_schemas(conn: &Connection, [source, target]: [&str; 2]) {
+    for schema in [source, target] {
         try_run(conn, &format!("drop user {schema} cascade"));
         run(
             conn,
@@ -114,16 +135,26 @@ pub fn setup(conn: &Connection) {
             ),
         );
     }
-    run(conn, "alter session set current_schema = pythia_cmp_a;");
+    run(
+        conn,
+        &format!("alter session set current_schema = {source};"),
+    );
     run(conn, SOURCE);
-    run(conn, "alter session set current_schema = pythia_cmp_b;");
+    run(
+        conn,
+        &format!("alter session set current_schema = {target};"),
+    );
     run(conn, TARGET);
     run(conn, "alter session set current_schema = system;");
 }
 
 pub fn teardown(conn: &Connection) {
+    teardown_schemas(conn, SCHEMAS);
+}
+
+pub fn teardown_schemas(conn: &Connection, schemas: [&str; 2]) {
     try_run(conn, "alter session set current_schema = system");
-    for schema in ["PYTHIA_CMP_A", "PYTHIA_CMP_B"] {
+    for schema in schemas {
         try_run(conn, &format!("drop user {schema} cascade"));
     }
 }

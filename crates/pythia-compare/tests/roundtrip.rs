@@ -1,13 +1,14 @@
 //! Compare → apply sync script → re-compare against a real database.
 //!
 //! Skipped unless `PYTHIA_TEST_DB_DBA=system/password@connect_string` is set
-//! (a DBA user that may create and drop the PYTHIA_CMP_A / PYTHIA_CMP_B schemas).
+//! (a DBA user that may create and drop the PYTHIA_CMP_A / PYTHIA_CMP_B schemas, here
+//! with the checkout's tag).
 
 use pythia_compare::data::{self, DataOptions, DataSource};
 use pythia_compare::schema::{self, Options, Status};
 mod common;
 
-use common::{connect, run, setup, teardown};
+use common::{connect, own_schemas, run, setup_schemas, teardown_schemas};
 
 fn describe(diff: &schema::SchemaDiff) -> String {
     diff.objects
@@ -33,14 +34,16 @@ fn schema_and_data_roundtrip() {
         eprintln!("PYTHIA_TEST_DB_DBA not set, skipping");
         return;
     };
-    setup(&conn);
+    let [a, b] = own_schemas();
+    let schemas = [a.as_str(), b.as_str()];
+    setup_schemas(&conn, schemas);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let options = Options {
             include_drops: true,
             ..Options::default()
         };
-        let source = schema::collect(&conn, "PYTHIA_CMP_A", &options).expect("collect source");
-        let target = schema::collect(&conn, "PYTHIA_CMP_B", &options).expect("collect target");
+        let source = schema::collect(&conn, &a, &options).expect("collect source");
+        let target = schema::collect(&conn, &b, &options).expect("collect target");
         let diff = schema::compare(&source, &target, &options);
         assert!(diff.errors.is_empty(), "{:?}", diff.errors);
 
@@ -61,13 +64,12 @@ fn schema_and_data_roundtrip() {
         assert_eq!(status("TRG"), Some(Status::OnlyInSource));
         assert_eq!(status("SYN"), Some(Status::OnlyInSource));
 
-        let script = diff.script("PYTHIA_CMP_A → PYTHIA_CMP_B");
+        let script = diff.script(&format!("{a} → {b}"));
         eprintln!("{script}");
         run(&conn, &script);
         run(&conn, "alter session set current_schema = system;");
 
-        let target =
-            schema::collect(&conn, "PYTHIA_CMP_B", &options).expect("collect target again");
+        let target = schema::collect(&conn, &b, &options).expect("collect target again");
         let again = schema::compare(&source, &target, &options);
         assert!(
             again.is_equal(),
@@ -77,11 +79,11 @@ fn schema_and_data_roundtrip() {
 
         // Data: DEPT rows differ (changed, missing, extra).
         let src = DataSource::Table {
-            schema: "PYTHIA_CMP_A".into(),
+            schema: a.clone(),
             table: "DEPT".into(),
         };
         let tgt = DataSource::Table {
-            schema: "PYTHIA_CMP_B".into(),
+            schema: b.clone(),
             table: "DEPT".into(),
         };
         let options = DataOptions {
@@ -108,7 +110,7 @@ fn schema_and_data_roundtrip() {
         assert!(d.is_equal(), "{d:?}");
         assert_eq!(d.equal, 3);
     }));
-    teardown(&conn);
+    teardown_schemas(&conn, schemas);
     if let Err(e) = result {
         std::panic::resume_unwind(e);
     }

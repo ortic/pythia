@@ -61,6 +61,8 @@ pub struct GridState {
     viewer: Option<(usize, usize)>,
     /// What the viewer shows of its cell.
     viewed: Option<Viewed>,
+    /// The image the viewer shows, which egui keeps until it's forgotten.
+    shown_image: Option<ShownImage>,
     scroll_to_cursor: bool,
     edit: Option<Editing>,
     /// Related rows reachable from a row (foreign keys), offered in the
@@ -822,6 +824,7 @@ impl GridState {
             ..Editing::default()
         });
         self.changes_revision += 1;
+        self.follow_new_rows(&[]);
     }
 
     /// Keeps `columns` of the editable grid read-only, e.g. those that
@@ -859,6 +862,7 @@ impl GridState {
     pub fn set_read_only(&mut self) {
         self.edit = None;
         self.changes_revision += 1;
+        self.follow_new_rows(&[]);
     }
 
     pub fn is_editable(&self) -> bool {
@@ -889,6 +893,7 @@ impl GridState {
             e.changes = changes;
             e.undo.clear();
             self.changes_revision += 1;
+            self.follow_new_rows(&[]);
         }
     }
 
@@ -898,6 +903,7 @@ impl GridState {
             e.undo.clear();
             e.active = None;
             self.changes_revision += 1;
+            self.follow_new_rows(&[]);
         }
     }
 
@@ -935,7 +941,7 @@ impl GridState {
     }
 
     /// Takes back the last change not applied (#257).
-    fn undo(&mut self, rows: &[Vec<Cell>]) {
+    fn undo(&mut self, _rows: &[Vec<Cell>]) {
         let Some(edit) = &mut self.edit else { return };
         let Some(before) = edit.undo.pop() else {
             return;
@@ -943,8 +949,18 @@ impl GridState {
         let kept = kept_new_rows(&edit.changes.inserts, &before.inserts);
         edit.changes = before;
         self.changes_revision += 1;
-        // The viewer, the dialog and an edit on a new row stay on it, or go
-        // with it (#299).
+        self.follow_new_rows(&kept);
+    }
+
+    /// Moves what is held on a new row by view row, the viewer, the dialog
+    /// and the cell being edited, to where `kept` has its row among the new
+    /// rows now; where it has none, the row went, and the viewer and the
+    /// dialog close and the edit ends. The anchor and the cursor stay on
+    /// the rows there are. Whatever takes new rows away or puts them back
+    /// goes through here (#299, #328): they stayed at their places, on
+    /// other rows or past the rows. Rows added last leave the others where
+    /// they are.
+    fn follow_new_rows(&mut self, kept: &[Option<usize>]) {
         let fetched = self.order.len();
         let to = |view_row: usize| match view_row.checked_sub(fetched) {
             Some(i) => Some(fetched + kept.get(i).copied().flatten()?),
@@ -962,8 +978,7 @@ impl GridState {
                 .take()
                 .and_then(|(view_row, col, text)| Some((to(view_row)?, col, text)));
         }
-        // Rows inserted may be gone again.
-        let last = self.view_len(rows).saturating_sub(1);
+        let last = self.view_len(&[]).saturating_sub(1);
         for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
             *row = (*row).min(last);
         }
@@ -1101,7 +1116,7 @@ impl GridState {
 
     fn delete_refs(&mut self, refs: &[RowRef]) {
         let Some(edit) = &mut self.edit else { return };
-        let mut new_rows: Vec<usize> = Vec::new();
+        let mut new_rows = BTreeSet::new();
         for &r in refs {
             match r {
                 RowRef::Existing(r) => {
@@ -1109,24 +1124,38 @@ impl GridState {
                         edit.changes.deletes.insert(r);
                     }
                 }
-                RowRef::New(i) => new_rows.push(i),
+                RowRef::New(i) => {
+                    new_rows.insert(i);
+                }
             }
         }
-        for i in new_rows.into_iter().rev() {
-            if i < edit.changes.inserts.len() {
-                edit.changes.inserts.remove(i);
-                // The files loaded into the new rows after it move up.
-                let loaded = std::mem::take(&mut edit.changes.loaded);
-                edit.changes.loaded = loaded
-                    .into_iter()
-                    .filter_map(|((row, col), value)| match row {
-                        RowRef::New(j) if j == i => None,
-                        RowRef::New(j) if j > i => Some(((RowRef::New(j - 1), col), value)),
-                        _ => Some(((row, col), value)),
-                    })
-                    .collect();
-            }
+        if new_rows.is_empty() {
+            return;
         }
+        // The new rows after those taken away move up.
+        let mut left = 0;
+        let kept: Vec<Option<usize>> = (0..edit.changes.inserts.len())
+            .map(|i| {
+                (!new_rows.contains(&i)).then(|| {
+                    left += 1;
+                    left - 1
+                })
+            })
+            .collect();
+        let mut kept_rows = kept.iter();
+        edit.changes
+            .inserts
+            .retain(|_| kept_rows.next().is_some_and(Option::is_some));
+        // So do the files loaded into them (#293).
+        let loaded = std::mem::take(&mut edit.changes.loaded);
+        edit.changes.loaded = loaded
+            .into_iter()
+            .filter_map(|((row, col), value)| match row {
+                RowRef::New(i) => Some(((RowRef::New(kept.get(i).copied()??), col), value)),
+                RowRef::Existing(_) => Some(((row, col), value)),
+            })
+            .collect();
+        self.follow_new_rows(&kept);
     }
 
     fn set_null(&mut self, rows: &[Vec<Cell>], columns: usize) {
@@ -3126,6 +3155,22 @@ struct ViewedKey {
     changes: u64,
 }
 
+/// An image the viewer shows, by its URI: egui keeps its bytes, its
+/// pixels and its texture until it is told to forget them, which dropping
+/// this does, once the viewer shows another value, closes, or goes with
+/// its grid. They stayed, of every image viewed, unless the viewer's ✕
+/// closed it (#333).
+struct ShownImage {
+    ctx: egui::Context,
+    uri: String,
+}
+
+impl Drop for ShownImage {
+    fn drop(&mut self) {
+        self.ctx.forget_image(&self.uri);
+    }
+}
+
 /// A binary value as the viewer shows it.
 struct ViewedBinary {
     bytes: Arc<[u8]>,
@@ -3237,6 +3282,7 @@ fn viewer(
 ) {
     let Some((r, c)) = state.viewer else {
         state.viewed = None;
+        state.shown_image = None;
         return;
     };
     let key = ViewedKey {
@@ -3249,6 +3295,14 @@ fn viewer(
         state.viewed = Some(Viewed::new(key, columns, rows, state));
     }
     let Some(viewed) = &state.viewed else { return };
+    // The same image again (rows fetched, another change) stays loaded.
+    let image = viewed.binary.as_ref().and_then(|b| b.image.as_ref());
+    if state.shown_image.as_ref().map(|i| &i.uri) != image {
+        state.shown_image = image.map(|uri| ShownImage {
+            ctx: ctx.clone(),
+            uri: uri.clone(),
+        });
+    }
     let name = columns.get(c).map_or("", |col| col.name.as_str());
     let files = state.value_files
         && columns
@@ -3356,11 +3410,9 @@ fn viewer(
             );
         });
     if !open {
-        if let Some(uri) = viewed.binary.as_ref().and_then(|b| b.image.as_ref()) {
-            ctx.forget_image(uri);
-        }
         state.viewer = None;
         state.viewed = None;
+        state.shown_image = None;
     } else if save {
         state.request_save(columns, rows, (r, c));
     }
@@ -4388,6 +4440,82 @@ mod tests {
         let (blue, _) = viewer_image(&ctx, &[vec![Some(BLUE.to_owned())]]);
         assert!(!blue.is_empty());
         assert_ne!(red, blue);
+    }
+
+    /// egui forgets an image once the viewer no longer shows it: on to
+    /// another cell, or closed by the grid, as a filter that hides its row
+    /// does. It forgot it only when the viewer's ✕ closed it, and kept each
+    /// other one's bytes, pixels and texture for good. The image shown
+    /// again after a change isn't loaded again.
+    #[test]
+    fn the_viewer_lets_go_of_the_images_it_showed() {
+        let png = |shade: u8| -> String {
+            let image = image::RgbImage::from_pixel(64, 64, image::Rgb([shade, 0, 0]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            bytes
+                .into_inner()
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect()
+        };
+        let columns = vec![Column {
+            name: "IMG".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let rows: Vec<Vec<Cell>> = (0..20).map(|shade| vec![Some(png(shade))]).collect();
+        let ctx = egui::Context::default();
+        crate::icons::install(&ctx);
+        let held = || {
+            use egui::load::BytesLoader as _;
+            let loaders = ctx.loaders();
+            let images: usize = loaders.image.lock().iter().map(|l| l.byte_size()).sum();
+            let textures: usize = loaders.texture.lock().iter().map(|l| l.byte_size()).sum();
+            loaders.include.byte_size() + images + textures
+        };
+        // The frames until the viewer paints its image, decoded meanwhile.
+        let painted = |state: &mut GridState| {
+            for frames in 1..100 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ResultGrid::new(&columns, &rows, state, "grid").show(ui);
+                });
+                output.textures_delta.clear();
+                let textured = output.shapes.iter().any(|s| match &s.shape {
+                    egui::Shape::Rect(r) => r.fill_texture_id() != egui::TextureId::default(),
+                    egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+                    _ => false,
+                });
+                if textured {
+                    return frames;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("no image");
+        };
+        let mut state = GridState::default();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let before = held();
+        let mut one = 0;
+        for row in 0..rows.len() {
+            state.viewer = Some((row, 0));
+            painted(&mut state);
+            if row == 0 {
+                one = held() - before;
+            }
+            if row % 2 == 0 {
+                state.set_filter("none");
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+                assert_eq!(state.viewer, None);
+                state.set_filter("");
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+        }
+        let now = held() - before;
+        assert!(now <= 2 * one, "{now} bytes held, one image {one}");
+        // Shown again after a change, the image isn't loaded again.
+        state.changes_revision += 1;
+        assert_eq!(painted(&mut state), 1);
     }
 
     /// The viewer of a binary value the grid holds cut short (#204) shows
@@ -5731,5 +5859,91 @@ mod tests {
         assert!(shown.ends_with("… (6000 bytes)"), "{shown}");
         assert_eq!(shown.len(), 4000 + "… (6000 bytes)".len());
         assert_eq!(Loaded::Text("short".into()).shown(Dialect::ORACLE), "short");
+    }
+
+    /// Delete / undelete rows and Discard take what is on the new rows
+    /// they take away with them, and what is on the new rows after those
+    /// follows its row, as the files loaded into them do (#293); the
+    /// selection stays on the rows there are. They stayed at their places:
+    /// the dialog's Apply and the value typed went into the next new row,
+    /// or into none, and a Paste added empty rows up to the cursor.
+    #[test]
+    fn new_rows_taken_away_take_what_is_on_them() {
+        let (c, r) = (cols(), rows());
+        let ctx = egui::Context::default();
+        let inserted = |state: &GridState| -> Vec<Cell> {
+            let inserts = &state.changes().unwrap().inserts;
+            inserts.iter().map(|row| row[1].clone()).collect()
+        };
+        let texts =
+            |texts: &[&str]| -> Vec<Cell> { texts.iter().map(|t| Some((*t).to_owned())).collect() };
+        let loaded = |state: &GridState| -> Vec<(RowRef, usize)> {
+            state.changes().unwrap().loaded.keys().copied().collect()
+        };
+        // p, q, r and s, files loaded into p's and s's A; the viewer and the
+        // dialog on r, s's B being typed into.
+        let pqrs = || {
+            let mut state = GridState::default();
+            state.set_editable(None);
+            click(&ctx, &c, &r, &mut state, "x", 1);
+            for (view_row, b) in [(3, "p"), (4, "q"), (5, "r"), (6, "s")] {
+                state.add_row(&r, 2);
+                state.edit_cell(&r, view_row, 1, Some(b.into()));
+            }
+            for (i, file) in [(0, "1"), (3, "4")] {
+                state.load_value(&r, RowRef::New(i), 0, Loaded::Text(file.into()));
+            }
+            state.viewer = Some((5, 1));
+            state.open_value_editor(&r, (5, 1));
+            state.start_edit(&r, (6, 1), Some("typed".into()));
+            state
+        };
+
+        // q deleted: they stay on r and s, a row up.
+        let mut state = pqrs();
+        state.select((4, 0), false);
+        state.delete_rows(2);
+        assert_eq!(inserted(&state), texts(&["p", "r", "s"]));
+        assert_eq!(loaded(&state), [(RowRef::New(0), 0), (RowRef::New(2), 0)]);
+        assert_eq!(state.viewer, Some((4, 1)));
+        assert_eq!(state.value_editor.as_ref().map(|e| e.view_row), Some(4));
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        assert_eq!(inserted(&state), texts(&["p", "r", "typed"]));
+        state.viewer = None;
+        state.value_editor.as_mut().unwrap().text = "dialog".into();
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        click(&ctx, &c, &r, &mut state, "Apply", 1);
+        assert_eq!(inserted(&state), texts(&["p", "dialog", "typed"]));
+
+        // r and s deleted, with the viewer, the dialog and the edit on
+        // them: those close and end, the selection goes to q, and a Paste
+        // goes there too.
+        let mut state = pqrs();
+        state.select((5, 0), false);
+        state.select((6, 1), true);
+        state.delete_rows(2);
+        assert_eq!(inserted(&state), texts(&["p", "q"]));
+        assert_eq!(loaded(&state), [(RowRef::New(0), 0)]);
+        assert_eq!(state.viewer, None);
+        assert!(state.value_editor.is_none());
+        assert!(state.edit.as_ref().unwrap().active.is_none());
+        assert_eq!((state.anchor, state.cursor), (Some((4, 0)), Some((4, 1))));
+        state.paste(&r, 2, "t");
+        assert_eq!(inserted(&state), texts(&["p", "t"]));
+
+        // Discard: the viewer and the dialog on r close, and the selection
+        // goes to the last row; the next new row isn't theirs.
+        let mut state = pqrs();
+        state.clear_changes();
+        assert!(loaded(&state).is_empty());
+        assert_eq!(state.viewer, None);
+        assert!(state.value_editor.is_none());
+        assert_eq!((state.anchor, state.cursor), (Some((2, 0)), Some((2, 0))));
+        state.add_row(&r, 2);
+        state.add_row(&r, 2);
+        state.add_row(&r, 2);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        assert_eq!(state.viewer, None);
+        assert!(state.value_editor.is_none());
     }
 }

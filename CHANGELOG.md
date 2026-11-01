@@ -1013,6 +1013,28 @@ All notable changes to Pythia are documented here. The format follows
   "Login script: ORA-01741" for `"r71_schema"` on Oracle, a schema
   `"""sales"""` for `"Sales"` on PostgreSQL and failed for MySQL's
   `` `my db` ``.
+- *Delete / undelete rows* on a new row and *Discard* no longer leave
+  *View value…*, the dialog editing a cell and a cell being typed into
+  on another row (#328). They stayed where they were in the view: on the
+  next new row, where the dialog's *Apply* wrote, or past the rows, where
+  the value typed was lost and the next *Insert row* came. They now
+  follow their rows, and on a row taken away the viewer and the dialog
+  close and the edit ends. The selection stays on the rows there are:
+  a Paste past them added empty new rows up to it.
+- *View value…* no longer keeps every image it showed in memory (#333).
+  egui kept an image's bytes, its pixels and its texture until the
+  viewer's ✕ closed it: going through a column of images with the viewer
+  open kept each one, as did a viewer closed by a filter, by Ctrl+Z or
+  with its result, a photo's pixels taking tens of megabytes twice. The
+  viewer now lets go of an image once it shows another value or closes.
+- Result editing: with *Auto-commit* on, an Apply whose connection is
+  lost part-way keeps the changes it made before applied (#338). Each
+  of them was committed as it ran, but all of them stayed pending on the
+  rows as they were fetched, and applying again reported "Conflict on
+  row 1: it was changed or deleted by another session". The result is
+  now fetched again, in a new session, with the changes from the one
+  that failed on waiting for Apply. In a transaction, which the lost
+  connection rolled back, all the changes still wait.
 
 ## [0.10.0] - 2026-10-30
 

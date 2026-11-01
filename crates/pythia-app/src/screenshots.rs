@@ -2897,7 +2897,8 @@ impl Side {
         }
     }
 
-    /// Runs a statement that must succeed: the rows of a query.
+    /// Runs a statement that must succeed: the rows of a query. Its
+    /// transaction state comes last, but on Oracle before what it did.
     fn run(&mut self, sql: &str) -> Vec<Vec<pythia_db::Cell>> {
         self.session.send(pythia_db::DbRequest::Execute {
             id: 1,
@@ -2906,14 +2907,20 @@ impl Side {
             binds: Vec::new(),
         });
         let mut rows = Vec::new();
-        loop {
+        let (mut done, mut ended) = (false, false);
+        while !(done && ended) {
             match self.next() {
-                pythia_db::DbEvent::Rows { rows: r, .. } => rows = r,
+                pythia_db::DbEvent::Rows { rows: r, .. } => {
+                    rows = r;
+                    done = true;
+                }
+                pythia_db::DbEvent::Executed { .. } => done = true,
                 pythia_db::DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
-                pythia_db::DbEvent::Transaction { .. } => return rows,
+                pythia_db::DbEvent::Transaction { .. } => ended = true,
                 _ => {}
             }
         }
+        rows
     }
 
     fn end(&mut self, request: pythia_db::DbRequest) {
@@ -3257,6 +3264,234 @@ fn a_connection_lost_after_an_apply_statement() {
     h.state_mut().test_close_focused();
     drop(h);
     locker.run("drop table r61_lost");
+}
+
+/// An Apply in auto-commit whose session is killed, a lost connection,
+/// while its update of row 2 waits for a lock: the update of row 1 before
+/// it was committed and stays applied, the result fetched again has it,
+/// and the changes of rows 2 and 3 wait for Apply, which makes them once.
+/// Before, all three waited on the rows as they were, and applying again
+/// found a conflict on row 1 (#338). On Oracle (`PYTHIA_TEST_DB`), SQL
+/// Server, MySQL and PostgreSQL, with their DBAs (PostgreSQL: the user
+/// itself).
+#[test]
+fn an_apply_cut_off_in_autocommit() {
+    use pythia_config::DbKind as Profile;
+    use pythia_db::DbKind;
+    let cases = [
+        (
+            "PYTHIA_TEST_DB",
+            "PYTHIA_TEST_DB_DBA",
+            DbKind::Oracle,
+            Profile::Oracle,
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            "PYTHIA_TEST_MSSQL_DBA",
+            DbKind::SqlServer,
+            Profile::SqlServer,
+        ),
+        (
+            "PYTHIA_TEST_MYSQL",
+            "PYTHIA_TEST_MYSQL_DBA",
+            DbKind::MySql,
+            Profile::MySql,
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            Profile::Postgres,
+        ),
+    ];
+    for (env, dba_env, kind, profile_kind) in cases {
+        let (Ok(spec), Ok(dba)) = (std::env::var(env), std::env::var(dba_env)) else {
+            eprintln!("{env} / {dba_env} not set, skipping");
+            continue;
+        };
+        apply_cut_off_in_autocommit(kind, profile_kind, &spec, &dba);
+    }
+}
+
+fn apply_cut_off_in_autocommit(
+    kind: pythia_db::DbKind,
+    profile_kind: pythia_config::DbKind,
+    spec: &str,
+    dba: &str,
+) {
+    use pythia_db::DbKind;
+    let mut locker = Side::connect(kind, spec);
+    let mut admin = Side::connect(kind, dba);
+    locker.run("drop table if exists r72_auto");
+    locker.run(if kind == DbKind::Oracle {
+        "create table r72_auto (id number primary key, v varchar2(10))"
+    } else {
+        "create table r72_auto (id int primary key, v varchar(10))"
+    });
+    locker.run("insert into r72_auto values (1, 'a'), (2, 'b'), (3, 'c')");
+    let locker_id = locker.run(match kind {
+        DbKind::Oracle => "select sys_context('userenv', 'sid') from dual",
+        DbKind::SqlServer => "select @@spid",
+        DbKind::MySql => "select connection_id()",
+        _ => "select pg_backend_pid()",
+    })[0][0]
+        .clone()
+        .unwrap();
+    // The session that waits for the locker, and how it is killed.
+    let waiting = match kind {
+        DbKind::Oracle => format!(
+            "select sid || ',' || serial# from v$session where blocking_session = {locker_id}"
+        ),
+        DbKind::SqlServer => format!(
+            "select session_id from sys.dm_exec_requests where blocking_session_id = {locker_id}"
+        ),
+        // sys.innodb_lock_waits doesn't always have the Apply's update,
+        // whose transaction information_schema.innodb_trx leaves out.
+        DbKind::MySql => format!(
+            "select id from information_schema.processlist \
+             where info like 'update r72_auto set v = ''y''%' and id <> {locker_id}"
+        ),
+        _ => format!(
+            "select pid from pg_stat_activity where {locker_id} = any(pg_blocking_pids(pid))"
+        ),
+    };
+    let kill = |id: &str| match kind {
+        // Marked for kill (ORA-00031), it is gone once the lock is let go.
+        DbKind::Oracle => format!(
+            "begin execute immediate 'alter system disconnect session ''{id}'' immediate'; \
+             exception when others then if sqlcode <> -31 then raise; end if; end;"
+        ),
+        DbKind::Postgres => format!("select pg_terminate_backend({id})"),
+        _ => format!("kill {id}"),
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: profile_kind,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_settings_mut().autocommit = true;
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r72_auto order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable(), "{kind:?}");
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    // Row 2 locked: the Apply updates row 1, then waits, and its session
+    // is killed.
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(false));
+    locker.run("update r72_auto set v = v where id = 2");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    let id = loop {
+        h.step();
+        if let Some(id) = admin.run(&waiting).first().and_then(|r| r[0].clone()) {
+            break id;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{kind:?}: not blocked"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    admin.run(&kill(&id));
+    // Gone, it lets row 2 go: on SQL Server, fetching the result again
+    // waits for it.
+    let started = Instant::now();
+    while admin
+        .run(&waiting)
+        .iter()
+        .any(|r| r[0].as_deref() == Some(id.as_str()))
+    {
+        h.step();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{kind:?}: still blocked"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    locker.end(pythia_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let text = |v: &str| vec![Some(v.to_owned())];
+    let stored = |locker: &mut Side| locker.run("select v from r72_auto order by id");
+    assert_eq!(
+        stored(&mut locker),
+        [text("x"), text("b"), text("c")],
+        "{kind:?}"
+    );
+    let (rows, updates, _, _, messages) = part(&mut h);
+    let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+    assert!(said("Connection lost."), "{kind:?}: {messages:?}");
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+        "{kind:?}: {messages:?}"
+    );
+    assert_eq!(
+        updates,
+        pairs(&[("2", "y"), ("3", "z")]),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        said("Auto-commit committed the 1 change(s) applied before it"),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        said("2 change(s) weren't applied: they wait for Apply"),
+        "{kind:?}: {messages:?}"
+    );
+
+    // Applied again, the two go in once.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        !messages.iter().any(|m| m.starts_with("Conflict")),
+        "{kind:?}: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{kind:?}: {messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+        "{kind:?}"
+    );
+    assert!(updates.is_empty(), "{kind:?}");
+    assert_eq!(
+        stored(&mut locker),
+        [text("x"), text("y"), text("z")],
+        "{kind:?}"
+    );
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r72_auto");
 }
 
 /// An Apply whose statement after the first is chosen as a deadlock's
