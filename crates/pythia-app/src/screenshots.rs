@@ -6814,6 +6814,37 @@ fn messages_lay_out_what_shows() {
     assert!(h.query_by_label("message 39999").is_some());
 }
 
+/// The Output tab lays out the lines it shows, not all of them (#321):
+/// with 40,000 lines of DBMS_OUTPUT a frame took 101 ms. The last one
+/// shows, at the bottom, and lines that come later too.
+#[test]
+fn output_lays_out_what_shows() {
+    let connection = "r66_output.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    w.state
+        .output
+        .extend((0..40_000).map(|i| format!("line {i:05}")));
+    w.state.bottom = crate::sql_window::BottomTab::Output;
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("line ").count();
+    assert!(laid_out < 200, "{laid_out} lines laid out");
+    assert!(h.query_by_label("line 39999").is_some());
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .output
+        .push("line 40000".into());
+    h.run_steps(3);
+    assert!(h.query_by_label("line 40000").is_some());
+}
+
 /// On MySQL a statement with several results shows each in a tab of its
 /// own (#290): a procedure's SELECTs, and statements kept together after
 /// DELIMITER, also with an error after the first. Only the first showed,

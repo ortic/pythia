@@ -110,8 +110,10 @@ pub struct RunState {
     pub profile: Option<(u64, Option<Result<crate::profiler::Profile, String>>)>,
     pub messages: Vec<Message>,
     /// Where they end in the Messages tab.
-    message_rows: MessageRows,
+    message_rows: TextRows,
     pub output: Vec<String>,
+    /// Where its lines end in the Output tab.
+    output_rows: TextRows,
     pub bottom: BottomTab,
     pub line_col: (usize, usize),
     /// A statement waiting for values in the Variables panel.
@@ -248,26 +250,26 @@ pub struct Message {
     pub stack: Vec<Frame>,
 }
 
-/// Where each message of the Messages tab ends, laid out at a width: the
-/// tab lays out only those in view (#291), which with tens of thousands
-/// of messages took most of a frame.
+/// Where each message of the Messages tab ends, or each line of the
+/// Output tab, laid out at a width: the tabs lay out only those in view
+/// (#291, #321), which with tens of thousands took most of a frame.
 #[derive(Default)]
-struct MessageRows {
+struct TextRows {
     width: f32,
     ends: Vec<f32>,
 }
 
-impl MessageRows {
-    /// Measures the messages not measured yet, and all of them again at
-    /// another width.
-    fn measure(&mut self, ui: &Ui, messages: &[Message], width: f32, gap: f32) {
-        if self.width != width || self.ends.len() > messages.len() {
+impl TextRows {
+    /// Measures the `count` rows not measured yet, each as high as
+    /// `height` says, and all of them again at another width.
+    fn measure(&mut self, count: usize, width: f32, gap: f32, height: impl Fn(usize) -> f32) {
+        if self.width != width || self.ends.len() > count {
             self.width = width;
             self.ends.clear();
         }
-        for m in &messages[self.ends.len()..] {
+        for i in self.ends.len()..count {
             let top = self.ends.last().map_or(0.0, |end| end + gap);
-            self.ends.push(top + message_height(ui, m, width));
+            self.ends.push(top + height(i));
         }
     }
 
@@ -294,22 +296,27 @@ impl MessageRows {
 /// The height of a message as the Messages tab lays it out at `width`: a
 /// label, or a stack's lines one below the other.
 fn message_height(ui: &Ui, m: &Message, width: f32) -> f32 {
-    let height = |text: &str| {
-        egui::WidgetText::from(RichText::new(text).monospace())
-            .into_galley(
-                ui,
-                Some(egui::TextWrapMode::Wrap),
-                width,
-                egui::FontSelection::Default,
-            )
-            .size()
-            .y
-    };
     if m.stack.is_empty() {
-        height(&m.text)
+        text_height(ui, &m.text, width)
     } else {
-        m.text.lines().map(height).sum()
+        m.text
+            .lines()
+            .map(|line| text_height(ui, line, width))
+            .sum()
     }
+}
+
+/// The height of a monospace label of `text` at `width`, wrapped.
+fn text_height(ui: &Ui, text: &str, width: f32) -> f32 {
+    egui::WidgetText::from(RichText::new(text).monospace())
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            width,
+            egui::FontSelection::Default,
+        )
+        .size()
+        .y
 }
 
 /// An `ORA-06512` line of an error, and the code it points at (#112).
@@ -541,8 +548,9 @@ impl SqlWindow {
         state.results.clear();
         state.plan = None;
         state.messages.clear();
-        state.message_rows = MessageRows::default();
+        state.message_rows = TextRows::default();
         state.output.clear();
+        state.output_rows = TextRows::default();
         state.bottom = BottomTab::Messages;
         self.editor.set_markers(Vec::new());
         if statements.is_empty() {
@@ -1433,7 +1441,7 @@ impl SqlWindow {
             failed: false,
         });
         self.state.messages.clear();
-        self.state.message_rows = MessageRows::default();
+        self.state.message_rows = TextRows::default();
         for dml in statements {
             self.state.queue.push_back(PendingStatement {
                 origin: None,
@@ -2848,7 +2856,10 @@ impl SqlWindow {
                     .stick_to_bottom(true)
                     .show_viewport(ui, |ui, viewport| {
                         let gap = ui.spacing().item_spacing.y;
-                        rows.measure(ui, messages, ui.available_width(), gap);
+                        let width = ui.available_width();
+                        rows.measure(messages.len(), width, gap, |i| {
+                            message_height(ui, &messages[i], width)
+                        });
                         ui.set_height(rows.height());
                         let shown = rows.shown(viewport.y_range());
                         let mut rect = ui.max_rect();
@@ -2900,13 +2911,28 @@ impl SqlWindow {
                 }
             }
             BottomTab::Output => {
+                // Only the lines in view are laid out, as in Messages (#321).
+                let rows = &mut state.output_rows;
+                let output = &state.output;
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &state.output {
-                            ui.label(RichText::new(line).monospace());
-                        }
+                    .show_viewport(ui, |ui, viewport| {
+                        let gap = ui.spacing().item_spacing.y;
+                        let width = ui.available_width();
+                        rows.measure(output.len(), width, gap, |i| {
+                            text_height(ui, &output[i], width)
+                        });
+                        ui.set_height(rows.height());
+                        let shown = rows.shown(viewport.y_range());
+                        let mut rect = ui.max_rect();
+                        rect.min.y += rows.top(shown.start, gap);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.skip_ahead_auto_ids(shown.start);
+                            for line in &output[shown] {
+                                ui.label(RichText::new(line).monospace());
+                            }
+                        });
                     });
             }
         }

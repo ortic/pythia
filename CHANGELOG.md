@@ -739,6 +739,9 @@ All notable changes to Pythia are documented here. The format follows
   with the next statement: MySQL answered ERROR 1065 or 1064, Oracle
   ORA-00900 and SQLite "bad parameter or other API misuse", which
   stopped the script; PostgreSQL and SQL Server said "; executed".
+- The Output tab of a SQL window lays out only the lines in view
+  (#321), as the Messages tab does since #291. It laid out every line of
+  DBMS_OUTPUT in each frame: with 40,000 a frame took 101 ms.
 
 ## [0.10.0] - 2026-10-30
 
