@@ -1,4 +1,5 @@
 use super::*;
+use crate::Syntax;
 
 fn corpus() -> Vec<(String, String)> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata");
@@ -84,14 +85,14 @@ fn corpus_is_lossless_and_idempotent() {
 fn corpus_statements_are_formatted() {
     for (name, src) in corpus() {
         for (i, o) in variants().iter().enumerate() {
-            for stmt in split_statements(&src) {
+            for stmt in split_statements_in(&src, Syntax::Oracle) {
                 let text = stmt.text(&src);
                 let unsupported = text.to_ascii_lowercase().contains("compound trigger");
                 if stmt.kind == StatementKind::SqlPlus || unsupported {
                     continue;
                 }
                 assert!(
-                    try_format_statement(text, stmt.kind, o).is_ok(),
+                    try_format_statement(text, stmt.kind, Syntax::Oracle, o).is_ok(),
                     "{name} (options #{i}): fell back for\n{text}"
                 );
             }
@@ -578,5 +579,62 @@ fn rules_in_words() {
         "THEN and LOOP on their own line",
     ] {
         assert!(rules.contains(expected), "{expected}\n{rules}");
+    }
+}
+
+/// Strings, comments and quoted names stay as each database reads them
+/// (#FMT). Lexed as Oracle's, MySQL's `'it\\'s from here'` got a line break
+/// and a space inside, `#` comments ran into the code after them, SQL
+/// Server's `[Order]` became `[ order ]`, and what followed such a token
+/// (the ORDER BY) wasn't laid out.
+#[test]
+fn strings_and_names_stay_as_each_database_reads_them() {
+    let o = with(|o| o.keyword_case = Case::Upper);
+    for (syntax, src, expected) in [
+        (
+            Syntax::MySql,
+            "select * from t where a = 'it\\'s from here' order by a",
+            "SELECT *\nFROM t\nWHERE a = 'it\\'s from here'\nORDER BY a",
+        ),
+        (
+            Syntax::MySql,
+            "select * from t where a = \"it's from here\" # from a comment\norder by a",
+            "SELECT *\nFROM t\nWHERE\n  a = \"it's from here\" # from a comment\nORDER BY a",
+        ),
+        (
+            Syntax::MySql,
+            "select * from `Order` where `Select` = 'x' order by `Group`",
+            "SELECT *\nFROM `Order`\nWHERE `Select` = 'x'\nORDER BY `Group`",
+        ),
+        (
+            Syntax::Postgres,
+            "select * from t where a = E'it\\'s from here' order by a",
+            "SELECT *\nFROM t\nWHERE a = E'it\\'s from here'\nORDER BY a",
+        ),
+        (
+            Syntax::Postgres,
+            "select $$it's from here$$ as s from t order by 1",
+            "SELECT $$it's from here$$ AS s\nFROM t\nORDER BY 1",
+        ),
+        (
+            Syntax::TSql,
+            "select * from [Order] where [Select] = 'From' order by [Group]",
+            "SELECT *\nFROM [Order]\nWHERE [Select] = 'From'\nORDER BY [Group]",
+        ),
+        (
+            Syntax::Sqlite,
+            "select * from [Order] o where o.[Select] = 'x' order by o.[Group]",
+            "SELECT *\nFROM [Order] o\nWHERE o.[Select] = 'x'\nORDER BY o.[Group]",
+        ),
+    ] {
+        let formatted = format_in(src, syntax, &o).text;
+        assert_eq!(formatted, expected, "{syntax:?}");
+        assert_eq!(
+            format_in(&formatted, syntax, &o).text,
+            formatted,
+            "{syntax:?}"
+        );
+        let ranged = format_range_in(src, 0..0, syntax, &o).text;
+        assert_eq!(ranged, expected, "{syntax:?}");
     }
 }

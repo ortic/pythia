@@ -450,6 +450,16 @@ All notable changes to Pythia are documented here. The format follows
   wrong cells, could only be taken back with *Discard*, which dropped
   every other change too. Ctrl+Z in the grid, or *Undo* in the cell's
   menu, now takes back the last change, one at a time.
+- *Format Code* no longer changes strings, comments and quoted names on
+  MySQL, PostgreSQL, SQL Server and SQLite (#259). It read every window
+  as Oracle's SQL: MySQL's `'it\'s FROM here'` got a line break and a
+  space inside and `from` in lower case, a `#` comment was cut and its
+  rest became code, `[Order]` became `[ order ]`, and PostgreSQL's
+  `E'…'` and `$$…$$` strings broke the same way; the rest of the
+  statement, such as its ORDER BY, wasn't laid out. The formatter now
+  reads the text as the window's database does, also when formatting on
+  save or as typed, and when checking what *AI: Format Unsupported
+  Statements* answers.
 
 ## [0.10.0] - 2026-10-30
 

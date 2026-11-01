@@ -5704,6 +5704,67 @@ fn tab_closes_when_released_on_its_close_button() {
     assert_eq!(windows(&h), open - 1, "clicked");
 }
 
+/// Format Code reads a SQL window's text as its database does (#259): on
+/// SQLite and SQL Server `[Order]` became `[ order ]`, and on MySQL a
+/// string with `\'` got a line break inside, leaving the ORDER BY as it
+/// was. MySQL, PostgreSQL and SQL Server when their test databases are
+/// set.
+#[test]
+fn format_reads_each_database_syntax() {
+    use crate::commands::Command;
+    use pythia_config::DbKind;
+    let bracketed = (
+        "select * from [Order] where [Select] = 'From' order by [Group]",
+        "select *\nfrom [Order]\nwhere [Select] = 'From'\norder by [Group]",
+    );
+    let format = |h: &mut Ui, connection: &str, (text, expected): (&str, &str)| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+        h.run_steps(2);
+        h.state_mut().test_command(Command::Format);
+        h.run_steps(2);
+        assert_eq!(
+            h.state_mut().test_sql_window().editor.text(),
+            expected,
+            "{connection}"
+        );
+        h.state_mut().test_sql_window().editor.set_text("");
+        h.state_mut().test_close_focused();
+    };
+    let (mut h, _file) = sqlite_file("format.db");
+    format(&mut h, "format.db", bracketed);
+    drop(h);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            (
+                "select * from t where a = 'it\\'s FROM here' order by a",
+                "select *\nfrom t\nwhere a = 'it\\'s FROM here'\norder by a",
+            ),
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            (
+                "select $$it's FROM here$$ as s from t order by 1",
+                "select $$it's FROM here$$ as s\nfrom t\norder by 1",
+            ),
+        ),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer, bracketed),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("format@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        format(&mut h, &connection, case);
+    }
+}
+
 /// Closing a SQL window, or Pythia, with changes to its results that
 /// weren't applied asks first (#245): a value being typed into a cell, and
 /// the changes waiting for Apply, were dropped without a word.

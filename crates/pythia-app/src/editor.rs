@@ -262,7 +262,7 @@ impl Editor {
 
     /// Formats the whole text (format on save); returns whether it changed.
     pub fn format_all(&mut self, options: &pythia_plsql::FormatOptions) -> bool {
-        let formatted = pythia_plsql::format(self.text(), options);
+        let formatted = pythia_plsql::format_in(self.text(), self.syntax(), options);
         formatted.changed && self.apply_format(&formatted.text)
     }
 
@@ -275,12 +275,13 @@ impl Editor {
         triggers: pythia_config::FormatTriggers,
         options: &pythia_plsql::FormatOptions,
     ) {
-        use pythia_plsql::{StatementKind, split_statements};
+        use pythia_plsql::{StatementKind, split_statements_in};
+        let syntax = self.syntax();
         let wanted: Option<Range<usize>> =
             if let Some(pasted) = out.pasted.clone().filter(|_| triggers.on_paste) {
                 // Statements the paste brought in whole, and SQL statements it
                 // touched; not a whole package for a pasted line.
-                let affected: Vec<Range<usize>> = split_statements(self.text())
+                let affected: Vec<Range<usize>> = split_statements_in(self.text(), syntax)
                     .into_iter()
                     .filter(|s| s.range.start < pasted.end && pasted.start < s.range.end)
                     .filter(|s| {
@@ -295,7 +296,7 @@ impl Editor {
                     .map(|(a, b)| a.start..b.end)
             } else if let Some(after) = out.semicolon_typed.filter(|_| triggers.on_statement_end) {
                 // The SQL statement this `;` ends.
-                split_statements(self.text())
+                split_statements_in(self.text(), syntax)
                     .into_iter()
                     .find(|s| s.kind == StatementKind::Sql && s.range.end + 1 == after)
                     .map(|s| s.range)
@@ -303,7 +304,7 @@ impl Editor {
                 None
             };
         if let Some(range) = wanted {
-            let formatted = pythia_plsql::format_range(self.text(), range, options);
+            let formatted = pythia_plsql::format_range_in(self.text(), range, syntax, options);
             if formatted.changed {
                 self.apply_format(&formatted.text);
             }

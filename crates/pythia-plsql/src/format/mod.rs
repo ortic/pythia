@@ -23,8 +23,8 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::lexer::{TokenKind, tokenize};
-use crate::splitter::{StatementKind, split_statements};
+use crate::lexer::{TokenKind, tokenize_in};
+use crate::splitter::{StatementKind, Syntax, split_statements_in};
 pub use infer::infer;
 use layout::{Layout, Tok};
 
@@ -187,7 +187,15 @@ pub fn describe(o: &FormatOptions) -> String {
 
 /// Formats a whole script.
 pub fn format(src: &str, options: &FormatOptions) -> Formatted {
-    let text = format_script(src, options);
+    format_in(src, Syntax::Oracle, options)
+}
+
+/// [`format`] for a script of a database with `syntax`, lexed and split
+/// the way it reads it (#259): MySQL's `'it\'s'` and `#` comments,
+/// PostgreSQL's `E'…'` and `$$…$$`, SQL Server's and SQLite's `[name]`
+/// stay whole.
+pub fn format_in(src: &str, syntax: Syntax, options: &FormatOptions) -> Formatted {
+    let text = format_script(src, syntax, options);
     Formatted {
         changed: text != src,
         text,
@@ -197,9 +205,19 @@ pub fn format(src: &str, options: &FormatOptions) -> Formatted {
 /// Formats only the statements overlapping `range` (byte offsets); the rest
 /// of `src` is left untouched.
 pub fn format_range(src: &str, range: Range<usize>, options: &FormatOptions) -> Formatted {
+    format_range_in(src, range, Syntax::Oracle, options)
+}
+
+/// [`format_range`] for a script of a database with `syntax`.
+pub fn format_range_in(
+    src: &str,
+    range: Range<usize>,
+    syntax: Syntax,
+    options: &FormatOptions,
+) -> Formatted {
     let mut text = String::with_capacity(src.len());
     let mut pos = 0;
-    for stmt in split_statements(src) {
+    for stmt in split_statements_in(src, syntax) {
         let r = stmt.range.clone();
         let (a, b) = (range.start, range.end.max(range.start));
         let overlaps = if a == b {
@@ -215,7 +233,7 @@ pub fn format_range(src: &str, range: Range<usize>, options: &FormatOptions) -> 
         // lines by the statement's starting column.
         let line_start = src[..r.start].rfind('\n').map_or(0, |i| i + 1);
         let prefix = &src[line_start..r.start];
-        let formatted = format_statement(&src[r.clone()], stmt.kind, options);
+        let formatted = format_statement(&src[r.clone()], stmt.kind, syntax, options);
         if prefix.chars().all(|c| c == ' ' || c == '\t') && !prefix.is_empty() {
             let pad = prefix.to_owned();
             let mut first = true;
@@ -241,10 +259,10 @@ pub fn format_range(src: &str, range: Range<usize>, options: &FormatOptions) -> 
     }
 }
 
-fn tokens(src: &str) -> Vec<(Tok<'_>, Range<usize>)> {
+fn tokens(src: &str, syntax: Syntax) -> Vec<(Tok<'_>, Range<usize>)> {
     let mut out = Vec::new();
     let mut nl = 0u32;
-    for t in tokenize(src) {
+    for t in tokenize_in(src, syntax) {
         match t.kind {
             TokenKind::Whitespace => {}
             TokenKind::Newline => nl += 1,
@@ -295,9 +313,9 @@ impl Script {
     }
 }
 
-fn format_script(src: &str, o: &FormatOptions) -> String {
-    let toks = tokens(src);
-    let statements = split_statements(src);
+fn format_script(src: &str, syntax: Syntax, o: &FormatOptions) -> String {
+    let toks = tokens(src, syntax);
+    let statements = split_statements_in(src, syntax);
     let mut script = Script {
         out: String::new(),
         line_comment: false,
@@ -315,9 +333,12 @@ fn format_script(src: &str, o: &FormatOptions) -> String {
                 .iter()
                 .position(|(_, s)| s.start >= stmt.range.end)
                 .map_or(toks.len(), |n| i + n);
-            let text = format_statement(&src[stmt.range.clone()], stmt.kind, o);
+            let text = format_statement(&src[stmt.range.clone()], stmt.kind, syntax, o);
             script.line(&text, blank(&tok));
-            script.line_comment = text.lines().last().is_some_and(ends_in_line_comment);
+            script.line_comment = text
+                .lines()
+                .last()
+                .is_some_and(|line| ends_in_line_comment(line, syntax));
             i = end.max(i + 1);
             next_stmt += 1;
             continue;
@@ -352,8 +373,8 @@ fn format_script(src: &str, o: &FormatOptions) -> String {
     script.out
 }
 
-fn ends_in_line_comment(line: &str) -> bool {
-    tokenize(line)
+fn ends_in_line_comment(line: &str, syntax: Syntax) -> bool {
+    tokenize_in(line, syntax)
         .last()
         .is_some_and(|t| t.kind == TokenKind::LineComment)
 }
@@ -365,17 +386,23 @@ fn ends_in_line_comment(line: &str) -> bool {
 /// safety check, as byte ranges of `src`. SQL*Plus commands, wrapped code
 /// and Java sources aren't listed.
 pub fn kept_as_written(src: &str, options: &FormatOptions) -> Vec<Range<usize>> {
-    split_statements(src)
+    kept_as_written_in(src, Syntax::Oracle, options)
+}
+
+/// [`kept_as_written`] for a script of a database with `syntax`.
+pub fn kept_as_written_in(src: &str, syntax: Syntax, options: &FormatOptions) -> Vec<Range<usize>> {
+    split_statements_in(src, syntax)
         .into_iter()
         .filter(|s| {
-            try_format_statement(&src[s.range.clone()], s.kind, options) == Err(Kept::Unsupported)
+            try_format_statement(&src[s.range.clone()], s.kind, syntax, options)
+                == Err(Kept::Unsupported)
         })
         .map(|s| s.range)
         .collect()
 }
 
-fn format_statement(text: &str, kind: StatementKind, o: &FormatOptions) -> String {
-    try_format_statement(text, kind, o).unwrap_or_else(|_| text.to_owned())
+fn format_statement(text: &str, kind: StatementKind, syntax: Syntax, o: &FormatOptions) -> String {
+    try_format_statement(text, kind, syntax, o).unwrap_or_else(|_| text.to_owned())
 }
 
 /// Why a statement is kept as written.
@@ -390,12 +417,13 @@ enum Kept {
 fn try_format_statement(
     text: &str,
     kind: StatementKind,
+    syntax: Syntax,
     o: &FormatOptions,
 ) -> Result<String, Kept> {
     if kind == StatementKind::SqlPlus {
         return Err(Kept::Opaque);
     }
-    let toks: Vec<Tok> = tokens(text).into_iter().map(|(t, _)| t).collect();
+    let toks: Vec<Tok> = tokens(text, syntax).into_iter().map(|(t, _)| t).collect();
     // Conditional compilation (#172): a branch is often part of a construct
     // (a WHERE clause, one of two headers), which the layout can't place.
     if toks
@@ -413,7 +441,7 @@ fn try_format_statement(
         return Err(Kept::Unsupported);
     }
     let formatted = doc::render(&doc, o.max_width.max(20));
-    if equivalent(text, &formatted) {
+    if equivalent_in(text, &formatted, syntax) {
         Ok(formatted)
     } else {
         Err(Kept::Unsupported)
@@ -424,8 +452,15 @@ fn try_format_statement(
 /// trailing blanks of line comments: `b` is `a` laid out differently. The
 /// formatter's safety check, also for formatting done elsewhere.
 pub fn equivalent(a: &str, b: &str) -> bool {
+    equivalent_in(a, b, Syntax::Oracle)
+}
+
+/// [`equivalent`] for code of a database with `syntax`, lexed the way it
+/// reads it: a string, comment or quoted name it reads as one token is
+/// compared whole (#259).
+pub fn equivalent_in(a: &str, b: &str, syntax: Syntax) -> bool {
     let sig = |s: &str| -> Vec<(TokenKind, String)> {
-        tokenize(s)
+        tokenize_in(s, syntax)
             .into_iter()
             .filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Newline))
             .map(|t| {
