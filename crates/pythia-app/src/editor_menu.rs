@@ -94,7 +94,7 @@ pub fn show(
                         .unwrap_or(Icon::Text);
                     let name = crate::browser::shown_qualified(cx.dialect, &object);
                     let name = match &member {
-                        Some(m) => format!("{name}.{}", m.to_lowercase()),
+                        Some(m) => format!("{name}.{}", crate::browser::shown_name(cx.dialect, m)),
                         None => name,
                     };
                     ui.horizontal(|ui| {

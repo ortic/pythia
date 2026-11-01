@@ -2328,7 +2328,7 @@ pub fn object_menu(ui: &mut Ui, object: &ObjectRef, options: &MenuOptions) -> Op
         match &options.member {
             Some(member) => item(
                 ui,
-                &format!("Edit {}", member.to_lowercase()),
+                &format!("Edit {}", shown_name(options.dialect, member)),
                 ObjectAction::EditAt(object.clone(), member.clone()),
             ),
             None => item(ui, "Edit", ObjectAction::Edit(object.clone())),

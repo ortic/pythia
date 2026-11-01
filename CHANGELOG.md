@@ -834,6 +834,12 @@ All notable changes to Pythia are documented here. The format follows
   INSERT names `"DATE"` and `"CAFé"`: the import failed with ORA-00942
   or ORA-00904 and left the table behind. Plain names still read in
   lowercase.
+- A package's subprograms read with their case in an editor's context
+  menu and in the program window (#336), as names do since #272. A
+  quoted `"MyProc"` read `myproc` in the menu's heading, its *Edit* and
+  "… not found", and `"myproc"` in the outline and "… isn't in the
+  body". They read quoted where they have lowercase letters, others in
+  lowercase.
 
 ## [0.10.0] - 2026-10-30
 

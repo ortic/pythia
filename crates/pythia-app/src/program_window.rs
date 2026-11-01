@@ -163,7 +163,8 @@ impl ProgramWindow {
                 return;
             }
         }
-        self.state.message = Some((false, format!("{} not found", member.to_lowercase())));
+        let shown = crate::browser::shown_name(pythia_db::Dialect::ORACLE, &member);
+        self.state.message = Some((false, format!("{shown} not found")));
     }
 
     pub fn active_editor(&mut self) -> Option<&mut Editor> {
@@ -939,7 +940,7 @@ impl ProgramWindow {
                     };
                     self.state.message = Some((
                         false,
-                        format!("{} isn't in the {what}", name.to_lowercase()),
+                        format!("{} isn't in the {what}", shown_source_name(&name)),
                     ));
                 }
             }
@@ -1049,6 +1050,34 @@ impl Part {
     fn is_dirty(&self) -> bool {
         self.editor.text() != self.saved
     }
+}
+
+/// A name as the source writes it, `name` or `owner.name`, quoted or not,
+/// as the browser shows Oracle's names (#272): stored without lowercase
+/// letters in lowercase, else quoted, so that `"MyProc"` doesn't read like
+/// `myproc` (#336).
+fn shown_source_name(text: &str) -> String {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted) = (0, false);
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+        .iter()
+        .map(|part| {
+            let (name, _) = pythia_plsql::normalize_ident(part.trim());
+            crate::browser::shown_name(pythia_db::Dialect::ORACLE, &name)
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// A procedure or function of a text (nested ones too).
@@ -1320,7 +1349,12 @@ impl Outline<'_> {
             ui.add_space(depth as f32 * 14.0);
             ui.spacing_mut().item_spacing.x = 5.0;
             ui.add(icon.sized(ui, IconSize::Small));
-            let mut name = RichText::new(item.name.to_lowercase()).monospace();
+            let shown = match item.kind {
+                // A statement's text, "anonymous block".
+                K::Block | K::Statement => item.name.to_lowercase(),
+                _ => shown_source_name(&item.name),
+            };
+            let mut name = RichText::new(shown).monospace();
             // Shown for a match below it.
             if !self.needle.is_empty() && !self.matches_name(item) {
                 name = name.weak();
@@ -1883,6 +1917,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// Names of the source and of members read as the browser shows
+    /// Oracle's (#336): quoted where they have lowercase letters, else in
+    /// lowercase.
+    #[test]
+    fn names_read_as_stored() {
+        assert_eq!(shown_source_name("\"MyProc\""), "\"MyProc\"");
+        assert_eq!(shown_source_name("MyProc"), "myproc");
+        assert_eq!(shown_source_name("\"MYPROC\""), "myproc");
+        assert_eq!(shown_source_name("hr.\"Emp.Pkg\""), "hr.\"Emp.Pkg\"");
+        assert_eq!(
+            shown_source_name("\"say \"\"hi\"\"\""),
+            "\"say \"\"hi\"\"\""
+        );
+        let mut w = ProgramWindow::with_sources(
+            ObjectRef {
+                owner: "HR".into(),
+                name: "Pkg".into(),
+                object_type: ObjectType::Package,
+            },
+            vec![
+                "create or replace package \"Pkg\" as\n  procedure p;\nend;".into(),
+                "create or replace package body \"Pkg\" as\n  procedure p is begin null; end;\nend;"
+                    .into(),
+            ],
+        );
+        w.goto_member("Gone", None);
+        assert_eq!(w.message(), Some((false, "\"Gone\" not found".into())));
+        w.goto_member("GONE", None);
+        assert_eq!(w.message(), Some((false, "gone not found".into())));
+    }
 
     #[test]
     fn strips_slash() {

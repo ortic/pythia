@@ -8011,6 +8011,111 @@ fn editor_context_menu() {
     conn.execute("drop table pythia_menu_t purge", &[]).unwrap();
 }
 
+/// A package's quoted subprogram reads as Oracle's SQL writes it, not in
+/// lowercase: in an editor's context menu, the program window's outline
+/// and its messages (#336).
+#[test]
+fn quoted_subprograms_keep_their_case() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R71_Pkg\" as\n  \
+                procedure \"R71_MyProc\" is begin null; end;\n  \
+                procedure r71_plain is begin null; end;\nend;";
+    for ddl in [
+        "create or replace package \"R71_Pkg\" as\n  procedure \"R71_MyProc\";\n  \
+         procedure r71_plain;\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R71_Pkg\".\"R71_MyProc\";\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R71_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R71_MyProc\"");
+    assert!(
+        h.query_by_label("pythia.\"R71_Pkg\".\"R71_MyProc\"")
+            .is_some()
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.state_mut().test_open(OpenRequest::ProgramMember {
+        connection: "pythia@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "PYTHIA".into(),
+            name: "R71_Pkg".into(),
+            object_type: pythia_db::ObjectType::Package,
+        },
+        member: "R71_Gone".into(),
+        parameter: None,
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_Gone\" not found".into()))
+    );
+    shown(&mut h, "\"R71_MyProc\"");
+    for label in ["r71_plain", "\"R71_Pkg\""] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    // Go to body of a procedure the body (as edited) leaves out.
+    h.state_mut().test_program().parts[1]
+        .editor
+        .set_text(body.replace("\"R71_MyProc\"", "r71_other"));
+    h.run_steps(3);
+    h.get_by_label("\"R71_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Go to body").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_MyProc\" isn't in the body".into()))
+    );
+    h.state_mut().test_program().parts[1].editor.set_text(body);
+    conn.execute("drop package \"R71_Pkg\"", &[]).unwrap();
+}
+
 /// Go to definition, Back/Forward, Switch Spec/Body, Go to Symbol and Find
 /// References in a package's program window, across its spec and body.
 #[test]
