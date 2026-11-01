@@ -166,6 +166,35 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
     tokens
 }
 
+/// The texts of the first `n` tokens of a statement that aren't comments,
+/// for telling what it does. In MySQL's syntax the code in a `/*!…*/` among
+/// them counts, which the server runs (#219), whatever its version.
+pub fn leading_tokens(sql: &str, syntax: Syntax, n: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    push_leading(sql, syntax, n, &mut out);
+    out
+}
+
+fn push_leading<'a>(sql: &'a str, syntax: Syntax, n: usize, out: &mut Vec<&'a str>) {
+    for t in tokenize_in(sql, syntax) {
+        if out.len() >= n {
+            return;
+        }
+        let text = &sql[t.span];
+        if t.kind.is_trivia() {
+            continue;
+        }
+        match text.strip_prefix("/*!") {
+            Some(code) if syntax == Syntax::MySql && t.kind == TokenKind::Hint => {
+                let code = code.strip_suffix("*/").unwrap_or(code);
+                let code = code.trim_start_matches(|c: char| c.is_ascii_digit());
+                push_leading(code, syntax, n, out);
+            }
+            _ => out.push(text),
+        }
+    }
+}
+
 /// A token MySQL reads differently from Oracle, as its kind and where it
 /// ends; `None` when it reads it the same.
 fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenKind, usize)> {
@@ -499,6 +528,30 @@ mod tests {
         assert_eq!(
             kinds("/*!40101 SET x=1 */;"),
             vec![(TokenKind::Semicolon, ";")]
+        );
+    }
+
+    #[test]
+    fn leading_tokens_of_statements() {
+        let mysql = |sql| leading_tokens(sql, Syntax::MySql, 2);
+        assert_eq!(mysql("/* x */ update t set a = 1"), ["update", "t"]);
+        assert_eq!(mysql("(select 1)"), ["(", "select"]);
+        // The code in `/*!…*/` (#219), not in MariaDB's `/*M!…*/`.
+        assert_eq!(
+            mysql("/*!40000 ALTER TABLE `t` DISABLE KEYS */"),
+            ["ALTER", "TABLE"]
+        );
+        assert_eq!(
+            mysql("/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER t"),
+            ["CREATE", "DEFINER"]
+        );
+        assert_eq!(
+            mysql("/*!*/ /*!50000 */ /*M!100100 drop */ delete"),
+            ["delete"]
+        );
+        assert_eq!(
+            leading_tokens("/*!40000 ALTER TABLE t */ select 1", Syntax::Oracle, 1),
+            ["select"]
         );
     }
 

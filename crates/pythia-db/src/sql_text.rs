@@ -1,23 +1,32 @@
 //! Reading statement text, for the backends that aren't Oracle: what a
 //! statement is, its bind variables, and values rendered as text.
 
-use pythia_plsql::{TokenKind, tokenize};
+use pythia_plsql::{Syntax, TokenKind, tokenize};
 
 use crate::compat::Release;
 
 /// The first one or two words of a statement, uppercase, comments skipped.
 pub(crate) fn leading_words(sql: &str) -> Vec<String> {
-    tokenize(sql)
+    leading_words_in(sql, Syntax::Oracle)
+}
+
+/// [`leading_words`] of a statement of a database with `syntax`: MySQL's
+/// `/*!…*/` holds code, which the server runs (#219).
+pub(crate) fn leading_words_in(sql: &str, syntax: Syntax) -> Vec<String> {
+    pythia_plsql::leading_tokens(sql, syntax, 2)
         .into_iter()
-        .filter(|t| !t.kind.is_trivia())
-        .take(2)
-        .map(|t| sql[t.span].to_ascii_uppercase())
+        .map(str::to_ascii_uppercase)
         .collect()
 }
 
 /// The statement's first word, e.g. `INSERT`, for "INSERT: 3 rows affected".
 pub(crate) fn statement_kind(sql: &str) -> String {
-    leading_words(sql)
+    statement_kind_in(sql, Syntax::Oracle)
+}
+
+/// [`statement_kind`] of a statement of a database with `syntax`.
+pub(crate) fn statement_kind_in(sql: &str, syntax: Syntax) -> String {
+    leading_words_in(sql, syntax)
         .into_iter()
         .next()
         .unwrap_or_else(|| "Statement".into())
@@ -192,6 +201,11 @@ mod tests {
     fn words_and_binds() {
         assert_eq!(leading_words("/* x */ update t set a = 1"), ["UPDATE", "T"]);
         assert_eq!(statement_kind("  "), "Statement");
+        // MySQL's `/*!…*/` holds code (#219).
+        let alter = "/*!40000 ALTER TABLE `t` DISABLE KEYS */";
+        assert_eq!(leading_words_in(alter, Syntax::MySql), ["ALTER", "TABLE"]);
+        assert_eq!(statement_kind_in(alter, Syntax::MySql), "ALTER");
+        assert_eq!(statement_kind(alter), "Statement");
         assert!(has_word(
             "with d as (delete from t returning *) select 1",
             &["DELETE"]

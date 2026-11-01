@@ -483,6 +483,51 @@ fn executable_comments_as_mysqldump_writes_them() {
     h.ok("drop table fs_exec");
 }
 
+/// The session reads a statement in `/*!…*/` by the code in it (#219):
+/// a change waits for Commit, DDL commits what was pending, and a SET
+/// TIME_ZONE (in every mysqldump's prologue) changes the zone shown.
+#[test]
+fn executable_comments_are_read_by_their_code() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists fs_tx");
+    h.ok("create table fs_tx (a int primary key)");
+
+    let DbEvent::Executed { summary, .. } = h.run(0, "/*!40000 INSERT INTO fs_tx VALUES (1) */")
+    else {
+        panic!("expected the insert to run")
+    };
+    assert_eq!(
+        (summary.kind.as_str(), summary.rows_affected),
+        ("INSERT", Some(1))
+    );
+    assert!(h.settle(), "the insert waits for Commit");
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    assert_eq!(h.scalar("select count(*) from fs_tx").as_deref(), Some("0"));
+
+    assert!(h.ok("insert into fs_tx values (2)"));
+    assert!(
+        !h.ok("/*!40000 ALTER TABLE `fs_tx` DISABLE KEYS */"),
+        "the ALTER committed the insert"
+    );
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    assert_eq!(h.scalar("select count(*) from fs_tx").as_deref(), Some("1"));
+
+    assert_eq!(
+        h.zone_after("set time_zone = '+05:00'").as_deref(),
+        Some("+05:00")
+    );
+    assert_eq!(
+        h.zone_after("/*!40103 SET TIME_ZONE='+00:00' */")
+            .as_deref(),
+        Some("+00:00")
+    );
+    h.ok("drop table fs_tx");
+}
+
 /// Without a database in the address, the login statements pick it (the
 /// profile's default schema): `Connected` reports the one they leave the
 /// session in, then their failures (#103).
