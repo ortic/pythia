@@ -597,6 +597,19 @@ fn mysql_data_editing() {
         connect_string: connect_string.into(),
         ..Default::default()
     };
+    // MySQL keeps JSON as a document of its own: a value typed with
+    // `\u00e9` reads `é`. MariaDB's JSON is text, kept as it was typed.
+    let mariadb = crate::test_db::run_on("PYTHIA_TEST_MYSQL", pythia_config::DbKind::MySql, |c| {
+        c.query("select version()", &[]).unwrap()[0][0].clone()
+    })
+    .flatten()
+    .is_some_and(|v| v.contains("MariaDB"));
+    let typed = r#"{"a": [1, "\u00e9"]}"#;
+    let stored = if mariadb {
+        typed
+    } else {
+        r#"{"a": [1, "é"]}"#
+    };
     let mut h = harness(true);
     h.state_mut().test_connect(profile, password.into());
     wait_until(&mut h, "connection", |app| app.test_connected());
@@ -663,8 +676,7 @@ fn mysql_data_editing() {
         assert_eq!(r.rows[0][3].as_deref(), Some("123457"));
         let rows = r.rows.clone();
         r.grid.edit_cell(&rows, 0, 0, Some(r"C:\new 'one'".into()));
-        r.grid
-            .edit_cell(&rows, 0, 2, Some(r#"{"a": [1, "\u00e9"]}"#.into()));
+        r.grid.edit_cell(&rows, 0, 2, Some(typed.into()));
         // Shown rounded, still found.
         r.grid.edit_cell(&rows, 0, 3, Some("2.5".into()));
         r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
@@ -683,7 +695,7 @@ fn mysql_data_editing() {
         let r = &mut w.state.results[0];
         assert_eq!(r.rows[0][0].as_deref(), Some(r"C:\new 'one'"));
         assert_eq!(r.rows[0][1].as_deref(), Some("2020-01-01 00:00:00"));
-        assert_eq!(r.rows[0][2].as_deref(), Some(r#"{"a": [1, "é"]}"#));
+        assert_eq!(r.rows[0][2].as_deref(), Some(stored));
         assert_eq!(r.rows[0][3].as_deref(), Some("2.5"));
         assert_eq!(r.rows[1][1].as_deref(), Some("2021-02-03 04:05:06"));
         assert_eq!(
