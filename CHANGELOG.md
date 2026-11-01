@@ -835,6 +835,12 @@ All notable changes to Pythia are documented here. The format follows
   materialized view … owner to …` where the owner isn't you. A role that
   can't give the view back to its owner gets an error, and the view
   stays as it was.
+- PostgreSQL: the DDL of a table, view, sequence, function or procedure
+  has its grants (#331), as a materialized view's has, a table's with
+  its columns' and its `serial` sequences'. Run elsewhere, a copy had no
+  privileges for any role but its owner, and a routine whose `EXECUTE`
+  was revoked from `PUBLIC` could be run by every role again: its DDL
+  now revokes that too.
 
 ## [0.10.0] - 2026-10-30
 

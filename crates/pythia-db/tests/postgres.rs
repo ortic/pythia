@@ -1458,6 +1458,107 @@ fn a_materialized_view_keeps_its_owner_data_and_storage() {
     h.ok("drop role r73_owner");
 }
 
+/// The DDL of a table, a view, a sequence and a routine has their grants,
+/// as a materialized view's has (#301): run in another schema, the copies
+/// have the same privileges, the table's serial sequence too, and a
+/// routine's EXECUTE that PUBLIC no longer has stays revoked (#331).
+#[test]
+fn the_ddl_has_the_grants() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r73_g, r73_g_copy cascade");
+    h.ok("drop role if exists \"R73 Reader\"");
+    h.ok("create role \"R73 Reader\"");
+    h.ok("create schema r73_g");
+    h.ok("create schema r73_g_copy");
+    for sql in [
+        "create table r73_g.r73_t (id serial, n int, m int)",
+        "grant select, insert on r73_g.r73_t to \"R73 Reader\"",
+        "grant update (n), select (m) on r73_g.r73_t to pg_monitor with grant option",
+        "grant select on r73_g.r73_t to public",
+        "revoke truncate on r73_g.r73_t from current_user",
+        "grant usage on sequence r73_g.r73_t_id_seq to \"R73 Reader\"",
+        "create view r73_g.r73_v as select n from r73_g.r73_t",
+        "grant select on r73_g.r73_v to \"R73 Reader\"",
+        "grant select (n) on r73_g.r73_v to pg_monitor",
+        "create sequence r73_g.r73_s",
+        "grant usage, select on sequence r73_g.r73_s to \"R73 Reader\" with grant option",
+        "grant update on sequence r73_g.r73_s to public",
+        "create function r73_g.r73_f(x int) returns int language sql as 'select x'",
+        "revoke execute on function r73_g.r73_f(int) from public",
+        "grant execute on function r73_g.r73_f(int) to \"R73 Reader\"",
+        "create function r73_g.r73_f(x text) returns text language sql as 'select x'",
+        "create procedure r73_g.r73_p() language sql as 'select 1'",
+        "grant execute on procedure r73_g.r73_p() to pg_monitor with grant option",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r73_g", "r73_t", ObjectType::Table);
+    for grant in [
+        "grant insert, select on r73_g.r73_t to \"R73 Reader\";",
+        "grant update (n), select (m) on r73_g.r73_t to pg_monitor with grant option;",
+        "grant select on r73_g.r73_t to public;",
+        "revoke truncate on r73_g.r73_t from ",
+        "grant usage on sequence r73_g.r73_t_id_seq to \"R73 Reader\";",
+    ] {
+        assert!(table.contains(grant), "{table}");
+    }
+    let function = ddl_of(&mut h, "r73_g", "r73_f", ObjectType::Function);
+    for grant in [
+        "grant execute on function r73_g.r73_f(x integer) to \"R73 Reader\";",
+        "revoke execute on function r73_g.r73_f(x integer) from public;",
+    ] {
+        assert!(function.contains(grant), "{function}");
+    }
+    assert!(
+        !function.contains("on function r73_g.r73_f(x text)"),
+        "{function}"
+    );
+    for (name, object_type) in [
+        ("r73_t", ObjectType::Table),
+        ("r73_v", ObjectType::View),
+        ("r73_s", ObjectType::Sequence),
+        ("r73_f", ObjectType::Function),
+        ("r73_p", ObjectType::Procedure),
+    ] {
+        let ddl = ddl_of(&mut h, "r73_g", name, object_type);
+        run_ddl(&mut h, &ddl, "r73_g.", "r73_g_copy.");
+    }
+    // Each object's and column's privileges, and who has them.
+    let privileges = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "with o (name, acl) as ( \
+               select relname, relacl from pg_class \
+                where relnamespace = '{schema}'::regnamespace \
+               union all \
+               select c.relname || '.' || a.attname, a.attacl \
+                 from pg_class c join pg_attribute a on a.attrelid = c.oid \
+                where c.relnamespace = '{schema}'::regnamespace and a.attnum > 0 \
+               union all \
+               select proname || '(' || pg_get_function_identity_arguments(oid) || ')', proacl \
+                 from pg_proc where pronamespace = '{schema}'::regnamespace) \
+             select string_agg(name || ' ' || coalesce(( \
+                      select string_agg(x.grantee::regrole || ' ' || x.privilege_type \
+                                        || case when x.is_grantable then '*' else '' end, \
+                                        ', ' order by x.grantee::regrole::text, \
+                                                      x.privilege_type) \
+                        from aclexplode(acl) x), 'default'), '; ' order by name) \
+               from o"
+        ))
+    };
+    let was = privileges(&mut h, "r73_g");
+    assert!(
+        was.as_deref()
+            .is_some_and(|p| p.contains("\"R73 Reader\" USAGE; r73_t_id_seq.is_called")),
+        "{was:?}"
+    );
+    assert_eq!(privileges(&mut h, "r73_g_copy"), was, "{table}");
+    h.ok("drop schema r73_g, r73_g_copy cascade");
+    h.ok("drop role \"R73 Reader\"");
+}
+
 /// Object filters find names without case whatever their letters: names
 /// collate as C, where upper() changes only ASCII letters, in the test
 /// database and in one whose lc_ctype is C.
