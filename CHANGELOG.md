@@ -451,6 +451,10 @@ All notable changes to Pythia are documented here. The format follows
   a word; SQL Server took it already. An odd number of digits gets a 0
   in front, as MySQL reads `0x…`. Text columns keep such a value as
   text.
+- MySQL: a table's *Indexes* show an index on an expression with its
+  expression (#258). An index on `((lower(name)))` showed no columns,
+  and one on `(id, (lower(name)))` read `id`, like an index on `id`
+  alone. Such a key part now reads ``(lower(`name`))``, as in the DDL.
 
 ## [0.10.0] - 2026-10-30
 

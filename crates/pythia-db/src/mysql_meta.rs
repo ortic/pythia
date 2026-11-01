@@ -263,21 +263,40 @@ fn columns(
         .collect())
 }
 
+/// A key part: its column, or a functional one's expression (MySQL
+/// 8.0.13) in parentheses as the DDL writes it (#258): it has no column.
+/// information_schema escapes the expression's strings once more
+/// (`_utf8mb4\'x\'`); `char(92)` is a backslash whatever
+/// `NO_BACKSLASH_ESCAPES` says, `char(39)` a quote.
+const KEY_PART: &str = "coalesce(column_name, concat('(', \
+     replace(replace(expression, repeat(char(92 using utf8mb4), 2), char(92 using utf8mb4)), \
+             concat(char(92 using utf8mb4), char(39 using utf8mb4)), char(39 using utf8mb4)), \
+     ')'))";
+
+/// A table's indexes, with their key parts as `part` gives them.
+fn indexes_sql(part: &str) -> String {
+    format!(
+        "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
+                if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
+                group_concat({part} order by seq_in_index separator ', ') as COLUMNS \
+           from information_schema.statistics \
+          where table_schema = ? and table_name = ? \
+          group by index_name, index_type, non_unique \
+          order by index_name = 'PRIMARY' desc, index_name"
+    )
+}
+
 fn details(
     conn: &mut Conn,
     owner: &str,
     name: &str,
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
+    let indexes;
     let sql = match detail {
         Detail::Indexes => {
-            "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
-                    if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
-                    group_concat(column_name order by seq_in_index separator ', ') as COLUMNS \
-               from information_schema.statistics \
-              where table_schema = ? and table_name = ? \
-              group by index_name, index_type, non_unique \
-              order by index_name = 'PRIMARY' desc, index_name"
+            indexes = indexes_sql(KEY_PART);
+            &indexes
         }
         Detail::Constraints => {
             "select t.constraint_name as CONSTRAINT_NAME, \
@@ -343,6 +362,11 @@ fn details(
         // definitions then.
         Err(e) if e.code == Some(1109) && matches!(detail, Detail::Uses | Detail::UsedBy) => {
             table(conn, &view_usage_by_definition(detail), params(), &[])
+        }
+        // No `expression` (MariaDB, MySQL before 8.0.13), so no functional
+        // key parts: the columns then.
+        Err(e) if e.code == Some(1054) && detail == Detail::Indexes => {
+            table(conn, &indexes_sql("column_name"), params(), &[])
         }
         result => result,
     }

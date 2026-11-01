@@ -1207,6 +1207,63 @@ fn dictionary() {
     h.ok("drop table meta_dept");
 }
 
+/// A functional key part (MySQL 8.0.13) reads as its expression in a
+/// table's indexes, as its DDL writes it (#257): it has no column, and the
+/// index showed none, or only its plain ones. MariaDB has no such parts.
+#[test]
+fn functional_index_parts() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let mariadb = h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"));
+    h.ok("drop table if exists r41_fi");
+    if mariadb {
+        h.ok("create table r41_fi (id int primary key, name varchar(30), index r41_n (name, id))");
+    } else {
+        h.ok(
+            "create table r41_fi (id int primary key, name varchar(30), j json, \
+              index r41_i ((lower(name))), index r41_mix (id, (lower(name)) desc), \
+              index r41_j ((cast(j->>'$.name' as char(30)))), \
+              index r41_q ((concat(name, 'a\\\\b''c'))))",
+        );
+    }
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "r41_fi".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let columns: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r[0].as_deref().unwrap(), r[3].as_deref().unwrap_or("")))
+        .collect();
+    if mariadb {
+        assert_eq!(columns, [("PRIMARY", "id"), ("r41_n", "name, id")]);
+    } else {
+        // information_schema escapes the strings' quotes and backslashes
+        // once more: `_utf8mb4\'$.name\'`.
+        assert_eq!(
+            columns,
+            [
+                ("PRIMARY", "id"),
+                ("r41_i", "(lower(`name`))"),
+                (
+                    "r41_j",
+                    "(cast(json_unquote(json_extract(`j`,_utf8mb4'$.name')) as char(30) \
+                     charset utf8mb4))"
+                ),
+                ("r41_mix", "id, (lower(`name`))"),
+                ("r41_q", r"(concat(`name`,_utf8mb4'a\\b\'c'))"),
+            ]
+        );
+    }
+    h.ok("drop table r41_fi");
+}
+
 #[test]
 fn accounts() {
     let Some(mut h) = Harness::connect() else {
