@@ -169,6 +169,40 @@ All notable changes to Pythia are documented here. The format follows
   answered. Those folders now say that the connection was lost before
   they were loaded, and *Refresh* loads them. The same goes for the
   other lookups on the connection, such as completion's.
+- PostgreSQL scripts are read the way PostgreSQL reads them (#201,
+  #202). A dollar-quoted body may start with a word: `AS $$BEGIN
+  RETURN 3; END$$` was split at its first `;` and failed with
+  "unterminated dollar-quoted string", and `SELECT $$abc$$ AS e;` ran
+  together with the next statement ("cannot insert multiple commands
+  into a prepared statement"). A backslash escapes the next character in
+  an `E'…'` string, so `E'it\'s; here'` no longer splits the script in
+  two. The editor highlights both the same way.
+- MySQL scripts know the `mysql` client's `DELIMITER` (#203). A script
+  with `DELIMITER ;;` or `DELIMITER $$` around its routines and
+  triggers, as `mysqldump` and most tutorials write them, failed with
+  "ERROR 1064 … near 'DELIMITER'", and a routine was split at every `;`
+  of its body: under `WHENEVER SQLERROR CONTINUE`, the statements of the
+  body ran on their own. After a line `DELIMITER x`, statements now end
+  at `x` until `DELIMITER ;`, and the line itself isn't sent. `/` on a
+  line of its own still ends a routine.
+- SQLite: when a view's, an index's or a trigger's statement ends with
+  a line comment, its DDL puts the `;` on a line of its own (#206).
+  SQLite keeps the statement as written, and the `;` went into the
+  comment: *Edit* on such a view dropped the view, and its create ran
+  together with the next statement and failed; a table's indexes were
+  lost when its DDL ran again.
+- Completion offers the columns after the alias of a table quoted with
+  backticks or brackets (#208). ``select o. from `order` o`` offered
+  nothing on MySQL and SQLite, nor `select t. from [my table] t` on SQL
+  Server and SQLite, though completion writes such names itself where
+  the database needs them.
+- MySQL scripts send the code in `/*!…*/` comments to the server, which
+  runs it (#216). `mysqldump` writes its SETs (`/*!40101 SET … */;`),
+  partitions and triggers that way: a statement made of such a comment
+  was left out, and its `;` went to the server ("Query was empty") or
+  ran together with the next statement, so the SETs never ran, a dumped
+  trigger was never created and a table lost its partitions. MariaDB's
+  `/*M!…*/` stays a comment.
 
 ## [0.10.0] - 2026-10-30
 

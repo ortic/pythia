@@ -4,7 +4,7 @@
 //! `temp` when it has objects, those of `ATTACH`). Names keep their case and
 //! are compared without it, as SQLite does.
 
-use pythia_plsql::{TokenKind, tokenize};
+use pythia_plsql::{Syntax, TokenKind, tokenize};
 use rusqlite::Connection;
 
 use crate::dialect::Dialect;
@@ -536,14 +536,10 @@ fn ddl(
     Ok(out)
 }
 
-/// A stored statement with its `;`.
+/// A stored statement with its `;`: SQLite keeps the text as written, a
+/// line comment at its end too (#206).
 fn statement(sql: &str) -> String {
-    let sql = sql.trim_end();
-    if sql.ends_with(';') {
-        format!("{sql}\n")
-    } else {
-        format!("{sql};\n")
-    }
+    format!("{}\n", pythia_plsql::terminated(sql, Syntax::Sqlite))
 }
 
 /// A generic table of text columns.

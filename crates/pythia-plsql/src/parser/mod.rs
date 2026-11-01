@@ -274,19 +274,22 @@ pub(crate) fn is_reserved(word: &str) -> bool {
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(word))
 }
 
-/// Normalizes an identifier token's text the way Oracle stores names.
+/// Normalizes an identifier token's text the way Oracle stores names. MySQL's
+/// and SQLite's `` `name` `` and SQL Server's and SQLite's `[name]` are
+/// quoted names too (#208); a doubled closing quote stands for one.
 pub fn normalize_ident(text: &str) -> (String, bool) {
-    if let Some(inner) = text.strip_prefix('"') {
-        (
-            inner
-                .strip_suffix('"')
-                .unwrap_or(inner)
-                .replace("\"\"", "\""),
-            true,
-        )
-    } else {
-        (text.to_uppercase(), false)
-    }
+    let close = match text.chars().next() {
+        Some('"') => '"',
+        Some('`') => '`',
+        Some('[') => ']',
+        _ => return (text.to_uppercase(), false),
+    };
+    let inner = &text[1..];
+    let inner = inner.strip_suffix(close).unwrap_or(inner);
+    (
+        inner.replace(&format!("{close}{close}"), &close.to_string()),
+        true,
+    )
 }
 
 pub(crate) struct Parser<'a> {

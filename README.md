@@ -261,8 +261,9 @@ for Linux, Windows and macOS.
   transactions that work as with Oracle: queries see what others
   committed, changes wait for Commit.
 - Scripts are read as MySQL reads them: `\` escapes in strings, `#`
-  comments, and `--` comments only before a space. As on every database
-  but Oracle, `&name` is no substitution variable unless `SET DEFINE ON`
+  comments, `--` comments only before a space, and `/*!…*/` as code (as
+  `mysqldump` writes its SETs and triggers). As on every database but
+  Oracle, `&name` is no substitution variable unless `SET DEFINE ON`
   says so.
   Warnings show as messages.
 - *Edit* on a result of one table changes its rows in place, as on
@@ -289,8 +290,10 @@ for Linux, Windows and macOS.
   statements and lock waits `SELECT` on `performance_schema`.
 - Everything built on Oracle's dictionary or PL/SQL — debugger, profiler,
   the rest of the monitor, reports, scheduler jobs, compare, import/export,
-  the other form editors — isn't offered on MySQL connections. As in SQL\*Plus,
-  end a routine with `/` on a line of its own (there is no `DELIMITER`).
+  the other form editors — isn't offered on MySQL connections. End a
+  routine with `/` on a line of its own, as in SQL\*Plus, or with a
+  `DELIMITER` of its own, as for the `mysql` client (`DELIMITER ;;` …
+  `END ;;` … `DELIMITER ;`).
 
 **PostgreSQL and SQL Server (experimental)**
 - *Type: PostgreSQL* with `host:5432/database` (`?sslmode=require` for TLS,

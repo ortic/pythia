@@ -12,6 +12,7 @@ use crate::Syntax;
 use crate::keywords::is_keyword;
 
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[logos(extras = Syntax)]
 pub enum TokenKind {
     #[regex(r"[ \t\r\f]+")]
     Whitespace,
@@ -25,7 +26,7 @@ pub enum TokenKind {
     #[token("/*+", block_comment)]
     Hint,
     /// `'...'` and `N'...'` string literals, and PostgreSQL's dollar-quoted
-    /// `$$...$$` / `$tag$...$tag$`.
+    /// `$$...$$` / `$tag$...$tag$` and `E'...'`.
     #[token("'", string)]
     #[regex("[nN]'", string)]
     #[token("$", dollar_string)]
@@ -39,9 +40,11 @@ pub enum TokenKind {
     /// Unquoted identifier. Keywords are reclassified by [`tokenize`].
     #[regex(r"[\p{L}][\p{L}\p{N}_$#]*")]
     Ident,
-    /// `"Name"`, and MySQL's `` `name` `` (a doubled backtick stands for one).
+    /// `"Name"`, MySQL's `` `name` `` (a doubled backtick stands for one),
+    /// and SQL Server's and SQLite's `[name]`.
     #[regex(r#""[^"\n]*"?"#)]
     #[regex(r"`([^`\n]|``)*`?")]
+    #[token("[", bracket_ident)]
     QuotedIdent,
     #[regex(r":[\p{L}][\p{L}\p{N}_$#]*")]
     #[regex(r":[0-9]+")]
@@ -104,15 +107,17 @@ pub fn tokenize(src: &str) -> Vec<Token> {
     tokenize_in(src, Syntax::Oracle)
 }
 
-/// [`tokenize`] for a script of a database with `syntax`. MySQL lexes three
+/// [`tokenize`] for a script of a database with `syntax`. MySQL lexes four
 /// things its own way: `\` escapes the next character in `'…'` and `"…"`
-/// (#187), `#` starts a line comment (#188), and `--` does only before
-/// whitespace or a control character (#189). Its `"…"` is a string.
+/// (#187), `#` starts a line comment (#188), `--` does only before
+/// whitespace or a control character (#189), and `/*!…*/` is code (#216).
+/// Its `"…"` is a string, and it has no dollar quotes. PostgreSQL's dollar-quoted body may start with a
+/// word (#201), and `\` escapes the next character in `E'…'` (#202).
+/// Neither has Oracle's directives.
 pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
-    let mysql = syntax == Syntax::MySql;
-    let mut lexer = TokenKind::lexer(src);
-    // Where `lexer` started: it starts again after a token MySQL ends
-    // elsewhere.
+    let mut lexer = TokenKind::lexer_with_extras(src, syntax);
+    // Where `lexer` started: it starts again after a token MySQL or
+    // PostgreSQL ends elsewhere.
     let mut base = 0;
     let mut tokens = Vec::new();
     while let Some(result) = lexer.next() {
@@ -122,15 +127,21 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
             Ok(kind) => kind,
             Err(()) => TokenKind::Error,
         };
-        if mysql && let Some((mysql_kind, end)) = mysql_token(src, kind, span.clone()) {
-            kind = mysql_kind;
+        let own = match syntax {
+            Syntax::MySql => mysql_token(src, kind, span.clone()),
+            Syntax::Postgres => postgres_token(src, kind, span.clone()),
+            _ => None,
+        };
+        if let Some((own_kind, end)) = own {
+            kind = own_kind;
             span.end = end;
             base = end;
-            lexer = TokenKind::lexer(&src[end..]);
+            lexer = TokenKind::lexer_with_extras(&src[end..], syntax);
         }
         // Oracle's `$IF` and `$$name` (#171): the raw lexer knows `$` only
-        // in dollar-quoted strings.
-        if matches!(kind, TokenKind::Ident | TokenKind::Keyword)
+        // in dollar-quoted strings. PostgreSQL's `$$name` is one (#201).
+        if !matches!(syntax, Syntax::MySql | Syntax::Postgres)
+            && matches!(kind, TokenKind::Ident | TokenKind::Keyword)
             && let Some(last) = tokens.last_mut().filter(|t: &&mut Token| {
                 t.kind == TokenKind::Error
                     && t.span.end == span.start
@@ -167,6 +178,11 @@ fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenK
             (!after.is_ascii_whitespace() && !after.is_ascii_control())
                 .then_some((TokenKind::Operator, span.start + 1))
         }
+        // An executable comment, `/*!…*/` or `/*!50003 …*/`, is code: the
+        // server reads its version itself (#216). It shows as a hint.
+        // MariaDB's `/*M!…*/` stays one: MySQL doesn't run it, and the
+        // first line of a mariadb-dump is one for its own client.
+        TokenKind::BlockComment if text.starts_with("/*!") => Some((TokenKind::Hint, span.end)),
         TokenKind::Error if text.starts_with('#') => {
             let end = src[span.start..]
                 .find('\n')
@@ -192,6 +208,16 @@ fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenK
         }
         _ => None,
     }
+}
+
+/// A token PostgreSQL reads differently from Oracle, as its kind and where
+/// it ends: `E'…'`, a string with backslash escapes (#202). `None` for the
+/// others.
+fn postgres_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenKind, usize)> {
+    (kind.is_word()
+        && src[span.clone()].eq_ignore_ascii_case("e")
+        && src[span.end..].starts_with('\''))
+    .then(|| (TokenKind::String, escaped_string_end(src, span.end)))
 }
 
 /// Where a string with backslash escapes that opens at `open` ends: after
@@ -251,8 +277,14 @@ fn string(lex: &mut logos::Lexer<TokenKind>) {
 /// Consumes the rest of a dollar-quoted string after its first `$`: the tag,
 /// the body and the closing tag (or the rest of the input). A `$` that
 /// doesn't open one stays an error token, as PostgreSQL's `$1` always was;
-/// [`tokenize`] makes Oracle's `$IF` and `$$name` directives of it.
+/// [`tokenize`] makes Oracle's `$IF` and `$$name` directives of it, so only
+/// PostgreSQL's `$$` opens a body that starts with a word (#201). MySQL
+/// has no dollar quotes: `$$` is text there, as in `DELIMITER $$`.
 fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
+    let syntax = lex.extras;
+    if syntax == Syntax::MySql {
+        return false;
+    }
     let rest = lex.remainder();
     let tag_len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -262,12 +294,38 @@ fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
         return false;
     }
     let body = &rest[tag_len + 1..];
-    if tag.is_empty() && body.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+    if syntax != Syntax::Postgres
+        && tag.is_empty()
+        && body.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+    {
         return false;
     }
     let close = format!("${tag}$");
     let len = body.find(&close).map_or(body.len(), |i| i + close.len());
     lex.bump(tag_len + 1 + len);
+    true
+}
+
+/// Consumes the rest of SQL Server's and SQLite's `[name]` (#208): up to
+/// its `]` (a doubled one stands for itself), or the end of the line.
+/// Elsewhere `[` stays an error token.
+fn bracket_ident(lex: &mut logos::Lexer<TokenKind>) -> bool {
+    if !matches!(lex.extras, Syntax::TSql | Syntax::Sqlite) {
+        return false;
+    }
+    let rest = lex.remainder().as_bytes();
+    let mut i = 0;
+    while i < rest.len() && rest[i] != b'\n' {
+        match rest[i] {
+            b']' if rest.get(i + 1) == Some(&b']') => i += 2,
+            b']' => {
+                i += 1;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    lex.bump(i);
     true
 }
 
@@ -300,6 +358,7 @@ fn q_string(lex: &mut logos::Lexer<TokenKind>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::normalize_ident;
 
     fn kinds(src: &str) -> Vec<(TokenKind, &str)> {
         tokenize(src)
@@ -426,6 +485,24 @@ mod tests {
     }
 
     #[test]
+    fn mysql_executable_comments() {
+        // `/*!…*/` is code the server reads (#216); MariaDB's `/*M!…*/`
+        // and other comments stay comments.
+        assert_eq!(
+            mysql_kinds("/*!40101 SET x=1 */; /*M!999999 y */ /* z */ /*!*/"),
+            vec![
+                (TokenKind::Hint, "/*!40101 SET x=1 */"),
+                (TokenKind::Semicolon, ";"),
+                (TokenKind::Hint, "/*!*/"),
+            ]
+        );
+        assert_eq!(
+            kinds("/*!40101 SET x=1 */;"),
+            vec![(TokenKind::Semicolon, ";")]
+        );
+    }
+
+    #[test]
     fn mysql_backticks() {
         assert_eq!(
             kinds("select `a b`.`x``y` from `t;1` `open"),
@@ -493,6 +570,122 @@ mod tests {
                 (TokenKind::Error, "$"),
                 (TokenKind::Keyword, "if"),
                 (TokenKind::Ident, "x$if"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracketed_names() {
+        // SQL Server's and SQLite's `[name]` (#208).
+        for syntax in [Syntax::TSql, Syntax::Sqlite] {
+            let src = "select [a b].[x]]y] from [t;1] [open";
+            let kinds: Vec<_> = tokenize_in(src, syntax)
+                .into_iter()
+                .filter(|t| !t.kind.is_trivia())
+                .map(|t| (t.kind, &src[t.span]))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    (TokenKind::Keyword, "select"),
+                    (TokenKind::QuotedIdent, "[a b]"),
+                    (TokenKind::Dot, "."),
+                    (TokenKind::QuotedIdent, "[x]]y]"),
+                    (TokenKind::Keyword, "from"),
+                    (TokenKind::QuotedIdent, "[t;1]"),
+                    (TokenKind::QuotedIdent, "[open"),
+                ],
+                "{syntax:?}"
+            );
+        }
+        assert_eq!(
+            kinds("[a]"),
+            vec![
+                (TokenKind::Error, "["),
+                (TokenKind::Ident, "a"),
+                (TokenKind::Error, "]"),
+            ]
+        );
+        assert_eq!(normalize_ident("[x]]y]"), ("x]y".into(), true));
+        assert_eq!(normalize_ident("`a``b`"), ("a`b".into(), true));
+        assert_eq!(normalize_ident("\"My\"\"T\""), ("My\"T".into(), true));
+        assert_eq!(normalize_ident("emp"), ("EMP".into(), false));
+    }
+
+    fn postgres_kinds(src: &str) -> Vec<(TokenKind, &str)> {
+        tokenize_in(src, Syntax::Postgres)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia())
+            .map(|t| (t.kind, &src[t.span]))
+            .collect()
+    }
+
+    #[test]
+    fn postgres_dollar_quotes() {
+        // A body may start with a letter or `_` right after the tag (#201).
+        assert_eq!(
+            postgres_kinds("as $$BEGIN RETURN 3; END$$; $$abc$$, $_x$a;$_x$, $1"),
+            vec![
+                (TokenKind::Keyword, "as"),
+                (TokenKind::String, "$$BEGIN RETURN 3; END$$"),
+                (TokenKind::Semicolon, ";"),
+                (TokenKind::String, "$$abc$$"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, "$_x$a;$_x$"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Error, "$"),
+                (TokenKind::Number, "1"),
+            ]
+        );
+        // PostgreSQL has no directives.
+        assert_eq!(
+            postgres_kinds("$IF $$x"),
+            vec![
+                (TokenKind::Error, "$"),
+                (TokenKind::Keyword, "IF"),
+                (TokenKind::String, "$$x"),
+            ]
+        );
+        // MySQL has no dollar quotes: `$$` is text, as in `DELIMITER $$`.
+        assert_eq!(
+            mysql_kinds("select $$ a; $$ $$b"),
+            vec![
+                (TokenKind::Keyword, "select"),
+                (TokenKind::Error, "$$"),
+                (TokenKind::Ident, "a"),
+                (TokenKind::Semicolon, ";"),
+                (TokenKind::Error, "$$"),
+                (TokenKind::Error, "$$"),
+                (TokenKind::Ident, "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_escape_strings() {
+        // A backslash escapes the next character in `E'…'` only (#202).
+        assert_eq!(
+            postgres_kinds(r"select E'it\'s; here', e'\\', 'a\', E 'b', N'c'"),
+            vec![
+                (TokenKind::Keyword, "select"),
+                (TokenKind::String, r"E'it\'s; here'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, r"e'\\'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, r"'a\'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Ident, "E"),
+                (TokenKind::String, "'b'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, "N'c'"),
+            ]
+        );
+        assert_eq!(
+            kinds(r"E'a\' x"),
+            vec![
+                (TokenKind::Ident, "E"),
+                (TokenKind::String, r"'a\'"),
+                (TokenKind::Ident, "x"),
             ]
         );
     }

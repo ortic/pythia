@@ -1,4 +1,5 @@
 use super::*;
+use pythia_plsql::Syntax;
 
 const HR_PKG: &str = include_str!("../../pythia-plsql/testdata/hr_pkg.sql");
 const TRIGGERS: &str = include_str!("../../pythia-plsql/testdata/triggers.sql");
@@ -390,6 +391,94 @@ fn quoted_identifiers() {
     assert_eq!(item.insert_text, "\"My Col\"");
     let l = labels("select * from \"Wei¦");
     has(&l, &["\"Weird Tab\""]);
+}
+
+/// Tables of a database that keeps names as written, all with the columns
+/// `id` and `note`.
+fn as_written(schema: &str, names: NameStyle, tables: &[&str]) -> CatalogCache {
+    let mut c = CatalogCache::new(schema).with_names(names);
+    c.set_schemas(vec![schema.into()]);
+    c.set_objects(
+        None,
+        tables.iter().map(|t| obj(schema, t, "TABLE")).collect(),
+    );
+    for t in tables {
+        c.set_columns(
+            schema,
+            t,
+            vec![col("id", "int", false), col("note", "text", true)],
+        );
+    }
+    c
+}
+
+/// The column labels completed in `src`, lexed as a script of `syntax`.
+fn columns_in(src: &str, syntax: Syntax, cat: &CatalogCache) -> Vec<String> {
+    let (text, offset) = split(src);
+    let c = Analysis::new_in(&text, syntax).complete(offset, cat);
+    assert!(c.missing.is_empty(), "{src}: {:?}", c.missing);
+    c.items.into_iter().map(|i| i.label).collect()
+}
+
+#[test]
+fn backticked_names() {
+    // MySQL's quoted names, as completion writes them itself (#208).
+    let cat = as_written(
+        "pythia",
+        NameStyle::Backticks,
+        &["fs_plain", "order", "spaced name", "a`b"],
+    );
+    for src in [
+        "select p.¦ from `fs_plain` p",
+        "select p.¦ from `pythia`.`fs_plain` p",
+        "select `fs_plain`.¦ from `fs_plain`",
+        "select o.¦ from `order` o",
+        "select s.¦ from `spaced name` as s",
+        "select x.¦ from `a``b` x",
+    ] {
+        let labels = columns_in(src, Syntax::MySql, &cat);
+        assert!(labels.contains(&"note".to_owned()), "{src}: {labels:?}");
+    }
+    // A schema without them is looked up as typed.
+    let (text, offset) = split("select p.¦ from pythia.`fs_plain` p");
+    assert_eq!(
+        Analysis::new_in(&text, Syntax::MySql)
+            .complete(offset, &cat)
+            .missing,
+        [CatalogRequest::Resolve {
+            schema: Some("PYTHIA".into()),
+            name: "fs_plain".into()
+        }]
+    );
+}
+
+#[test]
+fn bracketed_names() {
+    // SQLite's `…` and […], and SQL Server's […] (#208).
+    let cat = as_written(
+        "main",
+        NameStyle::AsWritten,
+        &["fs_plain", "my table", "a]b"],
+    );
+    for src in [
+        "select p.¦ from `fs_plain` p",
+        "select p.¦ from [fs_plain] p",
+        "select p.¦ from [main].[fs_plain] p",
+        "select [fs_plain].¦ from [fs_plain]",
+        "select m.¦ from [my table] m",
+        "select x.¦ from [a]]b] x",
+    ] {
+        let labels = columns_in(src, Syntax::Sqlite, &cat);
+        assert!(labels.contains(&"note".to_owned()), "{src}: {labels:?}");
+    }
+    let cat = as_written("dbo", NameStyle::Brackets, &["fs_plain", "order"]);
+    for src in [
+        "select p.¦ from [dbo].[fs_plain] p",
+        "select o.¦ from [order] o",
+    ] {
+        let labels = columns_in(src, Syntax::TSql, &cat);
+        assert!(labels.contains(&"note".to_owned()), "{src}: {labels:?}");
+    }
 }
 
 #[test]

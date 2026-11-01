@@ -30,24 +30,33 @@ pub use outline::{OutlineItem, OutlineKind};
 pub use pythia_plsql::ast::{Diagnostic, Severity};
 
 use catalog::Tracker;
-use pythia_plsql::Token;
 use pythia_plsql::ast::Ast;
+use pythia_plsql::{Syntax, Token};
 use sema::Sema;
 
 /// Parsed state of one source text.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
     src: String,
+    syntax: Syntax,
     tokens: Vec<Token>,
     ast: Ast,
 }
 
 impl Analysis {
     pub fn new(src: &str) -> Self {
-        let tokens = pythia_plsql::tokenize(src);
+        Self::new_in(src, Syntax::Oracle)
+    }
+
+    /// [`Analysis::new`] of code for a database with `syntax`, lexed the way
+    /// it reads it: SQL Server's and SQLite's `[name]` is a quoted name
+    /// (#208).
+    pub fn new_in(src: &str, syntax: Syntax) -> Self {
+        let tokens = pythia_plsql::tokenize_in(src, syntax);
         let ast = pythia_plsql::parse_tokens(src, &tokens);
         Self {
             src: src.to_owned(),
+            syntax,
             tokens,
             ast,
         }
@@ -55,10 +64,18 @@ impl Analysis {
 
     /// Re-parses if `src` differs from the analyzed text. Returns whether it did.
     pub fn update(&mut self, src: &str) -> bool {
-        if self.src == src && !(src.is_empty() && self.ast.scopes.is_empty()) {
+        self.update_in(src, self.syntax)
+    }
+
+    /// [`Analysis::update`] for code of a database with `syntax`.
+    pub fn update_in(&mut self, src: &str, syntax: Syntax) -> bool {
+        if self.src == src
+            && self.syntax == syntax
+            && !(src.is_empty() && self.ast.scopes.is_empty())
+        {
             return false;
         }
-        *self = Self::new(src);
+        *self = Self::new_in(src, syntax);
         true
     }
 

@@ -26,6 +26,8 @@ pub enum LineState {
     Str,
     /// Inside MySQL's `"..."`.
     DoubleStr,
+    /// Inside PostgreSQL's `E'...'`.
+    EscapeStr,
     /// Inside `q'<open>...<close>'`.
     QStr { open: char, close: char },
     /// Inside PostgreSQL's `$tag$...$tag$`.
@@ -100,6 +102,7 @@ pub fn lex_line_in(line: &str, state: LineState, syntax: Syntax) -> (Vec<LineTok
         LineState::Hint => "/*+".into(),
         LineState::Str => "'".into(),
         LineState::DoubleStr => "\"".into(),
+        LineState::EscapeStr => "E'".into(),
         LineState::QStr { open, .. } => format!("q'{open}"),
     };
     let src = format!("{prefix}{line}");
@@ -356,6 +359,8 @@ fn end_state(text: &str, kind: TokenKind, syntax: Syntax) -> LineState {
         TokenKind::String if !string_terminated(text, syntax) => {
             if text.starts_with('"') {
                 LineState::DoubleStr
+            } else if text.starts_with(['e', 'E']) {
+                LineState::EscapeStr
             } else {
                 LineState::Str
             }
@@ -386,13 +391,15 @@ fn end_state(text: &str, kind: TokenKind, syntax: Syntax) -> LineState {
 }
 
 fn string_terminated(text: &str, syntax: Syntax) -> bool {
-    let body = text.trim_start_matches(['n', 'N']);
+    // MySQL's `\` escapes the next character (#187), PostgreSQL's in
+    // `E'…'` (#202).
+    let escapes = syntax == Syntax::MySql || text.starts_with(['e', 'E']);
+    let body = &text[text.find(['\'', '"']).unwrap_or(0)..];
     let bytes = body.as_bytes();
     let quote = bytes[0];
     let mut i = 1;
     while i < bytes.len() {
-        // MySQL's `\` escapes the next character (#187).
-        if syntax == Syntax::MySql && bytes[i] == b'\\' {
+        if escapes && bytes[i] == b'\\' {
             i += 2;
             continue;
         }
@@ -538,6 +545,94 @@ mod tests {
         );
         // Oracle's strings know no backslash.
         assert_eq!(kinds(r"x = 'it\'", LineState::Normal).1, LineState::Normal);
+        // No dollar quotes: `DELIMITER $$` leaves the next lines code.
+        assert_eq!(
+            mysql("DELIMITER $$", LineState::Normal).1,
+            LineState::Normal
+        );
+        assert_eq!(mysql("END$$", LineState::Normal).1, LineState::Normal);
+    }
+
+    #[test]
+    fn mysql_executable_comments() {
+        // Code the server reads, shown as a hint, across lines too (#216).
+        assert_eq!(
+            mysql(
+                "/*!50003 TRIGGER t BEFORE INSERT ON x FOR EACH ROW begin",
+                LineState::Normal
+            ),
+            (
+                vec![(
+                    TokenKind::Hint,
+                    "/*!50003 TRIGGER t BEFORE INSERT ON x FOR EACH ROW begin"
+                )],
+                LineState::Hint
+            )
+        );
+        assert_eq!(
+            mysql("end */;;", LineState::Hint),
+            (
+                vec![
+                    (TokenKind::Hint, "end */"),
+                    (TokenKind::Semicolon, ";"),
+                    (TokenKind::Semicolon, ";"),
+                ],
+                LineState::Normal
+            )
+        );
+    }
+
+    fn postgres(line: &str, state: LineState) -> (Vec<(TokenKind, &str)>, LineState) {
+        let (tokens, end) = lex_line_in(line, state, Syntax::Postgres);
+        let tokens = tokens
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Whitespace)
+            .map(|t| (t.kind, &line[t.range]))
+            .collect();
+        (tokens, end)
+    }
+
+    #[test]
+    fn postgres_lines() {
+        // A body that starts with a word (#201).
+        let body = LineState::Dollar(DollarTag::new(""));
+        assert_eq!(postgres("as $$BEGIN", LineState::Normal).1, body);
+        assert_eq!(
+            postgres("as $$BEGIN RETURN 3; END$$;", LineState::Normal),
+            (
+                vec![
+                    (TokenKind::Keyword, "as"),
+                    (TokenKind::String, "$$"),
+                    (TokenKind::Keyword, "BEGIN"),
+                    (TokenKind::Keyword, "RETURN"),
+                    (TokenKind::Number, "3"),
+                    (TokenKind::Semicolon, ";"),
+                    (TokenKind::Keyword, "END"),
+                    (TokenKind::String, "$$"),
+                    (TokenKind::Semicolon, ";"),
+                ],
+                LineState::Normal
+            )
+        );
+        // `E'…'` goes on to the next line past `\'`, and ends there (#202).
+        let open = postgres(r"x = E'it\'s", LineState::Normal).1;
+        assert_ne!(open, LineState::Normal);
+        assert_eq!(
+            postgres(r"\\', y", open),
+            (
+                vec![
+                    (TokenKind::String, r"\\'"),
+                    (TokenKind::Comma, ","),
+                    (TokenKind::Ident, "y")
+                ],
+                LineState::Normal
+            )
+        );
+        assert_eq!(
+            postgres(r"x = 'it\'", LineState::Normal).1,
+            LineState::Normal
+        );
+        assert_eq!(postgres(r"x = E'it\'", LineState::Normal).1, open);
     }
 
     #[test]
