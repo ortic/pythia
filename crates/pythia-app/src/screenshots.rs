@@ -3255,6 +3255,73 @@ fn import_csv() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Imports into new tables named as given: a quoted name keeps its case,
+/// and columns that read quoted (a reserved word, a letter that isn't
+/// ASCII) are created as they are inserted into (#335).
+#[test]
+fn import_keeps_quoted_names() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pythia-import-r71-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r71.csv");
+    std::fs::write(&path, "Id;Date;Café\n1;31.12.2024;x\n2;01.01.2025;y\n").unwrap();
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["r71_import", "\"R71_My Table\"", "\"r71_my table\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    for table in ["r71_import", "\"R71_My Table\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        let message = h.state().test_import_message();
+        assert!(
+            matches!(&message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{table}: {message:?}"
+        );
+        let rows: Vec<(i64, String, String)> = conn
+            .query_as(
+                &format!(
+                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), \"CAFé\" from {table} order by id"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (1, "2024-12-31".into(), "x".into()),
+                (2, "2025-01-01".into(), "y".into())
+            ],
+            "{table}"
+        );
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables \
+              where upper(table_name) in ('R71_IMPORT', 'R71_MY TABLE') order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(made, ["R71_IMPORT", "R71_My Table"]);
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Debugs a block calling `demo_pkg.raise_salary` with a breakpoint in the
 /// package body: stops at the line, shows variables, steps and finishes.
 /// A debug run whose session can't connect to the debugger (no network ACL

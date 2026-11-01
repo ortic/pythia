@@ -827,6 +827,13 @@ All notable changes to Pythia are documented here. The format follows
   quotes and all, so a hit in `"R71_Data"` read `"r71_data"`: it failed
   with ORA-00942, or read the rows of another table. Plain names still
   read in lowercase.
+- *Import* into a new table creates the table and columns it inserts
+  into (#335). Its CREATE TABLE lowercased the quoted names too, so
+  `"R71_My Table"` was created as `"r71_my table"`, and a column read
+  from a header `Date` or `Café` as `"date"` or `"café"`, where the
+  INSERT names `"DATE"` and `"CAFé"`: the import failed with ORA-00942
+  or ORA-00904 and left the table behind. Plain names still read in
+  lowercase.
 
 ## [0.10.0] - 2026-10-30
 
