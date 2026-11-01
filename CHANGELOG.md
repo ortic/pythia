@@ -652,6 +652,12 @@ All notable changes to Pythia are documented here. The format follows
   a new row Ctrl+Z brought back in between. They now stay on their rows;
   on the row taken back, the viewer and the dialog close and the edit
   ends, which also no longer keeps the keys from the grid.
+- SQL Server: a connection lost once a statement of an Apply ran, while
+  Pythia read how many rows it changed, no longer reads as "Conflict on
+  row N: it was changed or deleted by another session" (#310). The
+  statement now fails with the lost connection, which says the statement
+  ran and its row count couldn't be read, and the change waits for
+  Apply. A connection out of step then is opened again.
 
 ## [0.10.0] - 2026-10-30
 

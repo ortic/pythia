@@ -2621,6 +2621,195 @@ fn an_apply_cut_off_by_a_new_connection() {
     locker.run("drop table r52_apply");
 }
 
+/// A TCP proxy to a database server that cuts one of the connections
+/// through it when a test says: the one waiting for a reply, when it
+/// sends again.
+struct Cutter {
+    port: u16,
+    links: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<Link>>>>,
+}
+
+/// A connection through a [`Cutter`].
+struct Link {
+    client: std::net::TcpStream,
+    server: std::net::TcpStream,
+    /// Since when the client waits for the reply to what it sent.
+    waiting: std::sync::Mutex<Option<Instant>>,
+    /// Cut when the client sends again.
+    cut: std::sync::atomic::AtomicBool,
+}
+
+impl Cutter {
+    fn start(server: &str) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let links = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = links.clone();
+        let server = server.to_owned();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let (Ok(client), Ok(server)) = (client, std::net::TcpStream::connect(&server))
+                else {
+                    continue;
+                };
+                let link = std::sync::Arc::new(Link {
+                    client,
+                    server,
+                    waiting: std::sync::Mutex::new(None),
+                    cut: Default::default(),
+                });
+                kept.lock().unwrap().push(link.clone());
+                let back = link.clone();
+                std::thread::spawn(move || back.pass(false));
+                std::thread::spawn(move || link.pass(true));
+            }
+        });
+        Self { port, links }
+    }
+
+    /// Has the connections that have waited a second or more for a reply
+    /// cut when they send again; how many there are.
+    fn cut_waiting(&self) -> usize {
+        let links = self.links.lock().unwrap();
+        links
+            .iter()
+            .filter(|l| {
+                let waiting = *l.waiting.lock().unwrap();
+                waiting.is_some_and(|since| since.elapsed() >= Duration::from_secs(1))
+            })
+            .map(|l| l.cut.store(true, std::sync::atomic::Ordering::SeqCst))
+            .count()
+    }
+}
+
+impl Link {
+    /// Passes on what the client sends (`up`), or what the server replies.
+    fn pass(&self, up: bool) {
+        use std::io::{Read, Write};
+        let (mut from, mut to) = if up {
+            (&self.client, &self.server)
+        } else {
+            (&self.server, &self.client)
+        };
+        let mut buffer = vec![0; 1 << 16];
+        while let Ok(n @ 1..) = from.read(&mut buffer) {
+            if up && self.cut.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let mut waiting = self.waiting.lock().unwrap();
+            *waiting = if up {
+                waiting.or(Some(Instant::now()))
+            } else {
+                None
+            };
+            drop(waiting);
+            if to.write_all(&buffer[..n]).is_err() {
+                break;
+            }
+        }
+        let _ = self.client.shutdown(std::net::Shutdown::Both);
+        let _ = self.server.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// An Apply on SQL Server whose connection is lost once its statement
+/// ran, while the session reads how many rows it changed (#310): the
+/// messages say the connection was lost, and the change waits for Apply.
+/// Before, they read "Conflict on row 1: it was changed or deleted by
+/// another session".
+#[test]
+fn a_connection_lost_after_an_apply_statement() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("PYTHIA_TEST_MSSQL"),
+        std::env::var("PYTHIA_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("PYTHIA_TEST_MSSQL / PYTHIA_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = pythia_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r61_lost");
+    locker.run("create table r61_lost (id int primary key, v varchar(10))");
+    locker.run("insert into r61_lost values (1, 'a'), (2, 'b')");
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let schema = locker.run("select schema_name()")[0][0].clone().unwrap();
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let (server, database) = connect_string.split_once('/').unwrap();
+    let cutter = Cutter::start(server);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: format!("127.0.0.1:{}/{database}", cutter.port),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r61_lost order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+    }
+    // Row 1 locked: the Apply's update waits, and its connection is cut
+    // when it reads the row count after it.
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(false));
+    locker.run("update r61_lost set v = v where id = 1");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    loop {
+        h.step();
+        let blocked = admin.run(&format!(
+            "select session_id from sys.dm_exec_requests \
+             where blocking_session_id = {locker_spid}"
+        ));
+        if !blocked.is_empty() && cutter.cut_waiting() > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "not blocked");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(cutter.cut_waiting(), 1, "only the window's session waits");
+    locker.end(pythia_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (_, updates, _, _, messages) = part(&mut h);
+    let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+    assert!(!said("Conflict"), "{messages:?}");
+    assert!(said("Lost connection to SQL Server"), "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.ends_with("\nThe statement ran; its row count couldn't be read.")),
+        "{messages:?}"
+    );
+    assert!(said("Connection lost."), "{messages:?}");
+    assert_eq!(updates, pairs(&[("1", "x")]), "{messages:?}");
+    let stored = admin.run(&format!("select v from {schema}.r61_lost order by id"));
+    let text = |v: &str| vec![Some(v.to_owned())];
+    assert_eq!(stored, [text("a"), text("b")]);
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r61_lost");
+}
+
 /// An Apply whose statement after the first is chosen as a deadlock's
 /// victim, on MySQL (`PYTHIA_TEST_MYSQL`, `PYTHIA_TEST_MYSQL_DBA`): InnoDB
 /// rolls the whole transaction back, and all the changes wait for Apply
