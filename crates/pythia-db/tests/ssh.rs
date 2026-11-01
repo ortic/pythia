@@ -37,6 +37,27 @@ AAAEBVQLxXdjxITDjOZBjt5FroC7D3RmIMHNpmHM2SpWMnuRtjbakZAAhgwazI7uMlM7PM
 LqTjCTT20x0RfIwLT+/wAAAABmNsaWVudAECAwQFBgc=
 -----END OPENSSH PRIVATE KEY-----
 ";
+/// An RSA key in PEM (`BEGIN RSA PRIVATE KEY`) with the passphrase
+/// `secret-phrase`; a wrong one fails in the padding.
+const RSA_PEM_ENCRYPTED: &str = "-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,1936B01A6061FEA2F3D098D20A73FD3E
+
+vs6iZ9PFPDoYeNLAbDsPAEvTg1ED1IUlBBvZtX+ih+K73VuYFlF/qp4+pm9BWRCe
+wvhd0EFHgykZyTVlLte3Zdhx4Lw8Hc4OhH8W+j2PiPf5q1d8okyKNqhWUBTLreAU
+WuiiJSoMPry9AYkxGZC8vsEFqO4F2TG7GzMb14d7wNv03j9rDFx+Bqkqp8IcL47t
+6UFQaQAq62Drg6u1d7VJaTfwMisiCiRXuAiXAyk4mHwiDD+/eSG6qybdFvf8tuHb
+5VSGvzxjMOKRhf/2DuMK3JLg+5RVlrPSDHYrwSkgUgQ4Kooeib6W0kLjVTs0Yjr2
+i39rDmlLHbcJZAHtJcqtYXb2WxpnRk6GhiBi6hdY3XE9dtI0xhzL7HofnUrFlh8i
+M2TYQTpXMqMGH0JLLBEFZ9Fw98MYZ+8K8SZZtkiwUXCg3Xboxx2v/D9Aw/Oywyf6
+bFzwBpuEub8bIiKbKL+/b51rNRFEFn/1sO9xPtRiN6X1Rdu64YurFwO4XOww41n0
+Xy+ah/+3AXyiVb2kqOcvysRRY3KZHdtw1mRoI8TlZCeTbSI6FcF1qanVxFGPdSyE
+96SbPTJ5d/bIX8PIFoKBQdOycBBZVUB9muh0aJ73OeUslqywGpOy8MXH5fyApSlu
+2Rakkxk1TW5NfcnYbAdZjOdTKPh84/bsqt0YyYBkMt9LWRywmPwsivaSrqGleLOD
+IIevSXsiQQeAirPb2ZmQjAjxAEK+IzjJo/xqaiz2hbVaFZU+YDBJO0Ku4ApmTkl2
+fmwHd6HRP0WXkJ8LXGI5hH9RW+p0WwU4YMu+TWdCaJG+F8PwZHTBYWEPXWsUTo4G
+-----END RSA PRIVATE KEY-----
+";
 /// `CLIENT_KEY` with the passphrase `secret-phrase`.
 const CLIENT_KEY_ENCRYPTED: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDAcFWMTM
@@ -382,11 +403,28 @@ fn logins() {
     );
     let tunnel = Tunnel::new(SshParams {
         password: "secret-phrase".into(),
-        key_file: Some(encrypted),
+        key_file: Some(encrypted.clone()),
         ..server.params(&dir)
     });
     let local = tunnel.forward("127.0.0.1", target.port()).unwrap();
     assert_eq!(echo(local).unwrap(), "hello\n");
+    // A wrong passphrase says so (#194), not "cryptographic error" or
+    // "Padding error".
+    let rsa = dir.join("id_rsa");
+    fs::write(&rsa, RSA_PEM_ENCRYPTED).unwrap();
+    for key in [encrypted, rsa] {
+        let error = forward_error(SshParams {
+            password: "wrong".into(),
+            key_file: Some(key),
+            ..server.params(&dir)
+        });
+        assert!(
+            error
+                .message
+                .contains("the passphrase doesn't open the key file"),
+            "{error}"
+        );
+    }
 
     let error = forward_error(SshParams {
         key_file: Some(dir.join("missing")),

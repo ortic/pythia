@@ -460,6 +460,21 @@ fn load_key(path: &Path, passphrase: &str) -> Result<russh::keys::PrivateKey, Db
             "SSH: the key file {} is protected by a passphrase: enter it as the SSH password",
             path.display()
         )),
+        // A wrong passphrase fails in the cipher, as "cryptographic error"
+        // or "Padding error" (#194): the key is encrypted, and it doesn't
+        // open it.
+        _ if passphrase.is_some()
+            && matches!(
+                russh::keys::load_secret_key(path, None),
+                Err(russh::keys::Error::KeyIsEncrypted)
+            ) =>
+        {
+            DbError::new(format!(
+                "SSH: the passphrase doesn't open the key file {}: enter the key's passphrase as \
+                 the SSH password",
+                path.display()
+            ))
+        }
         e => DbError::new(format!("SSH: reading the key file {}: {e}", path.display())),
     })
 }

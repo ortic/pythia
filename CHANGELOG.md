@@ -95,6 +95,9 @@ All notable changes to Pythia are documented here. The format follows
   `smalldatetime`, and SQLite's columns declared so are Excel dates
   now, not text (#193). Types with a time zone, and dates before 1900,
   which Excel has no day for, stay text.
+- A wrong passphrase for an SSH key file says so (#194): it said
+  "SshKey: cryptographic error" (OpenSSH keys) or "Padding error" (PEM
+  RSA keys).
 
 ## [0.10.0] - 2026-10-30
 
