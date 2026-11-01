@@ -827,6 +827,14 @@ All notable changes to Pythia are documented here. The format follows
   schema out where the connection's search path found them, `FROM t`
   for `public.t`, so that *Edit* in a SQL window whose search path finds
   another `t` first made the view read that one.
+- PostgreSQL: *Edit* of a materialized view keeps its owner, its lack
+  of data and its storage (#330). The view it made again belonged to the
+  role that ran *Edit*, was populated where it was made `with no data`,
+  and had the default storage parameters, tablespace and access method.
+  The DDL now has them where they aren't the defaults, and `alter
+  materialized view … owner to …` where the owner isn't you. A role that
+  can't give the view back to its owner gets an error, and the view
+  stays as it was.
 
 ## [0.10.0] - 2026-10-30
 

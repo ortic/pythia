@@ -1370,6 +1370,94 @@ fn a_views_ddl_names_its_tables_with_their_schemas() {
     h.ok("drop function r73_vp_f(int)");
 }
 
+/// A materialized view's DDL makes it as it is: owned by its owner where
+/// that isn't the role reading it, without data where it has none, with
+/// its storage parameters, tablespace and access method. Run in another
+/// schema by another role, the copy is the same (#330).
+#[test]
+fn a_materialized_view_keeps_its_owner_data_and_storage() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r73_mv, r73_mv_copy cascade");
+    h.ok("drop tablespace if exists r73_ts");
+    h.ok("drop access method if exists r73_heap");
+    h.ok("drop role if exists r73_owner");
+    h.ok("create role r73_owner");
+    h.ok("create schema r73_mv");
+    h.ok("create schema r73_mv_copy");
+    // A tablespace in the data directory, as tests make them.
+    h.ok("set allow_in_place_tablespaces = on");
+    h.ok("create tablespace r73_ts location ''");
+    h.ok("reset allow_in_place_tablespaces");
+    h.ok("create access method r73_heap type table handler heap_tableam_handler");
+    for schema in ["r73_mv", "r73_mv_copy"] {
+        h.ok(&format!("create table {schema}.r73_t (n int, t text)"));
+        h.ok(&format!("insert into {schema}.r73_t values (1, 'a')"));
+    }
+    h.ok("create materialized view r73_mv.r73_full as select n from r73_mv.r73_t");
+    h.ok("create materialized view r73_mv.r73_empty using r73_heap \
+         with (fillfactor = 70, autovacuum_enabled = off, toast.autovacuum_enabled = false) \
+         tablespace r73_ts as select n, t from r73_mv.r73_t with no data");
+    h.ok("alter materialized view r73_mv.r73_empty owner to r73_owner");
+    h.ok("create index r73_empty_n on r73_mv.r73_empty (n)");
+    let full = ddl_of(&mut h, "r73_mv", "r73_full", ObjectType::MaterializedView);
+    assert_eq!(
+        full,
+        "create materialized view r73_mv.r73_full as\n SELECT n\n   FROM r73_mv.r73_t;"
+    );
+    let empty = ddl_of(&mut h, "r73_mv", "r73_empty", ObjectType::MaterializedView);
+    assert!(
+        empty.starts_with(
+            "create materialized view r73_mv.r73_empty using r73_heap \
+             with (fillfactor='70', autovacuum_enabled=off, toast.autovacuum_enabled='false') \
+             tablespace r73_ts as\n SELECT n,\n    t\n   FROM r73_mv.r73_t\nwith no data;\n\n\
+             alter materialized view r73_mv.r73_empty owner to r73_owner;\n\n\
+             CREATE INDEX r73_empty_n ON r73_mv.r73_empty"
+        ),
+        "{empty}"
+    );
+    for ddl in [&full, &empty] {
+        run_ddl(&mut h, ddl, "r73_mv.r73_", "r73_mv_copy.r73_");
+    }
+    let state = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relowner::regrole, c.relispopulated, \
+                                         c.reloptions, s.reloptions, coalesce(t.spcname, '-'), \
+                                         a.amname, i.indexes), \
+                               '; ' order by c.relname) \
+               from pg_class c join pg_am a on a.oid = c.relam \
+               left join pg_class s on s.oid = c.reltoastrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              cross join lateral (select count(*) as indexes from pg_index \
+                                   where indrelid = c.oid) i \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind = 'm'"
+        ))
+    };
+    let me = h
+        .scalar("select current_user::regrole::text")
+        .unwrap_or_default();
+    let was = state(&mut h, "r73_mv");
+    assert_eq!(
+        was,
+        Some(format!(
+            "r73_empty r73_owner f {{fillfactor=70,autovacuum_enabled=off}} \
+             {{autovacuum_enabled=false}} r73_ts r73_heap 1; r73_full {me} t - heap 0"
+        ))
+    );
+    assert_eq!(state(&mut h, "r73_mv_copy"), was, "{empty}");
+    h.ok("drop schema r73_mv, r73_mv_copy cascade");
+    h.ok("drop tablespace r73_ts");
+    h.ok("drop access method r73_heap");
+    h.ok("drop role r73_owner");
+}
+
 /// Object filters find names without case whatever their letters: names
 /// collate as C, where upper() changes only ASCII letters, in the test
 /// database and in one whose lc_ctype is C.

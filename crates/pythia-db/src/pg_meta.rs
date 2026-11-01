@@ -561,10 +561,33 @@ fn ddl(
     }
 }
 
+/// A relation's storage parameters, then its TOAST table's as `toast.…`, as
+/// `with (…)` takes them (`c` is its `pg_class`); null without any. A value
+/// is quoted unless it is a name that needs no quotes, as `pg_get_indexdef`
+/// writes them: `fillfactor='70', autovacuum_enabled=off`.
+const STORAGE: &str = "(select string_agg(p.name || '=' \
+                                          || case when quote_ident(p.value) = p.value then p.value \
+                                                  else quote_literal(p.value) end, \
+                                          ', ' order by p.toast, p.n) \
+                          from (select false as toast, o.n, quote_ident(split_part(o.x, '=', 1)) as name, \
+                                       substr(o.x, strpos(o.x, '=') + 1) as value \
+                                  from unnest(c.reloptions) with ordinality o(x, n) \
+                                union all \
+                                select true, o.n, 'toast.' || quote_ident(split_part(o.x, '=', 1)), \
+                                       substr(o.x, strpos(o.x, '=') + 1) \
+                                  from pg_class s cross join unnest(s.reloptions) with ordinality o(x, n) \
+                                 where s.oid = c.reltoastrelid) p)";
+
 /// `CREATE` of a view or materialized view as stored, if there is one. A
 /// view is replaced in place, but Edit drops a materialized view and
 /// creates it again from this: without them the new one would come without
-/// its indexes, comments and grants (#301).
+/// its indexes, comments and grants (#301), and belong to the role that ran
+/// it, populated, with the default storage (#330). So a materialized view's
+/// `CREATE` has its access method, storage parameters and tablespace where
+/// they aren't the defaults, and `with no data` where it has none; its
+/// owner follows where it isn't the role reading the DDL. A role that can
+/// drop the view but can't give it back to its owner gets an error, and
+/// Edit's block leaves the view as it was.
 fn view_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -574,32 +597,50 @@ fn view_ddl(
 ) -> Result<Option<String>, DbError> {
     let (owner, name) = stored(pg, owner, name)?;
     let Some(row) = pg.first(
-        "select pg_get_viewdef(c.oid, true), c.oid, obj_description(c.oid, 'pg_class') \
-           from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-          where n.nspname = $1 and c.relname = $2",
+        &format!(
+            "select pg_get_viewdef(c.oid, true), c.oid, obj_description(c.oid, 'pg_class'), \
+                    c.relispopulated, \
+                    concat(case when a.amname <> current_setting('default_table_access_method') \
+                                then ' using ' || quote_ident(a.amname) end, \
+                           ' with (' || {STORAGE} || ')', \
+                           ' tablespace ' || quote_ident(t.spcname)), \
+                    case when r.rolname <> current_user then quote_ident(r.rolname) end \
+               from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+               join pg_roles r on r.oid = c.relowner \
+               left join pg_am a on a.oid = c.relam \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              where n.nspname = $1 and c.relname = $2"
+        ),
         &[&owner, &name],
     )?
     else {
         return Ok(None);
     };
     let mut row = row.into_iter();
-    let Some(definition) = row.next().flatten() else {
+    let mut next = || row.next().flatten();
+    let Some(definition) = next() else {
         return Ok(None);
     };
-    let oid = row.next().flatten().unwrap_or_default();
-    let comment = row.next().flatten();
+    let oid = next().unwrap_or_default();
+    let comment = next();
+    let populated = next().as_deref() != Some("f");
+    let storage = next().unwrap_or_default();
+    let role = next();
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
-    let create = if object_type == ObjectType::View {
-        "create or replace view"
+    let definition = definition.trim_end().trim_end_matches(';');
+    let mut ddl = if object_type == ObjectType::View {
+        format!("create or replace view {qualified} as\n{definition}")
     } else {
-        "create materialized view"
+        let data = if populated { "" } else { "\nwith no data" };
+        format!("create materialized view {qualified}{storage} as\n{definition}{data}")
     };
-    let mut ddl = format!(
-        "{create} {qualified} as\n{}",
-        definition.trim_end().trim_end_matches(';')
-    );
     let mut rest = String::new();
     if object_type == ObjectType::MaterializedView {
+        if let Some(role) = role {
+            rest.push_str(&format!(
+                "\n\nalter materialized view {qualified} owner to {role};"
+            ));
+        }
         indexes_and_comments(
             pg,
             &mut rest,

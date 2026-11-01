@@ -1829,6 +1829,124 @@ fn postgres_edit_keeps_a_materialized_views_indexes_grants_and_comments() {
     crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(drop).unwrap());
 }
 
+/// *Edit* of a PostgreSQL materialized view keeps its owner, its lack of
+/// data and its storage: the view the script made again was the editor's,
+/// populated, with the default parameters, tablespace and access method
+/// (#330).
+#[test]
+fn postgres_edit_keeps_a_materialized_views_owner_data_and_storage() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let connection = "r73-mv";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let superuser = crate::test_db::run_on(pg, DbKind::Postgres, |c| {
+        c.query(
+            "select rolsuper::text from pg_roles where rolname = current_user",
+            &[],
+        )
+        .unwrap()
+        .remove(0)
+        .remove(0)
+    })
+    .flatten();
+    if superuser.as_deref() != Some("true") {
+        return;
+    }
+    let drops = [
+        "drop table if exists r73_et cascade",
+        "drop tablespace if exists r73_ets",
+        "drop access method if exists r73_eheap",
+        "drop role if exists r73_eowner",
+    ];
+    let results = crate::test_db::execute_on(
+        pg,
+        DbKind::Postgres,
+        &[
+            drops[0],
+            drops[1],
+            drops[2],
+            drops[3],
+            "create role r73_eowner",
+            // A tablespace in the data directory, as tests make them.
+            "set allow_in_place_tablespaces = on",
+            "create tablespace r73_ets location ''",
+            "create access method r73_eheap type table handler heap_tableam_handler",
+            "create table r73_et (n int, s text)",
+            "insert into r73_et values (1, 'a')",
+            "create materialized view r73_emv using r73_eheap \
+             with (fillfactor = 70, toast.autovacuum_enabled = false) tablespace r73_ets \
+             as select n, s, 1 as k from r73_et with no data",
+            "alter materialized view r73_emv owner to r73_eowner",
+        ],
+    )
+    .unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // What the view has besides its query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select c.relowner::regrole::text, c.relispopulated::text, \
+                        array_to_string(c.reloptions, ','), array_to_string(s.reloptions, ','), \
+                        t.spcname, a.amname, pg_get_viewdef(c.oid) \
+                   from pg_class c join pg_am a on a.oid = c.relam \
+                   left join pg_class s on s.oid = c.reltoastrelid \
+                   left join pg_tablespace t on t.oid = c.reltablespace \
+                  where c.oid = 'r73_emv'::regclass",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert_eq!(
+        was[..6],
+        [
+            Some("r73_eowner".into()),
+            Some("false".into()),
+            Some("fillfactor=70".into()),
+            Some("autovacuum_enabled=false".into()),
+            Some("r73_ets".into()),
+            Some("r73_eheap".into()),
+        ]
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r73_emv".into(),
+        object_type: ObjectType::MaterializedView,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r73_emv"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| {
+        !app.test_focused_busy() && app.test_pending_tx()
+    });
+    h.state_mut().test_commit();
+    wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[6].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[..6], was[..6], "{script}");
+    let results = crate::test_db::execute_on(pg, DbKind::Postgres, &drops).unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+}
+
 /// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
 /// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
 /// changes before stay pending.
