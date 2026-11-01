@@ -535,6 +535,13 @@ All notable changes to Pythia are documented here. The format follows
   `1` and `1e-5` read 1 and 0.5. They now read as floats are shown,
   `5e-20` and `2.5e-20`, `1.00001` and `0.500005`; plain decimals still
   add up exactly.
+- Rows fetched into a sorted result no longer move the selection and
+  the cell being edited to other rows (#279). The rows that come in when
+  such a result is scrolled to its end are sorted in among the others,
+  and the selection, the cursor, the cell being edited, *View value…*
+  and the dialog editing a cell stayed where they were in the view, on
+  other rows: a value being typed went into another row. They now stay
+  on their rows, and so do new rows.
 
 ## [0.10.0] - 2026-10-30
 

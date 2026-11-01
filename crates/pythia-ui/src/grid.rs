@@ -333,9 +333,44 @@ impl GridState {
         if self.ordered_rows == rows.len() {
             return;
         }
-        self.order = self.order_of(rows, columns);
+        let order = self.order_of(rows, columns);
+        // Rows fetched since: sorted in among the others, or after them.
+        if self.order_revision > 0 && self.ordered_rows < rows.len() {
+            self.follow_rows(&order, rows.len());
+        }
+        self.order = order;
         self.ordered_rows = rows.len();
         self.order_revision += 1;
+    }
+
+    /// Moves what is held by view row (the selection, the cursor, the cell
+    /// being edited, the viewer and the dialog's cell) to where its row is
+    /// in `order`, the rows' new order, once more of the `count` rows were
+    /// fetched: they stayed in place, on other rows of a sorted result
+    /// (#279). New rows come after the fetched ones.
+    fn follow_rows(&mut self, order: &[usize], count: usize) {
+        let mut place = vec![None; count];
+        for (at, &r) in order.iter().enumerate() {
+            place[r] = Some(at);
+        }
+        let (before, now) = (self.order.len(), order.len());
+        let old = &self.order;
+        let moved = |view_row: &mut usize| {
+            *view_row = match old.get(*view_row) {
+                Some(&r) => place.get(r).copied().flatten().unwrap_or(*view_row),
+                None => *view_row - before + now,
+            }
+        };
+        let cells = [&mut self.anchor, &mut self.cursor, &mut self.viewer];
+        for (view_row, _) in cells.into_iter().flatten() {
+            moved(view_row);
+        }
+        if let Some(editor) = &mut self.value_editor {
+            moved(&mut editor.view_row);
+        }
+        if let Some((view_row, ..)) = self.edit.as_mut().and_then(|e| e.active.as_mut()) {
+            moved(view_row);
+        }
     }
 
     /// The rows passing the filter, in the order shown.
@@ -4493,5 +4528,60 @@ mod tests {
             summary_of(&["0.1", "0.2", "2.5"]),
             "Count 3 · Sum 2.8 · Avg 0.93333 · Min 0.1 · Max 2.5"
         );
+    }
+
+    /// Rows fetched later are sorted in among those shown: the selection,
+    /// the cursor, the cell being edited and the viewer stay on their rows
+    /// (#279). They stayed at their places in the view, on other rows, and a
+    /// value typed went into another row.
+    #[test]
+    fn rows_fetched_later_keep_the_selection() {
+        let columns = cols();
+        let row = |a: &str, b: &str| vec![Some(a.into()), Some(b.into())];
+        let mut rows = vec![row("2", "b"), row("4", "d")];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.set_sort(1, &rows, &columns);
+        state.add_row(&rows, 2);
+        state.edit_cell(&rows, 2, 0, Some("9".into()));
+        // b and d selected, d's B being edited, d's A in the viewer.
+        state.select((0, 0), false);
+        state.select((1, 1), true);
+        state.start_edit(&rows, (1, 1), Some("typed".into()));
+        state.viewer = Some((1, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        rows.extend([row("1", "a"), row("3", "c"), row("5", "e")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.order, [2, 0, 3, 1, 4]);
+        // From b to d, with c that came in between them.
+        assert_eq!(state.anchor, Some((1, 0)));
+        assert_eq!(state.cursor, Some((3, 1)));
+        assert_eq!(state.viewer, Some((3, 0)));
+        assert_eq!(state.value(&rows, 5, 0), Some("9"));
+        assert_eq!(
+            state.edit.as_ref().unwrap().active,
+            Some((3, 1, "typed".into()))
+        );
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::Enter)]);
+        let updates = &state.changes().unwrap().updates;
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[&1][&1].as_deref(), Some("typed"));
+        // The value editor's row too.
+        state.open_value_editor(&rows, (0, 1));
+        rows.push(row("0", "0"));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.value_editor.as_ref().map(|e| e.view_row), Some(1));
+        // Unsorted, the rows fetched come before the new rows.
+        let mut rows = vec![row("1", "a")];
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.add_row(&rows, 2);
+        assert_eq!(state.cursor, Some((1, 0)));
+        rows.push(row("2", "b"));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.cursor, Some((2, 0)));
     }
 }
