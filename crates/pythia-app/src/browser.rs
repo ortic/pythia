@@ -447,6 +447,14 @@ impl Browser {
         self.invalid_only = true;
     }
 
+    /// What the toolbar's Refresh does.
+    #[cfg(test)]
+    pub fn test_refresh(&mut self) -> Effects {
+        let mut effects = Effects::default();
+        self.refresh(&mut effects);
+        effects
+    }
+
     #[cfg(test)]
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_owned();
@@ -549,6 +557,7 @@ impl Browser {
 
     /// Reloads expanded folders (after compile/drop or on demand).
     fn refresh(&mut self, effects: &mut Effects) {
+        effects.catalog_changed = true;
         self.children.clear();
         self.parts.clear();
         let open: Vec<(String, ObjectType)> = self

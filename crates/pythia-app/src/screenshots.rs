@@ -7717,6 +7717,80 @@ impl Drop for SqliteFile {
     }
 }
 
+/// Completion forgets what the object browser changed or read again
+/// (#198): after the browser dropped a table, completion still offered its
+/// columns; after a column was added from outside, Refresh didn't make
+/// completion offer it.
+#[test]
+fn completion_follows_the_browser() {
+    use pythia_db::ObjectType;
+    let connection = "completion.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table cb_t (id integer, name text)",
+    );
+    // The columns completion offers after `x.` of `from cb_t x`.
+    let columns = |h: &mut Ui| -> Vec<String> {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select x\n  from cb_t x".into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(8..8);
+        h.run_steps(3);
+        h.event(egui::Event::Text(".".into()));
+        let mut labels = Vec::new();
+        for _ in 0..50 {
+            h.run_steps(1);
+            labels = h
+                .state_mut()
+                .test_sql_window()
+                .editor
+                .completion_labels()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if !labels.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+        labels
+    };
+    assert!(columns(&mut h).contains(&"name".to_owned()));
+
+    rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .execute("alter table cb_t add column extra integer", [])
+        .unwrap();
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.state_mut().test_refresh_browser();
+    h.run_steps(2);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    assert!(
+        columns(&mut h).contains(&"extra".to_owned()),
+        "after Refresh"
+    );
+
+    h.get_by_label("cb_t").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log().iter().any(|l| l.contains("dropped"))
+    });
+    h.run_steps(2);
+    assert_eq!(columns(&mut h), Vec::<String>::new(), "after Drop");
+}
+
 /// Maintenance of a SQLite table: its rows, pages and missing statistics,
 /// then ANALYZE (after which it has them), REINDEX and the integrity check.
 #[test]

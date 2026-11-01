@@ -240,6 +240,7 @@ impl ObjectView {
                 };
                 if ui.button("Refresh").clicked() {
                     effects.extend(self.load());
+                    effects.catalog_changed = true;
                 }
                 if self.object.object_type.has_source() {
                     if self.dialect.supports(Feature::PlSql) {

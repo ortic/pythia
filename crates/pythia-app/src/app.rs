@@ -1345,6 +1345,11 @@ impl PythiaApp {
         {
             self.refresh_invalid(name);
         }
+        if (effects.catalog_changed || effects.changed.is_some())
+            && let Some(name) = &connection
+        {
+            self.invalidate_catalog(name);
+        }
         if let (Some(id), Some((part, offset))) = (doc, effects.jumped_from) {
             self.nav.record(Position {
                 doc: id,
@@ -2427,6 +2432,7 @@ impl PythiaApp {
             open,
             log,
             invalid_changed,
+            catalog_changed,
             database,
             ..
         } = effects;
@@ -2453,6 +2459,9 @@ impl PythiaApp {
         }
         if invalid_changed && let Some(name) = self.browser.connection.clone() {
             self.refresh_invalid(&name);
+        }
+        if catalog_changed && let Some(name) = self.browser.connection.clone() {
+            self.invalidate_catalog(&name);
         }
     }
 
@@ -5277,6 +5286,12 @@ impl PythiaApp {
     /// Invalid objects counted for the status bar, if counted.
     pub fn test_invalid_total(&self, connection: &str) -> Option<u32> {
         self.invalid.get(connection).map(InvalidCount::total)
+    }
+
+    /// Refresh in the object browser's toolbar.
+    pub fn test_refresh_browser(&mut self) {
+        let effects = self.browser.test_refresh();
+        self.apply_browser(effects);
     }
 
     /// Counts the connection's invalid objects again, as after a change.
