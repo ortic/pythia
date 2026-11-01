@@ -285,6 +285,16 @@ impl CodeEditor {
             .retain(|m| m.line <= self.state.rope.len_lines());
     }
 
+    /// Highlights, folds and matches brackets the way scripts of a database
+    /// with `syntax` are read (Oracle's until set).
+    pub fn set_syntax(&mut self, syntax: pythia_plsql::Syntax) {
+        if syntax != self.state.highlighter.syntax() {
+            self.state.highlighter.set_syntax(&self.state.rope, syntax);
+            self.pairs_cache = None;
+            self.regions_cache = None;
+        }
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.state.rope.len_bytes()
     }
@@ -533,7 +543,8 @@ impl CodeEditor {
     fn regions(&mut self) -> &[fold::Region] {
         let rev = self.state.revision;
         if self.regions_cache.as_ref().is_none_or(|(r, _)| *r != rev) {
-            self.regions_cache = Some((rev, fold::regions(&self.state.text())));
+            let syntax = self.state.highlighter.syntax();
+            self.regions_cache = Some((rev, fold::regions_in(&self.state.text(), syntax)));
         }
         &self.regions_cache.as_ref().expect("just set").1
     }
@@ -809,7 +820,8 @@ impl CodeEditor {
     fn pairs(&mut self) -> &[matching::Pair] {
         let rev = self.state.revision;
         if self.pairs_cache.as_ref().is_none_or(|(r, _)| *r != rev) {
-            self.pairs_cache = Some((rev, matching::find_pairs(&self.state.text())));
+            let syntax = self.state.highlighter.syntax();
+            self.pairs_cache = Some((rev, matching::find_pairs_in(&self.state.text(), syntax)));
         }
         &self.pairs_cache.as_ref().expect("just set").1
     }

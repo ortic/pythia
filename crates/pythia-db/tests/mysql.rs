@@ -280,6 +280,36 @@ fn errors_carry_mysql_code_and_position() {
     assert_eq!(error.offset, Some(11), "{}", error.message);
 }
 
+/// A script is split where the server ends its statements: `\'` stays in
+/// the string (#187), `#` comments hold `;` and `'` (#188), and `--x` is
+/// code (#189).
+#[test]
+fn scripts_split_as_the_server_reads_them() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let script = "drop table if exists pythia_script;\n\
+                  create table pythia_script (id int, note varchar(50));\n\
+                  # the notes; it's a test\n\
+                  insert into pythia_script values (1, 'it\\'s; here'), (2, \"a \\\"b\\\"; c\");\n\
+                  select 1 --1 as two";
+    let statements: Vec<&str> = pythia_plsql::split_statements_in(script, Dialect::MYSQL.syntax())
+        .iter()
+        .map(|s| s.text(script))
+        .collect();
+    assert_eq!(statements.len(), 4, "{statements:?}");
+    for statement in &statements[..3] {
+        h.ok(statement);
+    }
+    assert_eq!(h.scalar(statements[3]).as_deref(), Some("2"));
+    assert_eq!(
+        h.scalar("select group_concat(note order by id separator '|') from pythia_script")
+            .as_deref(),
+        Some("it's; here|a \"b\"; c")
+    );
+    h.ok("drop table pythia_script");
+}
+
 /// Without a database in the address, the login statements pick it (the
 /// profile's default schema): `Connected` reports the one they leave the
 /// session in, then their failures (#103).

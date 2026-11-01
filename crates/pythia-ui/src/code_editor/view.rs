@@ -12,7 +12,7 @@ use pythia_plsql::TokenKind;
 use super::assist::{self, Completion, CompletionEntry, CompletionTrigger};
 use super::find::FindAction;
 use super::fold::{DisplayMap, Region, RegionKind};
-use super::highlight::lex_line;
+use super::highlight::lex_line_in;
 use super::matching::pair_at;
 use super::selection::Selection;
 use super::text::{
@@ -1410,7 +1410,8 @@ impl CodeEditor {
 
         // Text.
         let highlighted = |text: &str, l: usize| {
-            let (tokens, _) = lex_line(text, self.state.highlighter.state(l));
+            let highlighter = &self.state.highlighter;
+            let (tokens, _) = lex_line_in(text, highlighter.state(l), highlighter.syntax());
             let mut job = LayoutJob::default();
             let mut vcol = 0;
             for token in tokens {
@@ -1867,7 +1868,12 @@ impl CodeEditor {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, l) in body.iter().enumerate() {
                 let text = l.get(indent..).unwrap_or(l).replace('\t', "    ");
-                let (tokens, _) = lex_line(&text, self.state.highlighter.state(start + 1 + i));
+                let highlighter = &self.state.highlighter;
+                let (tokens, _) = lex_line_in(
+                    &text,
+                    highlighter.state(start + 1 + i),
+                    highlighter.syntax(),
+                );
                 let mut job = LayoutJob::default();
                 for token in tokens {
                     let format = TextFormat {

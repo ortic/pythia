@@ -54,6 +54,38 @@ impl History {
         self.dirty = true;
     }
 
+    /// Takes in the statements of `saved`, the file another Pythia may have
+    /// written since this one read it (#196): one entry per connection and
+    /// statement, at its last execution, in the order they ran.
+    pub fn merge(&mut self, saved: History) {
+        let key = |e: &Entry| (e.connection.clone(), e.sql.clone());
+        let mut at: std::collections::HashMap<(String, String), usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (key(e), i))
+            .collect();
+        for entry in saved.entries {
+            match at.get(&key(&entry)) {
+                Some(&i) => {
+                    let mine = &mut self.entries[i];
+                    mine.at = mine.at.max(entry.at);
+                    mine.count = mine.count.max(entry.count);
+                }
+                None => {
+                    at.insert(key(&entry), self.entries.len());
+                    self.entries.push(entry);
+                }
+            }
+        }
+        // Stable: entries of the same second keep their order.
+        self.entries.sort_by_key(|e| e.at);
+        if self.entries.len() > MAX_ENTRIES {
+            let excess = self.entries.len() - MAX_ENTRIES;
+            self.entries.drain(..excess);
+        }
+    }
+
     /// Newest first, optionally limited to one connection and a filter text.
     pub fn search<'a>(
         &'a self,
@@ -85,5 +117,34 @@ mod tests {
             .collect();
         assert_eq!(a, [("select 1 from dual", 2), ("select 2 from dual", 1)]);
         assert_eq!(h.search(None, "3").count(), 1);
+    }
+
+    /// Saving takes in the statements another Pythia saved (#196).
+    #[test]
+    fn merges_another_pythias() {
+        let entry = |sql: &str, at, count| Entry {
+            connection: "a".into(),
+            sql: sql.into(),
+            at,
+            count,
+        };
+        let mut mine = History {
+            entries: vec![entry("one", 10, 1), entry("both", 20, 2)],
+            dirty: true,
+        };
+        let saved = History {
+            entries: vec![entry("both", 30, 5), entry("theirs", 15, 1)],
+            dirty: false,
+        };
+        mine.merge(saved);
+        let entries: Vec<_> = mine
+            .entries
+            .iter()
+            .map(|e| (e.sql.as_str(), e.at, e.count))
+            .collect();
+        assert_eq!(
+            entries,
+            [("one", 10, 1), ("theirs", 15, 1), ("both", 30, 5)]
+        );
     }
 }

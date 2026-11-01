@@ -98,7 +98,12 @@ struct Workspace {
 pub struct PythiaApp {
     paths: Option<Paths>,
     settings: Settings,
+    /// The settings as this Pythia read or wrote them last: what it changed
+    /// since goes to the file (#196).
+    saved_settings: Settings,
     saved: SavedConnections,
+    /// When `connections.toml` was written as `saved` has it.
+    connections_modified: Option<std::time::SystemTime>,
     keymap: Keymap,
     /// The code and interface font files installed.
     loaded_fonts: Option<(String, String)>,
@@ -201,6 +206,7 @@ impl PythiaApp {
             .as_ref()
             .map(|p| load_or_default(&p.connections_file()))
             .unwrap_or_default();
+        let connections_modified = paths.as_ref().and_then(|p| modified(&p.connections_file()));
         let history: History = paths
             .as_ref()
             .map(|p| load_or_default(&history_file(p)))
@@ -220,7 +226,9 @@ impl PythiaApp {
             paths,
             keymap: Keymap::with_overrides(settings.keymap, &settings.keybindings),
             loaded_fonts: None,
+            saved_settings: settings.clone(),
             settings,
+            connections_modified,
             saved,
             notify: Notify(cc.egui_ctx.clone()),
             dock: DockState::new(vec![]),
@@ -370,14 +378,6 @@ impl PythiaApp {
         }
     }
 
-    fn save_user_reports(&self) {
-        if let Some(paths) = &self.paths
-            && let Err(e) = save_toml(&reports_file(paths), &self.user_reports)
-        {
-            error!("saving reports: {e:#}");
-        }
-    }
-
     /// The "Save as report" dialog.
     fn save_report_ui(&mut self, ctx: &egui::Context) {
         let Some((name, category, sql)) = &mut self.save_report else {
@@ -445,28 +445,60 @@ impl PythiaApp {
                 sql: sql.clone(),
             };
             self.log(format!("Saved report {}", report.name));
-            self.user_reports.save(report);
-            self.save_user_reports();
+            self.change_user_reports(|reports| reports.save(report));
             self.save_report = None;
         } else if !open {
             self.save_report = None;
         }
     }
 
-    fn save_settings(&self) {
-        if let Some(paths) = &self.paths
-            && let Err(e) = save_toml(&paths.settings_file(), &self.settings)
-        {
-            error!("saving settings: {e:#}");
+    /// Writes the settings this Pythia changed over the file's, so that
+    /// another Pythia's changes stay; unchanged, it writes nothing (#196).
+    fn save_settings(&mut self) {
+        if self.settings == self.saved_settings {
+            return;
+        }
+        if let Some(paths) = &self.paths {
+            let path = paths.settings_file();
+            let file = load_toml::<toml::Table>(&path)
+                .map_err(|e| error!("{e:#}"))
+                .ok();
+            let merged = crate::shared::merge_settings(&self.saved_settings, &self.settings, file);
+            if let Err(e) = save_toml(&path, &merged) {
+                error!("saving settings: {e:#}");
+                return;
+            }
+        }
+        self.saved_settings = self.settings.clone();
+    }
+
+    /// Changes the saved connections as the file has them now, which
+    /// another Pythia may have changed (#196).
+    fn change_connections(&mut self, change: impl FnOnce(&mut SavedConnections)) {
+        let path = self.paths.as_ref().map(Paths::connections_file);
+        crate::shared::change_toml(path.as_deref(), &mut self.saved, change);
+        self.connections_modified = path.as_deref().and_then(modified);
+    }
+
+    /// Takes the connections another Pythia saved since they were read.
+    fn reload_changed_connections(&mut self) {
+        let Some(path) = self.paths.as_ref().map(Paths::connections_file) else {
+            return;
+        };
+        let now = modified(&path);
+        if now != self.connections_modified {
+            self.connections_modified = now;
+            match load_toml(&path) {
+                Ok(saved) => self.saved = saved,
+                Err(e) => error!("{e:#}"),
+            }
         }
     }
 
-    fn save_connections(&self) {
-        if let Some(paths) = &self.paths
-            && let Err(e) = save_toml(&paths.connections_file(), &self.saved)
-        {
-            error!("saving connections: {e:#}");
-        }
+    /// Changes the saved reports as the file has them now (#196).
+    fn change_user_reports(&mut self, change: impl FnOnce(&mut crate::reports::UserReports)) {
+        let path = self.paths.as_ref().map(reports_file);
+        crate::shared::change_toml(path.as_deref(), &mut self.user_reports, change);
     }
 
     fn save_history(&mut self) {
@@ -474,6 +506,11 @@ impl PythiaApp {
             return;
         }
         if let Some(paths) = &self.paths {
+            // Another Pythia's statements stay (#196).
+            match load_toml::<History>(&history_file(paths)) {
+                Ok(saved) => self.history.merge(saved),
+                Err(e) => error!("{e:#}"),
+            }
             match save_toml(&history_file(paths), &self.history) {
                 Ok(()) => self.history.dirty = false,
                 Err(e) => error!("saving history: {e:#}"),
@@ -3257,11 +3294,9 @@ impl PythiaApp {
         if self.conns.get(&name).is_some() {
             self.disconnect(&name);
         }
-        if save_profile && let Some(paths) = &self.paths {
-            self.saved.upsert(profile.clone());
-            if let Err(e) = save_toml(&paths.connections_file(), &self.saved) {
-                error!("saving connections: {e:#}");
-            }
+        if save_profile && self.paths.is_some() {
+            let saved = profile.clone();
+            self.change_connections(|c| c.upsert(saved));
         }
         if profile.save_password {
             secrets::store(&name, &passwords.database);
@@ -3867,9 +3902,13 @@ impl PythiaApp {
             bar_menu(ui, "Help", |ui| groups(ui, &[&[Command::About]]));
         });
         if let Some(i) = delete {
-            let report = self.user_reports.reports.remove(i);
+            let report = self.user_reports.reports[i].clone();
             self.log(format!("Deleted report {}", report.name));
-            self.save_user_reports();
+            self.change_user_reports(|reports| {
+                reports
+                    .reports
+                    .retain(|r| !(r.name == report.name && r.category == report.category));
+            });
         }
     }
 
@@ -4406,6 +4445,9 @@ impl PythiaApp {
     }
 
     fn popups(&mut self, ctx: &egui::Context, commands: &mut Vec<Command>) {
+        if self.connect_dialog.open {
+            self.reload_changed_connections();
+        }
         match self.connect_dialog.ui(ctx, &self.saved) {
             Some(crate::dialogs::ConnectAction::Connect(request)) => {
                 self.connect(request.profile, request.passwords, request.save_profile);
@@ -4426,10 +4468,10 @@ impl PythiaApp {
                 passwords,
             }) => {
                 let name = profile.display_name();
-                if let Some(previous) = previous.filter(|p| *p != name) {
-                    self.saved.profiles.retain(|p| p.display_name() != previous);
-                    secrets::forget(&previous);
-                    secrets::forget_ssh(&previous);
+                let renamed = previous.filter(|p| *p != name);
+                if let Some(previous) = &renamed {
+                    secrets::forget(previous);
+                    secrets::forget_ssh(previous);
                 }
                 match &passwords {
                     Some(passwords) => {
@@ -4441,14 +4483,19 @@ impl PythiaApp {
                         secrets::forget_ssh(&name);
                     }
                 }
-                self.saved.upsert(profile);
-                self.save_connections();
+                self.change_connections(|saved| {
+                    if let Some(previous) = &renamed {
+                        saved.profiles.retain(|p| p.display_name() != *previous);
+                    }
+                    saved.upsert(profile);
+                });
             }
             Some(crate::dialogs::ConnectAction::Delete(name)) => {
-                self.saved.profiles.retain(|p| p.display_name() != name);
+                self.change_connections(|saved| {
+                    saved.profiles.retain(|p| p.display_name() != name);
+                });
                 secrets::forget(&name);
                 secrets::forget_ssh(&name);
-                self.save_connections();
             }
             None => {}
         }
@@ -5835,6 +5882,11 @@ fn history_file(paths: &Paths) -> std::path::PathBuf {
     paths.data_dir.join("history.toml")
 }
 
+/// When a file was last written, to tell another Pythia's saves.
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 fn load_or_default<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path) -> T {
     load_toml(path).unwrap_or_else(|e| {
         error!("{e:#}");
@@ -6047,6 +6099,69 @@ mod workspace_tests {
         // The database last picked in the browser (#133).
         assert_eq!(app.browser.marks.databases["shop@mysql"], "shop");
         assert_eq!(app.docs.len(), 1, "a new SQL window");
+    }
+
+    /// Two Pythias on one profile folder keep each other's changes (#196):
+    /// connections, reports, history, and settings the other didn't change.
+    #[test]
+    fn two_pythias_keep_each_others_files() {
+        let dir = std::env::temp_dir().join(format!("pythia-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+        };
+        let storage = Memory::default();
+        let open = || {
+            let mut cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+            cc.storage = Some(&storage);
+            PythiaApp::new(&cc, Some(paths.clone()))
+        };
+        let mut one = open();
+        let mut two = open();
+        let profile = |name: &str| ConnectionProfile {
+            name: name.into(),
+            ..Default::default()
+        };
+        let names = |c: &SavedConnections| {
+            c.profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+        };
+        one.change_connections(|c| c.upsert(profile("a")));
+        two.change_connections(|c| c.upsert(profile("b")));
+        assert_eq!(names(&two.saved), ["a", "b"]);
+        one.reload_changed_connections();
+        assert_eq!(names(&one.saved), ["a", "b"], "the dialog shows b");
+        two.change_connections(|c| c.profiles.retain(|p| p.name != "a"));
+        assert_eq!(names(&load_toml(&paths.connections_file()).unwrap()), ["b"]);
+
+        let report = |name: &str| crate::reports::UserReport {
+            name: name.into(),
+            category: String::new(),
+            sql: "select 1 from dual".into(),
+        };
+        one.change_user_reports(|r| r.save(report("mine")));
+        two.change_user_reports(|r| r.save(report("theirs")));
+        assert_eq!(two.user_reports.reports.len(), 2);
+
+        one.history.add("a", "select 1 from dual");
+        one.save_history();
+        two.history.add("a", "select 2 from dual");
+        two.save_history();
+        let history: History = load_toml(&history_file(&paths)).unwrap();
+        assert_eq!(history.entries.len(), 2);
+
+        one.settings.editor.tab_width = 2;
+        one.save_settings();
+        // Unchanged, two writes nothing; changed, only what it changed.
+        two.save_settings();
+        two.settings.ui_scale = 1.5;
+        two.save_settings();
+        let settings: Settings = load_toml(&paths.settings_file()).unwrap();
+        assert_eq!((settings.editor.tab_width, settings.ui_scale), (2, 1.5));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Pythia starts with the connect dialog, on the profile used last

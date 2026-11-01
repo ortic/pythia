@@ -318,7 +318,10 @@ fn xlsx(
     let sheet = workbook.add_worksheet();
     sheet.set_name(sheet_name(&options.sheet))?;
     let bold = XFormat::new().set_bold();
-    let date = XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+    let date = XFormat::new().set_num_format("yyyy-mm-dd");
+    let datetime = XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss");
+    // Excel shows milliseconds; the cell holds what its double can (#192).
+    let fraction = XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss.000");
     let first_row = u32::from(options.header);
     if options.header {
         for (c, col) in columns.iter().enumerate() {
@@ -330,16 +333,32 @@ fn xlsx(
         for (c, (col, cell)) in columns.iter().zip(row).enumerate() {
             let Some(value) = cell else { continue };
             let c = c as u16;
-            match (col.numeric, kind(col)) {
+            let as_date = if excel_date(col) {
+                excel_datetime(value)
+            } else {
+                None
+            };
+            match (col.numeric, as_date) {
                 (true, _) => match value.parse::<f64>() {
                     Ok(n) => sheet.write_number(r, c, n)?,
                     Err(_) => sheet.write_string(r, c, value)?,
                 },
-                (false, Kind::Date | Kind::Timestamp) => match excel_datetime(value) {
-                    Some(dt) => sheet.write_datetime_with_format(r, c, &dt, &date)?,
-                    None => sheet.write_string(r, c, value)?,
-                },
-                _ => sheet.write_string(r, c, value)?,
+                (
+                    false,
+                    Some(ExcelValue {
+                        date: dt,
+                        time,
+                        fraction: f,
+                    }),
+                ) => {
+                    let format = match (time, f) {
+                        (_, true) => &fraction,
+                        (true, false) => &datetime,
+                        (false, false) => &date,
+                    };
+                    sheet.write_datetime_with_format(r, c, &dt, format)?
+                }
+                (false, None) => sheet.write_string(r, c, value)?,
             };
         }
     }
@@ -366,11 +385,69 @@ fn sheet_name(name: &str) -> String {
     }
 }
 
-fn excel_datetime(text: &str) -> Option<rust_xlsxwriter::ExcelDateTime> {
-    // `YYYY-MM-DD HH24:MI:SS[.ff…][ ±TZH:TZM| region]`; time zones are dropped.
-    let text = text.split(' ').take(2).collect::<Vec<_>>().join("T");
-    let text = text.split('.').next()?;
-    rust_xlsxwriter::ExcelDateTime::parse_from_str(text).ok()
+/// Columns written as Excel dates: the dates and timestamps of every
+/// database (#193), but those with a time zone, which an Excel date can't
+/// hold.
+fn excel_date(col: &Column) -> bool {
+    let t = col.type_name.to_ascii_uppercase();
+    let zone = t.contains("TIME ZONE") || t.starts_with("DATETIMEOFFSET");
+    !zone
+        && (t == "DATE"
+            || t == "SMALLDATETIME"
+            || t.starts_with("TIMESTAMP")
+            || t.starts_with("DATETIME"))
+}
+
+/// A date as an Excel date, and what of it to show.
+struct ExcelValue {
+    date: rust_xlsxwriter::ExcelDateTime,
+    time: bool,
+    fraction: bool,
+}
+
+/// A date as the sessions show it, `YYYY-MM-DD[ HH:MM:SS[.f…]]`, with its
+/// fraction of a second (#192); anything after a space (a zone) is
+/// dropped. Other text, and dates Excel doesn't have (before 1900), stay
+/// text.
+fn excel_datetime(text: &str) -> Option<ExcelValue> {
+    let digits = |s: &str, at: &[usize], sep: u8| {
+        s.bytes().enumerate().all(|(i, b)| {
+            if at.contains(&i) {
+                b == sep
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    };
+    let mut parts = text.split(' ');
+    let date = parts.next()?;
+    // Excel's days start with 1900.
+    if date.len() != 10 || !digits(date, &[4, 7], b'-') || &date[..4] < "1900" {
+        return None;
+    }
+    let Some(time) = parts.next() else {
+        let date = rust_xlsxwriter::ExcelDateTime::parse_from_str(date).ok()?;
+        return Some(ExcelValue {
+            date,
+            time: false,
+            fraction: false,
+        });
+    };
+    let (hms, fraction) = match time.split_once('.') {
+        Some((hms, f)) => (hms, Some(f)),
+        None => (time, None),
+    };
+    let fraction_ok =
+        fraction.is_none_or(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
+    if hms.len() != 8 || !digits(hms, &[2, 5], b':') || !fraction_ok {
+        return None;
+    }
+    let date = rust_xlsxwriter::ExcelDateTime::parse_from_str(&format!("{date}T{time}")).ok()?;
+    Some(ExcelValue {
+        date,
+        time: true,
+        fraction: fraction.is_some(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -976,6 +1053,73 @@ mod tests {
         let (c, r) = sample();
         let bytes = export_to_vec(Format::Xlsx, &c, &r, &Options::default()).unwrap();
         assert_eq!(&bytes[..2], b"PK");
+    }
+
+    /// Every database's dates and timestamps become Excel dates (#193),
+    /// with their fractions of seconds (#192); those with a zone, and text
+    /// that isn't a date, stay text.
+    #[test]
+    fn xlsx_dates() {
+        use calamine::{Data, Reader};
+        let cases = [
+            ("DATE", "2020-03-04 23:09:48", Some(48.0)),
+            ("TIMESTAMP(6)", "2020-03-04 23:09:48.167000", Some(48.167)),
+            ("DATETIME", "2020-03-04 23:09:48.167", Some(48.167)),
+            ("timestamp", "2020-03-04 23:09:48.167", Some(48.167)),
+            ("datetime2", "2020-03-04 23:09:48.1670000", Some(48.167)),
+            ("datetime", "2020-03-04 23:09:48.167", Some(48.167)),
+            ("smalldatetime", "2020-03-04 23:09:00", Some(0.0)),
+            ("date", "2020-03-04", Some(-83388.0)),
+            (
+                "TIMESTAMP(6) WITH TIME ZONE",
+                "2020-03-04 23:09:48.167000 +01:00",
+                None,
+            ),
+            (
+                "timestamp with time zone",
+                "2020-03-04 23:09:48.167+01",
+                None,
+            ),
+            ("datetimeoffset", "2020-03-04 23:09:48.1670000 +01:00", None),
+            ("DATETIME", "yesterday", None),
+            ("DATETIME", "1899-12-31 10:00:00", None),
+        ];
+        let columns: Vec<Column> = cases
+            .iter()
+            .map(|(t, _, _)| Column {
+                name: "D".into(),
+                type_name: (*t).into(),
+                numeric: false,
+            })
+            .collect();
+        let rows = vec![cases.iter().map(|(_, v, _)| Some(v.to_string())).collect()];
+        let bytes = export_to_vec(Format::Xlsx, &columns, &rows, &Options::default()).unwrap();
+        let mut book = calamine::open_workbook_auto_from_rs(std::io::Cursor::new(bytes)).unwrap();
+        let sheet = book.worksheet_range("Result").unwrap();
+        // 2020-03-04 as an Excel day, and 23:09 as its fraction.
+        let day = 43894.0;
+        let hm = (23.0 * 3600.0 + 9.0 * 60.0) / 86400.0;
+        for (i, (t, value, seconds)) in cases.iter().enumerate() {
+            let cell = sheet.get((1, i)).unwrap();
+            match seconds {
+                Some(s) => {
+                    let Data::DateTime(dt) = cell else {
+                        panic!("{t} {value}: {cell:?}")
+                    };
+                    let expected = if *s < 0.0 {
+                        day
+                    } else {
+                        day + hm + s / 86400.0
+                    };
+                    assert!(
+                        (dt.as_f64() - expected).abs() < 1e-9,
+                        "{t}: {}",
+                        dt.as_f64()
+                    );
+                }
+                None => assert_eq!(cell, &Data::String(value.to_string()), "{t}"),
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use egui::{RichText, Ui};
 use pythia_db::{Cell, Column, DbError, DbEvent, DbRequest, Feature, MetaQuery, MetaResult};
 use pythia_plsql::{
-    StatementKind, Syntax, TokenKind, split_statements_in, statement_at_in, tokenize,
+    StatementKind, Syntax, TokenKind, split_statements_in, statement_at_in, tokenize, tokenize_in,
 };
 use pythia_ui::icons::{Icon, icon_button, icon_text_button};
 use pythia_ui::{GridState, ResultGrid, selection_data, shown_data, to_tsv};
@@ -26,8 +26,13 @@ pub struct SqlWindow {
     /// `&&var` / `DEFINE` values, by lowercase name.
     #[serde(default)]
     pub defines: BTreeMap<String, String>,
-    #[serde(default = "yes")]
-    pub substitution: bool,
+    /// `SET DEFINE ON|OFF` ran in the window. Without it, `&name` is
+    /// substituted on Oracle only, SQL*Plus's (#190).
+    #[serde(default)]
+    pub define: Option<bool>,
+    /// Saved before #190: off after `SET DEFINE OFF`.
+    #[serde(default = "yes", rename = "substitution", skip_serializing)]
+    legacy_substitution: bool,
     /// The Variables panel shows while the text has variables (#110).
     #[serde(default = "yes")]
     pub show_variables: bool,
@@ -290,7 +295,8 @@ impl SqlWindow {
             editor: Editor::new(text),
             bind_values: BTreeMap::new(),
             defines: BTreeMap::new(),
-            substitution: true,
+            define: None,
+            legacy_substitution: true,
             show_variables: true,
             path: None,
             saved_text: String::new(),
@@ -504,13 +510,13 @@ impl SqlWindow {
             self.state.bottom = BottomTab::Messages;
             return effects;
         }
-        if !find_binds(&stmt.sql).is_empty() {
+        if !find_binds(&stmt.sql, self.state.syntax).is_empty() {
             self.warn("Run with statistics doesn't support bind variables yet; use literals");
             self.state.bottom = BottomTab::Messages;
             return effects;
         }
-        let sql = if self.substitution {
-            substitute(&stmt.sql, &self.defines)
+        let sql = if self.substitutes() {
+            substitute(&stmt.sql, &self.defines, self.state.syntax)
         } else {
             stmt.sql
         };
@@ -542,13 +548,13 @@ impl SqlWindow {
             self.state.bottom = BottomTab::Messages;
             return;
         }
-        if !find_binds(&stmt.sql).is_empty() {
+        if !find_binds(&stmt.sql, self.state.syntax).is_empty() {
             self.warn("Execute to file doesn't support bind variables yet; use literals");
             self.state.bottom = BottomTab::Messages;
             return;
         }
-        let sql = if self.substitution {
-            substitute(&stmt.sql, &self.defines)
+        let sql = if self.substitutes() {
+            substitute(&stmt.sql, &self.defines, self.state.syntax)
         } else {
             stmt.sql
         };
@@ -718,8 +724,8 @@ impl SqlWindow {
         let Some(stmt) = self.statements(true).into_iter().next() else {
             return effects;
         };
-        let sql = if self.substitution {
-            substitute(&stmt.sql, &self.defines)
+        let sql = if self.substitutes() {
+            substitute(&stmt.sql, &self.defines, self.state.syntax)
         } else {
             stmt.sql
         };
@@ -749,7 +755,7 @@ impl SqlWindow {
                 format!("begin\n  {call};\nend;")
             }
         };
-        if !find_binds(&block).is_empty() {
+        if !find_binds(&block, self.state.syntax).is_empty() {
             self.warn("Profile doesn't support bind variables yet; use literals");
             self.state.bottom = BottomTab::Messages;
             return effects;
@@ -783,7 +789,7 @@ impl SqlWindow {
             view: Default::default(),
         });
         self.state.bottom = BottomTab::Plan;
-        let sql = substitute(&stmt.sql, &self.defines);
+        let sql = substitute(&stmt.sql, &self.defines, self.state.syntax);
         effects.request(
             Target::Main,
             DbRequest::Meta {
@@ -833,14 +839,25 @@ impl SqlWindow {
         effects
     }
 
+    /// Whether `&name` is a substitution variable: on Oracle, SQL*Plus's,
+    /// unless `SET DEFINE OFF`; elsewhere after `SET DEFINE ON` (#190).
+    pub fn substitutes(&self) -> bool {
+        self.define
+            .unwrap_or(self.legacy_substitution && self.state.syntax == Syntax::Oracle)
+    }
+
     /// Variables a statement uses: substitutions first, then binds.
     fn statement_variables(&self, sql: &str) -> Vec<Variable> {
-        let substitutions = if self.substitution {
-            dedup(find_substitutions(sql).into_iter().map(|s| s.name))
+        let substitutions = if self.substitutes() {
+            dedup(
+                find_substitutions(sql, self.state.syntax)
+                    .into_iter()
+                    .map(|s| s.name),
+            )
         } else {
             Vec::new()
         };
-        let binds = dedup(find_binds(sql).into_iter());
+        let binds = dedup(find_binds(sql, self.state.syntax).into_iter());
         substitutions
             .into_iter()
             .map(Variable::Substitution)
@@ -866,12 +883,12 @@ impl SqlWindow {
     /// The statement with its substitutions replaced, and its binds with
     /// their values (empty if none was entered).
     fn with_values(&self, sql: &str) -> (String, Vec<(String, Option<String>)>) {
-        let text = if self.substitution {
-            substitute(sql, &self.defines)
+        let text = if self.substitutes() {
+            substitute(sql, &self.defines, self.state.syntax)
         } else {
             sql.to_owned()
         };
-        let binds = dedup(find_binds(sql).into_iter())
+        let binds = dedup(find_binds(sql, self.state.syntax).into_iter())
             .into_iter()
             .map(|name| {
                 let value = self
@@ -911,7 +928,11 @@ impl SqlWindow {
     /// Variables of the whole text, in order of appearance; worked out
     /// again when the text changes.
     pub fn variables(&mut self) -> &[Variable] {
-        let key = (self.editor.revision(), self.substitution, self.state.syntax);
+        let key = (
+            self.editor.revision(),
+            self.substitutes(),
+            self.state.syntax,
+        );
         if self.state.variables.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut found: Vec<Variable> = Vec::new();
             let text = self.editor.text();
@@ -1198,7 +1219,7 @@ impl SqlWindow {
                     .strip_prefix("define ")
                     .or_else(|| lower.strip_prefix("def "))
                 {
-                    self.substitution = v.trim() != "off";
+                    self.define = Some(v.trim() != "off");
                 }
                 SqlPlus::Done
             }
@@ -1802,6 +1823,7 @@ impl SqlWindow {
     pub fn ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
         self.state.syntax = cx.dialect.syntax();
+        self.editor.set_syntax(self.state.syntax);
         egui::Panel::bottom(egui::Id::new(("sql-bottom", cx.id)))
             .resizable(true)
             .default_size(ui.available_height() * 0.45)
@@ -2723,9 +2745,9 @@ pub struct Substitution {
 
 /// Finds `&var` / `&&var` references, including inside string literals (as
 /// SQL*Plus does), but not inside comments.
-pub fn find_substitutions(sql: &str) -> Vec<Substitution> {
+pub fn find_substitutions(sql: &str, syntax: Syntax) -> Vec<Substitution> {
     let mut out = Vec::new();
-    for token in tokenize(sql) {
+    for token in tokenize_in(sql, syntax) {
         if !matches!(
             token.kind,
             TokenKind::SubstVar | TokenKind::String | TokenKind::QString
@@ -2767,10 +2789,10 @@ pub fn find_substitutions(sql: &str) -> Vec<Substitution> {
 }
 
 /// Replaces substitution variables that have a value.
-pub fn substitute(sql: &str, values: &BTreeMap<String, String>) -> String {
+pub fn substitute(sql: &str, values: &BTreeMap<String, String>, syntax: Syntax) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut pos = 0;
-    for s in find_substitutions(sql) {
+    for s in find_substitutions(sql, syntax) {
         if let Some(value) = values.get(&s.name) {
             out.push_str(&sql[pos..s.range.start]);
             out.push_str(value);
@@ -2822,12 +2844,12 @@ pub fn inline_binds(sql: &str, binds: &[(String, Option<String>)]) -> String {
 }
 
 /// Names of `:bind` variables, excluding trigger `:new`/`:old` references.
-pub fn find_binds(sql: &str) -> Vec<String> {
+pub fn find_binds(sql: &str, syntax: Syntax) -> Vec<String> {
     if pythia_plsql::unit_header(sql).is_some() {
         // Stored units (incl. triggers) don't take binds when created.
         return Vec::new();
     }
-    tokenize(sql)
+    tokenize_in(sql, syntax)
         .into_iter()
         .filter(|t| t.kind == TokenKind::BindVar)
         .map(|t| sql[t.span.start + 1..t.span.end].to_owned())
@@ -2840,12 +2862,17 @@ pub fn find_binds(sql: &str) -> Vec<String> {
 /// else to other databases and go to the server.
 pub(crate) fn client_command(sql: &str) -> bool {
     let line = sql.trim_start();
-    let command = line
+    let mut words = line
         .split(|c: char| c.is_whitespace() || c == ';')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
+        .filter(|w| !w.is_empty());
+    let command = words.next().unwrap_or_default().to_ascii_uppercase();
+    // `SET DEFINE ON|OFF` switches substitution variables (#190).
+    let define = command == "SET"
+        && words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("def") || w.eq_ignore_ascii_case("define"));
     line.starts_with('@')
+        || define
         || matches!(
             command.as_str(),
             "PRO"
@@ -3090,6 +3117,49 @@ mod tests {
         );
     }
 
+    /// `&name` is SQL*Plus's: substituted on Oracle, elsewhere only after
+    /// `SET DEFINE ON` (#190). A window saved after `SET DEFINE OFF` keeps
+    /// it off.
+    #[test]
+    fn substitution_is_oracles() {
+        let text = "insert into t values (2, 'A &amp; B')";
+        let mut w = SqlWindow::new("t".into(), text.into());
+        assert_eq!(w.variables(), [Variable::Substitution("amp".into())]);
+        w.state.syntax = Syntax::Sqlite;
+        assert!(w.variables().is_empty());
+        for (command, on) in [("set define on", true), ("SET DEF OFF", false)] {
+            let stmt = PendingStatement {
+                kind: StatementKind::SqlPlus,
+                sql: command.into(),
+                start: 0,
+                internal: None,
+                origin: None,
+            };
+            assert!(matches!(w.sqlplus(&stmt), SqlPlus::Done));
+            assert_eq!(w.substitutes(), on, "{command}");
+        }
+        for syntax in [
+            Syntax::Postgres,
+            Syntax::TSql,
+            Syntax::Sqlite,
+            Syntax::MySql,
+        ] {
+            let statements = split_statements_in("set define on;\nset x = 1", syntax);
+            let kinds: Vec<_> = statements.iter().map(|s| s.kind).collect();
+            assert_eq!(kinds[0], StatementKind::SqlPlus, "{syntax:?}");
+            assert!(client_command(
+                statements[0].text("set define on;\nset x = 1")
+            ));
+        }
+
+        let mut saved = serde_json::to_value(SqlWindow::new("t".into(), text.into())).unwrap();
+        assert!(saved.get("substitution").is_none(), "{saved}");
+        saved["substitution"] = false.into();
+        let mut old: SqlWindow = serde_json::from_value(saved).unwrap();
+        assert!(!old.substitutes());
+        assert!(old.variables().is_empty());
+    }
+
     #[test]
     fn client_commands() {
         for local in [
@@ -3098,6 +3168,8 @@ mod tests {
             "prompt hello",
             "define x = 1",
             "rem note",
+            "set define on",
+            "SET DEF '^'",
         ] {
             assert!(client_command(local), "{local}");
         }
@@ -3115,7 +3187,7 @@ mod tests {
     #[test]
     fn substitutions() {
         let sql = "select '&a', &&b. || x from t where c = &c -- &d\n/* &e */";
-        let names: Vec<_> = find_substitutions(sql)
+        let names: Vec<_> = find_substitutions(sql, Syntax::Oracle)
             .into_iter()
             .map(|s| (s.name, s.double))
             .collect();
@@ -3129,7 +3201,7 @@ mod tests {
             ("c".into(), "3".into()),
         ]);
         assert_eq!(
-            substitute(sql, &values),
+            substitute(sql, &values, Syntax::Oracle),
             "select '1', 2 || x from t where c = 3 -- &d\n/* &e */"
         );
     }
@@ -3137,13 +3209,21 @@ mod tests {
     #[test]
     fn binds() {
         assert_eq!(
-            find_binds("select :a, :B, :a from t where x = :1 and y = ':z'"),
+            find_binds(
+                "select :a, :B, :a from t where x = :1 and y = ':z'",
+                Syntax::Oracle
+            ),
             ["a", "B", "a"]
         );
         assert!(
-            find_binds("create or replace trigger t before insert on x for each row begin :new.id := 1; end;")
+            find_binds("create or replace trigger t before insert on x for each row begin :new.id := 1; end;", Syntax::Oracle)
                 .is_empty()
         );
+        // MySQL's `\'` doesn't end the string, nor `#` start a bind (#187,
+        // #188).
+        let mysql = r"select 'it\'s :x', :y # :z";
+        assert_eq!(find_binds(mysql, Syntax::MySql), ["y"]);
+        assert_eq!(find_binds(mysql, Syntax::Oracle), ["x"]);
         assert_eq!(
             dedup(["a".to_owned(), "A".to_owned(), "b".to_owned()].into_iter()),
             ["a", "b"]
@@ -3550,7 +3630,7 @@ mod tests {
                 Variable::Bind("b".into()),
             ]
         );
-        w.substitution = false;
+        w.define = Some(false);
         assert_eq!(
             w.variables(),
             [Variable::Bind("a".into()), Variable::Bind("b".into())]

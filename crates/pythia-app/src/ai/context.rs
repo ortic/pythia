@@ -72,8 +72,8 @@ pub fn sql_window(w: &SqlWindow, doc: DocId, task: &Task) -> Snapshot {
         if selected { "selection" } else { "statement" },
         line_of(w.editor.text(), range.start)
     );
-    let substituted = if w.substitution {
-        crate::sql_window::substitute(&text, &w.defines)
+    let substituted = if w.substitutes() {
+        crate::sql_window::substitute(&text, &w.defines, w.state.syntax)
     } else {
         text.clone()
     };
@@ -177,7 +177,7 @@ fn is_sql(text: &str) -> bool {
 /// Values remembered for the statement's bind variables.
 fn bind_values(w: &SqlWindow, sql: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for name in crate::sql_window::find_binds(sql) {
+    for name in crate::sql_window::find_binds(sql, w.state.syntax) {
         let line = match w.bind_values.get(&name.to_lowercase()) {
             Some(Some(value)) => format!(":{name} = '{}'", value.replace('\'', "''")),
             Some(None) => format!(":{name} = NULL"),

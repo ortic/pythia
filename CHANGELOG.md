@@ -44,6 +44,13 @@ All notable changes to Pythia are documented here. The format follows
   also with `SET NOCOUNT ON` or a trigger that changes other rows.
 
 ### Changed
+- `&name` substitution variables are SQL\*Plus's, so only Oracle's SQL
+  windows have them unless `SET DEFINE ON` turns them on (#190). On
+  MySQL, PostgreSQL, SQL Server and SQLite, `'A &amp; B'` or a URL with
+  `&b=2` asked for a value of `amp` or `b`, and changed the text that
+  went to the database. `SET DEFINE ON` and `SET DEFINE OFF` are carried
+  out by the window on every database; a window that had `SET DEFINE OFF`
+  keeps it.
 - On SQL Server, ASCII text for a `varchar` or `char` column is written
   as `'…'` instead of `N'…'`, in INSERT exports and when results are
   edited (#182). Compared with `N'…'`, SQL Server converts the column, and
@@ -59,10 +66,52 @@ All notable changes to Pythia are documented here. The format follows
 
 ### Fixed
 - INSERT exports on SQL Server wrote a `float` like 1e300 out in full
-  (#182), 301 digits, which SQL Server can't read (a decimal literal has at most
-  38 digits), and a `geometry` or `hierarchyid` value as text. Such a
-  float now has an exponent, and CLR types are written as the `0x…` they
-  are shown as.
+  (#182), 301 digits, which SQL Server can't read (a decimal literal has
+  at most 38 digits), and a `geometry` or `hierarchyid` value as text.
+  Such a float now has an exponent, and CLR types are written as the
+  `0x…` they are shown as.
+- MySQL scripts are read the way MySQL reads them (#187, #188, #189). A
+  backslash escapes the next character in a string, so `'it\'s; here'`
+  (as `mysqldump` writes it) no longer splits the script in two, and a
+  `:name` or `&` in it is no longer taken for a variable. `#` starts a
+  comment, so a `;` or `'` in one no longer splits or swallows the
+  script. `--` starts one only before a space, tab or line break:
+  `select 1 --comment` showed `--comment` as a comment, while MySQL read
+  `1 - -comment` and found no column `comment`. The editor highlights,
+  folds and matches brackets the same way, and shows MySQL's `"…"` as
+  the string it is there.
+- Settings → Keyboard no longer takes a key that typing and editing
+  need for a command (#191). A shortcut on Delete made Delete run the
+  command everywhere: in a SQL window it opened a new window and deleted
+  nothing. The same went for Enter, Tab, the arrows, letters with or
+  without Shift, and Ctrl with Backspace, Delete, an arrow, A, C, V, X, Y
+  or Z. Recording one now says so and waits for another key; such a
+  shortcut in `settings.toml` is ignored. Function keys, Alt and the
+  other Ctrl shortcuts are free.
+- *Export → Excel (xlsx)* keeps a timestamp's fraction of a second
+  (#192): `23:09:48.167` became `23:09:48`. It shows as
+  `yyyy-mm-dd hh:mm:ss.000`, and a date without a time as `yyyy-mm-dd`.
+  MySQL's `DATETIME`, SQL Server's `datetime`, `datetime2` and
+  `smalldatetime`, and SQLite's columns declared so are Excel dates
+  now, not text (#193). Types with a time zone, and dates before 1900,
+  which Excel has no day for, stay text.
+- A wrong passphrase for an SSH key file says so (#194): it said
+  "SshKey: cryptographic error" (OpenSSH keys) or "Padding error" (PEM
+  RSA keys).
+- PostgreSQL: *Drop* of a function or procedure with several argument
+  lists failed with "function name is not unique" (#195). The browser
+  lists such a name once, its source shows every version, and *Drop*
+  now drops every version, as the confirmation says.
+- Several Pythias open at once no longer undo each other's changes
+  (#196). Each wrote its files from what it read at its start: a
+  connection saved in one was gone once the other connected from the
+  dialog, saved reports likewise, the history was the last one's, and a
+  Pythia that exited later reset the settings the other had changed. A
+  change now goes to the file as it is (the connect dialog shows the
+  other's connections), the history is merged, and settings write only
+  what changed. The open windows are the first Pythia's; one started
+  while it runs keeps its own as long as it runs. Two saves at the same
+  moment no longer share a temporary file, where one of them failed.
 
 ## [0.10.0] - 2026-10-30
 

@@ -256,7 +256,7 @@ mod tests {
         let text = std::fs::read_to_string(&sql_path).unwrap();
         std::fs::remove_file(&sql_path).unwrap();
         assert!(
-            crate::sql_window::find_substitutions(&text).is_empty(),
+            crate::sql_window::find_substitutions(&text, pythia_plsql::Syntax::Oracle).is_empty(),
             "{text}"
         );
         let value = text

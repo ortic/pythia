@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
 use serde::{Serialize, de::DeserializeOwned};
@@ -108,7 +109,14 @@ pub fn save_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = toml::to_string_pretty(value)?;
-    let tmp = path.with_extension("toml.tmp");
+    // A temp file of its own: another Pythia, or another thread, may save
+    // the same file at the same time (#196).
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "toml.{}-{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
@@ -131,6 +139,34 @@ mod tests {
             load_toml::<Settings>(&dir.join("missing.toml")).unwrap(),
             Settings::default()
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Saves at the same time don't share a temp file (#196): with one,
+    /// they wrote over each other's, and a rename failed.
+    #[test]
+    fn saves_at_once() {
+        let dir = std::env::temp_dir().join(format!("pythia-config-saves-{}", std::process::id()));
+        let path = dir.join("settings.toml");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut settings = Settings::default();
+                    settings.editor.tab_width = i;
+                    for _ in 0..50 {
+                        save_toml(&path, &settings).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let back: Settings = load_toml(&path).unwrap();
+        assert!(back.editor.tab_width < 8);
+        let files: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 1, "{files:?}");
         fs::remove_dir_all(dir).unwrap();
     }
 

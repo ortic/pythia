@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use logos::Logos;
 
+use crate::Syntax;
 use crate::keywords::is_keyword;
 
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,15 +101,33 @@ pub struct Token {
 
 /// Lexes `src` into a lossless token stream.
 pub fn tokenize(src: &str) -> Vec<Token> {
+    tokenize_in(src, Syntax::Oracle)
+}
+
+/// [`tokenize`] for a script of a database with `syntax`. MySQL lexes three
+/// things its own way: `\` escapes the next character in `'…'` and `"…"`
+/// (#187), `#` starts a line comment (#188), and `--` does only before
+/// whitespace or a control character (#189). Its `"…"` is a string.
+pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
+    let mysql = syntax == Syntax::MySql;
     let mut lexer = TokenKind::lexer(src);
+    // Where `lexer` started: it starts again after a token MySQL ends
+    // elsewhere.
+    let mut base = 0;
     let mut tokens = Vec::new();
     while let Some(result) = lexer.next() {
-        let span = lexer.span();
-        let kind = match result {
+        let mut span = base + lexer.span().start..base + lexer.span().end;
+        let mut kind = match result {
             Ok(TokenKind::Ident) if is_keyword(&src[span.clone()]) => TokenKind::Keyword,
             Ok(kind) => kind,
             Err(()) => TokenKind::Error,
         };
+        if mysql && let Some((mysql_kind, end)) = mysql_token(src, kind, span.clone()) {
+            kind = mysql_kind;
+            span.end = end;
+            base = end;
+            lexer = TokenKind::lexer(&src[end..]);
+        }
         // Oracle's `$IF` and `$$name` (#171): the raw lexer knows `$` only
         // in dollar-quoted strings.
         if matches!(kind, TokenKind::Ident | TokenKind::Keyword)
@@ -134,6 +153,63 @@ pub fn tokenize(src: &str) -> Vec<Token> {
         tokens.push(Token { kind, span });
     }
     tokens
+}
+
+/// A token MySQL reads differently from Oracle, as its kind and where it
+/// ends; `None` when it reads it the same.
+fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenKind, usize)> {
+    let text = &src[span.clone()];
+    match kind {
+        TokenKind::LineComment => {
+            // `--x` is two minus signs; `--` at the end of the text is a
+            // comment.
+            let after = src.as_bytes().get(span.start + 2)?;
+            (!after.is_ascii_whitespace() && !after.is_ascii_control())
+                .then_some((TokenKind::Operator, span.start + 1))
+        }
+        TokenKind::Error if text.starts_with('#') => {
+            let end = src[span.start..]
+                .find('\n')
+                .map_or(src.len(), |i| span.start + i);
+            Some((TokenKind::LineComment, end))
+        }
+        // MySQL's names can't hold `#`: there the comment starts.
+        TokenKind::Ident | TokenKind::Keyword | TokenKind::BindVar | TokenKind::SubstVar => {
+            let hash = text.find('#').filter(|&i| i > 0)?;
+            let kind = match kind {
+                TokenKind::Ident | TokenKind::Keyword if is_keyword(&text[..hash]) => {
+                    TokenKind::Keyword
+                }
+                TokenKind::Keyword => TokenKind::Ident,
+                other => other,
+            };
+            Some((kind, span.start + hash))
+        }
+        TokenKind::String | TokenKind::QuotedIdent if !text.starts_with(['$', '`']) => {
+            let quote = text.find(['\'', '"'])?;
+            let end = escaped_string_end(src, span.start + quote);
+            (end != span.end || kind == TokenKind::QuotedIdent).then_some((TokenKind::String, end))
+        }
+        _ => None,
+    }
+}
+
+/// Where a string with backslash escapes that opens at `open` ends: after
+/// its closing quote (a doubled one stands for itself), or at the end of
+/// the text.
+fn escaped_string_end(src: &str, open: usize) -> usize {
+    let bytes = src.as_bytes();
+    let quote = bytes[open];
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b if b == quote && bytes.get(i + 1) == Some(&quote) => i += 2,
+            b if b == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// `$` and a word make a selection or error directive; `$$` and a name an
@@ -269,6 +345,84 @@ mod tests {
         );
         assert_eq!(kinds("q'[abc"), vec![(TokenKind::QString, "q'[abc")]);
         assert_eq!(kinds("$$ ab;c"), vec![(TokenKind::String, "$$ ab;c")]);
+    }
+
+    fn mysql_kinds(src: &str) -> Vec<(TokenKind, &str)> {
+        tokenize_in(src, Syntax::MySql)
+            .into_iter()
+            .filter(|t| !t.kind.is_trivia() || t.kind == TokenKind::LineComment)
+            .map(|t| (t.kind, &src[t.span]))
+            .collect()
+    }
+
+    #[test]
+    fn mysql_strings_comments_and_dashes() {
+        // A backslash escapes the next character (#187), in "…" too, which
+        // is a string; a doubled quote still stands for one.
+        assert_eq!(
+            mysql_kinds(r#"select 'it\'s; here', "a\"b;c", 'x\\', 'y''z', N'\'' ;"#),
+            vec![
+                (TokenKind::Keyword, "select"),
+                (TokenKind::String, r"'it\'s; here'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, r#""a\"b;c""#),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, r"'x\\'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, "'y''z'"),
+                (TokenKind::Comma, ","),
+                (TokenKind::String, r"N'\''"),
+                (TokenKind::Semicolon, ";"),
+            ]
+        );
+        assert_eq!(
+            mysql_kinds(r"'open\'"),
+            vec![(TokenKind::String, r"'open\'")]
+        );
+        // `#` comments (#188), also right after a name.
+        assert_eq!(
+            mysql_kinds("# it's; gone\nselect a#b\n, 1"),
+            vec![
+                (TokenKind::LineComment, "# it's; gone"),
+                (TokenKind::Keyword, "select"),
+                (TokenKind::Ident, "a"),
+                (TokenKind::LineComment, "#b"),
+                (TokenKind::Comma, ","),
+                (TokenKind::Number, "1"),
+            ]
+        );
+        // `--` is a comment before whitespace, a control character or the
+        // end, otherwise a minus (#189).
+        assert_eq!(
+            mysql_kinds("1 --x\n-- y\n--\t\n2--"),
+            vec![
+                (TokenKind::Number, "1"),
+                (TokenKind::Operator, "-"),
+                (TokenKind::Operator, "-"),
+                (TokenKind::Ident, "x"),
+                (TokenKind::LineComment, "-- y"),
+                (TokenKind::LineComment, "--\t"),
+                (TokenKind::Number, "2"),
+                (TokenKind::LineComment, "--"),
+            ]
+        );
+        // Backticks and Oracle's lexing stay as they were.
+        assert_eq!(
+            mysql_kinds("`a\\`"),
+            vec![(TokenKind::QuotedIdent, "`a\\`")]
+        );
+        assert_eq!(
+            tokenize(r"'a\' #--x")
+                .into_iter()
+                .map(|t| t.kind)
+                .collect::<Vec<_>>(),
+            [
+                TokenKind::String,
+                TokenKind::Whitespace,
+                TokenKind::Error,
+                TokenKind::LineComment
+            ]
+        );
     }
 
     #[test]

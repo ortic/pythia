@@ -10,7 +10,7 @@
 
 use std::ops::Range;
 
-use crate::lexer::{Token, TokenKind, tokenize};
+use crate::lexer::{Token, TokenKind, tokenize_in};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
@@ -22,9 +22,12 @@ pub enum StatementKind {
 /// Where a database's scripts end their statements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Syntax {
-    /// SQL*Plus (also used for MySQL so far).
+    /// SQL*Plus.
     #[default]
     Oracle,
+    /// MySQL and MariaDB: statements end as in SQL*Plus, lexed MySQL's way
+    /// ([`crate::tokenize_in`]).
+    MySql,
     /// PostgreSQL: every statement ends at `;`. Routine bodies are
     /// (dollar-quoted) strings; `BEGIN ATOMIC … END` keeps its `;`.
     Postgres,
@@ -36,6 +39,13 @@ pub enum Syntax {
     /// keeps its `;`. `BEGIN` and `END` starting a statement are
     /// transaction control.
     Sqlite,
+}
+
+impl Syntax {
+    /// Statements end as in SQL*Plus: at `;`, or at `/` after a block.
+    fn sqlplus(self) -> bool {
+        matches!(self, Syntax::Oracle | Syntax::MySql)
+    }
 }
 
 /// The client commands of SQL*Plus that Pythia runs itself; the rest of
@@ -145,7 +155,7 @@ pub fn split_statements_in(src: &str, syntax: Syntax) -> Vec<Statement> {
     Splitter::new(src, syntax).run()
 }
 
-/// Like [`split_statements`], reusing tokens from [`tokenize`].
+/// Like [`split_statements`], reusing tokens from [`crate::tokenize`].
 pub(crate) fn split_with_tokens(src: &str, tokens: Vec<Token>) -> Vec<Statement> {
     Splitter {
         src,
@@ -185,7 +195,7 @@ impl<'a> Splitter<'a> {
     fn new(src: &'a str, syntax: Syntax) -> Self {
         Self {
             src,
-            tokens: tokenize(src),
+            tokens: tokenize_in(src, syntax),
             syntax,
             out: Vec::new(),
         }
@@ -255,7 +265,7 @@ impl<'a> Splitter<'a> {
     /// ATOMIC … END` (PostgreSQL) and the `CASE … END` inside them.
     fn depth_change(&self, idx: usize, depth: usize) -> isize {
         let t = &self.tokens[idx];
-        if self.syntax == Syntax::Oracle || !t.kind.is_word() {
+        if self.syntax.sqlplus() || !t.kind.is_word() {
             return 0;
         }
         if self.word_eq(t, &["CASE"]) {
@@ -289,9 +299,20 @@ impl<'a> Splitter<'a> {
         if self.text(first) == "@" || self.text(first) == "@@" {
             return StatementKind::SqlPlus;
         }
-        if self.syntax != Syntax::Oracle {
+        if !self.syntax.sqlplus() {
             if self.word_eq(first, CLIENT_COMMANDS) {
                 return StatementKind::SqlPlus;
+            }
+            // `SET DEFINE ON` switches substitution variables on (#190).
+            if self.word_eq(first, &["SET"]) {
+                let define = words
+                    .next()
+                    .is_some_and(|n| self.word_eq(n, &["DEF", "DEFINE"]));
+                return if define {
+                    StatementKind::SqlPlus
+                } else {
+                    StatementKind::Sql
+                };
             }
             if self.syntax == Syntax::TSql {
                 if self.word_eq(first, &["DECLARE"]) {
@@ -594,6 +615,35 @@ mod tests {
                 ),
                 (StatementKind::Sql, "end transaction"),
                 (StatementKind::SqlPlus, "prompt done"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_scripts() {
+        // Statements end as in SQL*Plus; strings, comments and `--` are
+        // MySQL's (#187, #188, #189).
+        let src = "select 'it\\'s; here' as a;\n\
+                   # drop it; it's gone\n\
+                   insert into t values (1,'a\\\\'),(2,'b;c');\n\
+                   select 1 --x; select 2\n;\n\
+                   select 3 -- the end; really\n;\n\
+                   create procedure p() begin select 'x\\';'; end;\n/\n";
+        assert_eq!(
+            split_in(src, Syntax::MySql),
+            vec![
+                (StatementKind::Sql, "select 'it\\'s; here' as a"),
+                (
+                    StatementKind::Sql,
+                    "insert into t values (1,'a\\\\'),(2,'b;c')"
+                ),
+                (StatementKind::Sql, "select 1 --x"),
+                (StatementKind::Sql, "select 2"),
+                (StatementKind::Sql, "select 3"),
+                (
+                    StatementKind::PlSql,
+                    "create procedure p() begin select 'x\\';'; end;"
+                ),
             ]
         );
     }
