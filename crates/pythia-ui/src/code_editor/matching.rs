@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use pythia_plsql::{Token, TokenKind, tokenize};
+use pythia_plsql::{Syntax, Token, TokenKind, tokenize_in};
 
 /// A matched pair: the opening and closing token ranges (`END IF` spans both words).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +23,14 @@ enum Block {
 }
 
 /// All bracket and keyword pairs of `src`.
+#[cfg(test)]
 pub fn find_pairs(src: &str) -> Vec<Pair> {
-    let tokens: Vec<Token> = tokenize(src)
+    find_pairs_in(src, Syntax::Oracle)
+}
+
+/// [`find_pairs`] of a script of a database with `syntax`.
+pub fn find_pairs_in(src: &str, syntax: Syntax) -> Vec<Pair> {
+    let tokens: Vec<Token> = tokenize_in(src, syntax)
         .into_iter()
         .filter(|t| !t.kind.is_trivia())
         .collect();

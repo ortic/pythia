@@ -134,7 +134,8 @@ impl Dialect {
     /// How the database's scripts end their statements.
     pub fn syntax(self) -> Syntax {
         match self.0 {
-            DbKind::Oracle | DbKind::MySql => Syntax::Oracle,
+            DbKind::Oracle => Syntax::Oracle,
+            DbKind::MySql => Syntax::MySql,
             DbKind::Postgres => Syntax::Postgres,
             DbKind::SqlServer => Syntax::TSql,
             DbKind::Sqlite => Syntax::Sqlite,

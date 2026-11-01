@@ -59,10 +59,20 @@ All notable changes to Pythia are documented here. The format follows
 
 ### Fixed
 - INSERT exports on SQL Server wrote a `float` like 1e300 out in full
-  (#182), 301 digits, which SQL Server can't read (a decimal literal has at most
-  38 digits), and a `geometry` or `hierarchyid` value as text. Such a
-  float now has an exponent, and CLR types are written as the `0x…` they
-  are shown as.
+  (#182), 301 digits, which SQL Server can't read (a decimal literal has
+  at most 38 digits), and a `geometry` or `hierarchyid` value as text.
+  Such a float now has an exponent, and CLR types are written as the
+  `0x…` they are shown as.
+- MySQL scripts are read the way MySQL reads them (#187, #188, #189). A
+  backslash escapes the next character in a string, so `'it\'s; here'`
+  (as `mysqldump` writes it) no longer splits the script in two, and a
+  `:name` or `&` in it is no longer taken for a variable. `#` starts a
+  comment, so a `;` or `'` in one no longer splits or swallows the
+  script. `--` starts one only before a space, tab or line break:
+  `select 1 --comment` showed `--comment` as a comment, while MySQL read
+  `1 - -comment` and found no column `comment`. The editor highlights,
+  folds and matches brackets the same way, and shows MySQL's `"…"` as
+  the string it is there.
 
 ## [0.10.0] - 2026-10-30
 

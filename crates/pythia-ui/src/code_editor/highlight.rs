@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use pythia_plsql::{TokenKind, tokenize};
+use pythia_plsql::{Syntax, TokenKind, tokenize_in};
 use ropey::Rope;
 
 use super::text::line_text;
@@ -24,6 +24,8 @@ pub enum LineState {
     Hint,
     /// Inside `'...'`.
     Str,
+    /// Inside MySQL's `"..."`.
+    DoubleStr,
     /// Inside `q'<open>...<close>'`.
     QStr { open: char, close: char },
     /// Inside PostgreSQL's `$tag$...$tag$`.
@@ -63,21 +65,29 @@ pub struct LineToken {
     pub kind: TokenKind,
 }
 
-/// Lexes one line (without line break) that starts in `state`.
+/// Lexes one line (without line break) of an Oracle script that starts in
+/// `state`.
+#[cfg(test)]
 pub fn lex_line(line: &str, state: LineState) -> (Vec<LineToken>, LineState) {
+    lex_line_in(line, state, Syntax::Oracle)
+}
+
+/// Lexes one line (without line break) of a script with `syntax` that
+/// starts in `state`.
+pub fn lex_line_in(line: &str, state: LineState, syntax: Syntax) -> (Vec<LineToken>, LineState) {
     if let LineState::Dollar(tag) = state {
         // A routine's body: code up to the closing tag.
         let close = format!("${}$", tag.as_str());
         let Some(at) = line.find(&close) else {
-            return (code(line, 0), state);
+            return (code(line, 0, syntax), state);
         };
-        let mut tokens = code(&line[..at], 0);
+        let mut tokens = code(&line[..at], 0, syntax);
         let after = at + close.len();
         tokens.push(LineToken {
             range: at..after,
             kind: TokenKind::String,
         });
-        let (rest, end) = lex_line(&line[after..], LineState::Normal);
+        let (rest, end) = lex_line_in(&line[after..], LineState::Normal, syntax);
         tokens.extend(rest.into_iter().map(|t| LineToken {
             range: t.range.start + after..t.range.end + after,
             kind: t.kind,
@@ -89,13 +99,14 @@ pub fn lex_line(line: &str, state: LineState) -> (Vec<LineToken>, LineState) {
         LineState::Comment => "/*".into(),
         LineState::Hint => "/*+".into(),
         LineState::Str => "'".into(),
+        LineState::DoubleStr => "\"".into(),
         LineState::QStr { open, .. } => format!("q'{open}"),
     };
     let src = format!("{prefix}{line}");
     let p = prefix.len();
-    let raw = tokenize(&src);
+    let raw = tokenize_in(&src, syntax);
     let end_state = raw.last().map_or(LineState::Normal, |t| {
-        end_state(&src[t.span.clone()], t.kind)
+        end_state(&src[t.span.clone()], t.kind, syntax)
     });
     let mut tokens: Vec<LineToken> = raw
         .into_iter()
@@ -106,7 +117,7 @@ pub fn lex_line(line: &str, state: LineState) -> (Vec<LineToken>, LineState) {
                 kind: t.kind,
             };
             if t.kind == TokenKind::String && src[t.span.clone()].starts_with('$') {
-                dollar_parts(line, token)
+                dollar_parts(line, token, syntax)
             } else {
                 vec![token]
             }
@@ -119,8 +130,8 @@ pub fn lex_line(line: &str, state: LineState) -> (Vec<LineToken>, LineState) {
 }
 
 /// Text lexed as code, its tokens moved by `at`.
-fn code(text: &str, at: usize) -> Vec<LineToken> {
-    tokenize(text)
+fn code(text: &str, at: usize, syntax: Syntax) -> Vec<LineToken> {
+    tokenize_in(text, syntax)
         .into_iter()
         .map(|t| LineToken {
             range: t.span.start + at..t.span.end + at,
@@ -131,7 +142,7 @@ fn code(text: &str, at: usize) -> Vec<LineToken> {
 
 /// A dollar-quoted string as its tags (strings) around its body, shown as
 /// code: it is usually a routine's.
-fn dollar_parts(line: &str, token: LineToken) -> Vec<LineToken> {
+fn dollar_parts(line: &str, token: LineToken, syntax: Syntax) -> Vec<LineToken> {
     let text = &line[token.range.clone()];
     let open = text[1..].find('$').map_or(text.len(), |i| i + 2);
     let closed = text.len() >= 2 * open && text.ends_with(&text[..open]);
@@ -145,7 +156,7 @@ fn dollar_parts(line: &str, token: LineToken) -> Vec<LineToken> {
         range: start..start + open,
         kind: TokenKind::String,
     }];
-    parts.extend(code(&text[open..body_end], start + open));
+    parts.extend(code(&text[open..body_end], start + open, syntax));
     if closed {
         parts.push(LineToken {
             range: start + body_end..token.range.end,
@@ -329,7 +340,7 @@ fn mark_sqlplus(line: &str, tokens: &mut [LineToken]) {
 }
 
 /// State after the last token of a line: unterminated constructs continue.
-fn end_state(text: &str, kind: TokenKind) -> LineState {
+fn end_state(text: &str, kind: TokenKind, syntax: Syntax) -> LineState {
     match kind {
         TokenKind::BlockComment if !(text.len() >= 4 && text.ends_with("*/")) => LineState::Comment,
         TokenKind::Hint if !(text.len() >= 5 && text.ends_with("*/")) => LineState::Hint,
@@ -342,7 +353,13 @@ fn end_state(text: &str, kind: TokenKind) -> LineState {
                 LineState::Dollar(DollarTag::new(tag))
             }
         }
-        TokenKind::String if !string_terminated(text) => LineState::Str,
+        TokenKind::String if !string_terminated(text, syntax) => {
+            if text.starts_with('"') {
+                LineState::DoubleStr
+            } else {
+                LineState::Str
+            }
+        }
         TokenKind::QString => {
             let body = text.trim_start_matches(['n', 'N']);
             let mut chars = body.chars().skip(2); // q'
@@ -368,14 +385,19 @@ fn end_state(text: &str, kind: TokenKind) -> LineState {
     }
 }
 
-fn string_terminated(text: &str) -> bool {
+fn string_terminated(text: &str, syntax: Syntax) -> bool {
     let body = text.trim_start_matches(['n', 'N']);
     let bytes = body.as_bytes();
-    // bytes[0] is the opening quote.
+    let quote = bytes[0];
     let mut i = 1;
     while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if bytes.get(i + 1) == Some(&b'\'') {
+        // MySQL's `\` escapes the next character (#187).
+        if syntax == Syntax::MySql && bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
                 i += 2;
                 continue;
             }
@@ -390,15 +412,32 @@ fn string_terminated(text: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct Highlighter {
     states: Vec<LineState>,
+    syntax: Syntax,
 }
 
 impl Highlighter {
     pub fn new(rope: &Rope) -> Self {
+        Self::with_syntax(rope, Syntax::Oracle)
+    }
+
+    pub fn with_syntax(rope: &Rope, syntax: Syntax) -> Self {
         let mut h = Self {
             states: vec![LineState::Normal; rope.len_lines()],
+            syntax,
         };
         h.relex(rope, 0, rope.len_lines());
         h
+    }
+
+    /// The lexing of the database the text is for.
+    pub fn syntax(&self) -> Syntax {
+        self.syntax
+    }
+
+    pub fn set_syntax(&mut self, rope: &Rope, syntax: Syntax) {
+        if syntax != self.syntax {
+            *self = Self::with_syntax(rope, syntax);
+        }
     }
 
     pub fn state(&self, line: usize) -> LineState {
@@ -424,7 +463,7 @@ impl Highlighter {
         let n = self.states.len();
         let mut i = from;
         while i + 1 < n {
-            let (_, end) = lex_line(&line_text(rope, i), self.states[i]);
+            let (_, end) = lex_line_in(&line_text(rope, i), self.states[i], self.syntax);
             if i + 1 >= force_until && self.states[i + 1] == end {
                 break;
             }
@@ -454,6 +493,51 @@ mod tests {
                 .collect(),
             end,
         )
+    }
+
+    fn mysql(line: &str, state: LineState) -> (Vec<(TokenKind, &str)>, LineState) {
+        let (tokens, end) = lex_line_in(line, state, Syntax::MySql);
+        let tokens = tokens
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Whitespace)
+            .map(|t| (t.kind, &line[t.range]))
+            .collect();
+        (tokens, end)
+    }
+
+    #[test]
+    fn mysql_lines() {
+        // What the server runs: `--x` is code, `#` a comment (#188, #189).
+        assert_eq!(
+            mysql("select 1 --x # it's", LineState::Normal),
+            (
+                vec![
+                    (TokenKind::Keyword, "select"),
+                    (TokenKind::Number, "1"),
+                    (TokenKind::Operator, "-"),
+                    (TokenKind::Operator, "-"),
+                    (TokenKind::Ident, "x"),
+                    (TokenKind::LineComment, "# it's"),
+                ],
+                LineState::Normal
+            )
+        );
+        // A string with `\'` goes on to the next line, and ends there (#187).
+        assert_eq!(mysql(r"x = 'it\'s", LineState::Normal).1, LineState::Str);
+        assert_eq!(
+            mysql(r"\\', y", LineState::Str).0[0],
+            (TokenKind::String, r"\\'")
+        );
+        assert_eq!(
+            mysql(r#"x = "a\""#, LineState::Normal).1,
+            LineState::DoubleStr
+        );
+        assert_eq!(
+            mysql(r#"b" y"#, LineState::DoubleStr).0,
+            vec![(TokenKind::String, r#"b""#), (TokenKind::Ident, "y")]
+        );
+        // Oracle's strings know no backslash.
+        assert_eq!(kinds(r"x = 'it\'", LineState::Normal).1, LineState::Normal);
     }
 
     #[test]

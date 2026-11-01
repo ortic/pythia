@@ -112,6 +112,11 @@ impl Editor {
         self.inner.select(0..0);
     }
 
+    /// Reads the text as a script of a database with `syntax`.
+    pub fn set_syntax(&mut self, syntax: pythia_plsql::Syntax) {
+        self.inner.set_syntax(syntax);
+    }
+
     pub fn cursor(&self) -> usize {
         self.inner.cursor().min(self.text.len())
     }

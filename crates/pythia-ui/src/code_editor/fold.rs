@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use pythia_plsql::{StatementKind, Token, TokenKind, split_statements, tokenize};
+use pythia_plsql::{StatementKind, Syntax, Token, TokenKind, split_statements_in, tokenize_in};
 
 /// What a region is, for "fold all" decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,13 +37,19 @@ pub struct Region {
 
 /// All foldable regions of `src`, at most one per start line (the largest),
 /// sorted by start line.
+#[cfg(test)]
 pub fn regions(src: &str) -> Vec<Region> {
+    regions_in(src, Syntax::Oracle)
+}
+
+/// [`regions`] of a script of a database with `syntax`.
+pub fn regions_in(src: &str, syntax: Syntax) -> Vec<Region> {
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(src.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
     let line_of = |byte: usize| line_starts.partition_point(|&s| s <= byte) - 1;
 
-    let tokens = tokenize(src);
+    let tokens = tokenize_in(src, syntax);
     let mut out: Vec<Region> = Vec::new();
     let mut push = |start: usize, end: usize, kind: RegionKind, depth: usize| {
         if end > start {
@@ -101,7 +107,7 @@ pub fn regions(src: &str) -> Vec<Region> {
     structure(src, &tokens, &line_of, &mut push);
 
     // Multi-line SQL statements of a script (PL/SQL units fold by structure).
-    let statements = split_statements(src);
+    let statements = split_statements_in(src, syntax);
     if statements.len() > 1 {
         for s in statements.iter().filter(|s| s.kind == StatementKind::Sql) {
             let (a, b) = (
