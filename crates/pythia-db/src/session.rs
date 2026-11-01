@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -23,12 +23,110 @@ pub(crate) type CancelSlot = Arc<Mutex<Option<Canceller>>>;
 
 /// Handle to a database session running on its own worker thread.
 pub struct Session {
-    requests: Sender<DbRequest>,
+    requests: Sender<Envelope>,
     events: Receiver<DbEvent>,
     /// Shared with the worker so a running call can be interrupted.
     cancel: CancelSlot,
     /// A [`Session::cancel`] is on its way.
     cancelling: Arc<AtomicBool>,
+    /// The handle is gone: the worker skips the statements of scripts.
+    closing: Arc<AtomicBool>,
+}
+
+/// The statements of a script that a SQL window sends ahead, so its
+/// session runs them one after the other without waiting for the window
+/// to draw a frame in between (#291). Once one fails, unless the script
+/// goes on after errors, or once it is stopped (Break's error, the window
+/// closed), the session skips the rest without a word: the window counts
+/// them as skipped.
+#[derive(Clone, Default)]
+pub struct Script(Arc<ScriptState>);
+
+#[derive(Default)]
+struct ScriptState {
+    stopped: AtomicBool,
+    continues: AtomicBool,
+}
+
+impl Script {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Skips the statements not run yet.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, Ordering::Release);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(Ordering::Acquire)
+    }
+
+    /// `WHENEVER SQLERROR CONTINUE`: a statement that fails doesn't stop
+    /// the script.
+    pub fn continue_on_error(&self, on: bool) {
+        self.0.continues.store(on, Ordering::Release);
+    }
+
+    fn failed(&self) {
+        if !self.0.continues.load(Ordering::Acquire) {
+            self.stop();
+        }
+    }
+}
+
+impl PartialEq for Script {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Script {}
+
+impl std::fmt::Debug for Script {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Script")
+            .field("stopped", &self.is_stopped())
+            .finish()
+    }
+}
+
+/// A request as the worker gets it, with the script it is a statement of.
+struct Envelope {
+    request: DbRequest,
+    script: Option<Script>,
+}
+
+/// The script statement the worker runs: its request id, and its script.
+type Current = Arc<Mutex<Option<(u64, Script)>>>;
+
+/// The worker's side of the requests: a script's statements are skipped
+/// once it stopped or the session's handle is gone, and the one handed
+/// out is noted, so that [`Events::send`] stops its script when it fails.
+pub(crate) struct Requests {
+    rx: Receiver<Envelope>,
+    current: Current,
+    closing: Arc<AtomicBool>,
+}
+
+impl Requests {
+    pub(crate) fn recv(&self) -> Result<DbRequest, RecvError> {
+        loop {
+            let Envelope { request, script } = self.rx.recv()?;
+            let mut current = self.current.lock().expect("script mutex");
+            *current = None;
+            if let Some(script) = script {
+                if script.is_stopped() || self.closing.load(Ordering::Acquire) {
+                    debug!(?request, "skipped: its script stopped");
+                    continue;
+                }
+                if let DbRequest::Execute { id, .. } = &request {
+                    *current = Some((*id, script));
+                }
+            }
+            return Ok(request);
+        }
+    }
 }
 
 impl Session {
@@ -41,12 +139,20 @@ impl Session {
         let (ev_tx, ev_rx) = mpsc::channel();
         let cancel = Arc::new(Mutex::new(None));
         let shared = cancel.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let current = Current::default();
+        let req_rx = Requests {
+            rx: req_rx,
+            current: current.clone(),
+            closing: closing.clone(),
+        };
         thread::Builder::new()
             .name(format!("db-{}", params.username))
             .spawn(move || {
                 let events = Events {
                     tx: ev_tx,
                     notify: Box::new(notify),
+                    script: current,
                 };
                 match params.kind {
                     // Rather than connecting around the tunnel.
@@ -70,13 +176,26 @@ impl Session {
             events: ev_rx,
             cancel,
             cancelling: Arc::new(AtomicBool::new(false)),
+            closing,
         }
     }
 
     pub fn send(&self, request: DbRequest) {
         // The worker only goes away after `Disconnect` or a failed connect;
         // requests sent after that are meaningless anyway.
-        let _ = self.requests.send(request);
+        let _ = self.requests.send(Envelope {
+            request,
+            script: None,
+        });
+    }
+
+    /// Sends a statement of `script`, which the worker skips once the
+    /// script stopped.
+    pub fn send_in(&self, request: DbRequest, script: &Script) {
+        let _ = self.requests.send(Envelope {
+            request,
+            script: Some(script.clone()),
+        });
     }
 
     pub fn try_recv(&self) -> Option<DbEvent> {
@@ -114,6 +233,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // What a closed window's script had left doesn't run; a Commit or
+        // Rollback sent before still does.
+        self.closing.store(true, Ordering::Release);
         self.send(DbRequest::Disconnect);
     }
 }
@@ -121,10 +243,18 @@ impl Drop for Session {
 pub(crate) struct Events {
     tx: Sender<DbEvent>,
     notify: Box<dyn Fn() + Send>,
+    /// The script statement running, whose failure stops its script.
+    script: Current,
 }
 
 impl Events {
     pub(crate) fn send(&self, event: DbEvent) {
+        if let DbEvent::Failed { id, .. } = &event
+            && let Some((running, script)) = &*self.script.lock().expect("script mutex")
+            && running == id
+        {
+            script.failed();
+        }
         if self.tx.send(event).is_ok() {
             (self.notify)();
         }
@@ -145,12 +275,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn run(
-        params: ConnectParams,
-        requests: Receiver<DbRequest>,
-        events: Events,
-        shared: CancelSlot,
-    ) {
+    fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
         info!(?params, "connecting");
         let conn = match connect(&params) {
             Ok(conn) => Arc::new(conn),

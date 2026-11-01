@@ -722,6 +722,124 @@ fn queries_see_commits_and_lock_nothing() {
     a.ok("drop table fresh_t");
 }
 
+/// The events of statement `id` up to the transaction state that ends
+/// them, in short: `cols a`, `rows 1 false` (rows and whether more come),
+/// `failed 1146`; the others as they are.
+fn outline(h: &mut Harness, id: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        out.push(match h.next() {
+            DbEvent::Transaction { .. } => return out,
+            DbEvent::TimeZone(_) | DbEvent::Notice(_) => continue,
+            DbEvent::QueryStarted { id: of, columns } if of == id => {
+                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                format!("cols {}", names.join(" "))
+            }
+            DbEvent::Rows {
+                id: of, rows, more, ..
+            } if of == id => format!("rows {} {more}", rows.len()),
+            DbEvent::Failed { id: of, error, .. } if of == id => {
+                format!("failed {}", error.code.unwrap_or_default())
+            }
+            other => format!("{other:?}"),
+        });
+        // Waiting for a FetchMore: no transaction state comes yet.
+        if out.last().is_some_and(|e| e.ends_with(" true")) {
+            return out;
+        }
+    }
+}
+
+/// Every result of a statement that returns several (#290): a
+/// procedure's SELECTs, statements kept together after DELIMITER, a text
+/// with a DO before its SELECT. Only the first showed, without a word, and
+/// what failed after it was lost; a SELECT after a DO didn't show.
+#[test]
+fn several_results_of_one_statement() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop procedure if exists r51_p");
+    h.ok("create procedure r51_p() begin select 1 as a; do 0; select 'x' as b, 2 as c; end");
+    let id = 51;
+    let run = |h: &mut Harness, sql: &str, max_rows: usize| {
+        h.session.send(DbRequest::Execute {
+            id,
+            sql: sql.into(),
+            max_rows,
+            binds: vec![],
+        });
+        outline(h, id)
+    };
+    let two = [
+        "cols a",
+        "MoreResults { id: 51 }",
+        "rows 1 false",
+        "cols b c",
+        "rows 1 false",
+    ];
+    assert_eq!(run(&mut h, "call r51_p()", 10), two);
+    assert_eq!(
+        run(&mut h, "select 1 as a; select 'x' as b, 2 as c", 10),
+        two
+    );
+    assert_eq!(
+        run(&mut h, "do 0; select 3 as d; do 1", 10),
+        ["cols d", "rows 1 false"]
+    );
+    assert_eq!(
+        run(&mut h, "select 1 as a; select * from r51_no_such_table", 10),
+        [
+            "cols a",
+            "MoreResults { id: 51 }",
+            "rows 1 false",
+            "failed 1146"
+        ]
+    );
+    assert_eq!(
+        run(&mut h, "do 0; select * from r51_no_such_table", 10),
+        ["failed 1146"]
+    );
+    // A result fetched batch by batch: the next one comes after its last.
+    let paged = format!("{}; select 'end' as e", numbers(15));
+    assert_eq!(run(&mut h, &paged, 10), ["cols n label", "rows 10 true"]);
+    h.session.send(DbRequest::FetchMore { id, max_rows: 10 });
+    assert_eq!(
+        outline(&mut h, id),
+        [
+            "MoreResults { id: 51 }",
+            "rows 5 false",
+            "cols e",
+            "rows 1 false"
+        ]
+    );
+    // One result, as before.
+    assert_eq!(run(&mut h, "select 1 as a", 10), ["cols a", "rows 1 false"]);
+    // A file has the first, and the others are said.
+    h.session.send(DbRequest::ExecuteWhole {
+        id,
+        sql: "call r51_p()".into(),
+        max_rows: 10,
+    });
+    let mut notices = Vec::new();
+    let mut shown = Vec::new();
+    loop {
+        match h.next() {
+            DbEvent::Transaction { .. } => break,
+            DbEvent::Notice(text) => notices.push(text),
+            DbEvent::QueryStarted { .. } => shown.push("cols"),
+            DbEvent::Rows { .. } => shown.push("rows"),
+            _ => {}
+        }
+    }
+    assert_eq!(shown, ["cols", "rows"]);
+    assert_eq!(
+        notices,
+        ["The statement returned 1 more result(s); only the first was written to the file"]
+    );
+    h.ok("drop procedure r51_p");
+}
+
 #[test]
 fn closing_an_open_result_stops_the_server() {
     let Some(mut h) = Harness::connect() else {

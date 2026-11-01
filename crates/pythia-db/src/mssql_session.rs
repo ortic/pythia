@@ -19,7 +19,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
@@ -35,7 +34,7 @@ use tracing::{debug, info, warn};
 use crate::compat::Release;
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
-use crate::session::{CancelSlot, Canceller, Events};
+use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{
     WHOLE_BATCH_BYTES, civil_from_days, float_text, has_word, hex, leading_words, line_offset,
     release, replace_binds, row_bytes, statement_kind,
@@ -59,12 +58,7 @@ const SESSION_OPTIONS: &str = "set ansi_nulls on; set ansi_padding on; set ansi_
                                set quoted_identifier on; set ansi_null_dflt_on on; \
                                set implicit_transactions off; set xact_abort off";
 
-pub(crate) fn run(
-    params: ConnectParams,
-    requests: Receiver<DbRequest>,
-    events: Events,
-    shared: CancelSlot,
-) {
+pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let connected = runtime()
         .map_err(|e| DbError::new(format!("Can't start the SQL Server client: {e}")))
@@ -283,7 +277,7 @@ struct Fetch<'a> {
     /// Binary values whole, for a file (#204).
     whole: bool,
     started: Instant,
-    requests: &'a Receiver<DbRequest>,
+    requests: &'a Requests,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -401,7 +395,7 @@ impl Worker {
         sql: &str,
         max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
+        requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();

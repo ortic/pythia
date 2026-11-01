@@ -31,7 +31,7 @@ pub use pythia_plsql::ast::{Diagnostic, Severity};
 
 use catalog::Tracker;
 use pythia_plsql::ast::Ast;
-use pythia_plsql::{Syntax, Token};
+use pythia_plsql::{Syntax, Token, TokenKind};
 use sema::Sema;
 
 /// Parsed state of one source text.
@@ -39,6 +39,9 @@ use sema::Sema;
 pub struct Analysis {
     src: String,
     syntax: Syntax,
+    /// `&name` is a substitution variable (SQL*Plus's); otherwise `&` is
+    /// an operator.
+    substitution: bool,
     tokens: Vec<Token>,
     ast: Ast,
 }
@@ -50,13 +53,25 @@ impl Analysis {
 
     /// [`Analysis::new`] of code for a database with `syntax`, lexed the way
     /// it reads it: SQL Server's and SQLite's `[name]` is a quoted name
-    /// (#208).
+    /// (#208). `&name` is a substitution variable on Oracle only, as a SQL
+    /// window has it without `SET DEFINE` (#190).
     pub fn new_in(src: &str, syntax: Syntax) -> Self {
-        let tokens = pythia_plsql::tokenize_in(src, syntax);
+        Self::new_with(src, syntax, syntax == Syntax::Oracle)
+    }
+
+    /// [`Analysis::new_in`] with `&name` a substitution variable or not
+    /// (`SET DEFINE ON|OFF`). Without, `1&c.` is `1 & c.`, a bitwise AND
+    /// on MySQL, PostgreSQL, SQL Server and SQLite (#287).
+    pub fn new_with(src: &str, syntax: Syntax, substitution: bool) -> Self {
+        let mut tokens = pythia_plsql::tokenize_in(src, syntax);
+        if !substitution {
+            tokens = without_substitution(src, syntax, tokens);
+        }
         let ast = pythia_plsql::parse_tokens(src, &tokens);
         Self {
             src: src.to_owned(),
             syntax,
+            substitution,
             tokens,
             ast,
         }
@@ -64,18 +79,24 @@ impl Analysis {
 
     /// Re-parses if `src` differs from the analyzed text. Returns whether it did.
     pub fn update(&mut self, src: &str) -> bool {
-        self.update_in(src, self.syntax)
+        self.update_with(src, self.syntax, self.substitution)
     }
 
     /// [`Analysis::update`] for code of a database with `syntax`.
     pub fn update_in(&mut self, src: &str, syntax: Syntax) -> bool {
+        self.update_with(src, syntax, syntax == Syntax::Oracle)
+    }
+
+    /// [`Analysis::update_in`] with `&name` a substitution variable or not.
+    pub fn update_with(&mut self, src: &str, syntax: Syntax, substitution: bool) -> bool {
         if self.src == src
             && self.syntax == syntax
+            && self.substitution == substitution
             && !(src.is_empty() && self.ast.scopes.is_empty())
         {
             return false;
         }
-        *self = Self::new_in(src, syntax);
+        *self = Self::new_with(src, syntax, substitution);
         true
     }
 
@@ -116,7 +137,8 @@ impl Analysis {
         if let Some(close) = complete::unclosed_quote(&self.tokens, &self.src, offset) {
             let mut src = self.src.clone();
             src.insert(offset, close);
-            return Self::new_in(&src, self.syntax).complete_with(offset, catalog, options);
+            return Self::new_with(&src, self.syntax, self.substitution)
+                .complete_with(offset, catalog, options);
         }
         let tracker = Tracker::new(catalog);
         let mut completion = complete::complete(&self.sema(&tracker), offset, options);
@@ -198,6 +220,34 @@ impl Analysis {
         let sema = self.sema(&tracker);
         sema.token_at(offset).map(|i| self.tokens[i].span.clone())
     }
+}
+
+/// `tokens` with each `&name` the lexer found read as `&` operators and
+/// what follows them.
+fn without_substitution(src: &str, syntax: Syntax, tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if token.kind != TokenKind::SubstVar {
+            out.push(token);
+            continue;
+        }
+        let start = token.span.start;
+        let text = &src[token.span.clone()];
+        let rest = start + text.len() - text.trim_start_matches('&').len();
+        out.extend((start..rest).map(|at| Token {
+            kind: TokenKind::Operator,
+            span: at..at + 1,
+        }));
+        out.extend(
+            pythia_plsql::tokenize_in(&src[rest..token.span.end], syntax)
+                .into_iter()
+                .map(|t| Token {
+                    kind: t.kind,
+                    span: rest + t.span.start..rest + t.span.end,
+                }),
+        );
+    }
+    out
 }
 
 /// One-shot completion (parses `src`; keep an [`Analysis`] for repeated use).

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use pythia_db::{
     ConnectParams, DbEvent, DbKind, DbRequest, Detail, Dialect, MetaQuery, MetaResult, ObjectType,
-    Session,
+    Script, Session,
 };
 
 /// A new database file for one test, removed when it ends.
@@ -503,6 +503,108 @@ fn transactions_like_oracle() {
     h.session.send(DbRequest::Commit);
     assert!(matches!(h.next(), DbEvent::Notice(_)));
     assert!(!h.settle());
+}
+
+/// A script's statements, sent at once, run one after the other (#291):
+/// after one that fails the session skips the rest, unless the script goes
+/// on after errors; a stopped script, or one whose session's handle is
+/// gone, runs no more of them, while a Commit sent before still runs.
+#[test]
+fn script_statements_stop_at_an_error() {
+    let db = TempDb::new("script");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table r51_t (id integer primary key)");
+    let send = |h: &mut Harness, script: &Script, ids: std::ops::Range<u64>| {
+        for id in ids {
+            let sql = format!("insert into r51_t values ({})", id % 10);
+            let request = DbRequest::Execute {
+                id,
+                sql,
+                max_rows: 10,
+                binds: vec![],
+            };
+            h.session.send_in(request, script);
+        }
+    };
+    // The answers until `last`, or until nothing comes for a while.
+    let answered = |h: &mut Harness, last: u64| {
+        let mut ids = Vec::new();
+        while !ids.contains(&last) {
+            let Some(event) = (loop {
+                if let Some(event) = h.session.try_recv() {
+                    break Some(event);
+                }
+                if h.wake.recv_timeout(Duration::from_millis(500)).is_err() {
+                    break None;
+                }
+            }) else {
+                break;
+            };
+            match event {
+                DbEvent::Executed { id, .. } => ids.push(id),
+                DbEvent::Failed { id, .. } => ids.push(id + 100),
+                _ => {}
+            }
+        }
+        ids
+    };
+    // 11 fails as a duplicate of 1 (Failed as 111).
+    let script = Script::new();
+    send(&mut h, &script, 1..4);
+    send(&mut h, &script, 11..14);
+    assert_eq!(answered(&mut h, 13), [1, 2, 3, 111]);
+    assert!(script.is_stopped());
+    assert_eq!(h.scalar("select count(*) from r51_t").as_deref(), Some("3"));
+    h.ok("rollback");
+
+    let script = Script::new();
+    script.continue_on_error(true);
+    send(&mut h, &script, 1..4);
+    send(&mut h, &script, 11..14);
+    assert_eq!(answered(&mut h, 113), [1, 2, 3, 111, 112, 113]);
+    h.settle();
+    assert!(!script.is_stopped());
+    h.ok("rollback");
+
+    let script = Script::new();
+    script.stop();
+    send(&mut h, &script, 1..3);
+    assert_eq!(answered(&mut h, 2), Vec::<u64>::new());
+
+    // The handle dropped while a statement runs: the rest is skipped, what
+    // was sent outside the script before isn't.
+    let script = Script::new();
+    let execute = |id: u64, sql: &str| DbRequest::Execute {
+        id,
+        sql: sql.into(),
+        max_rows: 10,
+        binds: vec![],
+    };
+    h.session.send_in(
+        execute(
+            20,
+            "with recursive r (n) as (select 1 union all select n + 1 from r \
+             where n < 10000000) select count(*) from r",
+        ),
+        &script,
+    );
+    h.session
+        .send_in(execute(21, "insert into r51_t values (7)"), &script);
+    h.session.send(execute(22, "insert into r51_t values (8)"));
+    h.session.send(DbRequest::Commit);
+    // Counting, which says nothing until it's done.
+    std::thread::sleep(Duration::from_millis(200));
+    drop(h);
+    let mut h = Harness::connect(&db.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while h.scalar("select count(*) from r51_t").as_deref() != Some("1") {
+        assert!(std::time::Instant::now() < deadline, "not committed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        h.scalar("select group_concat(id) from r51_t").as_deref(),
+        Some("8")
+    );
 }
 
 #[test]

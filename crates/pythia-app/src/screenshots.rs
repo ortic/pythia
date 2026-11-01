@@ -6575,6 +6575,480 @@ fn format_reads_each_database_syntax() {
     }
 }
 
+/// What a window's statements and Explain plan answer, step by step.
+struct ExplainCase {
+    /// Changes what the window's session sees (a temporary table, the
+    /// search path, the current schema).
+    setup: &'static str,
+    /// A query on what only the window sees, and the name its plan shows.
+    explain: &'static str,
+    object: &'static str,
+    /// Opens the window's transaction, and counts what it changed: 1.
+    change: &'static str,
+    count: &'static str,
+}
+
+/// Runs `sql` in the focused SQL window; returns the first cell of its
+/// last result, after checking that nothing failed.
+fn run_in_window(h: &mut Ui, sql: &str) -> Option<String> {
+    h.state_mut().test_sql_window().editor.set_text(sql);
+    h.state_mut().test_execute_focused();
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    let w = h.state().test_sql_window_ref().unwrap();
+    let errors: Vec<&str> = w
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{sql}: {errors:?}");
+    w.state.results.last()?.rows.first()?.first()?.clone()
+}
+
+/// Explain plan of `sql` in the focused SQL window: its steps as
+/// `operation object`, or why there is no plan.
+fn explain_in_window(h: &mut Ui, sql: &str) -> Result<Vec<String>, String> {
+    h.state_mut().test_sql_window().editor.set_text(sql);
+    h.state_mut()
+        .test_command(crate::commands::Command::ExplainPlan);
+    wait_until(h, "plan", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.plan.as_ref().is_some_and(|p| p.result.is_some()))
+    });
+    let w = h.state().test_sql_window_ref().unwrap();
+    let plan = w
+        .state
+        .plan
+        .as_ref()
+        .and_then(|p| p.result.clone())
+        .unwrap();
+    plan.map(|rows| {
+        rows.into_iter()
+            .map(|r| format!("{} {}", r.operation, r.object))
+            .collect()
+    })
+}
+
+/// The case on `connection`, in a window of its own: Explain plan sees what
+/// the window does, and leaves its transaction as it was, also when there
+/// is no plan.
+fn explain_case(h: &mut Ui, connection: &str, case: &ExplainCase) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(h, case.setup);
+    let plan = explain_in_window(h, case.explain);
+    assert!(
+        plan.as_ref()
+            .is_ok_and(|steps| steps.iter().any(|s| s.to_lowercase().contains(case.object))),
+        "{connection}: {plan:?}"
+    );
+    run_in_window(h, case.change);
+    assert!(h.state().test_pending_tx(), "{connection}");
+    for sql in [case.explain, "select * from r51_no_such_table"] {
+        let plan = explain_in_window(h, sql);
+        assert_eq!(plan.is_ok(), sql == case.explain, "{connection}: {plan:?}");
+        assert!(h.state().test_pending_tx(), "{connection}: {sql}");
+        assert_eq!(
+            run_in_window(h, case.count).as_deref(),
+            Some("1"),
+            "{connection}: {sql}"
+        );
+    }
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| !app.test_pending_tx());
+}
+
+/// Runs `sql` in a new window on `connection` and steps frames, as the app
+/// draws them, until it is done: the frames it took, and the messages.
+fn frames_to_run(h: &mut Ui, connection: &str, sql: String) -> (usize, Vec<String>) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql,
+        run: true,
+    });
+    let mut frames = 0;
+    loop {
+        h.step();
+        frames += 1;
+        if !h.state().test_focused_busy() {
+            break;
+        }
+        assert!(frames < 1000, "still running after {frames} frames");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    (frames, messages)
+}
+
+/// A script runs at the session's pace, not a statement per frame (#291):
+/// 4,000 statements took 4,001 frames, 55 s here, and in the app as long
+/// as the window took to draw them. What a script does stays: a message
+/// per statement, its results, stopping at an error or going on after
+/// WHENEVER SQLERROR CONTINUE, and Break.
+#[test]
+fn scripts_run_at_the_sessions_pace() {
+    let connection = "r51_script.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key)",
+    );
+    let inserts = |from: usize, to: usize| {
+        (from..=to)
+            .map(|i| format!("insert into r51_t values ({i});\n"))
+            .collect::<String>()
+    };
+    // In the script's window, its transaction.
+    let count = |h: &mut Ui| run_in_window(h, "select count(*) from r51_t");
+
+    let script = format!(
+        "{}select count(*) from r51_t;\nselect max(id) from r51_t;\n",
+        inserts(1, 4000)
+    );
+    let (frames, messages) = frames_to_run(&mut h, connection, script);
+    assert!(frames < 200, "{frames} frames");
+    let inserted = messages
+        .iter()
+        .filter(|m| m.starts_with("INSERT: 1 row affected in "))
+        .count();
+    assert_eq!(inserted, 4000);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<(&str, Option<&str>)> = w
+        .state
+        .results
+        .iter()
+        .map(|r| (r.title.as_str(), r.rows[0][0].as_deref()))
+        .collect();
+    assert_eq!(
+        results,
+        [("Result 1", Some("4000")), ("Result 2", Some("4000"))]
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // An error stops the script: the statements after it don't run.
+    let script = format!(
+        "{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed"))
+            && messages.contains(&"1990 remaining statement(s) skipped".to_owned()),
+        "{:?}",
+        &messages[messages.len().saturating_sub(4)..]
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("10"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // After WHENEVER SQLERROR CONTINUE, they do.
+    let script = format!(
+        "whenever sqlerror continue\n{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed")),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("2000"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // Break stops the statement running and skips the others.
+    let slow = "with recursive r (n) as (select 1 union all select n + 1 from r) \
+                select count(*) from r;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("{slow}{}", inserts(1, 100)),
+        run: true,
+    });
+    h.run_steps(5);
+    assert!(h.state().test_focused_busy());
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "break", |app| !app.test_focused_busy());
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        messages.contains(&"100 remaining statement(s) skipped"),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("0"));
+}
+
+/// The Messages tab lays out the messages it shows, not all of them
+/// (#291): with 40,000 a frame took 268 ms. The last one shows, at the
+/// bottom.
+#[test]
+fn messages_lay_out_what_shows() {
+    let connection = "r51_messages.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    for i in 0..40_000 {
+        h.state_mut()
+            .test_sql_window()
+            .info(format!("message {i:05}"));
+    }
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("message ").count();
+    assert!(laid_out < 200, "{laid_out} messages laid out");
+    assert!(h.query_by_label("message 39999").is_some());
+}
+
+/// On MySQL a statement with several results shows each in a tab of its
+/// own (#290): a procedure's SELECTs, and statements kept together after
+/// DELIMITER, also with an error after the first. Only the first showed,
+/// and the error was lost. MariaDB's `BEGIN NOT ATOMIC` too, when the test
+/// database is MariaDB.
+#[test]
+fn mysql_statements_show_every_result() {
+    let connection = "r51@mysql";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MYSQL",
+        connection,
+        pythia_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    let mariadb = h.state().test_mariadb(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(&mut h, "drop procedure if exists r51_p");
+    run_in_window(
+        &mut h,
+        "create procedure r51_p() begin select 1 as a; select 'x' as b, 2 as c; end",
+    );
+    // Each result's title and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let row: Vec<&str> = r.rows[0]
+                    .iter()
+                    .map(|c| c.as_deref().unwrap_or(""))
+                    .collect();
+                format!("{}: {}", r.title, row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: 1", "Result 2: x 2"];
+    let mut cases = vec![
+        "call r51_p()",
+        "DELIMITER //\nselect 1 as a; select 'x' as b, 2 as c //\nDELIMITER ;",
+    ];
+    if mariadb {
+        cases.push("begin not atomic select 1 as a; select 'x' as b, 2 as c; end;");
+    }
+    for sql in cases {
+        let (results, messages) = shown(&mut h, sql);
+        assert_eq!(results, two, "{sql}: {messages:?}");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("1 row selected"))
+                .count(),
+            2,
+            "{sql}: {messages:?}"
+        );
+    }
+    let (results, messages) = shown(
+        &mut h,
+        "DELIMITER //\nselect 1 as a; select * from r51_no_such_table //\nselect 2 //",
+    );
+    assert_eq!(results, ["Result 1: 1"], "{messages:?}");
+    assert!(
+        messages.iter().any(|m| m.contains("1146"))
+            && messages
+                .iter()
+                .any(|m| m.contains("1 remaining statement(s) skipped")),
+        "{messages:?}"
+    );
+    run_in_window(&mut h, "drop procedure r51_p");
+}
+
+/// On SQLite `&` is an operator: completion after `1&c.` offers the
+/// alias's columns (#287), which it didn't, reading `&c.` as a
+/// substitution variable. After `SET DEFINE ON` it is one.
+#[test]
+fn completion_after_a_bitwise_and() {
+    let connection = "r51_and.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key, note text)",
+    );
+    let text = "select * from r51_t c where 1&c";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .select(text.len()..text.len());
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("note"))
+    });
+    assert!(
+        !h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+    run_in_window(&mut h, "set define on");
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+}
+
+/// Explain plan runs in the window's session, so it sees what Execute in
+/// that window sees (#269): a temporary table, PostgreSQL's search path,
+/// Oracle's current schema. On the connection's main session it said there
+/// was no such table, or explained another schema's. The window's
+/// transaction stays as it was. SQLite, and the servers whose test
+/// databases are set.
+#[test]
+fn explain_runs_in_the_windows_session() {
+    use pythia_config::DbKind;
+    let temp = |create: &'static str| ExplainCase {
+        setup: create,
+        explain: "select * from r51_t where name = 'x'",
+        object: "r51_t",
+        change: "insert into r51_t values (1, 'x')",
+        count: "select count(*) from r51_t",
+    };
+    let (mut h, _file) = sqlite_file("r51_explain.db");
+    explain_case(
+        &mut h,
+        "r51_explain.db",
+        &temp("create temp table r51_t (id integer primary key, name text)"),
+    );
+    drop(h);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            temp("create temporary table r51_t (id int primary key, name varchar(10))"),
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            ExplainCase {
+                setup: "create table #r51_t (id int primary key, name varchar(10))",
+                explain: "select * from #r51_t where name = 'x'",
+                object: "#r51_t",
+                change: "insert into #r51_t values (1, 'x')",
+                count: "select count(*) from #r51_t",
+            },
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            ExplainCase {
+                setup: "create schema if not exists r51_s;\n\
+                        create table if not exists r51_s.r51_p (id int, name text);\n\
+                        set search_path = r51_s",
+                explain: "select * from r51_p where name = 'x'",
+                object: "r51_p",
+                change: "insert into r51_p values (1, 'x')",
+                count: "select count(*) from r51_p",
+            },
+        ),
+    ];
+    for (env, kind, case) in servers {
+        let connection = format!("r51@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        explain_case(&mut h, &connection, &case);
+        if kind == DbKind::Postgres {
+            run_in_window(&mut h, "drop schema r51_s cascade");
+        }
+    }
+    // Oracle: a private temporary table, and the current schema.
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    crate::test_db::as_dba(&[
+        "begin execute immediate 'drop table system.r51_p purge'; \
+         exception when others then null; end;",
+        "create table system.r51_p (id number, name varchar2(10))",
+        "grant select, insert on system.r51_p to {user}",
+    ]);
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    explain_case(
+        &mut h,
+        &connection,
+        &ExplainCase {
+            setup: "create private temporary table ora$ptt_r51 (id number, name varchar2(10)) \
+                    on commit preserve definition",
+            explain: "select * from ora$ptt_r51 where name = 'x'",
+            object: "ora$ptt_r51",
+            change: "insert into ora$ptt_r51 values (1, 'x')",
+            count: "select count(*) from ora$ptt_r51",
+        },
+    );
+    explain_case(
+        &mut h,
+        &connection,
+        &ExplainCase {
+            setup: "alter session set current_schema = system",
+            explain: "select * from r51_p where name = 'x'",
+            object: "system.r51_p",
+            change: "insert into r51_p values (1, 'x')",
+            count: "select count(*) from r51_p",
+        },
+    );
+    drop(h);
+    crate::test_db::as_dba(&["drop table system.r51_p purge"]);
+}
+
 /// Closing a SQL window, or Pythia, with changes to its results that
 /// weren't applied asks first (#245): a value being typed into a cell, and
 /// the changes waiting for Apply, were dropped without a word.

@@ -608,9 +608,7 @@ impl PythiaApp {
                 continue;
             };
             if let DocKind::Sql(w) = &mut doc.kind {
-                w.state.running = None;
-                w.state.fetching = None;
-                w.state.queue.clear();
+                w.forget_run();
             }
             doc.connection = Some(name.clone());
             let effects = doc.on_attach(dialect);
@@ -1296,15 +1294,17 @@ impl PythiaApp {
                 continue;
             };
             match (target, doc) {
-                (Target::Own | Target::Connection(_), Some(id)) => {
+                (target @ (Target::Own | Target::Connection(_) | Target::Script(_)), Some(id)) => {
                     let autocommit = self
                         .conns
                         .get(&name)
                         .is_some_and(|c| self.autocommit_for(id, c));
                     let conn = self.conns.get_mut(&name).expect("checked above");
-                    conn.doc_session(id, autocommit, &self.notify)
-                        .session
-                        .send(request);
+                    let session = &conn.doc_session(id, autocommit, &self.notify).session;
+                    match target {
+                        Target::Script(script) => session.send_in(request, &script),
+                        _ => session.send(request),
+                    }
                 }
                 (Target::Meta, doc) if let Some(req) = request_key(&request) => {
                     if let Some(id) = doc {
@@ -3434,9 +3434,7 @@ impl PythiaApp {
             .filter(|d| d.connection.as_deref() == Some(name))
         {
             if let DocKind::Sql(w) = &mut doc.kind {
-                w.state.running = None;
-                w.state.fetching = None;
-                w.state.queue.clear();
+                w.forget_run();
                 // Unbound, it runs on the connection the toolbar shows,
                 // instead of asking to connect again.
                 doc.connection = None;
@@ -5106,6 +5104,10 @@ impl PythiaApp {
                 ..request
             });
         }
+    }
+
+    pub fn test_mariadb(&self, connection: &str) -> bool {
+        self.mariadb_of(Some(connection))
     }
 
     pub fn test_connected(&self) -> bool {

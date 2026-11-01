@@ -482,6 +482,79 @@ fn bracketed_names() {
 }
 
 #[test]
+fn names_of_a_completed_schema() {
+    // Completion after `r51_s.` keeps the schema's objects as stored; a
+    // name typed in another case is one of them where the database
+    // compares names without case (#282), the name as written first,
+    // then a table before a view. On Oracle it is another name.
+    for (syntax, names, quoted) in [
+        (Syntax::TSql, NameStyle::Brackets, "[r51_v]"),
+        (Syntax::MySql, NameStyle::Backticks, "`r51_v`"),
+        (Syntax::Sqlite, NameStyle::AsWritten, "\"r51_v\""),
+        (Syntax::Postgres, NameStyle::Lower, "\"r51_v\""),
+    ] {
+        let mut cat = as_written("main", names, &[]);
+        cat.set_objects(
+            Some("R51_S"),
+            vec![
+                obj("r51_s", "r51_v", "VIEW"),
+                obj("r51_s", "R51_v", "TABLE"),
+            ],
+        );
+        cat.set_columns("r51_s", "r51_v", vec![col("of_view", "int", false)]);
+        cat.set_columns("r51_s", "R51_v", vec![col("of_table", "int", false)]);
+        for (src, column) in [
+            ("select t.¦ from r51_s.r51_v t".to_owned(), "of_table"),
+            ("select r51_v.¦ from r51_s.R51_V".to_owned(), "of_table"),
+            (format!("select t.¦ from r51_s.{quoted} t"), "of_view"),
+        ] {
+            let labels = columns_in(&src, syntax, &cat);
+            assert_eq!(labels, [column], "{syntax:?}: {src}");
+        }
+    }
+    let mut cat = hr();
+    cat.set_columns("SCOTT", "EMP", vec![col("EMPNO", "NUMBER", false)]);
+    let labels = columns_in("select e.¦ from scott.emp e", Syntax::Oracle, &cat);
+    assert_eq!(labels, ["empno"]);
+    let labels = columns_in("select e.¦ from scott.\"emp\" e", Syntax::Oracle, &cat);
+    assert_eq!(labels, Vec::<String>::new());
+}
+
+#[test]
+fn bitwise_and_before_an_alias() {
+    // `&` is an operator outside Oracle: `1&c.` is `1 & c.`, not a
+    // substitution variable `&c.` (#287).
+    let cat = as_written("main", NameStyle::AsWritten, &["T"]);
+    for syntax in [
+        Syntax::MySql,
+        Syntax::Postgres,
+        Syntax::TSql,
+        Syntax::Sqlite,
+    ] {
+        for src in [
+            "select * from t c where 1&c.¦",
+            "select * from t c where c.id&c.¦ = 0",
+            "select c.id&&c.¦ from t c",
+        ] {
+            let labels = columns_in(src, syntax, &cat);
+            assert!(
+                labels.contains(&"note".to_owned()),
+                "{syntax:?}: {src}: {labels:?}"
+            );
+        }
+    }
+    // With `SET DEFINE ON` it is one, as on Oracle.
+    let (text, offset) = split("select * from t c where 1&c.¦");
+    for analysis in [
+        Analysis::new_with(&text, Syntax::MySql, true),
+        Analysis::new_in(&text, Syntax::Oracle),
+    ] {
+        let c = analysis.complete(offset, &cat);
+        assert!(c.items.iter().all(|i| i.label != "note"), "{:?}", c.items);
+    }
+}
+
+#[test]
 fn names_after_an_opening_quote() {
     // Typed after its opening quote, a name replaces the quote too and
     // comes closed, in the quotes typed; only names are offered.

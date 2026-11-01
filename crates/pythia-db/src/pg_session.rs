@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use crate::compat::Release;
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
-use crate::session::{CancelSlot, Canceller, Events};
+use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{
     WHOLE_BATCH_BYTES, char_offset, has_inner_semicolon, has_word, leading_words, release,
     replace_binds, row_bytes, statement_kind, word_followed_by,
@@ -60,12 +60,7 @@ const CANCEL_WAIT: Duration = Duration::from_secs(15);
 /// The savepoint each statement in a transaction runs after.
 const SAVEPOINT: &str = "pythia_statement";
 
-pub(crate) fn run(
-    params: ConnectParams,
-    requests: Receiver<DbRequest>,
-    events: Events,
-    shared: CancelSlot,
-) {
+pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let connected = runtime()
         .map_err(|e| DbError::new(format!("Can't start the PostgreSQL client: {e}")))
@@ -150,7 +145,7 @@ pub(crate) fn run(
             }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
-                let result = crate::pg_meta::run(&worker.pg(), &query);
+                let result = worker.meta(&query);
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -276,6 +271,24 @@ impl Worker {
         }
     }
 
+    /// Answers a dictionary lookup or a plan (a SQL window's, #269). In a
+    /// transaction it runs after a savepoint, so one that fails doesn't
+    /// abort the transaction.
+    fn meta(&self, query: &MetaQuery) -> Result<MetaResult, DbError> {
+        if !self.tx.pending {
+            return crate::pg_meta::run(&self.pg(), query);
+        }
+        self.pg().execute(&format!("savepoint {SAVEPOINT}"))?;
+        let result = crate::pg_meta::run(&self.pg(), query);
+        let back = if result.is_ok() {
+            format!("release savepoint {SAVEPOINT}")
+        } else {
+            format!("rollback to savepoint {SAVEPOINT}; release savepoint {SAVEPOINT}")
+        };
+        self.pg().execute(&back)?;
+        result
+    }
+
     /// Runs the login statements, which may set the search path (#103),
     /// then reads what the server is and its current schema. The
     /// statements' failures come back as notices.
@@ -323,7 +336,7 @@ impl Worker {
         sql: &str,
         max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
+        requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
@@ -613,7 +626,7 @@ struct Fetch<'a> {
     /// For a file: batches kept to [`WHOLE_BATCH_BYTES`] (#204).
     whole: bool,
     started: Instant,
-    requests: &'a Receiver<DbRequest>,
+    requests: &'a Requests,
 }
 
 /// A session's connection for queries of its own (dictionary lookups,

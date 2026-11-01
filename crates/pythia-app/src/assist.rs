@@ -160,8 +160,9 @@ impl Assist {
         self.analyzed_revision = Some(editor.revision());
         self.checked = check;
         // Lexed as the database reads it: `[name]` is a name on SQL Server
-        // and SQLite (#208).
-        self.analysis.update_in(editor.text(), editor.syntax());
+        // and SQLite (#208), `&` an operator unless it substitutes (#287).
+        self.analysis
+            .update_with(editor.text(), editor.syntax(), editor.substitution());
         let text = editor.text();
         let diagnostics = if check {
             self.analysis.diagnostics()
@@ -341,10 +342,11 @@ impl Assist {
         }
         let (source, layout) = self.source(editor.text());
         let source = source.into_owned();
+        let (syntax, substitution) = (editor.syntax(), editor.substitution());
         if self.companion.is_some() {
-            self.combined.update_in(&source, editor.syntax());
+            self.combined.update_with(&source, syntax, substitution);
         } else {
-            self.analysis.update_in(&source, editor.syntax());
+            self.analysis.update_with(&source, syntax, substitution);
         }
         self.catalog_revision = cx.catalog_revision;
 

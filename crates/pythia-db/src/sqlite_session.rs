@@ -16,7 +16,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use rusqlite::types::{Value, ValueRef};
@@ -25,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
-use crate::session::{CancelSlot, Canceller, Events};
+use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{WHOLE_BATCH_BYTES, hex, release, replace_binds, row_bytes, statement_kind};
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
@@ -38,12 +37,7 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise get an empty one of its own), kept while one of them is open.
 const SHARED_MEMORY: &str = "file:pythia-memory?mode=memory&cache=shared";
 
-pub(crate) fn run(
-    params: ConnectParams,
-    requests: Receiver<DbRequest>,
-    events: Events,
-    shared: CancelSlot,
-) {
+pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let conn = match open(&params.connect_string) {
         Ok(conn) => conn,
@@ -427,7 +421,7 @@ impl Worker {
         sql: &str,
         max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
+        requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
@@ -557,7 +551,7 @@ struct Fetch<'a> {
     whole: bool,
     started: Instant,
     events: &'a Events,
-    requests: &'a Receiver<DbRequest>,
+    requests: &'a Requests,
 }
 
 impl Fetch<'_> {

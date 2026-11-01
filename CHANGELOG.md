@@ -671,6 +671,47 @@ All notable changes to Pythia are documented here. The format follows
   timers that can corrupt memory. rsa, which the SSH tunnels use, still
   has RUSTSEC-2023-0071 (a timing side channel), for which there is no
   fixed version yet.
+- *Explain Plan* in a SQL window explains on the window's own session,
+  where its statements run (#269). It used the connection's main session,
+  so a temporary table, a search path, a current schema or a `use db` of
+  the window didn't count: Explain said there was no such table, or
+  explained another schema's. The window's transaction stays as it was,
+  also when there is no plan. While the window runs a statement, Explain
+  says so; on MySQL, PostgreSQL, SQL Server and SQLite it ends the fetch
+  of a result with rows left, which then says it shows the rows fetched.
+- *Explain Plan* of a selection without a statement, only a comment or
+  blank space, says "Nothing to explain" (#273); it did nothing and said
+  nothing. A lone `;` is no statement either: it was sent, and PostgreSQL
+  answered `explain (format json) ;` with a syntax error. `&name` is
+  replaced only where the window substitutes, as for *Execute*: on MySQL
+  a `DEFINE`d name changed `'A &amp; B'` in the plan's statement.
+- Completion offers the columns of a table in another schema also after
+  it listed that schema's objects (#282). On SQL Server, PostgreSQL,
+  MySQL and SQLite, once `select * from r51_s.` had offered `r51_t`,
+  `select t. from r51_s.r51_t t` offered nothing: the table, typed in
+  another case than stored, was taken for one that doesn't exist.
+- Completion after an alias that follows `&` without a space, as in
+  `where 1&c.`, offers its columns on MySQL, PostgreSQL, SQL Server and
+  SQLite (#287). It offered nothing, reading `&c.` as a substitution
+  variable, which there it is only after `SET DEFINE ON` (#190). Code
+  assistance now reads `&name` as the window substitutes.
+- MySQL: a statement with several results shows each in a tab of its own
+  (#290): the SELECTs of a procedure a `CALL` runs, statements kept
+  together after `DELIMITER` or in MariaDB's `BEGIN NOT ATOMIC`. Only the
+  first showed, without a word, and an error after it was lost, so the
+  script went on; a SELECT after a `DO` didn't show at all. Such an error
+  now fails the statement. *Execute to file* writes the first result and
+  says how many others there were.
+- A script in a SQL window runs at its database's pace (#291). It ran
+  one statement per frame the window drew: 4,000 short statements took
+  at least 67 s at 60 Hz, and longer while the window was in the
+  background. The window now sends a script's statements ahead to its
+  session, all but those it has to handle itself (variables to ask for,
+  `PROMPT`, `DEFINE`, `WHENEVER`, `@file`), which wait for the ones before
+  them. An error, Break's too, still stops the script unless `WHENEVER
+  SQLERROR CONTINUE`, and each statement keeps its message and its
+  result. The Messages tab lays out only the messages in view: with
+  40,000 of them a frame took a quarter of a second.
 
 ## [0.10.0] - 2026-10-30
 

@@ -231,6 +231,34 @@ impl CatalogCache {
     }
 }
 
+impl CatalogCache {
+    /// The object called `name` among a schema's `objects`, which hold the
+    /// names as stored. Oracle's are matched as they are: unquoted names
+    /// come uppercase, as it stores them. The other databases keep a name
+    /// as written, or fold it to lowercase (PostgreSQL), so a qualified
+    /// `name` (looked up in uppercase unless quoted) is matched as their
+    /// dictionaries answer it (#282): without case, the name as it is
+    /// first, then a table before a view. An unqualified one is the
+    /// database's to look up where it would, as SQLite's `temp` before
+    /// `main` (#236), unless it is there as written.
+    fn find<'a>(
+        &self,
+        objects: &'a [CatalogObject],
+        name: &str,
+        qualified: bool,
+    ) -> Option<&'a CatalogObject> {
+        let mut candidates = objects.iter().filter(|o| o.object_type != "SYNONYM");
+        if self.names == NameStyle::Upper || !qualified {
+            return candidates.find(|o| o.name == name);
+        }
+        let folded = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
+        let wanted = folded(name);
+        candidates
+            .filter(|o| folded(&o.name) == wanted)
+            .min_by_key(|o| (o.name != name, o.object_type != "TABLE"))
+    }
+}
+
 impl Catalog for CatalogCache {
     fn current_schema(&self) -> &str {
         &self.current_schema
@@ -262,9 +290,7 @@ impl Catalog for CatalogCache {
         // An object of the schema itself resolves without a round trip.
         let in_schema = schema.unwrap_or(&self.current_schema);
         if let Some(objects) = self.objects.get(in_schema)
-            && let Some(o) = objects
-                .iter()
-                .find(|o| o.name == name && o.object_type != "SYNONYM")
+            && let Some(o) = self.find(objects, name, schema.is_some())
         {
             return Lookup::Ready(Some(o.clone()));
         }
