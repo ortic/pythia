@@ -44,6 +44,13 @@ All notable changes to Pythia are documented here. The format follows
   also with `SET NOCOUNT ON` or a trigger that changes other rows.
 
 ### Changed
+- `&name` substitution variables are SQL\*Plus's, so only Oracle's SQL
+  windows have them unless `SET DEFINE ON` turns them on (#190). On
+  MySQL, PostgreSQL, SQL Server and SQLite, `'A &amp; B'` or a URL with
+  `&b=2` asked for a value of `amp` or `b`, and changed the text that
+  went to the database. `SET DEFINE ON` and `SET DEFINE OFF` are carried
+  out by the window on every database; a window that had `SET DEFINE OFF`
+  keeps it.
 - On SQL Server, ASCII text for a `varchar` or `char` column is written
   as `'…'` instead of `N'…'`, in INSERT exports and when results are
   edited (#182). Compared with `N'…'`, SQL Server converts the column, and

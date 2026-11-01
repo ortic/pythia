@@ -72,7 +72,7 @@ pub fn sql_window(w: &SqlWindow, doc: DocId, task: &Task) -> Snapshot {
         if selected { "selection" } else { "statement" },
         line_of(w.editor.text(), range.start)
     );
-    let substituted = if w.substitution {
+    let substituted = if w.substitutes() {
         crate::sql_window::substitute(&text, &w.defines, w.state.syntax)
     } else {
         text.clone()

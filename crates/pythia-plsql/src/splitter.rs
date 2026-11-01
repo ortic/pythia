@@ -303,6 +303,17 @@ impl<'a> Splitter<'a> {
             if self.word_eq(first, CLIENT_COMMANDS) {
                 return StatementKind::SqlPlus;
             }
+            // `SET DEFINE ON` switches substitution variables on (#190).
+            if self.word_eq(first, &["SET"]) {
+                let define = words
+                    .next()
+                    .is_some_and(|n| self.word_eq(n, &["DEF", "DEFINE"]));
+                return if define {
+                    StatementKind::SqlPlus
+                } else {
+                    StatementKind::Sql
+                };
+            }
             if self.syntax == Syntax::TSql {
                 if self.word_eq(first, &["DECLARE"]) {
                     return StatementKind::PlSql;
