@@ -1410,10 +1410,10 @@ fn dictionary_at_compatibility_level_100() {
         "    constraint [r63_emp_sal_ck] check ([sal]>=(0))",
         ");",
         "",
+        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
+        "",
         "create nonclustered index [r63_emp_cover] on [dbo].[r63_emp] ([deptno]) \
          include ([sal], [na,me]) where ([deptno] IS NOT NULL);",
-        "",
-        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
         "",
         "create nonclustered columnstore index [r63_emp_store] on [dbo].[r63_emp] \
          ([sal], [site]);",
@@ -1875,6 +1875,622 @@ fn index_options_and_storage() {
     assert_eq!(catalog_storage(&mut h, "r63_copy", "r63_", xml), before);
     drop(h);
     drop_database(&mut dba, "r63_opts");
+}
+/// A table's DDL, as `MetaQuery::Ddl` reads it.
+fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: table.into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// Drops the tables of `schema` whose names start with `prefix`, with their
+/// history tables and foreign keys; a temporal table's versioning goes off
+/// first.
+fn drop_tables(h: &mut Harness, schema: &str, prefix: &str) {
+    h.ok(&format!(
+        "declare @sql nvarchar(max) = N''; \
+         select @sql += N'alter table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N' set (system_versioning = off); ' \
+           from sys.tables t \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%' \
+            and t.temporal_type = 2; \
+         select @sql += N'alter table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N' drop constraint ' + quotename(f.name) + N'; ' \
+           from sys.foreign_keys f join sys.tables t on t.object_id = f.parent_object_id \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%'; \
+         select @sql += N'drop table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N'; ' \
+           from sys.tables t \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%' \
+             or t.object_id in (select h.history_table_id from sys.tables h \
+                                 where h.schema_id = schema_id('{schema}') \
+                                   and h.name like '{prefix}%'); \
+         exec (@sql)"
+    ));
+}
+
+/// A table's DDL collates its columns that aren't in the database's
+/// collation (#323): run elsewhere, a case-sensitive column stays one, and
+/// one in the database's collation takes that database's.
+#[test]
+fn column_collations() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_co", "r74_co");
+    h.ok("drop schema if exists r74_copy_co");
+    drop_tables(&mut h, &schema, "r74_co");
+    let default = h
+        .scalar("select cast(databasepropertyex(db_name(), 'Collation') as nvarchar(128))")
+        .expect("the database's collation");
+    h.ok(&format!(
+        "create table r74_co (id int, cs varchar(10) collate Latin1_General_CS_AS not null, \
+         d varchar(10), dd nvarchar(10) collate {default}, \
+         u varchar(max) collate Latin1_General_100_CI_AS_SC_UTF8, \
+         b char(2) collate Latin1_General_BIN2 constraint r74_co_b default 'x', \
+         up as upper(cs), t text collate Latin1_General_CS_AS)"
+    ));
+    let ddl = table_ddl(&mut h, &schema, "r74_co");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r74_co] (\n    \
+               [id] int null,\n    \
+               [cs] varchar(10) collate Latin1_General_CS_AS not null,\n    \
+               [d] varchar(10) null,\n    \
+               [dd] nvarchar(10) null,\n    \
+               [u] varchar(max) collate Latin1_General_100_CI_AS_SC_UTF8 null,\n    \
+               [b] char(2) collate Latin1_General_BIN2 null constraint [r74_co_b] default ('x'),\n    \
+               [up] as (upper([cs])),\n    \
+               [t] text collate Latin1_General_CS_AS null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.collation_name), '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c where c.object_id = object_id('[{owner}].[r74_co]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_co");
+    run_ddl_in(&mut h, &ddl, &schema, "r74_copy_co", &["r74_co"]);
+    assert_eq!(catalog(&mut h, "r74_copy_co"), before);
+    // The copy compares and keeps text as the original does.
+    for owner in [schema.as_str(), "r74_copy_co"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r74_co] (id, cs, u, t) values (1, 'a', N'čaj 茶', 'a')"
+        ));
+        assert_eq!(
+            h.scalar(&format!(
+                "select concat((select count(*) from [{owner}].[r74_co] \
+                                 where cs = 'A' or t like 'A'), \
+                               ' ', (select u from [{owner}].[r74_co]))"
+            ))
+            .as_deref(),
+            Some("0 čaj 茶"),
+            "{owner}"
+        );
+    }
+    drop_tables(&mut h, "r74_copy_co", "r74_co");
+    h.ok("drop schema r74_copy_co");
+    drop_tables(&mut h, &schema, "r74_co");
+}
+
+/// The temporal tables of `owner` whose names start with `prefix`, as the
+/// catalog has them: their versioning, history table and retention, their
+/// periods, generated and hidden columns, and their history tables'
+/// columns and indexes. A history table SQL Server named, and its index,
+/// read with `N` for the table's object_id.
+fn catalog_temporal(h: &mut Harness, owner: &str, prefix: &str, retention: bool) -> Vec<String> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%' and temporal_type <> 1"
+    );
+    let retention = if retention {
+        "t.history_retention_period, t.history_retention_period_unit_desc"
+    } else {
+        "''"
+    };
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.temporal_type, \
+                                         replace(object_name(t.history_table_id), \
+                                                 cast(t.object_id as varchar(20)), 'N'), \
+                                         case when object_schema_name(t.history_table_id) \
+                                                   = schema_name(t.schema_id) then 'own' end, \
+                                         {retention}, \
+                                         p.name, col_name(p.object_id, p.start_column_id), \
+                                         col_name(p.object_id, p.end_column_id)) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t left join sys.periods p on p.object_id = t.object_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         type_name(c.user_type_id), c.scale, c.is_nullable, \
+                                         c.generated_always_type, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', t.name, c.name, type_name(c.user_type_id), c.scale, \
+                                         c.is_nullable, c.generated_always_type, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by t.name, c.column_id) \
+               from sys.tables t join sys.columns c on c.object_id = t.history_table_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', t.name, \
+                                         replace(i.name, cast(t.object_id as varchar(20)), 'N'), \
+                                         i.type_desc, p.data_compression_desc, cols.names) \
+                               collate database_default, '; ') within group (order by t.name, i.name) \
+               from sys.tables t join sys.indexes i on i.object_id = t.history_table_id \
+               join sys.partitions p on p.object_id = i.object_id and p.index_id = i.index_id \
+              outer apply (select string_agg(col_name(ic.object_id, ic.column_id), ',') \
+                                    within group (order by ic.key_ordinal) as names \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id) cols \
+              where t.object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .filter_map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A temporal table's DDL makes one (#324): its period for system_time, its
+/// generated always columns, hidden ones too, and its system versioning
+/// with its history table and retention. Run elsewhere, SQL Server makes
+/// the history table as it made the original's, or uses one the history
+/// table's DDL made before; a history table SQL Server named is named for
+/// the copy.
+#[test]
+fn temporal_tables() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_t", "r74_t");
+    h.ok("drop schema if exists r74_copy_t");
+    drop_tables(&mut h, &schema, "r74_t");
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // HISTORY_RETENTION_PERIOD came with SQL Server 2017.
+    let retention = major >= 14;
+    let keep = if retention {
+        ", history_retention_period = 6 months"
+    } else {
+        ""
+    };
+    for sql in [
+        "create table r74_tp (id int constraint r74_tp_pk primary key, v varchar(10), \
+           f datetime2 generated always as row start hidden not null, \
+           u datetime2 generated always as row end hidden not null, \
+           period for system_time (f, u)) \
+         with (system_versioning = on)"
+            .to_owned(),
+        format!(
+            "create table r74_tq (id int constraint r74_tq_pk primary key, \
+               f datetime2(3) generated always as row start not null \
+                 constraint r74_tq_df default sysutcdatetime(), \
+               u datetime2(3) generated always as row end not null \
+                 constraint r74_tq_du default '9999-12-31 23:59:59.999', \
+               period for system_time (f, u)) \
+             with (system_versioning = on (history_table = [{schema}].[r74_tq_hist]{keep}))"
+        ),
+        "create table r74_tr (id int, f datetime2 generated always as row start not null, \
+           u datetime2 generated always as row end not null, period for system_time (f, u))"
+            .to_owned(),
+    ] {
+        h.ok(&sql);
+    }
+    let tp = table_ddl(&mut h, &schema, "r74_tp");
+    assert_eq!(
+        tp,
+        format!(
+            "create table [{schema}].[r74_tp] (\n    \
+               [id] int not null,\n    \
+               [v] varchar(10) null,\n    \
+               [f] datetime2(7) generated always as row start hidden not null,\n    \
+               [u] datetime2(7) generated always as row end hidden not null,\n    \
+               constraint [r74_tp_pk] primary key clustered ([id]),\n    \
+               period for system_time ([f], [u])\n\
+             ) with (system_versioning = on);\nGO\n"
+        )
+    );
+    let tq = table_ddl(&mut h, &schema, "r74_tq");
+    assert_eq!(
+        tq,
+        format!(
+            "create table [{schema}].[r74_tq] (\n    \
+               [id] int not null,\n    \
+               [f] datetime2(3) generated always as row start not null \
+                 constraint [r74_tq_df] default (sysutcdatetime()),\n    \
+               [u] datetime2(3) generated always as row end not null \
+                 constraint [r74_tq_du] default ('9999-12-31 23:59:59.999'),\n    \
+               constraint [r74_tq_pk] primary key clustered ([id]),\n    \
+               period for system_time ([f], [u])\n\
+             ) with (system_versioning = on (history_table = [{schema}].[r74_tq_hist]{keep}));\
+             \nGO\n"
+        )
+    );
+    let tr = table_ddl(&mut h, &schema, "r74_tr");
+    assert_eq!(
+        tr,
+        format!(
+            "create table [{schema}].[r74_tr] (\n    \
+               [id] int null,\n    \
+               [f] datetime2(7) generated always as row start not null,\n    \
+               [u] datetime2(7) generated always as row end not null,\n    \
+               period for system_time ([f], [u])\n\
+             );\nGO\n"
+        )
+    );
+    // The history table's own DDL makes a table SQL Server takes for one.
+    let hist = table_ddl(&mut h, &schema, "r74_tq_hist");
+    assert!(
+        hist.starts_with(&format!(
+            "create table [{schema}].[r74_tq_hist] (\n    \
+               [id] int not null,\n    \
+               [f] datetime2(3) not null,\n    \
+               [u] datetime2(3) not null\n\
+             );"
+        )),
+        "{hist}"
+    );
+    let before = catalog_temporal(&mut h, &schema, "r74_t", retention);
+    assert_eq!(before.len(), 4, "{before:?}");
+    h.ok("create schema r74_copy_t");
+    let tables = ["r74_tp", "r74_tq", "r74_tq_hist", "r74_tr"];
+    for ddl in [&tp, &hist, &tq, &tr] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_t", &tables);
+    }
+    assert_eq!(
+        catalog_temporal(&mut h, "r74_copy_t", "r74_t", retention),
+        before
+    );
+    // The copy keeps the rows' versions.
+    h.ok("insert into r74_copy_t.r74_tp (id, v) values (1, 'a')");
+    h.ok("update r74_copy_t.r74_tp set v = 'b'");
+    assert_eq!(
+        h.scalar("select count(*) from r74_copy_t.r74_tp for system_time all")
+            .as_deref(),
+        Some("2")
+    );
+    drop_tables(&mut h, "r74_copy_t", "r74_t");
+    h.ok("drop schema r74_copy_t");
+    drop_tables(&mut h, &schema, "r74_t");
+}
+
+/// A table's DDL keeps its sparse columns and its column set (#325): run
+/// elsewhere, the columns are sparse again and `select *` reads them
+/// through the column set.
+#[test]
+fn sparse_columns_and_column_sets() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_s", "r74_s");
+    h.ok("drop schema if exists r74_copy_s");
+    drop_tables(&mut h, &schema, "r74_s");
+    for sql in [
+        "create table r74_sp (id int not null, a int sparse null, \
+         b varchar(10) collate Latin1_General_CS_AS sparse, \
+         cs xml column_set for all_sparse_columns)",
+        "create table r74_sq (id int, a datetime2(3) sparse null)",
+    ] {
+        h.ok(sql);
+    }
+    let sp = table_ddl(&mut h, &schema, "r74_sp");
+    assert_eq!(
+        sp,
+        format!(
+            "create table [{schema}].[r74_sp] (\n    \
+               [id] int not null,\n    \
+               [a] int sparse null,\n    \
+               [b] varchar(10) collate Latin1_General_CS_AS sparse null,\n    \
+               [cs] xml column_set for all_sparse_columns null\n\
+             );\nGO\n"
+        )
+    );
+    let sq = table_ddl(&mut h, &schema, "r74_sq");
+    assert!(sq.contains("    [a] datetime2(3) sparse null\n"), "{sq}");
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, c.is_sparse, \
+                                         c.is_column_set, c.is_nullable, c.collation_name) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c \
+              where c.object_id in (object_id('[{owner}].[r74_sp]'), object_id('[{owner}].[r74_sq]'))"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_s");
+    for ddl in [&sp, &sq] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_s", &["r74_sp", "r74_sq"]);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_s"), before);
+    // Rows go in and come out through the column set.
+    h.ok("insert into r74_copy_s.r74_sp (id, cs) values (1, '<a>5</a>')");
+    assert_eq!(
+        h.scalar("select concat(a, ' ', cast(cs as nvarchar(100))) from r74_copy_s.r74_sp")
+            .as_deref(),
+        Some("5 <a>5</a>")
+    );
+    drop_tables(&mut h, "r74_copy_s", "r74_s");
+    h.ok("drop schema r74_copy_s");
+    drop_tables(&mut h, &schema, "r74_s");
+}
+
+/// A table's DDL keeps the states CREATE TABLE can't give (#326): foreign
+/// keys and checks added WITH NOCHECK, or disabled, are added so after the
+/// table, disabled indexes are disabled, and its lock escalation is set.
+/// Run elsewhere, the copy's constraints and indexes are as trusted and
+/// enabled as the original's.
+#[test]
+fn constraint_and_index_states() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_k", "r74_k");
+    h.ok("drop schema if exists r74_copy_k");
+    drop_tables(&mut h, &schema, "r74_k");
+    for sql in [
+        "create table r74_kp (id int constraint r74_kp_pk primary key, a int, \
+         constraint r74_kp_u unique (a))",
+        "create table r74_kc (id int, k int, n int, \
+         constraint r74_kc_fk foreign key (k) references r74_kp (id), \
+         constraint r74_kc_ck check (n > 0))",
+        "alter table r74_kc add constraint r74_kc_fk_off foreign key (id) references r74_kp (id)",
+        "alter table r74_kc add constraint r74_kc_ck_off check (k <> 0)",
+        "alter table r74_kc nocheck constraint r74_kc_fk_off",
+        "alter table r74_kc nocheck constraint r74_kc_ck_off",
+        "insert into r74_kc values (7, null, 500)",
+        "alter table r74_kc with nocheck add constraint r74_kc_fk_nc foreign key (n) \
+         references r74_kp (id) on delete cascade",
+        "alter table r74_kc with nocheck add constraint r74_kc_ck_nc check (n < 100)",
+        "create index r74_kc_k on r74_kc (k)",
+        "create index r74_kc_n on r74_kc (n)",
+        "alter index r74_kc_n on r74_kc disable",
+        "alter index r74_kp_u on r74_kp disable",
+        "alter table r74_kc set (lock_escalation = auto)",
+        "alter table r74_kp set (lock_escalation = disable)",
+        "create table r74_km (id int, v int)",
+        "create clustered index r74_km_c on r74_km (id)",
+        "create index r74_km_v on r74_km (v)",
+        "alter index r74_km_c on r74_km disable",
+    ] {
+        h.ok(sql);
+    }
+    let kp = table_ddl(&mut h, &schema, "r74_kp");
+    let t = format!("[{schema}].[r74_kp]");
+    assert_eq!(
+        kp,
+        format!(
+            "create table {t} (\n    \
+               [id] int not null,\n    \
+               [a] int null,\n    \
+               constraint [r74_kp_pk] primary key clustered ([id]),\n    \
+               constraint [r74_kp_u] unique nonclustered ([a])\n\
+             );\n\n\
+             alter table {t} set (lock_escalation = disable);\n\n\
+             alter index [r74_kp_u] on {t} disable;\nGO\n"
+        )
+    );
+    let kc = table_ddl(&mut h, &schema, "r74_kc");
+    let t = format!("[{schema}].[r74_kc]");
+    let p = format!("[{schema}].[r74_kp]");
+    assert_eq!(
+        kc,
+        format!(
+            "create table {t} (\n    \
+               [id] int null,\n    \
+               [k] int null,\n    \
+               [n] int null,\n    \
+               constraint [r74_kc_fk] foreign key ([k]) references {p} ([id]),\n    \
+               constraint [r74_kc_ck] check ([n]>(0))\n\
+             );\n\n\
+             alter table {t} set (lock_escalation = auto);\n\n\
+             create nonclustered index [r74_kc_k] on {t} ([k]);\n\n\
+             create nonclustered index [r74_kc_n] on {t} ([n]);\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_fk_nc] foreign key ([n]) \
+               references {p} ([id]) on delete cascade;\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_fk_off] foreign key ([id]) \
+               references {p} ([id]);\n\n\
+             alter table {t} nocheck constraint [r74_kc_fk_off];\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_ck_nc] check ([n]<(100));\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_ck_off] check ([k]<>(0));\n\n\
+             alter table {t} nocheck constraint [r74_kc_ck_off];\n\n\
+             alter index [r74_kc_n] on {t} disable;\nGO\n"
+        )
+    );
+    // A disabled clustered index disables the others too: they are
+    // disabled first, while the table can be read.
+    let km = table_ddl(&mut h, &schema, "r74_km");
+    let t = format!("[{schema}].[r74_km]");
+    assert!(
+        km.ends_with(&format!(
+            "create clustered index [r74_km_c] on {t} ([id]);\n\n\
+             create nonclustered index [r74_km_v] on {t} ([v]);\n\n\
+             alter index [r74_km_v] on {t} disable;\n\n\
+             alter index [r74_km_c] on {t} disable;\nGO\n"
+        )),
+        "{km}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let tables = format!(
+            "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+                and name like 'r74_k%'"
+        );
+        [
+            format!(
+                "select string_agg(concat_ws(' ', t.name, t.lock_escalation_desc) \
+                                   collate database_default, '; ') within group (order by t.name) \
+                   from sys.tables t where t.object_id in ({tables})"
+            ),
+            format!(
+                "select string_agg(x.line collate database_default, '; ') \
+                          within group (order by x.line) \
+                   from (select concat_ws(' ', object_name(parent_object_id), name, is_disabled, \
+                                          is_not_trusted, delete_referential_action) as line \
+                           from sys.foreign_keys where parent_object_id in ({tables}) \
+                         union all \
+                         select concat_ws(' ', object_name(parent_object_id), name, is_disabled, \
+                                          is_not_trusted, definition) \
+                           from sys.check_constraints where parent_object_id in ({tables})) x"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', object_name(i.object_id), i.name, \
+                                             i.type_desc, i.is_disabled) \
+                                   collate database_default, '; ') \
+                          within group (order by object_name(i.object_id), i.name) \
+                   from sys.indexes i where i.object_id in ({tables}) and i.type > 0"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_k");
+    let tables = ["r74_kp", "r74_kc", "r74_km"];
+    for ddl in [&kp, &kc, &km] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_k", &tables);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_k"), before);
+    // Rows the disabled constraints let into the original go into the copy.
+    for owner in [schema.as_str(), "r74_copy_k"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r74_kp] (id) values (0), (50)"
+        ));
+        h.ok(&format!(
+            "insert into [{owner}].[r74_kc] values (99, 0, 50)"
+        ));
+    }
+    drop_tables(&mut h, "r74_copy_k", "r74_k");
+    h.ok("drop schema r74_copy_k");
+    drop_tables(&mut h, &schema, "r74_k");
+}
+
+/// A table's DDL builds its clustered index first, so that the
+/// nonclustered ones aren't built again over it, and leaves out
+/// hypothetical indexes, which have statistics and no rows (#327): run
+/// elsewhere, the copy has the same indexes, all of them real.
+#[test]
+fn clustered_first_without_hypothetical_indexes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_h", "r74_h");
+    h.ok("drop schema if exists r74_copy_h");
+    drop_tables(&mut h, &schema, "r74_h");
+    for sql in [
+        "create table r74_hy (id int not null, a int, b int)",
+        "create index r74_hy_a on r74_hy (a)",
+        "create clustered index r74_hy_z on r74_hy (id)",
+        "create index r74_hy_hypo on r74_hy (b) with statistics_only = -1",
+        "create table r74_hc (id int, a int)",
+        "create index r74_hc_a on r74_hc (a)",
+        "create clustered columnstore index r74_hc_z on r74_hc",
+        "create table r74_hd (id int, a int)",
+        "create clustered index r74_hd_c on r74_hd (id)",
+        "create index r74_hd_hypo on r74_hd (a) with statistics_only = -1",
+        "alter index r74_hd_c on r74_hd disable",
+    ] {
+        h.ok(sql);
+    }
+    assert_eq!(
+        h.scalar(
+            "select count(*) from sys.indexes \
+              where name in ('r74_hy_hypo', 'r74_hd_hypo') and is_hypothetical = 1"
+        )
+        .as_deref(),
+        Some("2")
+    );
+    let hy = table_ddl(&mut h, &schema, "r74_hy");
+    let t = format!("[{schema}].[r74_hy]");
+    assert!(
+        hy.ends_with(&format!(
+            ");\n\n\
+             create clustered index [r74_hy_z] on {t} ([id]);\n\n\
+             create nonclustered index [r74_hy_a] on {t} ([a]);\nGO\n"
+        )),
+        "{hy}"
+    );
+    let hc = table_ddl(&mut h, &schema, "r74_hc");
+    let t = format!("[{schema}].[r74_hc]");
+    assert!(
+        hc.ends_with(&format!(
+            ");\n\n\
+             create clustered columnstore index [r74_hc_z] on {t};\n\n\
+             create nonclustered index [r74_hc_a] on {t} ([a]);\nGO\n"
+        )),
+        "{hc}"
+    );
+    // Disabling a clustered index disables the hypothetical ones too: they
+    // aren't disabled in the DDL either.
+    let hd = table_ddl(&mut h, &schema, "r74_hd");
+    let t = format!("[{schema}].[r74_hd]");
+    assert!(
+        hd.ends_with(&format!(
+            ");\n\n\
+             create clustered index [r74_hd_c] on {t} ([id]);\n\n\
+             alter index [r74_hd_c] on {t} disable;\nGO\n"
+        )),
+        "{hd}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(i.object_id), i.name, i.type_desc, \
+                                         i.is_hypothetical, i.is_disabled) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(i.object_id), i.name) \
+               from sys.indexes i \
+              where i.object_id in (select object_id from sys.tables \
+                                     where schema_id = schema_id('{owner}') \
+                                       and name like 'r74_h%') \
+                and i.type > 0 and i.is_hypothetical = 0"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_h");
+    let tables = ["r74_hy", "r74_hc", "r74_hd"];
+    for ddl in [&hy, &hc, &hd] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_h", &tables);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_h"), before);
+    assert_eq!(
+        h.scalar(
+            "select count(*) from sys.indexes \
+              where object_schema_name(object_id) = 'r74_copy_h' and is_hypothetical = 1"
+        )
+        .as_deref(),
+        Some("0")
+    );
+    drop_tables(&mut h, "r74_copy_h", "r74_h");
+    h.ok("drop schema r74_copy_h");
+    drop_tables(&mut h, &schema, "r74_h");
 }
 
 /// Object filters and Find find names without case, non-ASCII letters too,

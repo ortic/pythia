@@ -928,6 +928,41 @@ All notable changes to Pythia are documented here. The format follows
   `create sequence`, which next to a copy of the table failed with
   `relation … already exists`, and elsewhere made a sequence no column
   used.
+- SQL Server: a table's DDL keeps its columns' collations where they
+  aren't the database's (#323), `[code] varchar(10) collate
+  Latin1_General_CS_AS`. They were left out, so that run elsewhere a
+  case-sensitive or binary column compared without case, and a UTF-8
+  column stored only the letters of the database's code page: `čaj 茶`
+  became `caj ?`.
+- SQL Server: a temporal table's DDL makes a temporal table (#324): its
+  period columns are `generated always as row start` and `row end`,
+  `hidden` where they are, with `period for system_time (…)` and
+  `with (system_versioning = on (history_table = …,
+  history_retention_period = …))`. It made a plain table, which kept no
+  history and showed the hidden columns. A history table SQL Server
+  named is left out, so that a copy gets its own. Run elsewhere, SQL
+  Server makes the history table as it made the original's, or takes
+  the one the history table's DDL made before.
+- SQL Server: a table's DDL keeps its sparse columns and its column set
+  (#325), `[a] int sparse null`, `[cs] xml column_set for
+  all_sparse_columns null`. They were made plain columns: run elsewhere,
+  rows written through the column set left the sparse columns NULL,
+  `select *` read every sparse column, and a table of more than 1,024
+  columns failed.
+- SQL Server: a table's DDL keeps what CREATE TABLE can't give (#326).
+  A foreign key or check that isn't trusted is added after the table
+  `with nocheck`, and a disabled one then disabled (`nocheck
+  constraint`); a disabled index or key is disabled after it is made,
+  a clustered one last; and the table's `lock_escalation` is set where
+  it isn't `TABLE`. Run elsewhere, they were all enabled and trusted:
+  the copy rejected rows the original takes, and built and kept up to
+  date indexes the original doesn't.
+- SQL Server: a table's DDL makes its clustered index before the other
+  indexes (#327). It came in the order of their names, so that run
+  after the rows were loaded, the nonclustered indexes before it were
+  built twice, the second time by the clustered index. Hypothetical
+  indexes, which have statistics and no rows, are left out: they were
+  made as real ones.
 
 ## [0.10.0] - 2026-10-30
 
