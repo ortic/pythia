@@ -274,6 +274,13 @@ All notable changes to Pythia are documented here. The format follows
   of `select @x`, and a `SET` over two lines failed. `BEGIN` took in the
   rest of the script, up to a `/`; it now starts a transaction, and
   MariaDB's `BEGIN NOT ATOMIC` still opens a block.
+- PostgreSQL: a table opened with *Query* in the object browser can be
+  edited, and its INSERT exports name it (#237). The browser writes the
+  schema, `select * from public.orders`, and `public`, spelled like a
+  keyword, made the query look like one that reads no single table: the
+  result had no *Edit*, and *Copy as*, *Export* and *Execute to file*
+  wrote `insert into my_table`. The same went for a MySQL table such as
+  `shop.user`.
 
 ## [0.10.0] - 2026-10-30
 

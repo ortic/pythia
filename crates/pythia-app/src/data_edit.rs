@@ -326,7 +326,15 @@ fn parse(sql: &str) -> Option<Query> {
             .get(i)
             .is_some_and(|t| matches!(t.kind, TokenKind::Ident | TokenKind::QuotedIdent))
     };
-    if !ident(i) {
+    let separator = |i: usize| match kind(i) {
+        Some(TokenKind::Dot) => Some("."),
+        Some(TokenKind::Operator) if text(i) == ".." => Some(".."),
+        _ => None,
+    };
+    // A part of the name; next to a dot it may be spelled like a keyword,
+    // such as PostgreSQL's `public` (#237).
+    let part = |i: usize, dotted: bool| ident(i) || (dotted && kind(i) == Some(TokenKind::Keyword));
+    if !part(i, separator(i + 1).is_some()) {
         return None;
     }
     // `table`, `schema.table` or `database.schema.table`, also SQL
@@ -335,14 +343,9 @@ fn parse(sql: &str) -> Option<Query> {
     let mut table = text(i).to_owned();
     let mut parts = 1;
     let mut next = i + 1;
-    loop {
-        let separator = match kind(next) {
-            Some(TokenKind::Dot) => ".",
-            Some(TokenKind::Operator) if text(next) == ".." => "..",
-            _ => break,
-        };
+    while let Some(separator) = separator(next) {
         parts += separator.len();
-        if !ident(next + 1) || parts > 3 {
+        if !part(next + 1, true) || parts > 3 {
             return None;
         }
         table = format!("{table}{separator}{}", text(next + 1));
@@ -1026,6 +1029,24 @@ mod tests {
         );
         assert_eq!(single_table("select * from emp straight_join dept"), None);
         assert_eq!(single_table("update emp set x = 1"), None);
+        // A part named like a keyword next to a dot: PostgreSQL's public,
+        // as the object browser queries a table, a MySQL table named user
+        // (#237). A keyword alone is no table: Oracle's TABLE(…).
+        assert_eq!(
+            single_table("select * from public.\"guidelines-division\""),
+            Some("public.\"guidelines-division\"".into())
+        );
+        assert_eq!(
+            single_table("select * from public.orders o where o.id = 1"),
+            Some("public.orders".into())
+        );
+        assert!(can_edit("select * from public.orders"));
+        assert_eq!(
+            single_table("select * from shop.user"),
+            Some("shop.user".into())
+        );
+        assert_eq!(single_table("select * from table(f())"), None);
+        assert_eq!(single_table("select * from public"), None);
     }
 
     /// SQL Server's bracketed names, and names of a table in another
