@@ -3266,6 +3266,152 @@ fn a_connection_lost_after_an_apply_statement() {
     locker.run("drop table r61_lost");
 }
 
+/// An Apply in auto-commit on SQL Server whose connection is lost once a
+/// statement ran, while the session reads its row count (#310): auto-commit
+/// committed it, as it did the statements before, and none of them waits
+/// for Apply (#345). The insert of a new row waits for a lock, then the
+/// update of row 2. Before, the new row stayed pending, and applying again
+/// failed with a duplicate key; the update stayed pending on row 2's old
+/// value, which the table no longer had.
+#[test]
+fn a_connection_lost_after_an_apply_statement_in_autocommit() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("PYTHIA_TEST_MSSQL"),
+        std::env::var("PYTHIA_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("PYTHIA_TEST_MSSQL / PYTHIA_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = pythia_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r72_ran");
+    locker.run("create table r72_ran (id int primary key, v varchar(10))");
+    locker.run("insert into r72_ran values (1, 'a'), (2, 'b')");
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let (server, database) = connect_string.split_once('/').unwrap();
+    let cutter = Cutter::start(server);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: format!("127.0.0.1:{}/{database}", cutter.port),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_settings_mut().autocommit = true;
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r72_ran order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    // The Apply's statement that waits for the locker's lock is cut off
+    // when it reads its row count, once the lock is let go.
+    let cut_off = |h: &mut Harness<'_, PythiaApp>, locker: &mut Side, admin: &mut Side| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        let started = Instant::now();
+        loop {
+            h.step();
+            let blocked = admin.run(&format!(
+                "select session_id from sys.dm_exec_requests \
+                 where blocking_session_id = {locker_spid}"
+            ));
+            if !blocked.is_empty() && cutter.cut_waiting() > 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30), "not blocked");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        locker.end(pythia_db::DbRequest::Rollback);
+        locker
+            .session
+            .send(pythia_db::DbRequest::SetAutocommit(true));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+        part(h)
+    };
+    let ran = "\nThe statement ran; its row count couldn't be read.";
+    let stored = |locker: &mut Side| locker.run("select id, v from r72_ran order by id");
+    let row = |id: &str, v: &str| vec![Some(id.to_owned()), Some(v.to_owned())];
+
+    // Row 1 changed, row 3 new; the insert waits for the locker's row 3.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 2, 0, Some("3".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("n".into()));
+    }
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(false));
+    locker.run("insert into r72_ran values (3, 'theirs')");
+    let (rows, updates, inserts, _, messages) = cut_off(&mut h, &mut locker, &mut admin);
+    assert!(messages.iter().any(|m| m.ends_with(ran)), "{messages:?}");
+    assert_eq!(
+        stored(&mut locker),
+        [row("1", "x"), row("2", "b"), row("3", "n")]
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "n")]),
+        "{messages:?}"
+    );
+    assert!(updates.is_empty() && inserts.is_empty(), "{messages:?}");
+    let said = |messages: &[String], text: &str| messages.iter().any(|m| m == text);
+    let too = "Auto-commit committed its change too: only its row count wasn't read";
+    assert!(
+        said(
+            &messages,
+            "Auto-commit committed the 1 change(s) applied before it"
+        ),
+        "{messages:?}"
+    );
+    assert!(said(&messages, too), "{messages:?}");
+
+    // Row 2 changed, waiting for the locker's lock on it.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("y".into()));
+    }
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(false));
+    locker.run("update r72_ran set v = v where id = 2");
+    let (rows, updates, _, _, messages) = cut_off(&mut h, &mut locker, &mut admin);
+    assert!(messages.iter().any(|m| m.ends_with(ran)), "{messages:?}");
+    assert!(said(&messages, too), "{messages:?}");
+    assert!(
+        !messages.iter().any(|m| m.contains("another session")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        stored(&mut locker),
+        [row("1", "x"), row("2", "y"), row("3", "n")]
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "n")]),
+        "{messages:?}"
+    );
+    assert!(updates.is_empty(), "{messages:?}");
+    h.state_mut().test_close_focused();
+    drop(h);
+    locker.run("drop table r72_ran");
+}
+
 /// An Apply in auto-commit whose session is killed, a lost connection,
 /// while its update of row 2 waits for a lock: the update of row 1 before
 /// it was committed and stays applied, the result fetched again has it,
@@ -13891,6 +14037,72 @@ fn sqlite_files_round_trip() {
             drop: "drop table if exists lob_files;",
         },
     );
+}
+
+/// A file loaded into a new row lands in that row or in none (#344). The
+/// dialog and the file's bytes are on helper threads, and the new rows can
+/// change meanwhile: here the rows are discarded and two others inserted
+/// before the file comes. Before, it went into the second of them, a row
+/// it wasn't chosen for, and the message said it was loaded.
+#[test]
+fn a_file_loads_into_its_own_row_or_none() {
+    let (mut h, _db) = sqlite_file("lob-row.db");
+    let dir = std::env::temp_dir().join(format!("pythia-lob-row-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("q.bin");
+    std::fs::write(&file, [0xAB; 100]).unwrap();
+    run_script(
+        &mut h,
+        "lob-row.db",
+        "create table lob_row (id integer primary key, img blob);\n\
+         insert into lob_row values (1, X'CAFE');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-row.db".into(),
+        text: "select id, img from lob_row".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let add = |h: &mut Harness<'_, PythiaApp>, ids: &[&str]| {
+        let r = first_result(h);
+        let rows = r.rows.clone();
+        for id in ids {
+            r.grid.add_row(&rows, r.columns.len());
+            let view_row = rows.len() + r.grid.changes().unwrap().inserts.len() - 1;
+            r.grid.edit_cell(&rows, view_row, 0, Some((*id).into()));
+        }
+    };
+    add(&mut h, &["2", "3"]);
+    // Loaded into row 3's img; the rows are discarded and 7 and 8 are
+    // inserted while the file is chosen and read.
+    let before = message_count(&mut h);
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .chosen
+        .push_back(Some(file.clone()));
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (2, 1));
+    }
+    first_result(&mut h).grid.clear_changes();
+    add(&mut h, &["7", "8"]);
+    let said = file_done(&mut h, before);
+    let changes = first_result(&mut h).grid.changes().cloned().unwrap();
+    assert!(changes.loaded.is_empty(), "{:?}: {said}", changes.loaded);
+    let ids: Vec<Option<&str>> = changes.inserts.iter().map(|r| r[0].as_deref()).collect();
+    assert_eq!(ids, [Some("7"), Some("8")], "{said}");
+    assert!(
+        said.starts_with("Load from file: the new row it was chosen for is gone"),
+        "{said}"
+    );
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// *Load from file…* (#293), from the context menu and the value editor of

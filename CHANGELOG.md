@@ -1065,6 +1065,19 @@ All notable changes to Pythia are documented here. The format follows
   the row needed a PL/SQL block, and each BLOB's hex was copied for it:
   20,000 rows of 2000-byte BLOBs took 1.05 s in a debug build, now
   78 ms.
+- *Load from file…* into a new row (#293) puts the file into that row,
+  or into none (#344). The file is chosen and read while the grid goes
+  on: a new row deleted, taken back by Ctrl+Z or discarded meanwhile gave
+  the chosen row's place to another, and the file went there, or nowhere,
+  while the message said it was loaded. Where its row went, the file now
+  isn't loaded, and the message says so.
+- SQL Server: with *Auto-commit* on, a change whose statement ran but
+  whose row count couldn't be read, the connection lost in between
+  (#310), counts as applied (#345). Auto-commit had committed it, yet it
+  stayed pending: a new row's insert failed with a duplicate key when
+  applied again, and an update stayed on the row's old value or was
+  dropped with "… was changed by another session". The result is now
+  fetched again, and the messages say auto-commit committed it.
 
 ## [0.10.0] - 2026-10-30
 
