@@ -711,3 +711,117 @@ fn renamed_columns_stay_read_only() {
         }
     }
 }
+
+/// A binary value of 5000 bytes, which results hold cut short to 4000
+/// with its size (#223; PostgreSQL's bytea comes whole): set to itself it is
+/// left as it is, nothing written; edited, its row is found by the key
+/// alone, the value cut short can't be compared with the server's.
+fn cut_values(db: &mut Live, create: &str, value: &str, new: &str) {
+    db.script(&[
+        "drop table if exists fd_cut",
+        create,
+        &format!("insert into fd_cut values (1, {value}, 'x')"),
+    ]);
+    let (edit, columns, rows) = db.editable("fd_cut", "id");
+    let b = columns.iter().position(|c| c.name == "b").unwrap();
+    let n = columns.iter().position(|c| c.name == "n").unwrap();
+    let cut = rows[0][b].as_deref().and_then(pythia_db::cut_size);
+    let whole = db.dialect == Dialect::POSTGRES;
+    assert_eq!(cut, (!whole).then_some(5000), "{:?}", db.dialect);
+    let update = |cells: &[(usize, &str)]| Changes {
+        updates: BTreeMap::from([(
+            0,
+            cells
+                .iter()
+                .map(|(c, v)| (*c, Some((*v).to_owned())))
+                .collect(),
+        )]),
+        ..Changes::default()
+    };
+    let same = rows[0][b].clone().unwrap();
+    let statements = dml(
+        db.dialect,
+        &edit,
+        &columns,
+        &rows,
+        &update(&[(b, &same), (n, "y")]),
+    );
+    for statement in &statements {
+        assert!(
+            whole || !statement.sql.contains(" bytes)"),
+            "{:?}: {}",
+            db.dialect,
+            statement.sql
+        );
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    let (edit, columns, rows) = db.editable("fd_cut", "id");
+    for statement in dml(
+        db.dialect,
+        &edit,
+        &columns,
+        &rows,
+        &update(&[(b, new), (n, "z")]),
+    ) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    let length = match db.dialect.kind() {
+        DbKind::SqlServer => "datalength",
+        _ => "length",
+    };
+    let check = db.count(&format!("select {length}(b) from fd_cut"));
+    assert_eq!(check, "2", "{:?}", db.dialect);
+    assert_eq!(db.count("select n from fd_cut"), "z");
+    db.ok("drop table fd_cut");
+}
+
+#[test]
+fn cut_values_are_neither_checked_nor_written() {
+    let (mut db, path) = Live::sqlite("cut");
+    cut_values(
+        &mut db,
+        "create table fd_cut (id integer primary key, b blob, n text)",
+        "randomblob(5000)",
+        "CAFE",
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "create table fd_cut (id int primary key, b longblob, n varchar(5))",
+            "repeat(unhex('AB'), 5000)",
+            "CAFE",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "create table fd_cut (id int primary key, b bytea, n varchar(5))",
+            "decode(repeat('ab', 5000), 'hex')",
+            r"\xcafe",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "create table fd_cut (id int primary key, b varbinary(max), n nvarchar(5))",
+            "cast(replicate(cast(0xAB as varchar(max)), 5000) as varbinary(max))",
+            "0xCAFE",
+        ),
+    ];
+    for (env, kind, create, value, new) in servers {
+        if let Some(mut db) = Live::connect(env, kind) {
+            cut_values(&mut db, create, value, new);
+        }
+    }
+}

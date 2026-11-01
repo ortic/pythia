@@ -248,6 +248,13 @@ All notable changes to Pythia are documented here. The format follows
 - MariaDB: a TIMESTAMP column's type reads `TIMESTAMP`, no longer
   `TIMESTAMP UNSIGNED`, and an INET6 column's `CHAR`, not `CHAR
   UNSIGNED` (#221). MariaDB flags them unsigned; only numbers are.
+- Editing a row with a binary value over 4000 bytes no longer reports a
+  conflict on MySQL and SQL Server (#223). The grid holds such a value
+  cut short, and applying a change to it compared the cut part with the
+  server's value, which never matched. Such a value isn't compared now
+  (the row is found by its key), and a cut value pasted into a cell is
+  no longer written: MySQL and SQLite stored it as text, 8000 hex
+  digits and the size.
 
 ## [0.10.0] - 2026-10-30
 
