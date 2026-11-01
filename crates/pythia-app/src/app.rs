@@ -15,8 +15,8 @@ use crate::browser::Browser;
 use crate::commands::{Command, Keymap};
 use crate::connections::{Connection, Connections, Notify, Passwords, SessionKey};
 use crate::dialogs::{
-    Answer, CommandPalette, Confirm, ConfirmAction, ConnectDialog, FinderAction, HistoryDialog,
-    ObjectFinder, confirm_ui, opens_as_program,
+    Answer, CommandPalette, Confirm, ConfirmAction, ConnectDialog, ConnectRequest, FinderAction,
+    HistoryDialog, ObjectFinder, confirm_ui, opens_as_program,
 };
 use crate::documents::{
     DocContext, DocId, DocKind, Document, Effects, ObjectRef, OpenRequest, Target, request_id,
@@ -3360,14 +3360,41 @@ impl PythiaApp {
         self.connect_dialog.passwords_saved(saved);
     }
 
-    fn connect(&mut self, profile: ConnectionProfile, passwords: Passwords, save_profile: bool) {
+    /// Saves `profile` in place of `previous`, the saved connection the
+    /// connect dialog showed, in the file as it is now (#196). Another saved
+    /// connection with its name, but for case, isn't replaced (#246): the
+    /// dialog says so, and nothing is saved.
+    fn save_profile(&mut self, profile: &ConnectionProfile, previous: Option<&str>) -> bool {
+        let mut taken = None;
+        self.change_connections(|saved| taken = saved.save(profile.clone(), previous).err());
+        if let Some(other) = taken {
+            self.connect_dialog
+                .failed(crate::dialogs::name_taken(&other));
+            return false;
+        }
+        true
+    }
+
+    fn connect(&mut self, request: ConnectRequest) {
+        let ConnectRequest {
+            profile,
+            passwords,
+            save_profile,
+            previous,
+        } = request;
         let name = profile.display_name();
+        if save_profile && self.paths.is_some() {
+            if !self.save_profile(&profile, previous.as_deref()) {
+                return;
+            }
+            // Renamed: its passwords go with it.
+            if let Some(previous) = previous.filter(|p| *p != name) {
+                secrets::forget(&previous);
+                secrets::forget_ssh(&previous);
+            }
+        }
         if self.conns.get(&name).is_some() {
             self.disconnect(&name);
-        }
-        if save_profile && self.paths.is_some() {
-            let saved = profile.clone();
-            self.change_connections(|c| c.upsert(saved));
         }
         if profile.save_password {
             self.save_passwords(&name, &passwords);
@@ -4559,16 +4586,14 @@ impl PythiaApp {
             self.reload_changed_connections();
         }
         match self.connect_dialog.ui(ctx, &self.saved) {
-            Some(crate::dialogs::ConnectAction::Connect(request)) => {
-                self.connect(request.profile, request.passwords, request.save_profile);
-            }
+            Some(crate::dialogs::ConnectAction::Connect(request)) => self.connect(request),
             Some(crate::dialogs::ConnectAction::Trust { key, then }) => match key.trust() {
                 Ok(()) => {
                     self.log(format!(
                         "Trusted the SSH host key of {} ({})",
                         key.host, key.fingerprint
                     ));
-                    self.connect(then.profile, then.passwords, then.save_profile);
+                    self.connect(then);
                 }
                 Err(e) => self.connect_dialog.failed(e.to_string()),
             },
@@ -4578,24 +4603,20 @@ impl PythiaApp {
                 passwords,
             }) => {
                 let name = profile.display_name();
-                let renamed = previous.filter(|p| *p != name);
-                if let Some(previous) = &renamed {
-                    secrets::forget(previous);
-                    secrets::forget_ssh(previous);
-                }
-                match &passwords {
-                    Some(passwords) => self.save_passwords(&name, passwords),
-                    None => {
-                        secrets::forget(&name);
-                        secrets::forget_ssh(&name);
+                if self.save_profile(&profile, previous.as_deref()) {
+                    self.connect_dialog.saved(name.clone());
+                    if let Some(previous) = previous.filter(|p| *p != name) {
+                        secrets::forget(&previous);
+                        secrets::forget_ssh(&previous);
+                    }
+                    match &passwords {
+                        Some(passwords) => self.save_passwords(&name, passwords),
+                        None => {
+                            secrets::forget(&name);
+                            secrets::forget_ssh(&name);
+                        }
                     }
                 }
-                self.change_connections(|saved| {
-                    if let Some(previous) = &renamed {
-                        saved.profiles.retain(|p| p.display_name() != *previous);
-                    }
-                    saved.upsert(profile);
-                });
             }
             Some(crate::dialogs::ConnectAction::Delete(name)) => {
                 self.change_connections(|saved| {
@@ -5047,11 +5068,15 @@ impl eframe::App for PythiaApp {
 #[cfg(test)]
 impl PythiaApp {
     pub fn test_connect(&mut self, profile: ConnectionProfile, password: String) {
-        let passwords = Passwords {
-            database: password,
-            ssh: String::new(),
-        };
-        self.connect(profile, passwords, false);
+        self.connect(ConnectRequest {
+            profile,
+            passwords: Passwords {
+                database: password,
+                ssh: String::new(),
+            },
+            save_profile: false,
+            previous: None,
+        });
     }
 
     /// Connects as the connect dialog does, which can ask to trust an SSH
@@ -5067,7 +5092,10 @@ impl PythiaApp {
         if let Some(crate::dialogs::ConnectAction::Connect(request)) =
             self.connect_dialog.test_submit(profile, passwords)
         {
-            self.connect(request.profile, request.passwords, false);
+            self.connect(ConnectRequest {
+                save_profile: false,
+                ..request
+            });
         }
     }
 
@@ -5258,6 +5286,10 @@ impl PythiaApp {
         self.saved.profiles = profiles;
         let first = self.saved.profiles.first().cloned();
         self.connect_dialog.show(first.as_ref());
+    }
+
+    pub fn test_saved_profiles(&self) -> &[ConnectionProfile] {
+        &self.saved.profiles
     }
 
     pub fn test_close_connect(&mut self) {
@@ -6362,6 +6394,44 @@ mod workspace_tests {
         two.save_settings();
         let settings: Settings = load_toml(&paths.settings_file()).unwrap();
         assert_eq!((settings.editor.tab_width, settings.ui_scale), (2, 1.5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A connection that another Pythia saved since this one read the file
+    /// isn't replaced by one saved under its name either (#246).
+    #[test]
+    fn names_saved_meanwhile_stay() {
+        let dir = std::env::temp_dir().join(format!("pythia-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            data_dir: dir.join("data"),
+        };
+        let storage = Memory::default();
+        let open = || {
+            let mut cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+            cc.storage = Some(&storage);
+            PythiaApp::new(&cc, Some(paths.clone()))
+        };
+        let mut one = open();
+        let mut two = open();
+        let profile = |name: &str, user: &str| ConnectionProfile {
+            name: name.into(),
+            username: user.into(),
+            ..Default::default()
+        };
+        two.change_connections(|c| c.upsert(profile("super", "theirs")));
+        assert!(!one.save_profile(&profile("Super", "mine"), None));
+        let saved: SavedConnections = load_toml(&paths.connections_file()).unwrap();
+        assert_eq!(saved.profiles, [profile("super", "theirs")]);
+        assert!(
+            one.connect_dialog
+                .test_error()
+                .is_some_and(|e| e.contains("named super already")),
+            "{:?}",
+            one.connect_dialog.test_error()
+        );
+        assert!(one.save_profile(&profile("mine", "mine"), None));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

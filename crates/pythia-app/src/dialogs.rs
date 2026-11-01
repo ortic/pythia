@@ -52,6 +52,9 @@ pub struct ConnectRequest {
     pub profile: ConnectionProfile,
     pub passwords: Passwords,
     pub save_profile: bool,
+    /// The saved profile the form showed, which `profile` replaces when
+    /// it's saved (renamed, if its name changed).
+    pub previous: Option<String>,
 }
 
 pub enum ConnectAction {
@@ -68,6 +71,14 @@ pub enum ConnectAction {
         passwords: Option<Passwords>,
     },
     Delete(String),
+}
+
+/// Says that saving would replace the saved connection `name`.
+pub fn name_taken(name: &str) -> String {
+    format!(
+        "There's a saved connection named {name} already. Give this one another name, \
+         or pick {name} in the list to change it."
+    )
 }
 
 /// Accent colors offered for connections.
@@ -196,7 +207,7 @@ impl ConnectDialog {
                     });
                     ui.separator();
                 }
-                ui.vertical(|ui| self.form_ui(ui, &mut action));
+                ui.vertical(|ui| self.form_ui(ui, saved, &mut action));
             });
         });
         if modal.should_close() && !self.connecting {
@@ -300,11 +311,16 @@ impl ConnectDialog {
         }
         if let Some(p) = connect {
             self.pick(p);
-            *action = self.connect_request();
+            *action = self.connect_request(saved);
         }
     }
 
-    fn form_ui(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+    fn form_ui(
+        &mut self,
+        ui: &mut Ui,
+        saved: &SavedConnections,
+        action: &mut Option<ConnectAction>,
+    ) {
         ui.heading(if self.editing.is_some() {
             "Connection"
         } else {
@@ -596,7 +612,7 @@ impl ConnectDialog {
                             .clicked()
                     {
                         let key = Box::new(key.clone());
-                        if let Some(ConnectAction::Connect(then)) = self.connect_request() {
+                        if let Some(ConnectAction::Connect(then)) = self.connect_request(saved) {
                             *action = Some(ConnectAction::Trust { key, then });
                         }
                     }
@@ -644,17 +660,19 @@ impl ConnectDialog {
                     connect.request_focus();
                 }
                 if connect.clicked() || (submit && valid && !self.connecting) {
-                    *action = self.connect_request();
+                    *action = self.connect_request(saved);
                 }
                 if ui.add_enabled(valid, egui::Button::new("Save")).clicked() {
                     let profile = self.cleaned();
-                    let passwords = profile.save_password.then(|| self.passwords());
-                    *action = Some(ConnectAction::Save {
-                        previous: self.editing.clone(),
-                        profile: profile.clone(),
-                        passwords,
-                    });
-                    self.editing = Some(profile.display_name());
+                    self.error = self.name_taken(&profile, saved);
+                    if self.error.is_none() {
+                        let passwords = profile.save_password.then(|| self.passwords());
+                        *action = Some(ConnectAction::Save {
+                            previous: self.editing.clone(),
+                            profile,
+                            passwords,
+                        });
+                    }
                 }
                 if ui.button("Cancel").clicked() {
                     self.open = false;
@@ -787,19 +805,37 @@ impl ConnectDialog {
         profile
     }
 
-    fn connect_request(&mut self) -> Option<ConnectAction> {
+    /// Why `profile` can't be saved: another saved connection has its name,
+    /// but for case, and would be replaced (#246).
+    fn name_taken(&self, profile: &ConnectionProfile, saved: &SavedConnections) -> Option<String> {
+        saved
+            .taken_by(&profile.display_name(), self.editing.as_deref())
+            .map(|other| name_taken(&other.display_name()))
+    }
+
+    fn connect_request(&mut self, saved: &SavedConnections) -> Option<ConnectAction> {
         if !self.valid() {
             return None;
         }
-        self.error = None;
+        let profile = self.cleaned();
+        self.error = self.name_taken(&profile, saved);
         self.missing_client = false;
         self.host_key = None;
+        if self.error.is_some() {
+            return None;
+        }
         self.connecting = true;
         Some(ConnectAction::Connect(ConnectRequest {
-            profile: self.cleaned(),
+            profile,
             passwords: self.passwords(),
             save_profile: true,
+            previous: self.editing.clone(),
         }))
+    }
+
+    /// The profile was saved as `name`: the form shows that one now.
+    pub fn saved(&mut self, name: String) {
+        self.editing = Some(name);
     }
 
     /// Fills the form and presses Connect.
@@ -812,7 +848,7 @@ impl ConnectDialog {
         self.form = profile;
         self.password = passwords.database;
         self.ssh_password = passwords.ssh;
-        self.connect_request()
+        self.connect_request(&SavedConnections::default())
     }
 
     #[cfg(test)]

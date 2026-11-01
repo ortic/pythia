@@ -7522,6 +7522,120 @@ fn passwords_not_saved() {
     );
 }
 
+/// The connect dialog never saves a connection over another one (#246):
+/// Save under another saved connection's name replaced it, and after a
+/// rename that changed only the case, Connect kept both. Saved in a
+/// config directory, as the file has them (#196).
+#[test]
+fn connections_are_saved_under_their_own_name() {
+    let dir = std::env::temp_dir().join(format!("pythia-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = pythia_config::Paths {
+        config_dir: dir.clone(),
+        data_dir: dir.clone(),
+    };
+    let file = dir.join("names.db");
+    let profile = |name: &str, color: u8| ConnectionProfile {
+        name: name.into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", file.display()),
+        color: Some([color, 0, 0]),
+        ..Default::default()
+    };
+    let saved = || vec![profile("super", 1), profile("other", 2)];
+    let connections_file = paths.connections_file();
+    pythia_config::save_toml(
+        &connections_file,
+        &pythia_config::Connections { profiles: saved() },
+    )
+    .unwrap();
+    // Names and colors, as the file has them.
+    let in_file = || -> Vec<(String, u8)> {
+        let saved: pythia_config::Connections =
+            pythia_config::load_toml(&connections_file).unwrap();
+        saved
+            .profiles
+            .iter()
+            .map(|p| (p.name.clone(), p.color.map_or(0, |c| c[0])))
+            .collect()
+    };
+    let _lock = UI_LOCK.shared();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .with_pixels_per_point(1.5)
+        .build_eframe(move |cc| PythiaApp::new(cc, Some(paths)));
+    h.run_steps(2);
+    h.state_mut().test_show_connections(saved());
+    h.run_steps(2);
+    // Picks the saved connection `from` and types `to` as its name.
+    let rename = |h: &mut Harness<'_, PythiaApp>, from: &str, to: &str| {
+        h.get_by_label(from).click();
+        h.run_steps(2);
+        let field = h
+            .get_by(|n| {
+                n.role() == egui::accesskit::Role::TextInput && n.value().as_deref() == Some(from)
+            })
+            .rect()
+            .center();
+        h.event(egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.event(egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.run_steps(2);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text(to.into()));
+        h.run_steps(2);
+    };
+    let refused = |h: &Harness<'_, PythiaApp>| {
+        h.query_by_label_contains("There's a saved connection named")
+            .is_some()
+    };
+
+    // Under another one's name, in any case: refused, both stay.
+    for name in ["Super", "super"] {
+        rename(&mut h, "other", name);
+        h.get_by_label("Save").click();
+        h.run_steps(2);
+        assert!(refused(&h), "Save as {name}");
+        save(&mut h, "connect-name-taken");
+        assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+        h.get_by_label("Connect").click();
+        h.run_steps(2);
+        assert!(refused(&h), "Connect as {name}");
+        assert!(!h.state().test_connected());
+        assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+    }
+
+    // Its own name in another case: renamed, in its place.
+    rename(&mut h, "super", "Super");
+    h.get_by_label("Save").click();
+    h.run_steps(2);
+    assert!(!refused(&h));
+    assert_eq!(in_file(), [("Super".into(), 1), ("other".into(), 2)]);
+    rename(&mut h, "Super", "super");
+    h.get_by_label("Connect").click();
+    wait_until(&mut h, "connection", |app| app.test_connected_to("super"));
+    assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
+    let names: Vec<&str> = h
+        .state()
+        .test_saved_profiles()
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, ["super", "other"]);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A MySQL connection (`PYTHIA_TEST_MYSQL=user/password@host:port/database`):
 /// queries, transactions, browser and object views work; what MySQL can't
 /// do is left out of the menus, the toolbar and the browser.
