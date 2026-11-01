@@ -677,6 +677,10 @@ All notable changes to Pythia are documented here. The format follows
   name that comes again is now `ID_2` (or the next number no column is
   called). *Copy as*, the grid's *Export*, *Execute to file* and *Export
   tables* write JSON so.
+- Compare: sync scripts quote a column, table, constraint or index
+  called `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` or `SUCCESSFUL`
+  (#303), as INSERT statements do since #274: `create table words (id
+  NUMBER, resource NUMBER)` failed with ORA-03050.
 
 ## [0.10.0] - 2026-10-30
 

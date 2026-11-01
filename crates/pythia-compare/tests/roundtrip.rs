@@ -113,3 +113,59 @@ fn schema_and_data_roundtrip() {
         std::panic::resume_unwind(e);
     }
 }
+
+/// A table whose columns are called like reserved words, read from the
+/// database, is created again by the sync statements, and its missing
+/// columns are added to another (with `PYTHIA_TEST_DB`, no DBA needed).
+#[test]
+fn reserved_words_sync() {
+    use pythia_compare::table::{self, CreateOptions};
+    let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (user, password) = credentials.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, password, connect_string).unwrap();
+    let tables = ["R65_WORDS", "R65_WORDS_COPY", "R65_WORDS_FEW"];
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    run(
+        &conn,
+        "create table r65_words (id number primary key, \"RESOURCE\" number, \
+           \"RENAME\" number, \"EXCEPT\" number, \"MLSLABEL\" number, \"SUCCESSFUL\" number);
+         create table r65_words_few (id number primary key);",
+    );
+    let owner = user.to_ascii_uppercase();
+    let defs = table::load(&conn, &owner, Some("R65_WORDS")).unwrap();
+    let mut def = defs["R65_WORDS"].clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        def.name = "R65_WORDS_COPY".into();
+        for statement in table::create(&def, &CreateOptions::default()) {
+            run(&conn, &statement.sql);
+        }
+        let few = table::load(&conn, &owner, Some("R65_WORDS_FEW")).unwrap();
+        def.name = "R65_WORDS_FEW".into();
+        for statement in table::diff(&def, &few["R65_WORDS_FEW"], false).statements {
+            if statement.enabled {
+                run(&conn, &statement.sql);
+            }
+        }
+        for t in ["R65_WORDS_COPY", "R65_WORDS_FEW"] {
+            let columns: i64 = conn
+                .query_row_as(
+                    "select count(*) from user_tab_columns where table_name = :1 \
+                       and column_name in ('RESOURCE', 'RENAME', 'EXCEPT', 'MLSLABEL', 'SUCCESSFUL')",
+                    &[&t],
+                )
+                .unwrap();
+            assert_eq!(columns, 5, "{t}");
+        }
+    }));
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
