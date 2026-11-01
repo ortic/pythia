@@ -651,6 +651,50 @@ fn dictionary() {
     assert_eq!(objects_in(&mut h, "extra"), ["more"]);
 }
 
+/// SQLite keeps a statement as written, a line comment at its end too: the
+/// DDL's `;` goes on a line of its own after it (#206).
+#[test]
+fn ddl_ends_after_a_line_comment() {
+    let db = TempDb::new("comments");
+    let mut h = Harness::connect(&db.create());
+    for sql in [
+        "create table fs_t (a, b)",
+        "create index fs_t_a on fs_t (a) -- first index;",
+        "create index fs_t_b on fs_t (b)",
+        "create view fs_v as select 'foo' as a\nwhere 1\n    -- and 0",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = |h: &mut Harness, name: &str, object_type| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "main".into(),
+            name: name.into(),
+            object_type,
+        }) else {
+            panic!()
+        };
+        ddl
+    };
+    let table = ddl(&mut h, "fs_t", ObjectType::Table);
+    let view = ddl(&mut h, "fs_v", ObjectType::View);
+    assert!(view.ends_with("-- and 0\n;\n"), "{view}");
+    // Run again, elsewhere: the table with both indexes, and the view.
+    let copy = TempDb::new("comments-copy");
+    let mut other = Harness::connect(&copy.create());
+    let script = format!("{table}{view}select 1;");
+    let statements = pythia_plsql::split_statements_in(&script, Dialect::SQLITE.syntax());
+    assert_eq!(statements.len(), 5, "{script}");
+    for statement in &statements {
+        other.ok(statement.text(&script));
+    }
+    assert_eq!(
+        other
+            .scalar("select group_concat(name, ',') from sqlite_master where name like 'fs_%'")
+            .as_deref(),
+        Some("fs_t,fs_t_a,fs_t_b,fs_v")
+    );
+}
+
 fn objects_in(h: &mut Harness, schema: &str) -> Vec<String> {
     let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
         owner: schema.into(),

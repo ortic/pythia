@@ -2068,7 +2068,8 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
 /// a PL/SQL unit so the body's `;` stay in it. PostgreSQL's routines and
 /// views come with `CREATE OR REPLACE`, its triggers get it; SQL Server's
 /// get `CREATE OR ALTER`. SQLite has neither: drop, then create, a
-/// trigger's body keeping its `;` without a `/`.
+/// trigger's body keeping its `;` without a `/`, and the `;` after a line
+/// comment on a line of its own (#206).
 pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
     let ddl = ddl.trim_end();
     let qualified = dialect.qualified(&o.owner, &o.name);
@@ -2082,10 +2083,9 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => format!("{}\n", create_or(ddl, "or alter", "")),
         (pythia_db::DbKind::Sqlite, _) => format!(
-            "drop {} if exists {qualified};\n\n{}{}\n",
+            "drop {} if exists {qualified};\n\n{}\n",
             o.object_type.dictionary_name().to_lowercase(),
-            ddl,
-            if ddl.ends_with(';') { "" } else { ";" }
+            pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Sqlite)
         ),
         _ => format!(
             "drop {} if exists {qualified};\n\n{ddl}\n/\n",
@@ -2839,6 +2839,20 @@ mod tests {
         assert_eq!(
             pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
             2
+        );
+        // A view as written, a line comment at its end: the `;` goes on a
+        // line of its own (#206).
+        let view = "CREATE VIEW v AS select 'foo' as a\nwhere 1\n    -- and 0; really";
+        let script = replace_script(Dialect::SQLITE, &lite("v", ObjectType::View), view);
+        assert_eq!(
+            script,
+            "drop view if exists main.v;\n\nCREATE VIEW v AS select 'foo' as a\nwhere 1\n    \
+             -- and 0; really\n;\n"
+        );
+        let script = format!("{script}select 1;");
+        assert_eq!(
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
+            3
         );
         assert_eq!(
             drop_sql(Dialect::SQLITE, &lite("order", ObjectType::Table)),

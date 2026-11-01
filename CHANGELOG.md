@@ -128,6 +128,12 @@ All notable changes to Pythia are documented here. The format follows
   body ran on their own. After a line `DELIMITER x`, statements now end
   at `x` until `DELIMITER ;`, and the line itself isn't sent. `/` on a
   line of its own still ends a routine.
+- SQLite: when a view's, an index's or a trigger's statement ends with
+  a line comment, its DDL puts the `;` on a line of its own (#206).
+  SQLite keeps the statement as written, and the `;` went into the
+  comment: *Edit* on such a view dropped the view, and its create ran
+  together with the next statement and failed; a table's indexes were
+  lost when its DDL ran again.
 
 ## [0.10.0] - 2026-10-30
 

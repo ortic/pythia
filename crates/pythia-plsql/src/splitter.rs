@@ -185,6 +185,18 @@ pub fn statement_at_in(src: &str, offset: usize, syntax: Syntax) -> Option<State
     statements.into_iter().nth(idx)
 }
 
+/// `sql` ended by `;`, unless it has one, in a script of a database with
+/// `syntax`. After a line comment, which would take it in, the `;` goes on
+/// a line of its own (#206).
+pub fn terminated(sql: &str, syntax: Syntax) -> String {
+    let sql = sql.trim_end();
+    match tokenize_in(sql, syntax).last().map(|t| t.kind) {
+        Some(TokenKind::Semicolon) => sql.to_owned(),
+        Some(TokenKind::LineComment) => format!("{sql}\n;"),
+        _ => format!("{sql};"),
+    }
+}
+
 struct Splitter<'a> {
     src: &'a str,
     tokens: Vec<Token>,
@@ -884,5 +896,15 @@ mod tests {
             "select 2 from dual"
         );
         assert_eq!(statement_at("", 0), None);
+    }
+
+    #[test]
+    fn terminated_statements() {
+        let lite = |sql| terminated(sql, Syntax::Sqlite);
+        assert_eq!(lite("select 1 \n"), "select 1;");
+        assert_eq!(lite("select 1;\n"), "select 1;");
+        assert_eq!(lite("select 1 /* one; */"), "select 1 /* one; */;");
+        // A line comment would take the `;` in (#206).
+        assert_eq!(lite("select 1\n  -- one;"), "select 1\n  -- one;\n;");
     }
 }
