@@ -343,9 +343,11 @@ impl GridState {
             return;
         }
         let order = self.order_of(rows, columns);
-        // Rows fetched since: sorted in among the others, or after them.
-        if self.order_revision > 0 && self.ordered_rows < rows.len() {
-            self.follow_rows(&order, rows.len());
+        // Rows fetched since, sorted in among the others or after them, or
+        // a sort or a filter (`set_sort`, `set_filter`).
+        if self.order_revision > 0 {
+            let chosen = self.ordered_rows == usize::MAX;
+            self.follow_rows(rows, &order, chosen);
         }
         self.order = order;
         self.ordered_rows = rows.len();
@@ -354,31 +356,44 @@ impl GridState {
 
     /// Moves what is held by view row (the selection, the cursor, the cell
     /// being edited, the viewer and the dialog's cell) to where its row is
-    /// in `order`, the rows' new order, once more of the `count` rows were
-    /// fetched: they stayed in place, on other rows of a sorted result
-    /// (#279). New rows come after the fetched ones.
-    fn follow_rows(&mut self, order: &[usize], count: usize) {
-        let mut place = vec![None; count];
+    /// in `order`, the rows' new order: they stayed in place, on other rows
+    /// (#279, #296). New rows come after the fetched ones. After a sort or
+    /// a filter (`chosen`), a selection of several rows, which don't stand
+    /// together in another order, keeps the cursor's row. On a row the
+    /// filter hides, the viewer and the dialog close, and the value being
+    /// typed is kept.
+    fn follow_rows(&mut self, rows: &[Vec<Cell>], order: &[usize], chosen: bool) {
+        let mut place = vec![None; rows.len()];
         for (at, &r) in order.iter().enumerate() {
             place[r] = Some(at);
         }
-        let (before, now) = (self.order.len(), order.len());
-        let old = &self.order;
-        let moved = |view_row: &mut usize| {
-            *view_row = match old.get(*view_row) {
-                Some(&r) => place.get(r).copied().flatten().unwrap_or(*view_row),
-                None => *view_row - before + now,
-            }
+        let now = order.len();
+        let to = |old: &[usize], view_row: usize| match old.get(view_row) {
+            Some(&r) => place.get(r).copied().flatten(),
+            None => Some(view_row - old.len() + now),
         };
-        let cells = [&mut self.anchor, &mut self.cursor, &mut self.viewer];
-        for (view_row, _) in cells.into_iter().flatten() {
-            moved(view_row);
+        if let Some((view_row, ..)) = self.edit.as_ref().and_then(|e| e.active.as_ref())
+            && to(&self.order, *view_row).is_none()
+        {
+            self.finish_edit(rows, true);
         }
-        if let Some(editor) = &mut self.value_editor {
-            moved(&mut editor.view_row);
-        }
-        if let Some((view_row, ..)) = self.edit.as_mut().and_then(|e| e.active.as_mut()) {
-            moved(view_row);
+        let old = std::mem::take(&mut self.order);
+        let at = |(view_row, col): (usize, usize)| Some((to(&old, view_row)?, col));
+        let cursor = self.cursor.and_then(at);
+        self.anchor = match (self.anchor, cursor) {
+            (Some((_, col)), Some((view_row, _))) if chosen => Some((view_row, col)),
+            (anchor, _) => anchor.and_then(at),
+        };
+        self.cursor = cursor;
+        self.viewer = self.viewer.and_then(at);
+        self.value_editor = self.value_editor.take().and_then(|mut editor| {
+            editor.view_row = to(&old, editor.view_row)?;
+            Some(editor)
+        });
+        if let Some((view_row, ..)) = self.edit.as_mut().and_then(|e| e.active.as_mut())
+            && let Some(moved) = to(&old, *view_row)
+        {
+            *view_row = moved;
         }
     }
 
@@ -4025,8 +4040,9 @@ mod tests {
             summary(&rows, &mut state).as_deref(),
             Some("Count 4 · Sum 110 · Avg 27.5 · Min 1 · Max 100")
         );
-        // The rows with 99999 and 199999.
+        // The rows with 99999 and 199999, once the filter shows them.
         state.set_filter("99999");
+        state.view_order(&rows, &columns);
         state.anchor = Some((0, 0));
         state.cursor = Some((1, 0));
         assert_eq!(
@@ -4816,5 +4832,82 @@ mod tests {
             let copied = copied(&ctx, &columns, &rows, &mut state, vec![button(false)]);
             assert!(copied == Some(value), "{last}: not copied whole");
         }
+    }
+
+    /// A sort or a filter keeps the selection, the cursor, the cell being
+    /// edited, the viewer and the dialog editing a cell on their rows
+    /// (#296). They stayed at their places in the view, on other rows: Set
+    /// NULL, Delete, the value typed and the dialog's Apply went into rows
+    /// that weren't selected.
+    #[test]
+    fn a_sort_or_a_filter_keeps_the_selection_on_its_rows() {
+        let columns = cols();
+        let row = |a: &str, b: &str| vec![Some(a.into()), Some(b.into())];
+        let rows = vec![row("1", "c"), row("2", "a"), row("3", "b")];
+        let ctx = egui::Context::default();
+        let new = || {
+            let mut state = GridState::default();
+            state.set_editable(None);
+            state
+        };
+        let mut state = new();
+        // c's B selected, in the viewer and in the dialog; a's being
+        // edited. Sorted by B: a, b, c.
+        click(&ctx, &columns, &rows, &mut state, "c", 1);
+        state.viewer = Some((0, 1));
+        state.open_value_editor(&rows, (0, 1));
+        state.start_edit(&rows, (1, 1), Some("typed".into()));
+        state.set_sort(1, &rows, &columns);
+        assert_eq!(state.order, [1, 2, 0]);
+        assert_eq!((state.anchor, state.cursor), (Some((2, 1)), Some((2, 1))));
+        assert_eq!(state.viewer, Some((2, 1)));
+        assert_eq!(state.value_editor.as_ref().map(|e| e.view_row), Some(2));
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::Enter)]);
+        let updates = |state: &GridState| state.changes().unwrap().updates.clone();
+        assert_eq!(updates(&state)[&1][&1].as_deref(), Some("typed"));
+        // Set NULL and Delete take c (before: b), and so does the dialog.
+        state.set_null(&rows, 2);
+        state.delete_rows(2);
+        assert_eq!(updates(&state).keys().collect::<Vec<_>>(), [&0, &1]);
+        assert_eq!(updates(&state)[&0][&1], None);
+        let deletes = &state.changes().unwrap().deletes;
+        assert_eq!(deletes.iter().collect::<Vec<_>>(), [&0]);
+        state.viewer = None;
+        state.value_editor.as_mut().unwrap().text = "dialog".into();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        click(&ctx, &columns, &rows, &mut state, "Apply", 1);
+        assert_eq!(updates(&state)[&0][&1].as_deref(), Some("dialog"));
+        assert_eq!(updates(&state)[&1][&1].as_deref(), Some("typed"));
+
+        // Rows a and b selected, sorted the other way: c, b, a. They no
+        // longer stand together: the cursor's row b stays selected.
+        let mut state = new();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.set_sort(1, &rows, &columns);
+        state.select((0, 0), false);
+        state.select((1, 1), true);
+        state.set_sort(1, &rows, &columns);
+        assert_eq!(state.order, [0, 2, 1]);
+        assert_eq!((state.anchor, state.cursor), (Some((1, 0)), Some((1, 1))));
+        state.set_null(&rows, 2);
+        assert_eq!(updates(&state).keys().collect::<Vec<_>>(), [&2]);
+
+        // A filter: the viewer stays on b, the dialog on c, which it
+        // hides, closes, and the edit of a's cell keeps its value.
+        let mut state = new();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.viewer = Some((2, 1));
+        state.open_value_editor(&rows, (0, 1));
+        state.start_edit(&rows, (1, 1), Some("kept".into()));
+        state.set_filter("b");
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.order, [2]);
+        assert_eq!(state.viewer, Some((0, 1)));
+        assert!(state.value_editor.is_none());
+        assert!(state.edit.as_ref().unwrap().active.is_none());
+        assert_eq!(updates(&state)[&1][&1].as_deref(), Some("kept"));
+        state.set_filter("");
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.viewer, Some((2, 1)));
     }
 }

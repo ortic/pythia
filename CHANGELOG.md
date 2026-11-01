@@ -635,6 +635,16 @@ All notable changes to Pythia are documented here. The format follows
   statement rolls back; with a transaction pending in the window it
   stops at its `begin`, before anything changed. PostgreSQL's drops and
   creates the view in one `DO` block, which waits for Commit.
+- A sort or a filter of the result grid no longer moves the selection
+  and the cell being edited to other rows (#296). After a click on a
+  column's header, the selection, the cursor, the cell being edited,
+  *View value…* and the dialog editing a cell stayed where they were in
+  the view, on other rows: *Set NULL*, *Delete / undelete rows*, a value
+  typed and the dialog's *Apply* went into rows that weren't selected.
+  A filter did the same to the viewer, the dialog and the edit. They now
+  stay on their rows; a selection of several rows keeps the cursor's
+  row. Where the filter hides their row, the viewer and the dialog close
+  and the value being typed is kept.
 
 ## [0.10.0] - 2026-10-30
 
