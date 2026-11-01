@@ -9708,6 +9708,101 @@ fn drop_names_the_object_as_its_database_writes_it() {
     }
 }
 
+/// The object browser, an object's tab, Favorites and Recent show a name
+/// with the case that tells it apart (#272). Every name was lowercased, so
+/// PostgreSQL's "R55Case" and r55case, MySQL's R55Case and r55case, and
+/// Oracle's R55_CASE, "R55_Case" and "R55_case" each read the same; Oracle's
+/// uppercase names still read in lowercase.
+#[test]
+fn names_keep_the_case_that_tells_them_apart() {
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Creates the tables (name, as shown) and finds each in the browser
+    // once; the second one in its tab, Favorites and Recent too.
+    let check = |h: &mut Ui, owner: &str, script: &str, drops: &str, tables: &[(&str, &str)]| {
+        let connection = "r55-case";
+        run_script(h, connection, script);
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_browser().set_filter("R55");
+        h.state_mut().test_refresh_browser();
+        wait_until(h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        for (_, shown) in tables {
+            assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+        }
+        let (name, shown) = tables[1];
+        let object = ObjectRef {
+            owner: owner.into(),
+            name: name.into(),
+            object_type: ObjectType::Table,
+        };
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: object.clone(),
+        });
+        wait_until(h, "its view", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_focused_title().as_deref(), Some(shown));
+        h.state_mut().test_close_focused();
+        // The folder left out (only invalid objects), Favorites and Recent.
+        h.state_mut().test_browser().test_marks(object);
+        h.run_steps(3);
+        assert_eq!(h.query_all_by_label(shown).count(), 2, "{shown}");
+        run_script(h, connection, drops);
+    };
+
+    let (mut h, _file) = sqlite_file("r55-case");
+    check(
+        &mut h,
+        "main",
+        "create table R55Case (a);\ncreate table r55_other (a)",
+        "drop table R55Case;\ndrop table r55_other",
+        &[("r55_other", "r55_other"), ("R55Case", "R55Case")],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    let both = |create: &str, quoted: &str| {
+        (
+            format!("{create} {quoted} (a int);\n{create} r55case (a int)"),
+            format!("drop table {quoted};\ndrop table r55case"),
+        )
+    };
+    for (env, kind, owner, quoted) in [
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "public",
+            "\"R55Case\"",
+        ),
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql, "pythia", "R55Case"),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-case", kind) {
+            let (script, drops) = both("create table", quoted);
+            check(
+                &mut h,
+                owner,
+                &script,
+                &drops,
+                &[("r55case", "r55case"), ("R55Case", "R55Case")],
+            );
+        }
+    }
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-case", DbKind::Oracle) {
+        check(
+            &mut h,
+            "PYTHIA",
+            "create table r55_case (a int);\ncreate table \"R55_Case\" (a int);\n\
+             create table \"R55_case\" (a int)",
+            "drop table r55_case;\ndrop table \"R55_Case\";\ndrop table \"R55_case\"",
+            &[
+                ("R55_CASE", "r55_case"),
+                ("R55_Case", "\"R55_Case\""),
+                ("R55_case", "\"R55_case\""),
+            ],
+        );
+    }
+}
+
 /// A name typed after its opening quote is completed and closed (#234):
 /// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
 /// didn't open.

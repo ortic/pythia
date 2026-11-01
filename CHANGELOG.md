@@ -519,6 +519,15 @@ All notable changes to Pythia are documented here. The format follows
   quoted every name as Oracle would, on any database: SQLite's
   `main.t` read `"main"."t"`, MySQL's ``shop.`my t` `` read
   `"shop"."my t"`, two strings. A MySQL account reads `'user'@'host'`.
+- The object browser shows names with their case (#272). It showed
+  every name in lowercase, so PostgreSQL's `"Foo"` and `foo`, MySQL's
+  `Foo` and `foo` on Linux, and Oracle's `FOO`, `"Foo"` and `"foo"` each
+  looked the same, and SQLite's or SQL Server's `Foo` didn't read as
+  created. Names show as they are; on Oracle an uppercase name still
+  reads in lowercase (`foo`), and one with lowercase letters as SQL
+  writes it (`"Foo"`). So do the tabs, *Favorites* and *Recent*, a
+  table's indexes, constraints and triggers (and their *Copy name*), and
+  the object named in an editor's context menu.
 
 ## [0.10.0] - 2026-10-30
 

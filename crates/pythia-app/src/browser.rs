@@ -1305,7 +1305,7 @@ impl Browser {
                     if !object.valid {
                         paint_invalid_badge(ui, icon_response.rect);
                     }
-                    let mut text = name(object.name.to_lowercase());
+                    let mut text = name(shown_name(self.dialect, &object.name));
                     if !object.valid {
                         text = text.color(ui.visuals().error_fg_color);
                     }
@@ -1386,7 +1386,8 @@ impl Browser {
                         PartKind::Trigger => Icon::Trigger,
                     };
                     ui.add(icon.sized(ui, small));
-                    let mut text = name(part.name.to_lowercase());
+                    let part_name = shown_name(self.dialect, &part.name);
+                    let mut text = name(part_name.clone());
                     if !part.enabled {
                         text = text.strikethrough().color(ui.visuals().weak_text_color());
                     }
@@ -1399,11 +1400,8 @@ impl Browser {
                     };
                     ui.weak(format!("{tag}{}", part.detail));
                     let state = if part.enabled { "" } else { " (disabled)" };
-                    let label = label.on_hover_text(format!(
-                        "{}{state}\n{tag}{}",
-                        part.name.to_lowercase(),
-                        part.detail
-                    ));
+                    let label =
+                        label.on_hover_text(format!("{part_name}{state}\n{tag}{}", part.detail));
                     let trigger = ObjectRef {
                         owner: table.owner.clone(),
                         name: part.name.clone(),
@@ -1427,7 +1425,7 @@ impl Browser {
                             ui.close();
                         }
                         if ui.button("Copy name").clicked() {
-                            ui.ctx().copy_text(part.name.to_lowercase());
+                            ui.ctx().copy_text(part_name.clone());
                             ui.close();
                         }
                     });
@@ -1440,8 +1438,10 @@ impl Browser {
                         Icon::Procedure
                     };
                     ui.add(icon.sized(ui, small));
-                    let label =
-                        ui.add(egui::Label::new(name(m.name.to_lowercase())).sense(Sense::click()));
+                    let label = ui.add(
+                        egui::Label::new(name(shown_name(self.dialect, &m.name)))
+                            .sense(Sense::click()),
+                    );
                     ui.weak(&m.signature);
                     label.context_menu(|ui| {
                         let subprogram = || Subprogram {
@@ -1513,15 +1513,9 @@ impl Browser {
                         object_type: *object_type,
                     };
                     let selected = self.selected.as_ref() == Some(&account);
-                    // Oracle's names are uppercase; the others' as created.
-                    let shown = if self.dialect == Dialect::ORACLE {
-                        name.to_lowercase()
-                    } else {
-                        (*name).to_owned()
-                    };
                     let response = ui.add(egui::Button::selectable(
                         selected,
-                        RichText::new(shown).font(names.clone()),
+                        RichText::new(shown_name(self.dialect, name)).font(names.clone()),
                     ));
                     let editors = has_form(self.dialect, *object_type);
                     if response.clicked() {
@@ -1549,14 +1543,11 @@ impl Browser {
                         .unwrap_or(Icon::Text);
                     ui.add(icon.sized(ui, small));
                     let selected = self.selected.as_ref() == Some(*object);
-                    let mut text = name(object.name.to_lowercase());
-                    if Some(object.owner.as_str()) != self.schema.as_deref() {
-                        text = name(format!(
-                            "{}.{}",
-                            object.owner.to_lowercase(),
-                            object.name.to_lowercase()
-                        ));
-                    }
+                    let text = if Some(object.owner.as_str()) == self.schema.as_deref() {
+                        name(shown_name(self.dialect, &object.name))
+                    } else {
+                        name(shown_qualified(self.dialect, object))
+                    };
                     let response = self.drag_source(ui, object, |ui| {
                         ui.add(
                             egui::Button::selectable(selected, text).sense(Sense::click_and_drag()),
@@ -2461,6 +2452,29 @@ impl Template {
     }
 }
 
+/// `name` as the browser, tabs and titles show it (#272): as it is, so
+/// that names told apart by case read apart. Oracle's names in its default
+/// uppercase read in lowercase, which reads better, and the others as its
+/// SQL writes them (`"Foo"`), so that they don't read like those.
+pub fn shown_name(dialect: Dialect, name: &str) -> String {
+    if dialect != Dialect::ORACLE {
+        name.to_owned()
+    } else if name.chars().any(char::is_lowercase) {
+        dialect.quote_ident(name)
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// `owner.name`, each [`shown_name`], or the name alone without an owner.
+pub fn shown_qualified(dialect: Dialect, o: &ObjectRef) -> String {
+    let name = shown_name(dialect, &o.name);
+    if o.owner.is_empty() {
+        return name;
+    }
+    format!("{}.{name}", shown_name(dialect, &o.owner))
+}
+
 /// `name` as the SQL of `dialect` writes it: quoted where it needs it,
 /// Oracle's plain names in lowercase, which read better. A quoted name
 /// keeps its case, the dictionary's (#230).
@@ -2869,6 +2883,37 @@ mod tests {
             template(Dialect::MYSQL, Template::Select, &object, &cols),
             "select o.id,\n       o.Total,\n       o.`key`\n  from shop.`Order` o"
         );
+    }
+
+    /// Names keep the case that tells them apart; Oracle's uppercase ones
+    /// read in lowercase (#272).
+    #[test]
+    fn shown_names() {
+        for (dialect, name, shown) in [
+            (Dialect::ORACLE, "EMP", "emp"),
+            (Dialect::ORACLE, "MY TABLE", "my table"),
+            (Dialect::ORACLE, "Emp", "\"Emp\""),
+            (Dialect::ORACLE, "emp", "\"emp\""),
+            (Dialect::POSTGRES, "Emp", "Emp"),
+            (Dialect::POSTGRES, "emp", "emp"),
+            (Dialect::POSTGRES, "EMP", "EMP"),
+            (Dialect::MYSQL, "Emp", "Emp"),
+            (Dialect::SQLSERVER, "Emp", "Emp"),
+            (Dialect::SQLITE, "Emp", "Emp"),
+        ] {
+            assert_eq!(shown_name(dialect, name), shown, "{dialect:?} {name}");
+        }
+        let emp = |owner: &str| ObjectRef {
+            owner: owner.into(),
+            name: "Emp".into(),
+            object_type: ObjectType::Table,
+        };
+        assert_eq!(shown_qualified(Dialect::ORACLE, &emp("HR")), "hr.\"Emp\"");
+        assert_eq!(
+            shown_qualified(Dialect::POSTGRES, &emp("Sales")),
+            "Sales.Emp"
+        );
+        assert_eq!(shown_qualified(Dialect::POSTGRES, &emp("")), "Emp");
     }
 
     /// Names that need quotes give binds that are binds: a bind ends at a

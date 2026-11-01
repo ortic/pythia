@@ -82,7 +82,7 @@ impl ObjectView {
     }
 
     pub fn title(&self) -> String {
-        self.object.name.to_lowercase()
+        crate::browser::shown_name(self.dialect, &self.object.name)
     }
 
     #[cfg(test)]

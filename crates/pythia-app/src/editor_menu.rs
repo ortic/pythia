@@ -92,9 +92,10 @@ pub fn show(
                 if let Some(connection) = &cx.connection {
                     let icon = Icon::for_object_type(object.object_type.dictionary_name())
                         .unwrap_or(Icon::Text);
+                    let name = crate::browser::shown_qualified(cx.dialect, &object);
                     let name = match &member {
-                        Some(m) => format!("{}.{}", object.qualified(), m).to_lowercase(),
-                        None => object.qualified().to_lowercase(),
+                        Some(m) => format!("{name}.{}", m.to_lowercase()),
+                        None => name,
                     };
                     ui.horizontal(|ui| {
                         ui.add(icon.sized(ui, pythia_ui::icons::IconSize::Small));

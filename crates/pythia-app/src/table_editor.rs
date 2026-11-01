@@ -174,7 +174,9 @@ impl TableEditor {
         if self.creating {
             "New table".to_owned()
         } else {
-            format!("{} (edit)", self.object.name.to_lowercase())
+            // Oracle's tables (Feature::ObjectEditors), named as shown (#272).
+            let name = crate::browser::shown_name(pythia_db::Dialect::ORACLE, &self.object.name);
+            format!("{name} (edit)")
         }
     }
 
