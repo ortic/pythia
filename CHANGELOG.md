@@ -353,6 +353,30 @@ All notable changes to Pythia are documented here. The format follows
   rows" in the result bar, they wrote all 100, in the order fetched,
   while leaving hidden columns out. The message says how many rows were
   exported ("Exported 12 rows to result.csv").
+- MySQL scripts end `SET`, `SHOW`, `DESC`, `EXECUTE` and `START
+  TRANSACTION` at their `;`, as MySQL does (#225). They ended at the end
+  of their line, so what followed on it went to the server with them and
+  ran unseen: `select 1; set @x = 3; select @x;` never showed the result
+  of `select @x`, and a `SET` over two lines failed. `BEGIN` took in the
+  rest of the script, up to a `/`; it now starts a transaction, and
+  MariaDB's `BEGIN NOT ATOMIC` still opens a block.
+- PostgreSQL: a table opened with *Query* in the object browser can be
+  edited, and its INSERT exports name it (#237). The browser writes the
+  schema, `select * from public.orders`, and `public`, spelled like a
+  keyword, made the query look like one that reads no single table: the
+  result had no *Edit*, and *Copy as*, *Export* and *Execute to file*
+  wrote `insert into my_table`. The same went for a MySQL table such as
+  `shop.user`.
+- *Export tables* writes INSERTs into the table as Oracle names it
+  (#242): a name that needs quotes is quoted, as the columns were.
+  `"guidelines-division"` became `insert into guidelines-division`, a
+  syntax error, and `"Foo"` became `foo`, another table. Plain names
+  stay in lowercase.
+- MySQL: names that are MySQL's reserved words, such as `rank`,
+  `system`, `groups`, `change` or `read`, are written in backticks
+  (#233). Only Oracle's keywords were, so INSERT exports of a table with
+  such a column failed with ERROR 1064 when they ran, as did editing
+  that column in a result, and completion inserted the name bare.
 
 ## [0.10.0] - 2026-10-30
 

@@ -734,7 +734,7 @@ fn needs_backticks(name: &str) -> bool {
     let ok_rest = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'));
-    !(ok_start && ok_rest) || RESERVED.contains(&name.to_ascii_uppercase().as_str())
+    !(ok_start && ok_rest) || pythia_plsql::is_reserved(name, pythia_plsql::Syntax::MySql)
 }
 
 /// Whether a SQL Server name must be written in square brackets.
@@ -1257,6 +1257,8 @@ mod tests {
         assert_eq!(text(NameStyle::Brackets, "a]b"), "[a]]b]");
         assert_eq!(text(NameStyle::Brackets, "Emp"), "Emp");
         assert_eq!(text(NameStyle::Backticks, "order"), "`order`");
+        assert_eq!(text(NameStyle::Backticks, "rank"), "`rank`");
+        assert_eq!(text(NameStyle::Backticks, "status"), "status");
         assert_eq!(text(NameStyle::AsWritten, "Emp"), "Emp");
         assert_eq!(text(NameStyle::AsWritten, "order"), "\"order\"");
         assert_eq!(text(NameStyle::AsWritten, "my \"t\""), "\"my \"\"t\"\"\"");

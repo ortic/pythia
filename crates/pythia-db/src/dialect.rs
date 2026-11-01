@@ -241,10 +241,8 @@ impl Dialect {
     /// Server and SQLite keep their case.
     pub fn quote_ident(self, name: &str) -> String {
         let reserved = match self.0 {
-            DbKind::Postgres | DbKind::SqlServer | DbKind::Sqlite => {
-                pythia_plsql::is_reserved(name, self.syntax())
-            }
-            DbKind::Oracle | DbKind::MySql => pythia_plsql::is_keyword(name),
+            DbKind::Oracle => pythia_plsql::is_keyword(name),
+            _ => pythia_plsql::is_reserved(name, self.syntax()),
         };
         let plain = |start: fn(char) -> bool, rest: fn(char) -> bool| {
             name.chars().next().is_some_and(start) && name.chars().all(rest) && !reserved
@@ -401,6 +399,11 @@ mod tests {
         assert_eq!(mysql.quote_ident("my table"), "`my table`");
         assert_eq!(mysql.quote_ident("a`b"), "`a``b`");
         assert_eq!(mysql.quote_ident("2fa"), "`2fa`");
+        // MySQL's reserved words that Oracle's aren't (#233).
+        for word in ["rank", "system", "groups", "change", "read", "Window"] {
+            assert_eq!(mysql.quote_ident(word), format!("`{word}`"));
+        }
+        assert_eq!(mysql.quote_ident("status"), "status");
         assert_eq!(mysql.qualified("pythia", "emp"), "pythia.emp");
         let postgres = Dialect::POSTGRES;
         assert_eq!(postgres.quote_ident("emp_2"), "emp_2");
