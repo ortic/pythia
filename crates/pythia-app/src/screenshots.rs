@@ -1471,6 +1471,271 @@ fn sqlserver_data_editing() {
     });
 }
 
+/// The rows of the focused window's first result as (id, v), the changes
+/// waiting for Apply as (id, v) of the rows updated, (id, v) of the new
+/// rows and the ids of the rows deleted, and its messages.
+type Part = (
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn part(h: &mut Harness<'_, PythiaApp>) -> Part {
+    let w = h.state_mut().test_sql_window();
+    let text = |c: &Option<String>| c.clone().unwrap_or_default();
+    let r = &w.state.results[0];
+    let rows: Vec<(String, String)> = r
+        .rows
+        .iter()
+        .map(|row| (text(&row[0]), text(&row[1])))
+        .collect();
+    let changes = r.grid.changes().cloned().unwrap_or_default();
+    let updates = changes
+        .updates
+        .iter()
+        .map(|(row, cells)| {
+            (
+                rows[*row].0.clone(),
+                cells.get(&1).map(text).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let inserts = changes
+        .inserts
+        .iter()
+        .map(|row| (text(&row[0]), text(&row[1])))
+        .collect();
+    let deletes = changes
+        .deletes
+        .iter()
+        .map(|row| rows[*row].0.clone())
+        .collect();
+    let messages = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    (rows, updates, inserts, deletes, messages)
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect()
+}
+
+/// An Apply that stops part-way, at a statement that fails (a CHECK) or
+/// finds a conflict (#247), on the connection `profile` (named
+/// `shop`) with `create` making `pythia_part (id, v)`, whose CHECK refuses
+/// `bad`: the result shows what was applied, the rest waits for Apply.
+/// Before, the changes before the failure were applied in the transaction
+/// but still pending in the grid, and applying again found a conflict on
+/// the first of them.
+fn applied_part_way_on(profile: ConnectionProfile, password: String, create: &str) {
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, PythiaApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        h.state_mut().test_close_focused();
+    };
+    let apply = |h: &mut Harness<'_, PythiaApp>| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+    };
+    run(&mut h, "drop table if exists pythia_part;");
+    run(
+        &mut h,
+        &format!(
+            "{create};\n\
+             insert into pythia_part (id, v) values (1, 'a');\n\
+             insert into pythia_part (id, v) values (2, 'b');\n\
+             insert into pythia_part (id, v) values (3, 'c');\n\
+             insert into pythia_part (id, v) values (4, 'd');\n\
+             commit;"
+        ),
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from pythia_part order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let grid_window = h.state().test_focused();
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+
+    // Deletes run first, then updates by row, then inserts: the update of
+    // row 2 fails after the delete of 4 and the update of 1.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        r.grid.delete_row(&rows, 3);
+        r.grid.edit_cell(&rows, 0, 1, Some("x".into()));
+        r.grid.edit_cell(&rows, 1, 1, Some("bad".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("z".into()));
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 4, 0, Some("5".into()));
+        r.grid.edit_cell(&rows, 4, 1, Some("n".into()));
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, deletes, messages) = part(&mut h);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m == "3 change(s) weren't applied: they wait for Apply"),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+        "{messages:?}"
+    );
+    assert_eq!(updates, pairs(&[("2", "bad"), ("3", "z")]));
+    assert_eq!(inserts, pairs(&[("5", "n")]));
+    assert!(deletes.is_empty());
+
+    // Corrected, the rest applies once, without a conflict.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("y".into()));
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("Conflict")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z"), ("5", "n")])
+    );
+    assert!(updates.is_empty() && inserts.is_empty());
+
+    // New rows: the first goes in, the second fails and waits.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        for (view, (id, v)) in [(4, ("6", "p")), (5, ("7", "bad"))] {
+            r.grid.add_row(&rows, r.columns.len());
+            r.grid.edit_cell(&rows, view, 0, Some(id.into()));
+            r.grid.edit_cell(&rows, view, 1, Some(v.into()));
+        }
+    }
+    apply(&mut h);
+    let (rows, updates, inserts, _, messages) = part(&mut h);
+    assert_eq!(rows.len(), 5, "{rows:?} {messages:?}");
+    assert_eq!(rows[4], ("6".to_owned(), "p".to_owned()));
+    assert!(updates.is_empty());
+    assert_eq!(inserts, pairs(&[("7", "bad")]));
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 5, 1, Some("q".into()));
+    }
+    apply(&mut h);
+    let (rows, _, inserts, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert_eq!(rows.len(), 6, "{rows:?}");
+    assert_eq!(rows[5], ("7".to_owned(), "q".to_owned()));
+    assert!(inserts.is_empty());
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // A conflict: the row another session changed keeps its value and
+    // loses the change, the change after it waits.
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 0, 1, Some("k".into()));
+        r.grid.edit_cell(&rows, 2, 1, Some("m".into()));
+        r.grid.edit_cell(&rows, 3, 1, Some("o".into()));
+    }
+    run(
+        &mut h,
+        "update pythia_part set v = 'theirs' where id = 3;\ncommit;",
+    );
+    h.state_mut().test_focus(grid_window);
+    apply(&mut h);
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.starts_with("Conflict on row 3")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        &rows[..4],
+        &pairs(&[("1", "k"), ("2", "y"), ("3", "theirs"), ("5", "n")])[..]
+    );
+    assert_eq!(updates, pairs(&[("5", "o")]));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run(&mut h, "drop table pythia_part;");
+}
+
+#[test]
+fn applied_part_way() {
+    let path = std::env::temp_dir().join(format!("pythia-part-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let sqlite = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        ..Default::default()
+    };
+    let create = "create table pythia_part (id int primary key, v varchar(10) not null \
+                  check (v <> 'bad'))";
+    applied_part_way_on(sqlite, String::new(), create);
+    let _ = std::fs::remove_file(&path);
+    for (env, kind) in [
+        ("PYTHIA_TEST_MYSQL", pythia_config::DbKind::MySql),
+        ("PYTHIA_TEST_POSTGRES", pythia_config::DbKind::Postgres),
+        ("PYTHIA_TEST_MSSQL", pythia_config::DbKind::SqlServer),
+    ] {
+        let Some(spec) = std::env::var(env).ok() else {
+            continue;
+        };
+        let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+        let (username, password) = credentials.split_once('/').unwrap();
+        let profile = ConnectionProfile {
+            name: "shop".into(),
+            kind,
+            username: username.into(),
+            connect_string: connect_string.into(),
+            ..Default::default()
+        };
+        applied_part_way_on(profile, password.into(), create);
+    }
+}
+
 /// Types `.` after a table alias in a real editor and waits for the
 /// completion popup, which needs a round trip to the dictionary.
 #[test]

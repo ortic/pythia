@@ -403,6 +403,15 @@ All notable changes to Pythia are documented here. The format follows
   A name another connection has, in any case, is now refused with a
   message, for *Save* and *Connect*; a connection can still change the
   case of its own name, and *Connect* renames it as *Save* does.
+- An *Apply* of result changes that stops part-way, at a value the
+  database refuses or at a conflict, no longer leaves the changes before
+  it applied but still pending (#247). Applying again found a conflict
+  on the first of them ("changed or deleted by another session"), a new
+  row went in twice, and a commit committed changes the grid showed as
+  not applied. The result is now fetched again and shows its rows as
+  they are; the changes that weren't applied wait for *Apply*, but for
+  those on a row another session changed meanwhile, which the messages
+  name.
 
 ## [0.10.0] - 2026-10-30
 
