@@ -125,6 +125,10 @@ All notable changes to Pythia are documented here. The format follows
   a blob in an `image`, `binary(16)` or untyped column was exported as
   text, showed as text and gave a false conflict when its row was
   edited. Text in a BLOB column no longer shows as `0xhello world`.
+- A very long value on one line no longer freezes the result grid
+  (#212). A 10 MB value took 1.6 s to appear, on every scroll that
+  brought it back too, and 470 MB of memory while it was shown; a cell
+  now lays out the first 500 characters of it.
 
 ## [0.10.0] - 2026-10-30
 

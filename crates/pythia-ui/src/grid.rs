@@ -16,6 +16,10 @@ use egui_extras::{Column as TableColumn, TableBuilder};
 use pythia_data::Format;
 use pythia_db::{Cell, Column};
 
+/// The characters of a value's first line a cell lays out at most: more
+/// than any column is wide, and a 10 MB line isn't laid out whole (#212).
+const SHOWN_CHARS: usize = 500;
+
 /// Per-result view state, owned by whoever owns the rows.
 #[derive(Default)]
 pub struct GridState {
@@ -960,16 +964,25 @@ impl Draw<'_> {
     /// A column's width before the user resized it: its header and the first
     /// rows' values, within limits.
     fn initial_width(&self, c: usize) -> f32 {
+        const MAX_CHARS: usize = 48;
         let content = self
             .rows
             .iter()
             .take(200)
             .filter_map(|r| r.get(c)?.as_deref())
-            .map(|v| v.lines().next().unwrap_or_default().chars().count())
+            // No further than the widest column (#212).
+            .map(|v| {
+                v.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(MAX_CHARS)
+                    .count()
+            })
             .max()
             .unwrap_or(4);
         let chars = content.max(self.columns[c].name.chars().count() + 2).max(4) as f32;
-        (chars * self.look.char_width + 16.0).min(self.look.char_width * 48.0)
+        (chars * self.look.char_width + 16.0).min(self.look.char_width * MAX_CHARS as f32)
     }
 }
 
@@ -1451,7 +1464,15 @@ fn data_cell(
         .as_ref()
         .and_then(|e| e.active.as_ref())
         .is_some_and(|(r, ec, _)| *r == view_row && *ec == c);
-    let value = state.value(d.rows, view_row, c).map(str::to_owned);
+    // What the cell shows of the value, not a copy of all of it (#212).
+    let binary = is_binary(col);
+    let shown = state.value(d.rows, view_row, c).map(|text| {
+        if binary {
+            binary_summary(text)
+        } else {
+            cell_text(text)
+        }
+    });
     let mut edit_done = None;
     let (_, response) = row.col(|ui| {
         let rect = ui.max_rect();
@@ -1508,22 +1529,16 @@ fn data_cell(
             Layout::left_to_right(Align::Center)
         };
         let strike = cell_state == CellState::Deleted;
-        let binary = is_binary(col);
-        ui.with_layout(layout, |ui| match value.as_deref() {
-            Some(text) if binary => {
+        ui.with_layout(layout, |ui| match shown {
+            Some(summary) if binary => {
                 ui.add(
-                    egui::Label::new(
-                        look.text(binary_summary(text))
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate()
-                    .selectable(false),
+                    egui::Label::new(look.text(summary).color(ui.visuals().weak_text_color()))
+                        .truncate()
+                        .selectable(false),
                 );
             }
             Some(text) => {
-                let first = text.lines().next().unwrap_or_default();
-                let more = if first.len() < text.len() { " …" } else { "" };
-                let mut rich = look.text(format!("{first}{more}"));
+                let mut rich = look.text(text);
                 if strike {
                     rich = rich.strikethrough();
                 }
@@ -2123,6 +2138,18 @@ fn viewer(
     }
 }
 
+/// What a cell shows of a value: its first line, at most [`SHOWN_CHARS`] of
+/// it, and ` …` when there is more.
+fn cell_text(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    let end = first
+        .char_indices()
+        .nth(SHOWN_CHARS)
+        .map_or(first.len(), |(i, _)| i);
+    let more = if end < text.len() { " …" } else { "" };
+    format!("{}{more}", &first[..end])
+}
+
 /// BLOB, RAW and LONG RAW values arrive as hex text.
 fn is_binary(col: &Column) -> bool {
     let t = col.type_name.to_ascii_uppercase();
@@ -2658,6 +2685,32 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    /// A cell lays out no more of a value than it can show (#212): 10 MB on
+    /// one line took 1.6 s to lay out and kept 470 MB per cell.
+    #[test]
+    fn huge_values_are_cut_to_the_cell() {
+        let columns = cols();
+        let huge = format!("{}\nsecond line", "x".repeat(10 << 20));
+        let rows = vec![vec![Some("1".into()), Some(huge)]];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let cell = drawn
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .find(|t| t.starts_with("xxx"))
+                .expect("the value");
+            assert_eq!(cell, format!("{} …", "x".repeat(SHOWN_CHARS)));
+        }
+        assert!(
+            started.elapsed().as_secs_f64() < 1.0,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// The keys keep reaching the grid after the click that focused it
