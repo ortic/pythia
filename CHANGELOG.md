@@ -396,6 +396,15 @@ All notable changes to Pythia are documented here. The format follows
   cell and the changes waiting for *Apply* were dropped without a word;
   only an uncommitted transaction was asked about. *Discard and close*
   (or *Exit and discard*) goes ahead, *Cancel* keeps them.
+- An *Apply* of result changes that stops part-way, at a value the
+  database refuses or at a conflict, no longer leaves the changes before
+  it applied but still pending (#247). Applying again found a conflict
+  on the first of them ("changed or deleted by another session"), a new
+  row went in twice, and a commit committed changes the grid showed as
+  not applied. The result is now fetched again and shows its rows as
+  they are; the changes that weren't applied wait for *Apply*, but for
+  those on a row another session changed meanwhile, which the messages
+  name.
 
 ## [0.10.0] - 2026-10-30
 

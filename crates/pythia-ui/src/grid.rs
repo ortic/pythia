@@ -477,6 +477,14 @@ impl GridState {
             })
     }
 
+    /// Replaces the pending changes, e.g. with those kept for the rows
+    /// fetched again.
+    pub fn set_changes(&mut self, changes: Changes) {
+        if let Some(e) = &mut self.edit {
+            e.changes = changes;
+        }
+    }
+
     pub fn clear_changes(&mut self) {
         if let Some(e) = &mut self.edit {
             e.changes = Changes::default();

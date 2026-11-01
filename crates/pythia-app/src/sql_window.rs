@@ -79,6 +79,11 @@ pub struct RunState {
     pub relation_requests: BTreeMap<u64, u64>,
     /// Task id of the key lookup an edit waits for.
     pub key_lookup: Option<u64>,
+    /// The Apply under way.
+    pub apply: Option<Apply>,
+    /// The changes an Apply didn't make, for the result (by request id)
+    /// that fetches its rows again (#247).
+    pub unapplied: Option<(u64, crate::data_edit::Unapplied)>,
     /// "Execute to file": the file dialog (with the query), then the run.
     pub to_file_pick: Option<(
         std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
@@ -159,7 +164,21 @@ pub enum Internal {
         replaces: Option<u64>,
     },
     /// DML applying grid changes; must affect exactly `expect_rows` rows.
-    Dml { expect_rows: u64, what: String },
+    Dml {
+        expect_rows: u64,
+        what: String,
+        change: crate::data_edit::Change,
+    },
+}
+
+/// An Apply under way: the result's changes as they were, those that got a
+/// statement, and those whose statement went through.
+pub struct Apply {
+    /// The result, by request id.
+    pub result: u64,
+    pub changes: pythia_ui::Changes,
+    pub planned: Vec<crate::data_edit::Change>,
+    pub applied: Vec<crate::data_edit::Change>,
 }
 
 pub struct Running {
@@ -1013,12 +1032,26 @@ impl SqlWindow {
                     }),
                 }
             }
-            _ => DbRequest::Execute {
-                id,
-                sql: sql.clone(),
-                max_rows: cx.fetch_size,
-                binds: Vec::new(),
-            },
+            _ => {
+                // After an Apply that didn't make every change, as many rows
+                // as the result had, for those changes to find theirs.
+                let rows = match (&internal, &self.state.apply) {
+                    (Internal::EditQuery { replaces, .. }, Some(apply))
+                        if *replaces == Some(apply.result)
+                            && apply.applied.len() < apply.planned.len() =>
+                    {
+                        let fetched = self.state.results.iter().find(|r| r.id == apply.result);
+                        fetched.map_or(0, |r| r.rows.len()) + apply.changes.inserts.len()
+                    }
+                    _ => 0,
+                };
+                DbRequest::Execute {
+                    id,
+                    sql: sql.clone(),
+                    max_rows: cx.fetch_size.max(rows),
+                    binds: Vec::new(),
+                }
+            }
         };
         self.state.running = Some(Running {
             start,
@@ -1047,6 +1080,7 @@ impl SqlWindow {
             return Effects::default();
         }
         let (source, replaces) = (result.sql.clone(), result.id);
+        self.state.apply = None;
         if cx.dialect.kind() == pythia_db::DbKind::Oracle {
             let edit = crate::data_edit::Editable {
                 table,
@@ -1089,6 +1123,40 @@ impl SqlWindow {
         });
     }
 
+    /// Puts the changes an Apply didn't make back on result `id`, fetched
+    /// again, and says what couldn't be kept.
+    fn keep_unapplied(&mut self, id: u64, unapplied: &crate::data_edit::Unapplied) {
+        let Some(result) = self.state.results.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        let width = result.edit.as_ref().map_or(0, |e| e.key.width());
+        let key_start = result.columns.len().saturating_sub(width);
+        let (changes, lost) = unapplied.keep(&result.rows, key_start);
+        let kept = changes.count();
+        result.grid.set_changes(changes);
+        for line in lost {
+            self.warn(line);
+        }
+        if kept > 0 {
+            self.info(format!(
+                "{kept} change(s) weren't applied: they wait for Apply"
+            ));
+        }
+        self.state.bottom = BottomTab::Messages;
+    }
+
+    /// Drops the statements of the Apply that remain, all but the query that
+    /// fetches its result again: the result shows what was applied, and the
+    /// changes that weren't stay pending (#247). Returns how many were
+    /// dropped.
+    fn stop_applying(&mut self) -> usize {
+        let before = self.state.queue.len();
+        self.state
+            .queue
+            .retain(|s| matches!(s.internal, Some(Internal::EditQuery { .. })));
+        before - self.state.queue.len()
+    }
+
     /// Generated DML for the pending changes of result `index`.
     fn pending_dml(&self, index: usize, cx: &DocContext) -> Vec<crate::data_edit::Dml> {
         let Some(result) = self.state.results.get(index) else {
@@ -1115,6 +1183,12 @@ impl SqlWindow {
             return Effects::default();
         };
         let replaces = Some(result.id);
+        self.state.apply = result.grid.changes().map(|changes| Apply {
+            result: result.id,
+            changes: changes.clone(),
+            planned: statements.iter().map(|d| d.change).collect(),
+            applied: Vec::new(),
+        });
         self.state.messages.clear();
         for dml in statements {
             self.state.queue.push_back(PendingStatement {
@@ -1125,6 +1199,7 @@ impl SqlWindow {
                 internal: Some(Internal::Dml {
                     expect_rows: dml.expect_rows,
                     what: dml.what,
+                    change: dml.change,
                 }),
             });
         }
@@ -1516,6 +1591,22 @@ impl SqlWindow {
                     result.sql = edit.source.clone();
                     replace = replaces
                         .and_then(|old| self.state.results.iter().position(|r| r.id == old));
+                    // An Apply's changes that weren't made stay pending.
+                    if let (Some(i), Some(apply)) = (
+                        replace,
+                        self.state.apply.take_if(|a| Some(a.result) == *replaces),
+                    ) {
+                        let unapplied = crate::data_edit::Unapplied::new(
+                            &apply.changes,
+                            &apply.planned,
+                            &apply.applied,
+                            &self.state.results[i].rows,
+                            key_start,
+                        );
+                        if !unapplied.is_empty() {
+                            self.state.unapplied = Some((id, unapplied));
+                        }
+                    }
                 }
                 let index = match replace {
                     Some(i) => {
@@ -1672,6 +1763,9 @@ impl SqlWindow {
                     "{rows} selected in {}{suffix}",
                     fmt_duration(elapsed)
                 ));
+                if let Some((_, unapplied)) = self.state.unapplied.take_if(|(r, _)| *r == id) {
+                    self.keep_unapplied(id, &unapplied);
+                }
                 effects.extend(self.run_next(cx));
             }
             DbEvent::Executed {
@@ -1679,22 +1773,29 @@ impl SqlWindow {
             } => {
                 let running = self.state.running.take();
                 self.state.done += 1;
-                if let Some(Internal::Dml { expect_rows, what }) =
-                    running.as_ref().and_then(|r| r.internal.clone())
+                if let Some(Internal::Dml {
+                    expect_rows,
+                    what,
+                    change,
+                }) = running.as_ref().and_then(|r| r.internal.clone())
                 {
                     if summary.rows_affected != Some(expect_rows) {
-                        let skipped = std::mem::take(&mut self.state.queue).len();
+                        let skipped = self.stop_applying();
                         self.state.messages.push(Message {
                             level: Level::Error,
                             text: format!(
                                 "Conflict on {what}: it was changed or deleted by another session since it was fetched. \
-                                 Nothing after it was applied ({skipped} statement(s) skipped); roll back or refresh and retry."
+                                 Nothing after it was applied ({skipped} statement(s) skipped)."
                             ),
                             jump: None,
                             stack: Vec::new(),
                         });
                         self.state.bottom = BottomTab::Messages;
+                        effects.extend(self.run_next(cx));
                         return effects;
+                    }
+                    if let Some(apply) = &mut self.state.apply {
+                        apply.applied.push(change);
                     }
                     if !self
                         .state
@@ -1732,7 +1833,7 @@ impl SqlWindow {
                     return effects;
                 }
                 self.error(&error);
-                self.state.running = None;
+                let running = self.state.running.take();
                 self.state.done += 1;
                 if self.state.continue_on_error && !self.state.queue.is_empty() {
                     self.info(format!(
@@ -1742,10 +1843,21 @@ impl SqlWindow {
                     effects.extend(self.run_next(cx));
                     return effects;
                 }
-                let dropped = std::mem::take(&mut self.state.queue).len();
+                // A lost connection rolled the changes before it back: they
+                // all stay pending, on the rows as they were.
+                let applying = !error.is_connection_lost()
+                    && matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
+                let dropped = if applying {
+                    self.stop_applying()
+                } else {
+                    std::mem::take(&mut self.state.queue).len()
+                };
                 self.info(format!("Failed after {}", fmt_duration(elapsed)));
                 if dropped > 0 {
                     self.info(format!("{dropped} remaining statement(s) skipped"));
+                }
+                if applying {
+                    effects.extend(self.run_next(cx));
                 }
             }
             DbEvent::TaskDone { id, result }

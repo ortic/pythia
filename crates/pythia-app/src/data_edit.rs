@@ -12,6 +12,8 @@
 //! concurrency), so a row changed by another session is reported as a
 //! conflict rather than silently overwritten.
 
+use std::collections::{BTreeMap, HashMap};
+
 use pythia_data::literal;
 use pythia_db::{Cell, Client, Column, DbError, DbKind, Dialect};
 use pythia_plsql::{TokenKind, tokenize};
@@ -724,6 +726,134 @@ pub struct Dml {
     pub expect_rows: u64,
     /// Human description for conflict messages, e.g. `row 12`.
     pub what: String,
+    /// The change it applies.
+    pub change: Change,
+}
+
+/// A pending change of the grid, by its index there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// A fetched row deleted.
+    Delete(usize),
+    /// A fetched row's cells changed.
+    Update(usize),
+    /// A new row.
+    Insert(usize),
+}
+
+/// A row's changed cells: column → (value fetched, new value).
+type Cells = BTreeMap<usize, (Cell, Cell)>;
+
+/// The changes of an Apply that weren't made, by the key of their rows (the
+/// result's last columns), to keep pending once the result is fetched
+/// again (#247): those whose statement failed, found a conflict or didn't
+/// run.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Unapplied {
+    /// A row's key, and its changed cells.
+    updates: Vec<(Vec<Cell>, Cells)>,
+    deletes: Vec<Vec<Cell>>,
+    inserts: Vec<Vec<Cell>>,
+}
+
+impl Unapplied {
+    /// The `changes` to `rows` that had a statement (`planned`) but weren't
+    /// `applied`; those without one are dropped, as an Apply drops them.
+    pub fn new(
+        changes: &Changes,
+        planned: &[Change],
+        applied: &[Change],
+        rows: &[Vec<Cell>],
+        key_start: usize,
+    ) -> Self {
+        let mut out = Self::default();
+        let key = |r: usize| {
+            rows.get(r)
+                .map(|row| row[key_start.min(row.len())..].to_vec())
+        };
+        for change in planned.iter().filter(|c| !applied.contains(c)) {
+            match *change {
+                Change::Delete(r) => out.deletes.extend(key(r)),
+                Change::Update(r) => {
+                    let (Some(key), Some(cells)) = (key(r), changes.updates.get(&r)) else {
+                        continue;
+                    };
+                    let cells = cells
+                        .iter()
+                        .map(|(&c, new)| (c, (value(&rows[r], c), new.clone())))
+                        .collect();
+                    out.updates.push((key, cells));
+                }
+                Change::Insert(i) => out.inserts.extend(changes.inserts.get(i).cloned()),
+            }
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.deletes.is_empty() && self.inserts.is_empty()
+    }
+
+    /// The changes again, on `rows` (the result fetched again), and what
+    /// wasn't kept: a row no longer among them, or one whose cells changed
+    /// no longer have the values fetched. Another session changed those,
+    /// which the next Apply would have reported as a conflict, and the
+    /// change would now overwrite.
+    pub fn keep(&self, rows: &[Vec<Cell>], key_start: usize) -> (Changes, Vec<String>) {
+        let at: HashMap<&[Cell], usize> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| (&row[key_start.min(row.len())..], r))
+            .collect();
+        let name = |key: &[Cell]| {
+            key.iter()
+                .map(|v| v.as_deref().unwrap_or("NULL"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut changes = Changes::default();
+        let mut lost = Vec::new();
+        for key in &self.deletes {
+            match at.get(key.as_slice()) {
+                Some(&r) => {
+                    changes.deletes.insert(r);
+                }
+                None => lost.push(format!(
+                    "The row with key {} isn't in the result any more: it wasn't deleted",
+                    name(key)
+                )),
+            }
+        }
+        for (key, cells) in &self.updates {
+            let Some(&r) = at.get(key.as_slice()) else {
+                lost.push(format!(
+                    "The row with key {} isn't in the result any more: its changes weren't kept",
+                    name(key)
+                ));
+                continue;
+            };
+            if cells
+                .iter()
+                .any(|(&c, (fetched, _))| value(&rows[r], c) != *fetched)
+            {
+                lost.push(format!(
+                    "The row with key {} was changed by another session: its changes weren't kept",
+                    name(key)
+                ));
+                continue;
+            }
+            let cells: BTreeMap<usize, Cell> = cells
+                .iter()
+                .filter(|(_, (fetched, new))| fetched != new)
+                .map(|(&c, (_, new))| (c, new.clone()))
+                .collect();
+            if !cells.is_empty() {
+                changes.updates.insert(r, cells);
+            }
+        }
+        changes.inserts = self.inserts.clone();
+        (changes, lost)
+    }
 }
 
 /// PostgreSQL types compared with `=`: their text reads back as the value
@@ -916,6 +1046,7 @@ pub fn dml(
             sql: format!("delete from {table} where {found}"),
             expect_rows: 1,
             what: format!("row {}", r + 1),
+            change: Change::Delete(r),
         });
     }
     for (&r, cells) in &changes.updates {
@@ -963,6 +1094,7 @@ pub fn dml(
             ),
             expect_rows: 1,
             what: format!("row {}", r + 1),
+            change: Change::Update(r),
         });
     }
     for (i, row) in changes.inserts.iter().enumerate() {
@@ -991,6 +1123,7 @@ pub fn dml(
             ),
             expect_rows: 1,
             what: format!("new row {}", i + 1),
+            change: Change::Insert(i),
         });
     }
     out
@@ -1292,6 +1425,83 @@ mod tests {
                 "insert into emp (ID) values (3)",
             ]
         );
+    }
+
+    /// What an Apply that stopped part-way didn't make stays pending on the
+    /// rows fetched again (#247), on Oracle by ROWID: row 3's delete and
+    /// row 1's update went through, row 2's failed and row 4's didn't run.
+    /// A row another session changed loses its change, as does one that's
+    /// gone; the new row stays new.
+    #[test]
+    fn unapplied_changes_stay_pending() {
+        let row = |id: &str, name: &str, rowid: &str| {
+            vec![
+                Some(id.to_owned()),
+                Some(name.to_owned()),
+                Some(rowid.to_owned()),
+            ]
+        };
+        let columns = vec![
+            col("ID", "NUMBER", true),
+            col("NAME", "VARCHAR2(10)", false),
+            col(ROWID_COLUMN, "ROWID", false),
+        ];
+        let rows = vec![
+            row("1", "a", "AAA1"),
+            row("2", "b", "AAA2"),
+            row("3", "c", "AAA3"),
+            row("4", "d", "AAA4"),
+            row("5", "e", "AAA5"),
+        ];
+        let set = |v: &str| BTreeMap::from([(1, Some(v.to_owned()))]);
+        let changes = Changes {
+            updates: BTreeMap::from([(0, set("x")), (1, set("y")), (3, set("z")), (4, set("w"))]),
+            inserts: vec![vec![Some("6".into()), Some("n".into()), None]],
+            deletes: [2].into(),
+        };
+        let edit = Editable {
+            table: "emp".into(),
+            source: "select * from emp".into(),
+            key: RowKey::Rowid,
+        };
+        let planned: Vec<Change> = dml(Dialect::ORACLE, &edit, &columns, &rows, &changes)
+            .into_iter()
+            .map(|d| d.change)
+            .collect();
+        assert_eq!(
+            planned,
+            [
+                Change::Delete(2),
+                Change::Update(0),
+                Change::Update(1),
+                Change::Update(3),
+                Change::Update(4),
+                Change::Insert(0),
+            ]
+        );
+        let applied = [Change::Delete(2), Change::Update(0)];
+        let unapplied = Unapplied::new(&changes, &planned, &applied, &rows, 2);
+        assert!(!unapplied.is_empty());
+        // Fetched again: 3 is gone, 1 has its new value, another session
+        // changed 4 and deleted 5, and the rows come in another order.
+        let again = vec![
+            row("4", "theirs", "AAA4"),
+            row("2", "b", "AAA2"),
+            row("1", "x", "AAA1"),
+        ];
+        let (kept, lost) = unapplied.keep(&again, 2);
+        assert_eq!(kept.updates, BTreeMap::from([(1, set("y"))]));
+        assert_eq!(kept.inserts, changes.inserts);
+        assert!(kept.deletes.is_empty());
+        assert_eq!(
+            lost,
+            [
+                "The row with key AAA4 was changed by another session: its changes weren't kept",
+                "The row with key AAA5 isn't in the result any more: its changes weren't kept",
+            ]
+        );
+        // Everything applied: nothing to keep.
+        assert!(Unapplied::new(&changes, &planned, &planned, &rows, 2).is_empty());
     }
 
     #[test]
