@@ -149,9 +149,15 @@ impl ExportTables {
         self.start()
     }
 
+    /// The schema as typed, as Oracle reads it: `"my_schema"` as written,
+    /// others in uppercase (#337); empty for the current one.
+    fn owner(&self) -> String {
+        Dialect::ORACLE.typed_name(&self.owner)
+    }
+
     fn load_tables(&mut self) -> Effects {
         let mut effects = Effects::default();
-        let owner = self.owner.trim().to_uppercase();
+        let owner = self.owner();
         let id = request_id();
         self.state.tables_request = Some(id);
         let task: pythia_db::TaskFn = Box::new(move |conn: &Connection| {
@@ -202,7 +208,7 @@ impl ExportTables {
             return effects;
         }
         let settings = Settings {
-            owner: self.owner.trim().to_uppercase(),
+            owner: self.owner(),
             folder: folder.clone(),
             format: self.format,
             options: Options {

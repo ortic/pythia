@@ -159,7 +159,8 @@ impl DataSearch {
         if value.trim().is_empty() || self.is_busy() {
             return effects;
         }
-        let owner = Some(self.owner.trim().to_uppercase())
+        // As Oracle reads it: `"my_schema"` as written (#337).
+        let owner = Some(Dialect::ORACLE.typed_name(&self.owner))
             .filter(|o| !o.is_empty())
             .or_else(|| {
                 cx.catalog

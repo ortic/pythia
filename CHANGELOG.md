@@ -840,6 +840,14 @@ All notable changes to Pythia are documented here. The format follows
   "… not found", and `"myproc"` in the outline and "… isn't in the
   body". They read quoted where they have lowercase letters, others in
   lowercase.
+- The *Schema* of *Export tables*, *Search data* and *Search source*
+  takes a quoted name as written (#337): `"r71_schema"` finds the schema
+  `r71_schema`, `hr` still `HR`. They uppercased what was typed, quotes
+  and all, so a schema with lowercase letters couldn't be named and
+  nothing was found. So does a connection's *Default schema*, which gave
+  "Login script: ORA-01741" for `"r71_schema"` on Oracle, a schema
+  `"""sales"""` for `"Sales"` on PostgreSQL and failed for MySQL's
+  `` `my db` ``.
 
 ## [0.10.0] - 2026-10-30
 

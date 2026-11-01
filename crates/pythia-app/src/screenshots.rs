@@ -403,6 +403,90 @@ fn screenshots() {
     }
 }
 
+/// The Schema of Export tables, Search data and Search source takes a
+/// quoted name as written and others in uppercase, as Oracle reads names:
+/// a schema "r71_schema" is found by `"r71_schema"` (#337).
+#[test]
+fn schemas_are_taken_as_typed() {
+    let (Some((profile, password)), Some(dba)) =
+        (profile(), crate::test_db::connect("PYTHIA_TEST_DB_DBA"))
+    else {
+        eprintln!("PYTHIA_TEST_DB / PYTHIA_TEST_DB_DBA not set, skipping");
+        return;
+    };
+    let user = profile.username.to_uppercase();
+    let _ = dba.execute("drop user \"r71_schema\" cascade", &[]);
+    for sql in [
+        "create user \"r71_schema\" no authentication quota unlimited on users".to_owned(),
+        "create table \"r71_schema\".r71_t (name varchar2(20))".to_owned(),
+        "insert into \"r71_schema\".r71_t values ('r71_needle')".to_owned(),
+        "commit".to_owned(),
+        format!("grant select on \"r71_schema\".r71_t to {user}"),
+        "create procedure \"r71_schema\".r71_p is begin null; -- r71_needle\nend;".to_owned(),
+        format!("grant execute on \"r71_schema\".r71_p to {user}"),
+    ] {
+        dba.execute(&sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let typed = "\"r71_schema\"";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    let folder = std::env::temp_dir().join(format!("pythia-r71-export-{}", std::process::id()));
+    let export = h.state_mut().test_export_tables();
+    export.owner = typed.into();
+    export.folder = Some(folder.clone());
+    h.get_by_label("Reload").click();
+    h.run_steps(3);
+    wait_until(&mut h, "tables of the schema", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(h.query_all_by_label("r71_t").count(), 1);
+    h.get_by_label("Select all").click();
+    h.run_steps(2);
+    let effects = h.state_mut().test_export_tables().start_now();
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_export_tables().message().cloned();
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 1 rows from 1 table(s)")),
+        "{message:?}"
+    );
+    let csv = std::fs::read_to_string(folder.join("r71_t.csv")).unwrap();
+    assert!(csv.contains("r71_needle"), "{csv}");
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::SearchData);
+    h.run_steps(3);
+    h.state_mut().test_data_search().owner = typed.into();
+    h.state_mut().test_search_data("r71_needle", false);
+    wait_until(&mut h, "data search", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_data_hits(), ["R71_T.NAME=1"]);
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::FindInSource);
+    h.run_steps(3);
+    h.state_mut().test_source_search().owner = typed.into();
+    h.state_mut().test_search_source("r71_needle");
+    wait_until(&mut h, "source search", |app| !app.test_focused_busy());
+    assert!(
+        h.query_by_label_contains("r71_schema.R71_P").is_some(),
+        "no hit in r71_p"
+    );
+    h.state_mut().test_close_focused();
+
+    dba.execute("drop user \"r71_schema\" cascade", &[])
+        .unwrap();
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
 /// Edits a result in the grid, applies it, and checks that a row changed by
 /// another session in the meantime is reported as a conflict.
 #[test]
