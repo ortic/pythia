@@ -150,7 +150,7 @@ pub(crate) fn run(
             }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
-                let result = crate::pg_meta::run(&worker.pg(), &query);
+                let result = worker.meta(&query);
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -274,6 +274,24 @@ impl Worker {
             client: &self.client,
             release: self.release,
         }
+    }
+
+    /// Answers a dictionary lookup or a plan (a SQL window's, #269). In a
+    /// transaction it runs after a savepoint, so one that fails doesn't
+    /// abort the transaction.
+    fn meta(&self, query: &MetaQuery) -> Result<MetaResult, DbError> {
+        if !self.tx.pending {
+            return crate::pg_meta::run(&self.pg(), query);
+        }
+        self.pg().execute(&format!("savepoint {SAVEPOINT}"))?;
+        let result = crate::pg_meta::run(&self.pg(), query);
+        let back = if result.is_ok() {
+            format!("release savepoint {SAVEPOINT}")
+        } else {
+            format!("rollback to savepoint {SAVEPOINT}; release savepoint {SAVEPOINT}")
+        };
+        self.pg().execute(&back)?;
+        result
     }
 
     /// Runs the login statements, which may set the search path (#103),

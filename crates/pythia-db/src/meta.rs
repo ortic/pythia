@@ -792,7 +792,31 @@ fn test_link(conn: &Connection, owner: &str, name: &str) -> Result<String, DbErr
     Ok(result?)
 }
 
+/// The plan of `sql` from `EXPLAIN PLAN`, which writes it into PLAN_TABLE.
+/// The session's transaction stays as it was, a SQL window's (#269): the
+/// plan's rows are rolled back to a savepoint when a transaction is open,
+/// with the transaction they started when none is, also without a plan.
 fn explain_plan(conn: &Connection, sql: &str) -> Result<MetaResult, DbError> {
+    let open = conn
+        .query_row_as::<Option<String>>(
+            "select dbms_transaction.local_transaction_id from dual",
+            &[],
+        )?
+        .is_some();
+    if open {
+        conn.execute("savepoint pythia_explain", &[])?;
+    }
+    let result = plan_rows(conn, sql);
+    if open {
+        conn.execute("rollback to savepoint pythia_explain", &[])?;
+    } else {
+        conn.rollback()?;
+    }
+    result
+}
+
+/// [`explain_plan`]'s rows, left in PLAN_TABLE.
+fn plan_rows(conn: &Connection, sql: &str) -> Result<MetaResult, DbError> {
     let statement_id = format!("PYTHIA{}", std::process::id());
     conn.execute(
         "delete from plan_table where statement_id = :1",
@@ -810,16 +834,10 @@ fn explain_plan(conn: &Connection, sql: &str) -> Result<MetaResult, DbError> {
            from plan_table where statement_id = :1 order by id",
         &[&statement_id],
     )?;
-    let result = table_result(
+    table_result(
         rows,
         &["ID", "PARENT_ID", "DEPTH", "COST", "ROWS", "BYTES", "TIME"],
-    );
-    conn.execute(
-        "delete from plan_table where statement_id = :1",
-        &[&statement_id],
-    )?;
-    conn.rollback()?;
-    result
+    )
 }
 
 /// The plan of a cursor in the shared pool with the row source statistics

@@ -508,6 +508,14 @@ All notable changes to Pythia are documented here. The format follows
   of a fetched row failed the same way, and a text column's NULL was
   replaced by `''`. *Set NULL* and the value editor's *Apply* work as
   before.
+- *Explain Plan* in a SQL window explains on the window's own session,
+  where its statements run (#269). It used the connection's main session,
+  so a temporary table, a search path, a current schema or a `use db` of
+  the window didn't count: Explain said there was no such table, or
+  explained another schema's. The window's transaction stays as it was,
+  also when there is no plan. While the window runs a statement, Explain
+  says so; on MySQL, PostgreSQL, SQL Server and SQLite it ends the fetch
+  of a result with rows left, which then says it shows the rows fetched.
 
 ## [0.10.0] - 2026-10-30
 

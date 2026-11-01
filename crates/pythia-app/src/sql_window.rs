@@ -195,6 +195,9 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Cell>>,
     /// More rows can be fetched.
     pub more: bool,
+    /// Its query was ended with rows left, which can't be fetched now
+    /// (#269).
+    pub ended: bool,
     pub elapsed: Duration,
     pub grid: GridState,
     /// Set once the result was made editable.
@@ -379,20 +382,7 @@ impl SqlWindow {
     }
 
     pub fn is_running(&self) -> bool {
-        self.state.running.is_some()
-            || self.state.to_file.is_some()
-            || self.state.fetching.is_some()
-            || self.state.prompt.is_some()
-            || self
-                .state
-                .statistics
-                .as_ref()
-                .is_some_and(|(_, r)| r.is_none())
-            || self
-                .state
-                .profile
-                .as_ref()
-                .is_some_and(|(_, r)| r.is_none())
+        self.session_busy() || self.state.prompt.is_some()
     }
 
     /// Whether Debug has an anonymous block to run (the selection's first
@@ -805,15 +795,39 @@ impl SqlWindow {
         effects
     }
 
-    /// Runs `EXPLAIN PLAN` for the current statement (on the main session).
+    /// Runs `EXPLAIN PLAN` for the current statement in the window's own
+    /// session, which sees what its statements did (#269): its temporary
+    /// tables, search path or current schema.
     pub fn explain(&mut self) -> Effects {
         let mut effects = Effects::default();
+        if self.session_busy() {
+            self.info(
+                "Explain plan runs in this window's session, which is running a statement: \
+                 try again once it's done",
+            );
+            self.state.bottom = BottomTab::Messages;
+            return effects;
+        }
         let Some(stmt) = self.statements(true).into_iter().next() else {
             return effects;
         };
         if stmt.kind != StatementKind::Sql {
             self.info("Explain plan works for SQL statements only");
             return effects;
+        }
+        // Their sessions read one result at a time: the plan's query ends
+        // the one with rows left, whose FetchMore would then find none.
+        if self.state.syntax != Syntax::Oracle
+            && let Some(open) = self.state.results.last_mut().filter(|r| r.more && !r.ended)
+        {
+            open.ended = true;
+            let text = format!(
+                "{} shows the {} rows fetched: Explain plan ended its query (run it again for \
+                 the rest)",
+                open.title,
+                open.rows.len()
+            );
+            self.info(text);
         }
         let id = request_id();
         self.state.plan = Some(Plan {
@@ -824,13 +838,31 @@ impl SqlWindow {
         self.state.bottom = BottomTab::Plan;
         let sql = substitute(&stmt.sql, &self.defines, self.state.syntax);
         effects.request(
-            Target::Main,
+            Target::Own,
             DbRequest::Meta {
                 id,
                 query: MetaQuery::ExplainPlan { sql },
             },
         );
         effects
+    }
+
+    /// Whether the window's session is busy with a statement, a fetch or a
+    /// tool of the window.
+    fn session_busy(&self) -> bool {
+        self.state.running.is_some()
+            || self.state.to_file.is_some()
+            || self.state.fetching.is_some()
+            || self
+                .state
+                .statistics
+                .as_ref()
+                .is_some_and(|(_, r)| r.is_none())
+            || self
+                .state
+                .profile
+                .as_ref()
+                .is_some_and(|(_, r)| r.is_none())
     }
 
     /// Sends the next queued statement, handling SQL*Plus commands locally.
@@ -1565,6 +1597,7 @@ impl SqlWindow {
                     columns,
                     rows: Vec::new(),
                     more: true,
+                    ended: false,
                     elapsed: Duration::ZERO,
                     grid: GridState::default(),
                     edit: None,
@@ -2303,7 +2336,7 @@ impl SqlWindow {
                             icon_text_button(ui, Icon::Grid, "Fetch all")
                         }
                     };
-                    if result.more && idle && fetch_all(ui).clicked() {
+                    if result.more && !result.ended && idle && fetch_all(ui).clicked() {
                         state.fetching = Some(result.id);
                         effects.request(
                             Target::Own,
@@ -2395,7 +2428,7 @@ impl SqlWindow {
                     });
                 }
                 let result = &state.results[i];
-                let is_open = state.results.len() == i + 1 && result.more;
+                let is_open = state.results.len() == i + 1 && result.more && !result.ended;
                 if out.reached_end && is_open && state.running.is_none() && state.fetching.is_none()
                 {
                     state.fetching = Some(result.id);
@@ -3758,6 +3791,76 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The plan requested of the window's own session, by the effects.
+    fn explained(effects: &Effects) -> Vec<String> {
+        effects
+            .requests
+            .iter()
+            .filter_map(|(target, r)| match (target, r) {
+                (
+                    Target::Own,
+                    DbRequest::Meta {
+                        query: MetaQuery::ExplainPlan { sql },
+                        ..
+                    },
+                ) => Some(sql.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Explain plan runs in the window's own session (#269), so not while
+    /// a statement runs there. On MySQL its query ends a result's fetch:
+    /// the result says so instead of fetching nothing more.
+    #[test]
+    fn explain_runs_in_the_windows_session() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "select * from t".into());
+        assert_eq!(explained(&w.explain()), ["select * from t"]);
+
+        let running = sent(&w.execute(false, &cx));
+        assert_eq!(running.len(), 1);
+        assert_eq!(explained(&w.explain()), Vec::<String>::new());
+        assert!(
+            w.state
+                .messages
+                .last()
+                .is_some_and(|m| m.text.contains("running a statement")),
+        );
+        let id = running[0].0;
+        w.on_event(
+            DbEvent::QueryStarted {
+                id,
+                columns: Vec::new(),
+            },
+            &cx,
+        );
+        w.on_event(
+            DbEvent::Rows {
+                id,
+                rows: vec![Vec::new(); 100],
+                more: true,
+                elapsed: Duration::ZERO,
+            },
+            &cx,
+        );
+        // Oracle keeps the result open.
+        assert_eq!(explained(&w.explain()), ["select * from t"]);
+        assert!(!w.state.results[0].ended);
+
+        w.state.syntax = Syntax::MySql;
+        assert_eq!(explained(&w.explain()), ["select * from t"]);
+        let result = &w.state.results[0];
+        assert!(result.more && result.ended);
+        assert!(
+            w.state
+                .messages
+                .iter()
+                .any(|m| m.text.starts_with("Result 1 shows the 100 rows fetched")),
+        );
     }
 
     /// On a read-only connection only queries reach the server: also the

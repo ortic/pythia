@@ -455,6 +455,7 @@ mod tests {
             }],
             rows: vec![vec![Some("KING".into())]],
             more: false,
+            ended: false,
             elapsed: Default::default(),
             grid: Default::default(),
             edit: None,
