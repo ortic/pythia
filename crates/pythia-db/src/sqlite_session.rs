@@ -27,7 +27,7 @@ use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{WHOLE_BATCH_BYTES, hex, release, replace_binds, row_bytes, statement_kind};
 use crate::types::{
-    Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
 
 /// How long a statement waits for another session's lock on the file.
@@ -415,7 +415,7 @@ impl Worker {
         id: u64,
         sql: &str,
         max_rows: usize,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
@@ -753,15 +753,17 @@ pub(crate) fn cell(value: ValueRef<'_>, whole: bool) -> Cell {
 }
 
 /// Replaces `:name` binds by `?` with their values in order.
-fn positional(sql: &str, binds: &[(String, Option<String>)]) -> (String, Vec<Value>) {
+fn positional(sql: &str, binds: &[(String, Bind)]) -> (String, Vec<Value>) {
     if binds.is_empty() {
         return (sql.to_owned(), Vec::new());
     }
     let mut values = Vec::new();
     let sql = replace_binds(sql, binds, |_, value| {
         values.push(match value {
-            Some(v) => bind_value(v),
-            None => Value::Null,
+            Bind::Text(Some(v)) => bind_value(v),
+            Bind::Text(None) => Value::Null,
+            Bind::Bytes(bytes) => Value::Blob(bytes.to_vec()),
+            Bind::LongText(text) => Value::Text(text.to_string()),
         });
         "?".into()
     });

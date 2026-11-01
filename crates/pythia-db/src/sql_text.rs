@@ -4,6 +4,7 @@
 use pythia_plsql::{Syntax, TokenKind, tokenize};
 
 use crate::compat::Release;
+use crate::types::Bind;
 
 /// The first one or two words of a statement, uppercase, comments skipped.
 pub(crate) fn leading_words(sql: &str) -> Vec<String> {
@@ -71,8 +72,8 @@ pub(crate) fn has_inner_semicolon(sql: &str) -> bool {
 /// position (from 1) and value.
 pub(crate) fn replace_binds(
     sql: &str,
-    binds: &[(String, Option<String>)],
-    mut replace: impl FnMut(usize, &Option<String>) -> String,
+    binds: &[(String, Bind)],
+    mut replace: impl FnMut(usize, &Bind) -> String,
 ) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
@@ -139,12 +140,16 @@ pub fn float_text<F: std::fmt::Debug + std::fmt::Display>(value: F) -> String {
 
 /// The size of a binary value a result holds cut short: the number in
 /// `… (10485760 bytes)` after the hex of its first [`SHOWN_BYTES`] (also
-/// after SQL Server's `0x`). `None` for any other text.
+/// after SQL Server's `0x`, and PostgreSQL's `\x` of a file's bytes the
+/// grid shows so, #293). `None` for any other text.
 pub fn cut_size(value: &str) -> Option<u64> {
     if !value.ends_with(" bytes)") {
         return None;
     }
-    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("\\x"))
+        .unwrap_or(value);
     let (head, tail) = hex.split_at_checked(SHOWN_BYTES * 2)?;
     let size: u64 = tail
         .strip_prefix("… (")?
@@ -228,13 +233,13 @@ mod tests {
         assert!(has_inner_semicolon("select 1; select 2"));
         assert!(!has_inner_semicolon("select ';' from t;"));
         let binds = vec![
-            ("id".to_owned(), Some("7".to_owned())),
-            ("n".to_owned(), None),
+            ("id".to_owned(), Some("7".to_owned()).into()),
+            ("n".to_owned(), Bind::Text(None)),
         ];
         let sql = replace_binds(
             "select * from t where id = :ID or :n is null and x = ':id' and y = :other",
             &binds,
-            |i, v| format!("${i}{}", if v.is_some() { "v" } else { "" }),
+            |i, v| format!("${i}{}", if *v == Bind::Text(None) { "" } else { "v" }),
         );
         assert_eq!(
             sql,
@@ -252,6 +257,7 @@ mod tests {
         assert_eq!(cut, format!("{}… (10000 bytes)", "AB".repeat(4000)));
         assert_eq!(cut_size(&cut), Some(10_000));
         assert_eq!(cut_size(&format!("0x{cut}")), Some(10_000));
+        assert_eq!(cut_size(&format!("\\x{cut}")), Some(10_000));
         let whole = hex(&big, true);
         assert_eq!(whole, "AB".repeat(10_000));
         assert_eq!(cut_size(&whole), None);

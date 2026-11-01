@@ -42,6 +42,30 @@ All notable changes to Pythia are documented here. The format follows
   isn't used as a key. The database fills in an identity or serial left
   empty in a new row. On SQL Server, rows affected are the statement's own
   also with `SET NOCOUNT ON` or a trigger that changes other rows.
+- *Save to file…* writes a binary or long text value of a result to a
+  file (#293), from the cell's context menu or from *View value…*: the
+  bytes as they are, text as UTF-8, on a helper thread. The dialog
+  suggests the column's name with `.bin` or `.txt`, or the extension the
+  first bytes say (`.png`, `.jpg`, `.gif`, `.pdf`, `.zip`, `.gz`). The
+  grid holds a binary value past 4000 bytes cut short (#204): a result
+  being edited fetches the value again whole by its row's key, a result
+  that isn't saves what the grid holds whole and asks to be edited for
+  the rest. A change not applied is saved as it is. The columns: Oracle's
+  BLOB, RAW, LONG RAW, CLOB, NCLOB and LONG; MySQL's BLOB, BINARY,
+  VARBINARY and TEXT; PostgreSQL's bytea and text; SQL Server's binary,
+  varbinary, image, varchar, nvarchar, text and ntext; SQLite's blob and
+  text columns.
+  *Load from file…*, in the context menu and the value editor of a result
+  being edited, makes a file the cell's pending change: its bytes in a
+  binary column, its text in a text column, which takes UTF-8 only. The
+  cell shows it by its size, Ctrl+Z takes it back, and *Apply* binds it
+  whole rather than writing it as a literal, which Oracle refuses past
+  4000 characters and which is impractical for megabytes anywhere. Files
+  up to 256 MB load. On Oracle, *Apply* also binds a value typed that no
+  literal holds: over 2000 bytes in a BLOB, RAW or LONG RAW (ORA-01704),
+  over 4000 bytes of text in a LONG (ORA-64203), and a CLOB's or NCLOB's
+  over 200,000 characters, near where its literal of parts (#317) fails
+  with ORA-01489.
 
 ### Changed
 - `&name` substitution variables are SQL\*Plus's, so only Oracle's SQL

@@ -90,15 +90,30 @@ impl Live {
 
     /// Runs a statement as a SQL window does.
     fn run(&mut self, sql: &str) -> Result<Ran, DbError> {
+        self.run_with(sql, Vec::new())
+    }
+
+    /// Runs a statement of an Apply, with its binds (#293).
+    fn apply(&mut self, statement: &super::Dml) -> Result<Ran, DbError> {
+        self.run_with(&statement.sql, statement.binds.clone())
+    }
+
+    fn run_with(
+        &mut self,
+        sql: &str,
+        binds: Vec<(String, pythia_db::Bind)>,
+    ) -> Result<Ran, DbError> {
         self.session.send(DbRequest::Execute {
             id: 1,
             sql: sql.into(),
             max_rows: 100_000,
-            binds: Vec::new(),
+            binds,
         });
         let mut columns = Vec::new();
         let mut outcome = None;
-        // The session's transaction is reported last.
+        // The session's transaction is reported last; Oracle's before the
+        // event that ends the statement.
+        let oracle = self.dialect.kind() == DbKind::Oracle;
         loop {
             match self.next() {
                 DbEvent::QueryStarted { columns: c, .. } => columns = c,
@@ -109,12 +124,15 @@ impl Live {
                     outcome = Some(Ok(Ran::Done(summary.rows_affected)));
                 }
                 DbEvent::Failed { error, .. } => outcome = Some(Err(error)),
-                DbEvent::Transaction { .. } => {
+                DbEvent::Transaction { .. } if !oracle => {
                     if let Some(outcome) = outcome {
                         return outcome;
                     }
                 }
                 _ => {}
+            }
+            if oracle && let Some(outcome) = outcome.take() {
+                return outcome;
             }
         }
     }
@@ -1200,6 +1218,7 @@ fn oracle_long_clobs_can_be_changed() {
     for sql in [
         "create table r65_long_clob (id number primary key, c clob)",
         "insert into r65_long_clob values (1, to_clob(rpad('x', 4000, 'x')) || rpad('y', 1000, 'y'))",
+        "commit",
     ] {
         conn.execute(sql, &[]).unwrap();
     }
@@ -1226,13 +1245,121 @@ fn oracle_long_clobs_can_be_changed() {
         inserts: vec![vec![Some("2".into()), Some(new.clone()), None]],
         ..Changes::default()
     };
+    // As the window runs them: a CLOB the pure-Rust driver types LONG is
+    // bound past 4000 bytes (#293).
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
     for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
-        let ran = conn
-            .execute(&statement.sql, &[])
-            .and_then(|s| s.row_count());
-        assert!(matches!(ran, Ok(1)), "{ran:?}\n{}", &statement.sql[..200]);
+        let ran = db.apply(&statement);
+        let sql = &statement.sql[..statement.sql.len().min(200)];
+        assert!(matches!(ran, Ok(Ran::Done(Some(1)))), "{ran:?}\n{sql}");
     }
     let (_, rows) = fetch("select c from r65_long_clob order by id");
     assert_eq!(rows, [[Some(changed)], [Some(new)]]);
     conn.execute("drop table r65_long_clob purge", &[]).unwrap();
+}
+
+/// Values typed into Oracle cells that no literal holds are bound (#293):
+/// 3000 bytes in a BLOB and in a LONG RAW, which `hextoraw` refuses past
+/// 2000 (ORA-01704), 5000 bytes of text in a LONG (ORA-64203 for its
+/// literal of parts), and 260000 characters in a CLOB, past the parts
+/// its literal takes (ORA-01489); in a fetched row and in a new one, read
+/// back as typed.
+#[test]
+fn oracle_values_past_their_literals() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let tables = ["lob_typed", "lob_typed_raw", "lob_typed_long"];
+    for table in tables {
+        let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+    }
+    for sql in [
+        "create table lob_typed (id number primary key, b blob, c clob)",
+        "insert into lob_typed values (1, hextoraw('CAFE'), 'old')",
+        "create table lob_typed_raw (id number primary key, l long raw)",
+        "insert into lob_typed_raw values (1, hextoraw('CAFE'))",
+        "create table lob_typed_long (id number primary key, l long)",
+        "insert into lob_typed_long values (1, 'old')",
+        // The window's session applies the changes.
+        "commit",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let hex = |seed: usize| -> String {
+        (0..3000)
+            .map(|i| format!("{:02X}", (i * 7 + seed) % 256))
+            .collect()
+    };
+    let long_text = |n: usize, c: &str| c.repeat(n);
+    let cases = [
+        (
+            "lob_typed",
+            vec![(1, format!("0x{}", hex(1))), (2, long_text(260_000, "é"))],
+            vec![hex(1), long_text(260_000, "é")],
+        ),
+        ("lob_typed_raw", vec![(1, hex(2))], vec![hex(2)]),
+        (
+            "lob_typed_long",
+            vec![(1, long_text(2500, "é"))],
+            vec![long_text(2500, "é")],
+        ),
+    ];
+    for (table, typed, read) in cases {
+        let edit = Editable {
+            table: table.into(),
+            source: format!("select * from {table} order by id"),
+            key: RowKey::Rowid,
+        };
+        let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+        let mut new = vec![Some("2".to_owned())];
+        new.resize(columns.len(), None);
+        for (c, v) in &typed {
+            new[*c] = Some(v.clone());
+        }
+        let changes = Changes {
+            updates: BTreeMap::from([(
+                0,
+                typed.iter().map(|(c, v)| (*c, Some(v.clone()))).collect(),
+            )]),
+            inserts: vec![new],
+            ..Changes::default()
+        };
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+            assert!(
+                !statement.binds.is_empty(),
+                "{table}: {}",
+                &statement.sql[..100.min(statement.sql.len())]
+            );
+            let ran = db.apply(&statement);
+            assert!(matches!(ran, Ok(Ran::Done(Some(1)))), "{table}: {ran:?}");
+        }
+        let names: Vec<&str> = typed
+            .iter()
+            .map(|(c, _)| columns[*c].name.as_str())
+            .collect();
+        let (_, rows) = fetch(&format!(
+            "select {} from {table} order by id",
+            names.join(", ")
+        ));
+        let read: Vec<Option<String>> = read.into_iter().map(Some).collect();
+        assert!(
+            rows.len() == 2 && rows.iter().all(|r| *r == read),
+            "{table}: not as typed"
+        );
+    }
+    for table in tables {
+        conn.execute(&format!("drop table {table} purge"), &[])
+            .unwrap();
+    }
 }

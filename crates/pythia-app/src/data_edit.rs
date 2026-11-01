@@ -15,9 +15,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pythia_data::literal;
-use pythia_db::{Cell, Client, Column, DbError, DbKind, Dialect};
+use pythia_db::{Bind, Cell, Client, Column, DbError, DbKind, Dialect};
 use pythia_plsql::{TokenKind, tokenize};
-use pythia_ui::Changes;
+use pythia_ui::{Changes, Loaded, RowRef};
 
 /// Name of the ROWID column added to editable queries.
 pub const ROWID_COLUMN: &str = "PYTHIA$ROWID";
@@ -728,6 +728,71 @@ pub struct Dml {
     pub what: String,
     /// The change it applies.
     pub change: Change,
+    /// Values for its bind variables: those loaded from files, and those
+    /// Oracle takes no literal of (#293).
+    pub binds: Vec<(String, Bind)>,
+}
+
+/// What an UPDATE or INSERT writes into `col`: a value loaded from a file
+/// as the next of `binds`, which the statement names as returned (#293),
+/// as is a value Oracle takes no literal of ([`oracle_bind`]); any other
+/// as a literal. A literal of megabytes would be impractical anywhere.
+fn written(
+    dialect: Dialect,
+    col: &Column,
+    value: Option<&str>,
+    file: Option<&Loaded>,
+    binds: &mut Vec<(String, Bind)>,
+) -> String {
+    let bind = match (file, value) {
+        (Some(loaded), _) => Some(loaded.bind()),
+        (None, Some(v)) if dialect.kind() == DbKind::Oracle => oracle_bind(col, v),
+        _ => None,
+    };
+    let Some(bind) = bind else {
+        return literal(dialect, col, value);
+    };
+    let name = format!("pythia_value{}", binds.len() + 1);
+    let named = format!(":{name}");
+    binds.push((name, bind));
+    named
+}
+
+/// The parts of 1000 characters of a CLOB's literal (#317) that a value
+/// may have before it is bound: Oracle takes about 250 of them, beyond
+/// which the literal fails with ORA-01489.
+const CLOB_LITERAL_PARTS: usize = 200;
+
+/// A value typed into an Oracle cell that no literal holds, bound instead
+/// (#293): bytes past the 2000 a `hextoraw` takes (#314) in a BLOB, RAW or
+/// LONG RAW, text past 4000 bytes in a LONG (and in a CLOB or NCLOB,
+/// which the pure-Rust driver types LONG), and a CLOB's or NCLOB's text
+/// past [`CLOB_LITERAL_PARTS`]. `None` for any other, and for a binary
+/// value that isn't hex, whose literal fails as it did.
+fn oracle_bind(col: &Column, value: &str) -> Option<Bind> {
+    let t = col.type_name.to_ascii_uppercase();
+    if t.starts_with("RAW") || t == "BLOB" || t == "LONG RAW" {
+        // Typed as the grid shows it, `0x…` is the bytes of its digits.
+        let digits = match value.strip_prefix("0x") {
+            Some(d) if d.len() % 2 == 1 => format!("0{d}"),
+            Some(d) => d.to_owned(),
+            None => value.to_owned(),
+        };
+        if digits.len() <= 2 * HEX_LITERAL_BYTES || !digits.len().is_multiple_of(2) {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = (0..digits.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(digits.get(i..i + 2)?, 16).ok())
+            .collect();
+        return bytes.map(|b| Bind::Bytes(b.into()));
+    }
+    let long = match t.as_str() {
+        "LONG" => value.len() > 4000,
+        "CLOB" | "NCLOB" => value.encode_utf16().count() > CLOB_LITERAL_PARTS * 1000,
+        _ => false,
+    };
+    long.then(|| Bind::LongText(value.into()))
 }
 
 /// A pending change of the grid, by its index there.
@@ -750,10 +815,22 @@ type Cells = BTreeMap<usize, (Cell, Cell)>;
 /// run.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Unapplied {
-    /// A row's key, and its changed cells.
-    updates: Vec<(Vec<Cell>, Cells)>,
+    /// A row's key, its changed cells, and the files loaded into them.
+    updates: Vec<(Vec<Cell>, Cells, Files)>,
     deletes: Vec<Vec<Cell>>,
-    inserts: Vec<Vec<Cell>>,
+    inserts: Vec<(Vec<Cell>, Files)>,
+}
+
+/// The values loaded from files into a row's cells, by column (#293).
+type Files = BTreeMap<usize, Loaded>;
+
+/// The files of `changes` loaded into `row`.
+fn files_of(changes: &Changes, row: RowRef) -> Files {
+    changes
+        .loaded
+        .range((row, 0)..=(row, usize::MAX))
+        .map(|(&(_, c), loaded)| (c, loaded.clone()))
+        .collect()
 }
 
 impl Unapplied {
@@ -782,9 +859,15 @@ impl Unapplied {
                         .iter()
                         .map(|(&c, new)| (c, (value(&rows[r], c), new.clone())))
                         .collect();
-                    out.updates.push((key, cells));
+                    out.updates
+                        .push((key, cells, files_of(changes, RowRef::Existing(r))));
                 }
-                Change::Insert(i) => out.inserts.extend(changes.inserts.get(i).cloned()),
+                Change::Insert(i) => out.inserts.extend(
+                    changes
+                        .inserts
+                        .get(i)
+                        .map(|row| (row.clone(), files_of(changes, RowRef::New(i)))),
+                ),
             }
         }
         out
@@ -824,7 +907,7 @@ impl Unapplied {
                 )),
             }
         }
-        for (key, cells) in &self.updates {
+        for (key, cells, files) in &self.updates {
             let Some(&r) = at.get(key.as_slice()) else {
                 lost.push(format!(
                     "The row with key {} isn't in the result any more: its changes weren't kept",
@@ -842,16 +925,27 @@ impl Unapplied {
                 ));
                 continue;
             }
+            // A file's value stays, also where it shows as the value did.
             let cells: BTreeMap<usize, Cell> = cells
                 .iter()
-                .filter(|(_, (fetched, new))| fetched != new)
+                .filter(|(c, (fetched, new))| fetched != new || files.contains_key(c))
                 .map(|(&c, (_, new))| (c, new.clone()))
                 .collect();
             if !cells.is_empty() {
                 changes.updates.insert(r, cells);
             }
+            for (&c, loaded) in files {
+                changes
+                    .loaded
+                    .insert((RowRef::Existing(r), c), loaded.clone());
+            }
         }
-        changes.inserts = self.inserts.clone();
+        for (i, (row, files)) in self.inserts.iter().enumerate() {
+            changes.inserts.push(row.clone());
+            for (&c, loaded) in files {
+                changes.loaded.insert((RowRef::New(i), c), loaded.clone());
+            }
+        }
         (changes, lost)
     }
 }
@@ -1051,6 +1145,42 @@ fn cut(value: &Cell) -> bool {
     value.as_deref().and_then(pythia_db::cut_size).is_some()
 }
 
+/// Where a fetched `row` of `edit`'s result is the row of its table, by
+/// the key in its last columns; `None` without its key (the key
+/// [`row_key`] picks can always be compared).
+fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -> Option<String> {
+    let key_start = columns.len().saturating_sub(edit.key.width());
+    match &edit.key {
+        RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
+        RowKey::Columns(key) => {
+            let checks: Option<Vec<String>> = key
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let v = value(row, key_start + i)?;
+                    same(dialect, name, &columns[key_start + i], Some(&v))
+                })
+                .collect();
+            checks.map(|c| c.join(" and "))
+        }
+    }
+}
+
+/// The query that fetches the value of column `col` of a fetched `row` of
+/// `edit`'s result again, by the row's key: *Save to file…* writes it
+/// whole (#293).
+pub fn value_query(
+    dialect: Dialect,
+    edit: &Editable,
+    columns: &[Column],
+    row: &[Cell],
+    col: usize,
+) -> Option<String> {
+    let found = row_is(dialect, edit, columns, row)?;
+    let name = dialect.quote_ident(&columns.get(col)?.name);
+    Some(format!("select {name} from {} where {found}", edit.table))
+}
+
 /// Generates the DML for `changes` to the rows of `edit`, in `dialect`'s
 /// SQL. The last columns of `columns` / `rows` hold the key.
 pub fn dml(
@@ -1066,22 +1196,7 @@ pub fn dml(
     // Written under their names: the table's columns as they are (#218).
     let plain = plain_columns(&edit.source, key_start);
     let editable = |c: usize| plain.get(c).copied().unwrap_or(false);
-    // Where the row is the one fetched; `None` without its key (the key
-    // [`row_key`] picks can always be compared).
-    let row_is = |row: &[Cell]| match &edit.key {
-        RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
-        RowKey::Columns(key) => {
-            let checks: Option<Vec<String>> = key
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let v = value(row, key_start + i)?;
-                    same(dialect, name, &columns[key_start + i], Some(&v))
-                })
-                .collect();
-            checks.map(|c| c.join(" and "))
-        }
-    };
+    let row_is = |row: &[Cell]| row_is(dialect, edit, columns, row);
 
     for &r in &changes.deletes {
         let Some(row) = rows.get(r) else { continue };
@@ -1093,6 +1208,7 @@ pub fn dml(
             expect_rows: 1,
             what: format!("row {}", r + 1),
             change: Change::Delete(r),
+            binds: Vec::new(),
         });
     }
     for (&r, cells) in &changes.updates {
@@ -1103,21 +1219,21 @@ pub fn dml(
         let Some(found) = row_is(row) else {
             continue;
         };
+        let file = |c: usize| changes.loaded.get(&(RowRef::Existing(r), c));
         let cells: Vec<_> = cells
             .iter()
-            .filter(|(c, v)| editable(**c) && !cut(v))
+            .filter(|(c, v)| editable(**c) && (file(**c).is_some() || !cut(v)))
             .collect();
         if cells.is_empty() {
             continue;
         }
+        let mut binds = Vec::new();
         let sets: Vec<String> = cells
             .iter()
             .map(|(c, v)| {
-                format!(
-                    "{} = {}",
-                    dialect.quote_ident(&columns[**c].name),
-                    literal(dialect, &columns[**c], v.as_deref())
-                )
+                let col = &columns[**c];
+                let value = written(dialect, col, v.as_deref(), file(**c), &mut binds);
+                format!("{} = {value}", dialect.quote_ident(&col.name))
             })
             .collect();
         // A column that can't be compared is left out of the check.
@@ -1141,13 +1257,15 @@ pub fn dml(
             expect_rows: 1,
             what: format!("row {}", r + 1),
             change: Change::Update(r),
+            binds,
         });
     }
     for (i, row) in changes.inserts.iter().enumerate() {
+        let file = |c: usize| changes.loaded.get(&(RowRef::New(i), c));
         let cells: Vec<(usize, &str)> = row
             .iter()
             .enumerate()
-            .filter(|(c, v)| editable(*c) && !cut(v))
+            .filter(|(c, v)| editable(*c) && (file(*c).is_some() || !cut(v)))
             .filter_map(|(c, v)| Some((c, v.as_deref()?)))
             .collect();
         if cells.is_empty() {
@@ -1157,9 +1275,10 @@ pub fn dml(
             .iter()
             .map(|(c, _)| dialect.quote_ident(&columns[*c].name))
             .collect();
+        let mut binds = Vec::new();
         let values: Vec<String> = cells
             .iter()
-            .map(|(c, v)| literal(dialect, &columns[*c], Some(v)))
+            .map(|(c, v)| written(dialect, &columns[*c], Some(v), file(*c), &mut binds))
             .collect();
         out.push(Dml {
             sql: format!(
@@ -1170,6 +1289,7 @@ pub fn dml(
             expect_rows: 1,
             what: format!("new row {}", i + 1),
             change: Change::Insert(i),
+            binds,
         });
     }
     out
@@ -1418,6 +1538,46 @@ mod tests {
         );
     }
 
+    /// Save to file fetches a value again by its row's key (#293).
+    #[test]
+    fn values_are_fetched_by_their_rows_key() {
+        let oracle = Editable {
+            table: "docs".into(),
+            source: "select * from docs".into(),
+            key: RowKey::Rowid,
+        };
+        let columns = vec![
+            col("ID", "NUMBER", true),
+            col("DOC", "BLOB", false),
+            col(ROWID_COLUMN, "ROWID", false),
+        ];
+        let row = vec![Some("1".into()), None, Some("AAAx".into())];
+        assert_eq!(
+            value_query(Dialect::ORACLE, &oracle, &columns, &row, 1).as_deref(),
+            Some("select DOC from docs where rowid = 'AAAx'")
+        );
+        let keyed = Editable {
+            table: "[dbo].[Docs]".into(),
+            source: "select * from [dbo].[Docs]".into(),
+            key: RowKey::Columns(vec!["doc id".into()]),
+        };
+        let columns = vec![
+            col("Body Text", "nvarchar", false),
+            col("pythia$doc id", "int", true),
+        ];
+        let row = vec![Some("x".into()), Some("7".into())];
+        assert_eq!(
+            value_query(Dialect::SQLSERVER, &keyed, &columns, &row, 0).as_deref(),
+            Some("select [Body Text] from [dbo].[Docs] where [doc id] = 7")
+        );
+        // Without its key, a row isn't found.
+        let row = vec![Some("x".into()), None];
+        assert_eq!(
+            value_query(Dialect::SQLSERVER, &keyed, &columns, &row, 0),
+            None
+        );
+    }
+
     #[test]
     fn unquoting() {
         assert_eq!(unquote("emp"), ["emp"]);
@@ -1453,6 +1613,7 @@ mod tests {
             updates: BTreeMap::from([(1, BTreeMap::from([(1, Some("b'c".into()))]))]),
             inserts: vec![vec![Some("3".into()), None, None]],
             deletes: [0].into(),
+            ..Changes::default()
         };
         let edit = Editable {
             table: "emp".into(),
@@ -1504,6 +1665,7 @@ mod tests {
             updates: BTreeMap::from([(0, set("x")), (1, set("y")), (3, set("z")), (4, set("w"))]),
             inserts: vec![vec![Some("6".into()), Some("n".into()), None]],
             deletes: [2].into(),
+            ..Changes::default()
         };
         let edit = Editable {
             table: "emp".into(),
@@ -1550,6 +1712,131 @@ mod tests {
         assert!(Unapplied::new(&changes, &planned, &planned, &rows, 2).is_empty());
     }
 
+    /// A value loaded from a file is bound whole, not written as a literal,
+    /// also when it shows cut short; an Apply that didn't make it keeps it
+    /// pending, the file's value with it (#293).
+    #[test]
+    fn files_are_bound() {
+        let columns = vec![
+            col("id", "INT", true),
+            col("b", "BLOB", false),
+            col("t", "TEXT", false),
+            col("pythia$id", "INT", true),
+        ];
+        let rows = vec![vec![
+            Some("1".into()),
+            None,
+            Some("x".into()),
+            Some("1".into()),
+        ]];
+        let bytes = Loaded::Bytes(vec![7; 5000].into());
+        let text = Loaded::Text("é".repeat(3000).into());
+        let shown = |l: &Loaded| Some(l.shown(Dialect::MYSQL));
+        let changes = Changes {
+            updates: BTreeMap::from([(0, BTreeMap::from([(1, shown(&bytes)), (2, shown(&text))]))]),
+            inserts: vec![vec![Some("2".into()), shown(&bytes), None, None]],
+            loaded: BTreeMap::from([
+                ((RowRef::Existing(0), 1), bytes.clone()),
+                ((RowRef::Existing(0), 2), text.clone()),
+                ((RowRef::New(0), 1), bytes.clone()),
+            ]),
+            ..Changes::default()
+        };
+        let edit = Editable {
+            table: "docs".into(),
+            source: "select * from docs".into(),
+            key: RowKey::Columns(vec!["id".into()]),
+        };
+        let statements = dml(Dialect::MYSQL, &edit, &columns, &rows, &changes);
+        let sql: Vec<&str> = statements.iter().map(|d| d.sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            [
+                "update docs set b = :pythia_value1, t = :pythia_value2 \
+                 where id = 1 and b is null and t = 'x'",
+                "insert into docs (id, b) values (2, :pythia_value1)",
+            ]
+        );
+        assert_eq!(
+            statements[0].binds,
+            [
+                ("pythia_value1".to_owned(), bytes.bind()),
+                ("pythia_value2".to_owned(), text.bind())
+            ]
+        );
+        assert_eq!(
+            statements[1].binds,
+            [("pythia_value1".to_owned(), bytes.bind())]
+        );
+
+        let planned: Vec<Change> = statements.iter().map(|d| d.change).collect();
+        let unapplied = Unapplied::new(&changes, &planned, &[], &rows, 3);
+        let (kept, lost) = unapplied.keep(&rows, 3);
+        assert!(lost.is_empty(), "{lost:?}");
+        assert_eq!(kept, changes);
+    }
+
+    /// On Oracle, a value typed that no literal holds is bound too (#293):
+    /// bytes past 2000 in a BLOB, RAW or LONG RAW, text past 4000 bytes in
+    /// a LONG (a CLOB as the pure-Rust driver types it), and a CLOB's past
+    /// the 200 parts of its literal; shorter ones stay literals.
+    #[test]
+    fn oracle_binds_what_no_literal_holds() {
+        let bytes = |n: usize| "AB".repeat(n);
+        let cases = [
+            ("BLOB", bytes(2000), false),
+            ("BLOB", bytes(2001), true),
+            ("BLOB", format!("0x{}", bytes(3000)), true),
+            ("BLOB", format!("0x{}B", bytes(3000)), true),
+            ("RAW(2000)", bytes(2001), true),
+            ("LONG RAW", bytes(5000), true),
+            // Not hex: its literal fails as it did.
+            ("BLOB", "xy".repeat(3000), false),
+            ("LONG", "é".repeat(2000), false),
+            ("LONG", "é".repeat(2001), true),
+            ("CLOB", "é".repeat(150_000), false),
+            ("NCLOB", "x".repeat(200_001), true),
+            ("VARCHAR2(4000)", "x".repeat(5000), false),
+        ];
+        for (type_name, value, bound) in cases {
+            let bind = oracle_bind(&col("C", type_name, false), &value);
+            assert_eq!(bind.is_some(), bound, "{type_name} of {}", value.len());
+        }
+        let blob = col("B", "BLOB", false);
+        assert_eq!(
+            oracle_bind(&blob, &format!("0x{}1", "00".repeat(2000))),
+            Some(Bind::Bytes([vec![0; 2000], vec![1]].concat().into()))
+        );
+
+        let columns = vec![
+            col("ID", "NUMBER", true),
+            blob,
+            col(ROWID_COLUMN, "ROWID", false),
+        ];
+        let rows = vec![vec![Some("1".into()), None, Some("AAA1".into())]];
+        let changes = Changes {
+            updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(bytes(3000)))]))]),
+            inserts: vec![vec![Some("2".into()), Some("CAFE".into()), None]],
+            ..Changes::default()
+        };
+        let edit = Editable {
+            table: "docs".into(),
+            source: "select * from docs".into(),
+            key: RowKey::Rowid,
+        };
+        let statements = dml(Dialect::ORACLE, &edit, &columns, &rows, &changes);
+        let sql: Vec<&str> = statements.iter().map(|d| d.sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            [
+                "update docs set B = :pythia_value1 where rowid = 'AAA1' and B is null",
+                "insert into docs (ID, B) values (2, hextoraw('CAFE'))",
+            ]
+        );
+        assert_eq!(statements[0].binds.len(), 1);
+        assert!(statements[1].binds.is_empty());
+    }
+
     #[test]
     fn generates_mysql_dml() {
         let columns = vec![
@@ -1585,7 +1872,7 @@ mod tests {
                 ),
             ]),
             inserts: vec![vec![None, Some("2".into()), Some("it's".into())]],
-            deletes: [].into(),
+            ..Changes::default()
         };
         let edit = Editable {
             table: "`order`".into(),

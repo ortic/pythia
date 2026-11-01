@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::documents::{DocContext, Effects, ObjectRef, OpenRequest, Target, request_id};
 use crate::editor::{Editor, Marker, MarkerKind};
 
+mod value_file;
+
 #[derive(Serialize, Deserialize)]
 pub struct SqlWindow {
     pub title: String,
@@ -134,6 +136,8 @@ pub struct RunState {
     debuggable: Option<(EditorPosition, bool)>,
     /// Result of a running export (file dialog + write on a helper thread).
     pub export: Option<std::sync::mpsc::Receiver<ExportDone>>,
+    /// Values saved to files and files loaded into cells (#293).
+    pub value_files: value_file::ValueFiles,
     pub selection_summary: Option<String>,
     /// Where the connection's scripts end their statements (from the
     /// document context, each frame).
@@ -183,6 +187,8 @@ pub enum Internal {
         expect_rows: u64,
         what: String,
         change: crate::data_edit::Change,
+        /// The values of files loaded into cells (#293).
+        binds: Vec<(String, pythia_db::Bind)>,
     },
 }
 
@@ -1005,6 +1011,7 @@ impl SqlWindow {
     fn session_busy(&self) -> bool {
         self.state.running.is_some()
             || self.state.to_file.is_some()
+            || self.state.value_files.fetching()
             || self.state.fetching.is_some()
             || self
                 .state
@@ -1254,7 +1261,7 @@ impl SqlWindow {
                 id,
                 sql,
                 max_rows: cx.fetch_size,
-                binds,
+                binds: binds.into_iter().map(|(n, v)| (n, v.into())).collect(),
             },
         );
     }
@@ -1293,11 +1300,15 @@ impl SqlWindow {
                     }
                     _ => 0,
                 };
+                let binds = match &internal {
+                    Internal::Dml { binds, .. } => binds.clone(),
+                    _ => Vec::new(),
+                };
                 DbRequest::Execute {
                     id,
                     sql: sql.clone(),
                     max_rows: cx.fetch_size.max(rows),
-                    binds: Vec::new(),
+                    binds,
                 }
             }
         };
@@ -1452,6 +1463,7 @@ impl SqlWindow {
                     expect_rows: dml.expect_rows,
                     what: dml.what,
                     change: dml.change,
+                    binds: dml.binds,
                 }),
             });
         }
@@ -1478,10 +1490,30 @@ impl SqlWindow {
             }
             EditAction::ShowSql(i) => {
                 let mut effects = Effects::default();
+                // A value bound is named by the statement (#293).
                 let script: Vec<String> = self
                     .pending_dml(i, cx)
                     .into_iter()
-                    .map(|d| format!("{};", d.sql))
+                    .map(|d| {
+                        let files: Vec<String> = d
+                            .binds
+                            .iter()
+                            .map(|(name, value)| {
+                                let bytes = match value {
+                                    pythia_db::Bind::Bytes(bytes) => bytes.len(),
+                                    pythia_db::Bind::LongText(text) => text.len(),
+                                    pythia_db::Bind::Text(text) => {
+                                        text.as_ref().map_or(0, String::len)
+                                    }
+                                };
+                                format!(":{name} is a value of {bytes} bytes, bound")
+                            })
+                            .collect();
+                        match files.is_empty() {
+                            true => format!("{};", d.sql),
+                            false => format!("-- {}\n{};", files.join(", "), d.sql),
+                        }
+                    })
                     .collect();
                 if let Some(connection) = cx.connection.clone() {
                     effects.open.push(crate::documents::OpenRequest::Sql {
@@ -1801,6 +1833,9 @@ impl SqlWindow {
 
     fn handle_event(&mut self, event: DbEvent, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
+        let Some(event) = self.value_event(event) else {
+            return effects;
+        };
         let streamed = match &event {
             DbEvent::QueryStarted { id, .. }
             | DbEvent::Rows { id, .. }
@@ -1844,6 +1879,7 @@ impl SqlWindow {
                     link_relations: Vec::new(),
                 };
                 result.grid.dialect = cx.dialect;
+                result.grid.value_files = true;
                 result.grid.table = crate::data_edit::single_table(&result.sql);
                 result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
@@ -2069,6 +2105,7 @@ impl SqlWindow {
                     expect_rows,
                     what,
                     change,
+                    ..
                 }) = running.as_ref().and_then(|r| r.internal.clone())
                 {
                     if summary.rows_affected != Some(expect_rows) {
@@ -2361,6 +2398,7 @@ impl SqlWindow {
 
     fn bottom_ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = self.poll_to_file(ui, cx.dialect);
+        self.poll_value_files(ui.ctx(), cx, &mut effects);
         let mut edit_action = None;
         let variables = self.variables().len();
         let show_variables = &mut self.show_variables;
@@ -2700,6 +2738,9 @@ impl SqlWindow {
                 )
                 .show(ui);
                 state.selection_summary = out.selection_summary;
+                if let Some(request) = result.grid.take_file_request() {
+                    state.value_files.ask(result.id, request);
+                }
                 if let Some(text) = result.grid.take_failed() {
                     state.messages.push(Message {
                         level: Level::Error,
@@ -4565,8 +4606,8 @@ mod tests {
         assert_eq!(
             binds,
             &[
-                ("a".to_owned(), None),
-                ("b".to_owned(), Some(String::new()))
+                ("a".to_owned(), pythia_db::Bind::Text(None)),
+                ("b".to_owned(), pythia_db::Bind::Text(Some(String::new())))
             ]
         );
         assert_eq!(w.bind_values["b"], Some(String::new()));

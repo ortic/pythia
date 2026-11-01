@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use egui::{Align, Align2, Key, Layout, RichText, Sense, Ui};
 use egui_extras::{Column as TableColumn, TableBuilder};
@@ -100,6 +101,11 @@ pub struct GridState {
     pub time_zone: Option<String>,
     /// Why a copy failed, for the owner to show (a value held cut short).
     failed: Option<String>,
+    /// The owner saves values to files and loads files into cells: the
+    /// context menu, the viewer and the value editor offer it (#293).
+    pub value_files: bool,
+    /// *Save to file…* or *Load from file…* chosen, for the owner.
+    file_request: Option<FileRequest>,
 }
 
 /// What the summary of a selection was worked out for: the selection,
@@ -163,6 +169,130 @@ pub struct Changes {
     pub inserts: Vec<Vec<Cell>>,
     /// Existing rows to delete.
     pub deletes: BTreeSet<usize>,
+    /// Values loaded from files, by row and column (#293). The new value
+    /// in `updates` or `inserts` is what the grid shows of one.
+    pub loaded: BTreeMap<(RowRef, usize), Loaded>,
+}
+
+/// A value loaded from a file into a cell (#293): held whole until Apply
+/// binds it, while the cell shows its size, as it shows a value held cut
+/// short.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Loaded {
+    /// The file's bytes, for a binary column.
+    Bytes(Arc<[u8]>),
+    /// The file as UTF-8 text, for a text column.
+    Text(Arc<str>),
+}
+
+impl Loaded {
+    /// The size in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Loaded::Bytes(bytes) => bytes,
+            Loaded::Text(text) => text.as_bytes(),
+        }
+    }
+
+    /// The bind variable's value Apply sends.
+    pub fn bind(&self) -> pythia_db::Bind {
+        match self {
+            Loaded::Bytes(bytes) => pythia_db::Bind::Bytes(bytes.clone()),
+            Loaded::Text(text) => pythia_db::Bind::LongText(text.clone()),
+        }
+    }
+
+    /// The value as the cell holds it, which the grid shows: the hex of a
+    /// binary value as `dialect` writes it, cut short past
+    /// [`pythia_db::SHOWN_BYTES`] with its size after it (#204), and the
+    /// first bytes of a longer text so too.
+    pub fn shown(&self, dialect: Dialect) -> String {
+        let shown = pythia_db::SHOWN_BYTES;
+        let cut = |n: usize| {
+            if n > shown {
+                format!("… ({n} bytes)")
+            } else {
+                String::new()
+            }
+        };
+        match self {
+            Loaded::Bytes(bytes) => {
+                let prefix = match dialect.kind() {
+                    DbKind::SqlServer => "0x",
+                    DbKind::Postgres => "\\x",
+                    _ => "",
+                };
+                let hex: String = bytes[..bytes.len().min(shown)]
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect();
+                format!("{prefix}{hex}{}", cut(bytes.len()))
+            }
+            Loaded::Text(text) => {
+                let end = text.floor_char_boundary(shown);
+                format!("{}{}", &text[..end], cut(text.len()))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Loaded {
+    // Megabytes as their size.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Loaded::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
+            Loaded::Text(text) => write!(f, "Text({} bytes)", text.len()),
+        }
+    }
+}
+
+/// *Save to file…* or *Load from file…* chosen in a grid, for its owner to
+/// ask for the file and do it (#293).
+#[derive(Debug, Clone)]
+pub enum FileRequest {
+    Save(SaveValue),
+    /// Load a file into this cell of the grid being edited: as bytes into a
+    /// binary column, as UTF-8 text into a text column.
+    Load {
+        row: RowRef,
+        col: usize,
+        binary: bool,
+    },
+}
+
+/// A cell's value to save to a file.
+#[derive(Debug, Clone)]
+pub struct SaveValue {
+    pub row: RowRef,
+    pub col: usize,
+    /// A binary column's value is written as its bytes, a text column's as
+    /// UTF-8.
+    pub binary: bool,
+    /// The file name the dialog suggests: the column's, with `.bin` or
+    /// `.txt`, or the extension the first bytes of a binary value say.
+    pub file_name: String,
+    pub source: SaveSource,
+}
+
+/// Where a value saved to a file comes from.
+#[derive(Debug, Clone)]
+pub enum SaveSource {
+    /// The cell's pending change, a value loaded from a file.
+    Loaded(Loaded),
+    /// The value as the grid holds it whole: a pending change typed in, or
+    /// the value of a result that isn't being edited (see [`value_bytes`]).
+    Held(String),
+    /// A fetched row of the result being edited, by its index: the owner
+    /// fetches the value again whole by the row's key.
+    Fetch(usize),
 }
 
 impl Changes {
@@ -206,9 +336,11 @@ impl Editing {
 }
 
 /// A view row resolved to either a fetched row or a new one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowRef {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowRef {
+    /// A fetched row, by its index into the rows.
     Existing(usize),
+    /// A new row, by its index into [`Changes::inserts`].
     New(usize),
 }
 
@@ -258,6 +390,132 @@ impl GridState {
     /// Why *Copy as* copied nothing, once.
     pub fn take_failed(&mut self) -> Option<String> {
         self.failed.take()
+    }
+
+    /// *Save to file…* or *Load from file…* chosen, once.
+    pub fn take_file_request(&mut self) -> Option<FileRequest> {
+        self.file_request.take()
+    }
+
+    /// Asks the owner to save the value of a cell to a file, as *Save to
+    /// file…* does (#293). A value held cut short, which only the result
+    /// being edited fetches again, fails.
+    pub fn request_save(
+        &mut self,
+        columns: &[Column],
+        rows: &[Vec<Cell>],
+        (view_row, col): (usize, usize),
+    ) {
+        let Some(binary) = columns.get(col).and_then(|c| file_kind(self.dialect, c)) else {
+            return;
+        };
+        self.sync(rows, columns);
+        let row = self.row_ref(view_row);
+        let Some(held) = self.value(rows, view_row, col) else {
+            self.failed = Some("Save to file: the value is NULL".into());
+            return;
+        };
+        let loaded = self.loaded_at(view_row, col).cloned();
+        let first = match &loaded {
+            Some(loaded) => loaded.bytes()[..loaded.len().min(16)].to_vec(),
+            None if binary => decode_hex(&hex_digits(held).chars().take(32).collect::<String>())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        // A fetched value the result being edited finds again by its key,
+        // unless it was changed: the change is saved.
+        let fetch = match (&self.edit, row) {
+            (Some(edit), RowRef::Existing(r))
+                if !edit.is_locked(col)
+                    && !edit
+                        .changes
+                        .updates
+                        .get(&r)
+                        .is_some_and(|u| u.contains_key(&col)) =>
+            {
+                Some(r)
+            }
+            _ => None,
+        };
+        let source = match (loaded, fetch) {
+            (Some(loaded), _) => SaveSource::Loaded(loaded),
+            (None, Some(r)) => SaveSource::Fetch(r),
+            (None, None) if pythia_db::cut_size(held).is_some() => {
+                self.failed = Some(format!(
+                    "Save to file: the grid holds the first {} bytes of this value. Edit the \
+                     result: Save to file then fetches the value whole.",
+                    pythia_db::SHOWN_BYTES
+                ));
+                return;
+            }
+            (None, None) => SaveSource::Held(held.to_owned()),
+        };
+        self.file_request = Some(FileRequest::Save(SaveValue {
+            row,
+            col,
+            binary,
+            file_name: file_name(&columns[col].name, binary, &first),
+            source,
+        }));
+    }
+
+    /// Asks the owner for a file to load into a cell of the grid being
+    /// edited, as *Load from file…* does (#293).
+    pub fn request_load(&mut self, columns: &[Column], (view_row, col): (usize, usize)) {
+        if self.edit.as_ref().is_none_or(|e| e.is_locked(col)) {
+            return;
+        }
+        let Some(binary) = columns.get(col).and_then(|c| file_kind(self.dialect, c)) else {
+            return;
+        };
+        self.file_request = Some(FileRequest::Load {
+            row: self.row_ref(view_row),
+            col,
+            binary,
+        });
+    }
+
+    /// Makes a file's value the pending change of a cell (#293), a step
+    /// Ctrl+Z takes back. The value editor open on the cell closes: the
+    /// file replaced its text.
+    pub fn load_value(&mut self, rows: &[Vec<Cell>], row: RowRef, col: usize, loaded: Loaded) {
+        self.sync(rows, &[]);
+        let shown = loaded.shown(self.dialect);
+        self.undoable(|s| {
+            let Some(edit) = s.edit.as_mut().filter(|e| !e.is_locked(col)) else {
+                return;
+            };
+            let cell = match row {
+                RowRef::Existing(r) if rows.get(r).is_some_and(|row| col < row.len()) => edit
+                    .changes
+                    .updates
+                    .entry(r)
+                    .or_default()
+                    .entry(col)
+                    .or_default(),
+                RowRef::Existing(_) => return,
+                RowRef::New(i) => {
+                    match edit.changes.inserts.get_mut(i).and_then(|r| r.get_mut(col)) {
+                        Some(cell) => cell,
+                        None => return,
+                    }
+                }
+            };
+            *cell = Some(shown);
+            edit.changes.loaded.insert((row, col), loaded);
+        });
+        if let Some(ed) = &self.value_editor
+            && ed.col == col
+            && self.row_ref(ed.view_row) == row
+        {
+            self.value_editor = None;
+        }
+    }
+
+    /// The value loaded from a file into a cell, if it has one (#293).
+    fn loaded_at(&self, view_row: usize, col: usize) -> Option<&Loaded> {
+        let row = self.row_ref(view_row);
+        self.edit.as_ref()?.changes.loaded.get(&(row, col))
     }
 
     /// All column indices in the order shown, hidden ones included.
@@ -742,12 +1000,25 @@ impl GridState {
 
     fn set_value(&mut self, rows: &[Vec<Cell>], view_row: usize, col: usize, value: Cell) {
         let row_ref = self.row_ref(view_row);
+        // A value loaded from a file stays, set again to what the cell or
+        // the value editor shows of it (#293).
+        if let Some(loaded) = self.loaded_at(view_row, col) {
+            let text = match loaded {
+                Loaded::Text(text) => Some(&**text),
+                Loaded::Bytes(_) => None,
+            };
+            let value = value.as_deref();
+            if value.is_some() && (value == self.value(rows, view_row, col) || value == text) {
+                return;
+            }
+        }
         let Some(edit) = self.edit.as_mut() else {
             return;
         };
         if edit.is_locked(col) {
             return;
         }
+        edit.changes.loaded.remove(&(row_ref, col));
         match row_ref {
             RowRef::Existing(r) => {
                 let original = rows.get(r).and_then(|row| row.get(col)).cloned().flatten();
@@ -844,6 +1115,16 @@ impl GridState {
         for i in new_rows.into_iter().rev() {
             if i < edit.changes.inserts.len() {
                 edit.changes.inserts.remove(i);
+                // The files loaded into the new rows after it move up.
+                let loaded = std::mem::take(&mut edit.changes.loaded);
+                edit.changes.loaded = loaded
+                    .into_iter()
+                    .filter_map(|((row, col), value)| match row {
+                        RowRef::New(j) if j == i => None,
+                        RowRef::New(j) if j > i => Some(((RowRef::New(j - 1), col), value)),
+                        _ => Some(((row, col), value)),
+                    })
+                    .collect();
             }
         }
     }
@@ -925,10 +1206,14 @@ impl GridState {
         if self.edit.as_ref().is_none_or(|e| e.is_locked(cell.1)) {
             return;
         }
-        let text = self
-            .value(rows, cell.0, cell.1)
-            .unwrap_or_default()
-            .to_owned();
+        // A text loaded from a file whole, not what the cell shows of it.
+        let text = match self.loaded_at(cell.0, cell.1) {
+            Some(Loaded::Text(text)) => text.to_string(),
+            _ => self
+                .value(rows, cell.0, cell.1)
+                .unwrap_or_default()
+                .to_owned(),
+        };
         self.value_editor = Some(ValueEditor {
             view_row: cell.0,
             col: cell.1,
@@ -1907,13 +2192,17 @@ fn data_cell(
         .is_some_and(|(r, ec, _)| *r == view_row && *ec == c);
     // What the cell shows of the value, not a copy of all of it (#212).
     let binary = is_binary(state.dialect, col);
-    let shown = state.value(d.rows, view_row, c).map(|text| {
-        if binary {
-            binary_summary(text)
-        } else {
-            cell_text(text)
-        }
-    });
+    let shown = match state.loaded_at(view_row, c) {
+        // A file's text by its size, as a value held cut short (#293).
+        Some(Loaded::Text(text)) => Some(text_summary(text)),
+        _ => state.value(d.rows, view_row, c).map(|text| {
+            if binary {
+                binary_summary(text)
+            } else {
+                cell_text(text)
+            }
+        }),
+    };
     let mut edit_done = None;
     let (_, response) = row.col(|ui| {
         let rect = ui.max_rect();
@@ -2004,6 +2293,14 @@ fn data_cell(
 }
 
 fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut GridState) {
+    // Values of binary and text columns go to files and come from them
+    // (#293).
+    let file_cell = state.cursor.filter(|&(_, c)| {
+        state.value_files
+            && columns
+                .get(c)
+                .is_some_and(|col| file_kind(state.dialect, col).is_some())
+    });
     if state.is_editable() {
         if ui.button("Edit cell").clicked() {
             if let Some(cell) = state.cursor {
@@ -2015,6 +2312,16 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
             if let Some(cell) = state.cursor {
                 state.open_value_editor(rows, cell);
             }
+            ui.close();
+        }
+        if let Some(cell) = file_cell
+            && state.edit.as_ref().is_some_and(|e| !e.is_locked(cell.1))
+            && ui
+                .button("Load from file…")
+                .on_hover_text("The file becomes the cell's value, applied with Apply")
+                .clicked()
+        {
+            state.request_load(columns, cell);
             ui.close();
         }
         if ui.button("Set NULL").clicked() {
@@ -2113,6 +2420,17 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
     if ui.button("View value…").clicked() {
         state.viewer = state.cursor;
         ui.close();
+    }
+    if let Some(cell) = file_cell {
+        let null = state.value(rows, cell.0, cell.1).is_none();
+        if ui
+            .add_enabled(!null, egui::Button::new("Save to file…"))
+            .on_disabled_hover_text("The value is NULL")
+            .clicked()
+        {
+            state.request_save(columns, rows, cell);
+            ui.close();
+        }
     }
     if ui
         .button(if state.record_view {
@@ -2695,8 +3013,10 @@ fn value_editor(
     let column = columns.get(ed.col);
     let name = column.map_or("", |c| c.name.as_str());
     let date = column.is_some_and(is_temporal);
+    let files = state.value_files && column.is_some_and(|c| file_kind(state.dialect, c).is_some());
     let mut open = true;
     let mut result: Option<Cell> = None;
+    let mut load = false;
     egui::Window::new(format!("Edit {name} — row {}", ed.view_row + 1))
         .id(id.with("value-editor"))
         .open(&mut open)
@@ -2753,9 +3073,22 @@ fn value_editor(
                 if ui.button("Set NULL").clicked() {
                     result = Some(None);
                 }
+                if files
+                    && ui
+                        .button("Load from file…")
+                        .on_hover_text("The file becomes the cell's value, applied with Apply")
+                        .clicked()
+                {
+                    load = true;
+                }
                 ui.weak(format!("{} characters", ed.text.chars().count()));
             });
         });
+    if load {
+        let cell = (ed.view_row, ed.col);
+        state.request_load(columns, cell);
+        return;
+    }
     if let Some(value) = result {
         let (view_row, col) = (ed.view_row, ed.col);
         state.value_editor = None;
@@ -2772,6 +3105,8 @@ struct Viewed {
     value: Cell,
     /// The value is a change not applied, which isn't copied (#250).
     unapplied: bool,
+    /// The value was loaded from a file (#293).
+    loaded: bool,
     chars: usize,
     /// The value as formatted JSON, if it is an object or an array.
     pretty: Option<String>,
@@ -2793,7 +3128,7 @@ struct ViewedKey {
 
 /// A binary value as the viewer shows it.
 struct ViewedBinary {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     /// The size of a value held cut short (#232).
     cut: Option<u64>,
     /// Named by its bytes: egui keeps an image by its URI, and the next
@@ -2805,13 +3140,20 @@ struct ViewedBinary {
 
 impl Viewed {
     fn new(key: ViewedKey, columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Self {
-        let (value, unapplied) = state.viewed(rows, key.cell);
+        let (mut value, unapplied) = state.viewed(rows, key.cell);
+        // A file's value whole, not what the cell shows of it (#293).
+        let loaded = state.loaded_at(key.cell.0, key.cell.1).cloned();
+        if let Some(Loaded::Text(text)) = &loaded {
+            value = Some(text.to_string());
+        }
         let binary = columns
             .get(key.cell.1)
             .is_some_and(|col| is_binary(state.dialect, col));
         let binary = value.as_deref().filter(|_| binary).and_then(|v| {
-            let bytes = decode_hex(held_hex(v))?;
-            let cut = pythia_db::cut_size(v);
+            let (bytes, cut): (Arc<[u8]>, _) = match &loaded {
+                Some(Loaded::Bytes(bytes)) => (bytes.clone(), None),
+                _ => (decode_hex(held_hex(v))?.into(), pythia_db::cut_size(v)),
+            };
             let image = image_kind(&bytes).filter(|_| cut.is_none()).map(|kind| {
                 format!(
                     "bytes://pythia-grid/{:016x}.{kind}",
@@ -2847,6 +3189,7 @@ impl Viewed {
             chars: value.as_deref().map_or(0, |v| v.chars().count()),
             value,
             unapplied,
+            loaded: loaded.is_some(),
             pretty,
             rows,
             binary,
@@ -2907,6 +3250,11 @@ fn viewer(
     }
     let Some(viewed) = &state.viewed else { return };
     let name = columns.get(c).map_or("", |col| col.name.as_str());
+    let files = state.value_files
+        && columns
+            .get(c)
+            .is_some_and(|col| file_kind(state.dialect, col).is_some());
+    let mut save = false;
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2941,7 +3289,9 @@ fn viewer(
                 if viewed.rows.as_ref().is_some_and(|(_, cut)| *cut) {
                     ui.weak(format!("· lines cut every {VIEWER_ROW_CHARS} characters"));
                 }
-                if viewed.unapplied {
+                if viewed.loaded {
+                    ui.weak("· loaded from a file, not applied");
+                } else if viewed.unapplied {
                     ui.weak("· changed, not applied");
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2950,6 +3300,9 @@ fn viewer(
                         .on_disabled_hover_text("Apply or discard the change first");
                     if copy.clicked() {
                         ctx.copy_text(viewed.value.clone().unwrap_or_default());
+                    }
+                    if files && viewed.value.is_some() && ui.button("Save to file…").clicked() {
+                        save = true;
                     }
                 });
             });
@@ -3008,6 +3361,8 @@ fn viewer(
         }
         state.viewer = None;
         state.viewed = None;
+    } else if save {
+        state.request_save(columns, rows, (r, c));
     }
 }
 
@@ -3051,6 +3406,86 @@ fn is_binary(dialect: Dialect, col: &Column) -> bool {
         DbKind::Postgres => t == "bytea",
         DbKind::Sqlite => t.to_ascii_uppercase().contains("BLOB"),
     }
+}
+
+/// Whether *Save to file…* and *Load from file…* take a column's values,
+/// and as what: `Some(true)` as bytes, `Some(false)` as text (#293).
+/// Oracle's BLOB, RAW, LONG RAW, CLOB, NCLOB and LONG (the thin driver
+/// types LOBs as LONG and LONG RAW); MySQL's BLOB, BINARY, VARBINARY and
+/// TEXT types; PostgreSQL's bytea and text; SQL Server's binary,
+/// varbinary, image, varchar, nvarchar (`max` or not, which a result
+/// doesn't say), text and ntext; SQLite's columns of blobs and of text
+/// affinity.
+fn file_kind(dialect: Dialect, col: &Column) -> Option<bool> {
+    let t = col.type_name.as_str();
+    let text = match dialect.kind() {
+        DbKind::Oracle => {
+            let t = t.to_ascii_uppercase();
+            if t == "BFILE" {
+                return None;
+            }
+            matches!(t.as_str(), "CLOB" | "NCLOB" | "LONG")
+        }
+        DbKind::MySql => t == "TEXT",
+        DbKind::SqlServer => matches!(t, "varchar" | "nvarchar" | "text" | "ntext"),
+        DbKind::Postgres => t == "text",
+        DbKind::Sqlite => {
+            let t = t.to_ascii_uppercase();
+            !t.contains("BLOB") && ["TEXT", "CHAR", "CLOB"].iter().any(|a| t.contains(a))
+        }
+    };
+    if text {
+        Some(false)
+    } else {
+        is_binary(dialect, col).then_some(true)
+    }
+}
+
+/// The file name *Save to file…* suggests for a value of column `name`:
+/// the name, with `.txt` for text and `.bin` for bytes, unless their
+/// `first` bytes say what they are.
+fn file_name(name: &str, binary: bool, first: &[u8]) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = match stem.trim_matches('_') {
+        "" => "value",
+        stem => stem,
+    };
+    let extension = match first {
+        _ if !binary => "txt",
+        [0x89, b'P', b'N', b'G', ..] => "png",
+        [0xFF, 0xD8, 0xFF, ..] => "jpg",
+        [b'G', b'I', b'F', b'8', ..] => "gif",
+        [b'%', b'P', b'D', b'F', ..] => "pdf",
+        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] | [b'P', b'K', 7, 8, ..] => "zip",
+        [0x1F, 0x8B, ..] => "gz",
+        _ => "bin",
+    };
+    format!("{stem}.{extension}")
+}
+
+/// The bytes of a value the grid holds whole, as *Save to file…* writes
+/// them: a binary value's hex decoded (SQLite's blob column may hold text,
+/// which is written as it is), text as UTF-8.
+pub fn value_bytes(text: &str, binary: bool) -> Result<Vec<u8>, String> {
+    if pythia_db::cut_size(text).is_some() {
+        return Err(format!(
+            "the grid holds the first {} bytes of the value",
+            pythia_db::SHOWN_BYTES
+        ));
+    }
+    if binary && let Some(bytes) = decode_hex(hex_digits(text)) {
+        return Ok(bytes);
+    }
+    Ok(text.as_bytes().to_vec())
 }
 
 /// The hex digits of a binary value, after SQL Server's `0x` or
@@ -3098,6 +3533,15 @@ fn binary_summary(text: &str) -> String {
     let more = if hex.len() > 16 { "…" } else { "" };
     let size = pythia_db::cut_size(hex).map_or(hex.len() / 2, |n| n as usize);
     format!("0x{head}{more} · {}", human_bytes(size))
+}
+
+/// `Grüße aus Zürich… · 1.6 MB` for a long text loaded from a file: the
+/// start of its first line and its size (#293).
+fn text_summary(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    let head: String = first.chars().take(40).collect();
+    let more = if head.len() < text.len() { "…" } else { "" };
+    format!("{head}{more} · {}", human_bytes(text.len()))
 }
 
 fn image_kind(bytes: &[u8]) -> Option<&'static str> {
@@ -5018,5 +5462,274 @@ mod tests {
         click(&ctx, &c, &r, &mut state, "x", 1);
         frame(&ctx, &c, &r, &mut state, vec![key(Key::ArrowDown)]);
         assert_eq!(state.cursor, Some((1, 1)));
+    }
+
+    fn col_of(name: &str, type_name: &str) -> Column {
+        Column {
+            name: name.into(),
+            type_name: type_name.into(),
+            numeric: false,
+        }
+    }
+
+    /// Save to file and Load from file take binary and long text columns,
+    /// by each database's type names (#293).
+    #[test]
+    fn files_take_binary_and_text_columns() {
+        use pythia_db::Dialect;
+        let cases = [
+            (Dialect::ORACLE, "BLOB", Some(true)),
+            (Dialect::ORACLE, "RAW(16)", Some(true)),
+            (Dialect::ORACLE, "LONG RAW", Some(true)),
+            (Dialect::ORACLE, "CLOB", Some(false)),
+            (Dialect::ORACLE, "NCLOB", Some(false)),
+            (Dialect::ORACLE, "LONG", Some(false)),
+            (Dialect::ORACLE, "BFILE", None),
+            (Dialect::ORACLE, "VARCHAR2(10)", None),
+            (Dialect::MYSQL, "BLOB", Some(true)),
+            (Dialect::MYSQL, "VARBINARY", Some(true)),
+            (Dialect::MYSQL, "TEXT", Some(false)),
+            (Dialect::MYSQL, "VARCHAR", None),
+            (Dialect::POSTGRES, "bytea", Some(true)),
+            (Dialect::POSTGRES, "text", Some(false)),
+            (Dialect::POSTGRES, "json", None),
+            (Dialect::SQLSERVER, "varbinary", Some(true)),
+            (Dialect::SQLSERVER, "image", Some(true)),
+            (Dialect::SQLSERVER, "nvarchar", Some(false)),
+            (Dialect::SQLSERVER, "ntext", Some(false)),
+            (Dialect::SQLSERVER, "int", None),
+            (Dialect::SQLITE, "BLOB", Some(true)),
+            (Dialect::SQLITE, "TEXT", Some(false)),
+            (Dialect::SQLITE, "VARCHAR(20)", Some(false)),
+            (Dialect::SQLITE, "INTEGER", None),
+        ];
+        for (dialect, type_name, kind) in cases {
+            assert_eq!(
+                file_kind(dialect, &col_of("C", type_name)),
+                kind,
+                "{dialect:?} {type_name}"
+            );
+        }
+    }
+
+    /// The dialog suggests the column's name, with the extension the first
+    /// bytes say (#293).
+    #[test]
+    fn file_names_say_what_the_value_is() {
+        let cases: [(&str, bool, &[u8], &str); 10] = [
+            (
+                "PHOTO",
+                true,
+                &[0x89, b'P', b'N', b'G', 13, 10],
+                "PHOTO.png",
+            ),
+            ("photo", true, &[0xFF, 0xD8, 0xFF, 0xE0], "photo.jpg"),
+            ("anim", true, b"GIF89a", "anim.gif"),
+            ("doc", true, b"%PDF-1.7", "doc.pdf"),
+            ("archive", true, &[b'P', b'K', 3, 4], "archive.zip"),
+            ("dump", true, &[0x1F, 0x8B, 8], "dump.gz"),
+            ("data", true, &[0, 1, 2], "data.bin"),
+            ("notes", false, b"%PDF", "notes.txt"),
+            ("my col/x", true, &[], "my_col_x.bin"),
+            ("\"\"", false, &[], "value.txt"),
+        ];
+        for (name, binary, first, file) in cases {
+            assert_eq!(file_name(name, binary, first), file);
+        }
+    }
+
+    /// A value the grid holds whole is written as its bytes; one held cut
+    /// short isn't (#293).
+    #[test]
+    fn values_saved_as_their_bytes() {
+        assert_eq!(value_bytes("CAFE01", true), Ok(vec![0xCA, 0xFE, 1]));
+        assert_eq!(value_bytes("0xCAFE", true), Ok(vec![0xCA, 0xFE]));
+        assert_eq!(value_bytes("\\xcafe", true), Ok(vec![0xCA, 0xFE]));
+        // Text in a SQLite blob column.
+        assert_eq!(value_bytes("grüße", true), Ok("grüße".as_bytes().to_vec()));
+        assert_eq!(value_bytes("CAFE", false), Ok(b"CAFE".to_vec()));
+        let cut = format!("{}… (5000 bytes)", "AB".repeat(pythia_db::SHOWN_BYTES));
+        assert!(value_bytes(&cut, true).is_err());
+    }
+
+    /// Save to file asks for a whole value: the result being edited
+    /// fetches a fetched row's again, a change is saved as it is, and a
+    /// value held cut short of a result not edited is refused (#293).
+    #[test]
+    fn saves_take_the_value_whole() {
+        use pythia_db::Dialect;
+        let columns = vec![col_of("ID", "INTEGER"), col_of("IMG", "BLOB")];
+        let cut = format!(
+            "{PNG}{}… (9000 bytes)",
+            "00".repeat(pythia_db::SHOWN_BYTES - PNG.len() / 2)
+        );
+        let rows = vec![
+            vec![Some("1".into()), Some(PNG.into())],
+            vec![Some("2".into()), Some(cut)],
+            vec![Some("3".into()), None],
+        ];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            value_files: true,
+            ..Default::default()
+        };
+        state.sync(&rows, &columns);
+        let source = |state: &mut GridState, cell| {
+            state.request_save(&columns, &rows, cell);
+            match state.take_file_request() {
+                Some(FileRequest::Save(save)) => {
+                    assert_eq!(save.file_name, "IMG.png");
+                    Ok(save.source)
+                }
+                other => Err((other, state.take_failed())),
+            }
+        };
+        assert!(matches!(source(&mut state, (0, 1)), Ok(SaveSource::Held(v)) if v == PNG));
+        let refused = source(&mut state, (1, 1))
+            .unwrap_err()
+            .1
+            .unwrap_or_default();
+        assert!(refused.contains("Edit the result"), "{refused}");
+        assert!(
+            source(&mut state, (2, 1))
+                .unwrap_err()
+                .1
+                .unwrap()
+                .contains("NULL")
+        );
+        // Nothing for a number.
+        state.request_save(&columns, &rows, (0, 0));
+        assert!(state.take_file_request().is_none());
+
+        state.set_editable(None);
+        assert!(matches!(
+            source(&mut state, (1, 1)),
+            Ok(SaveSource::Fetch(1))
+        ));
+        state.edit_cell(&rows, 0, 1, Some(PNG.to_lowercase()));
+        assert!(
+            matches!(source(&mut state, (0, 1)), Ok(SaveSource::Held(v)) if v == PNG.to_lowercase())
+        );
+    }
+
+    /// A file loaded into a cell is its pending change: the cell shows it
+    /// by its size and the viewer whole, Ctrl+Z takes it back, typing the
+    /// shown text again keeps it, and new rows deleted take theirs along
+    /// (#293).
+    #[test]
+    fn files_load_into_cells() {
+        use pythia_db::Dialect;
+        let columns = vec![
+            col_of("ID", "INTEGER"),
+            col_of("IMG", "BLOB"),
+            col_of("DOC", "TEXT"),
+        ];
+        let rows = vec![vec![Some("1".into()), None, Some("old".into())]];
+        let ctx = egui::Context::default();
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            value_files: true,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        state.sync(&rows, &columns);
+        let bytes: Arc<[u8]> = (0..9000u32).map(|i| (i % 256) as u8).collect();
+        let text: Arc<str> = "Grüße\n".repeat(1000).into();
+        state.request_load(&columns, (0, 1));
+        assert!(matches!(
+            state.take_file_request(),
+            Some(FileRequest::Load {
+                row: RowRef::Existing(0),
+                col: 1,
+                binary: true
+            })
+        ));
+        state.request_load(&columns, (0, 0));
+        assert!(state.take_file_request().is_none(), "not a file's column");
+        state.load_value(&rows, RowRef::Existing(0), 1, Loaded::Bytes(bytes.clone()));
+        state.load_value(&rows, RowRef::Existing(0), 2, Loaded::Text(text.clone()));
+        let changes = state.changes().unwrap().clone();
+        let shown = changes.updates[&0][&1].clone().unwrap();
+        assert_eq!(pythia_db::cut_size(&shown), Some(9000));
+        assert!(shown.starts_with("000102"));
+        assert_eq!(changes.loaded.len(), 2);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert!(
+            texts(&drawn).contains(&"0x0001020304050607… · 8.8 KB"),
+            "{:?}",
+            texts(&drawn)
+        );
+        assert!(
+            texts(&drawn).contains(&"Grüße… · 7.8 KB"),
+            "{:?}",
+            texts(&drawn)
+        );
+        // The viewer has the text whole, and saves the file's value.
+        state.viewer = Some((0, 2));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(
+            state.viewed.as_ref().unwrap().value.as_deref(),
+            Some(&*text)
+        );
+        state.request_save(&columns, &rows, (0, 2));
+        assert!(matches!(
+            state.take_file_request(),
+            Some(FileRequest::Save(SaveValue { source: SaveSource::Loaded(Loaded::Text(t)), .. })) if t == text
+        ));
+        // Set again to what it shows, a value stays the file's.
+        state.edit_cell(&rows, 0, 1, Some(shown));
+        state.edit_cell(&rows, 0, 2, Some(text.to_string()));
+        assert_eq!(state.changes().unwrap().loaded.len(), 2);
+        // Typed over, it isn't; Ctrl+Z brings it back.
+        state.edit_cell(&rows, 0, 2, Some("typed".into()));
+        assert_eq!(state.changes().unwrap().loaded.len(), 1);
+        state.undo(&rows);
+        assert_eq!(state.changes().unwrap(), &changes);
+        state.undo(&rows);
+        state.undo(&rows);
+        assert!(state.changes().unwrap().is_empty());
+
+        // New rows: deleting the first takes its file, the second's moves up.
+        state.add_row(&rows, 3);
+        state.add_row(&rows, 3);
+        state.load_value(&rows, RowRef::New(0), 1, Loaded::Bytes(bytes.clone()));
+        state.load_value(&rows, RowRef::New(1), 2, Loaded::Text(text.clone()));
+        state.cursor = Some((1, 0));
+        state.anchor = state.cursor;
+        state.delete_rows(3);
+        let changes = state.changes().unwrap();
+        assert_eq!(changes.inserts.len(), 1);
+        let loaded: Vec<_> = changes.loaded.keys().copied().collect();
+        assert_eq!(loaded, [(RowRef::New(0), 2)]);
+        // An open value editor gives way to the file.
+        state.open_value_editor(&rows, (1, 1));
+        assert!(state.value_editor.is_some());
+        state.load_value(&rows, RowRef::New(0), 1, Loaded::Bytes(bytes));
+        assert!(state.value_editor.is_none());
+    }
+
+    /// What a cell holds of a file's value, as each database shows binary
+    /// values: cut short past 4000 bytes, with the size the grid reads
+    /// back (#293).
+    #[test]
+    fn loaded_values_show_as_held() {
+        use pythia_db::Dialect;
+        let small = Loaded::Bytes(Arc::from(&[0xCA, 0xFE][..]));
+        assert_eq!(small.shown(Dialect::ORACLE), "CAFE");
+        assert_eq!(small.shown(Dialect::SQLSERVER), "0xCAFE");
+        assert_eq!(small.shown(Dialect::POSTGRES), "\\xCAFE");
+        let big = Loaded::Bytes(vec![0xAB; 5000].into());
+        for dialect in [Dialect::MYSQL, Dialect::SQLSERVER, Dialect::POSTGRES] {
+            assert_eq!(
+                pythia_db::cut_size(&big.shown(dialect)),
+                Some(5000),
+                "{dialect:?}"
+            );
+        }
+        let text = Loaded::Text("é".repeat(3000).into());
+        let shown = text.shown(Dialect::ORACLE);
+        assert!(shown.ends_with("… (6000 bytes)"), "{shown}");
+        assert_eq!(shown.len(), 4000 + "… (6000 bytes)".len());
+        assert_eq!(Loaded::Text("short".into()).shown(Dialect::ORACLE), "short");
     }
 }

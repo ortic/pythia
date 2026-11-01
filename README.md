@@ -34,7 +34,9 @@ for Linux, Windows and macOS.
 - Results in a virtualized grid: sorting, rectangular selection, aggregates,
   record view, value viewer, copy and export (CSV, TSV, JSON, Excel,
   INSERT statements, Markdown, HTML). Columns can be resized, hidden,
-  moved by dragging their header and frozen at the left.
+  moved by dragging their header and frozen at the left. *Save to file…*
+  writes a binary or long text value (an image in a BLOB, a document in a
+  CLOB) to a file.
 - **Follow foreign keys**: right-click a row to open its parent row or its
   child rows in any table referencing it.
 - **Chart any result** as bars or lines: the x axis defaults to the first text
@@ -42,7 +44,8 @@ for Linux, Windows and macOS.
   filter and sort.
 - **Edit results in place** — no `FOR UPDATE` locks: changes are checked
   against the fetched values when applied, so concurrent modifications are
-  reported instead of overwritten. "Show SQL" previews the DML.
+  reported instead of overwritten. "Show SQL" previews the DML. *Load from
+  file…* puts a file into a binary or long text cell.
 - **Execute to file** streams a query of any size into CSV, TSV, JSON,
   INSERT statements or Markdown, with live row count and cancel, on every
   database.

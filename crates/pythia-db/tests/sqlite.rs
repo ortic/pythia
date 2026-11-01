@@ -6,8 +6,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use pythia_db::{
-    ConnectParams, DbEvent, DbKind, DbRequest, Detail, Dialect, MetaQuery, MetaResult, ObjectType,
-    Script, Session,
+    Bind, ConnectParams, DbEvent, DbKind, DbRequest, Detail, Dialect, MetaQuery, MetaResult,
+    ObjectType, Script, Session,
 };
 
 /// A new database file for one test, removed when it ends.
@@ -415,7 +415,10 @@ fn values_types_and_binds() {
         id: 2,
         sql: "select count(*), :B is null, :a, 'it''s :a' from v where i = :A".into(),
         max_rows: 10,
-        binds: vec![("A".into(), Some("7".into())), ("b".into(), None)],
+        binds: vec![
+            ("A".into(), Bind::Text(Some("7".into()))),
+            ("b".into(), Bind::Text(None)),
+        ],
     });
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     let DbEvent::Rows { rows, .. } = h.next_result() else {
@@ -1024,4 +1027,94 @@ fn filters_match_any_letters_without_case() {
     assert_eq!(found("R62_ČA"), ["r62_čaj"]);
     assert_eq!(found("ère"), ["r62_bière"]);
     assert_eq!(found("r62_*e"), ["r62_tea", "r62_bière", "r62_Straße"]);
+}
+
+/// Megabytes with every byte value, and text that isn't ASCII: what a
+/// statement binds whole (#293), and the same reversed.
+fn whole_values(seed: usize) -> (Vec<u8>, String) {
+    let mut bytes: Vec<u8> = (0..3usize << 20)
+        .map(|i| ((i * 7 + i / 256 + seed) % 256) as u8)
+        .collect();
+    let mut text: String = (0..20_000)
+        .map(|i| format!("Zeile {i}: Grüße aus Zürich, 日本語のテキスト, Ελληνικά, 😀\n"))
+        .collect();
+    if seed > 0 {
+        bytes.reverse();
+        text = text.chars().rev().collect();
+    }
+    (bytes, text)
+}
+
+/// The bytes of a binary value fetched whole as hex (after `0x` or `\x`).
+fn unhex(text: &str) -> Vec<u8> {
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("\\x"))
+        .unwrap_or(text);
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// `name` bound to the bytes or the text of `values`.
+fn binds(values: &(Vec<u8>, String), names: &[&str]) -> Vec<(String, Bind)> {
+    names
+        .iter()
+        .map(|&name| {
+            let value = match name {
+                "b" => Bind::Bytes(values.0.as_slice().into()),
+                _ => Bind::LongText(values.1.as_str().into()),
+            };
+            (name.to_owned(), value)
+        })
+        .collect()
+}
+
+impl Harness {
+    /// Runs a statement with `binds`; its rows affected, or the error.
+    fn bound(&mut self, sql: &str, binds: Vec<(String, Bind)>) -> Result<Option<u64>, String> {
+        self.session.send(DbRequest::Execute {
+            id: 7,
+            sql: sql.into(),
+            max_rows: 10,
+            binds,
+        });
+        match self.next_result() {
+            DbEvent::Executed { summary, .. } => Ok(summary.rows_affected),
+            DbEvent::Failed { error, .. } => Err(error.text()),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    /// The first row of a query, its values whole.
+    fn whole_row(&mut self, sql: &str) -> Vec<Option<String>> {
+        self.session.send(DbRequest::ExecuteWhole {
+            id: 8,
+            sql: sql.into(),
+            max_rows: 10,
+        });
+        assert!(matches!(self.next_result(), DbEvent::QueryStarted { .. }));
+        let DbEvent::Rows { mut rows, .. } = self.next_result() else {
+            panic!("{sql}: expected rows")
+        };
+        rows.remove(0)
+    }
+}
+
+/// Bytes bind as a blob and text as text, a number too, whole: megabytes
+/// into a BLOB and a TEXT column, inserted and updated (#293).
+#[test]
+fn values_bound_whole() {
+    let db = TempDb::new("bound");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table lob_bound (id integer primary key, b blob, t text)");
+    let (first, second) = (whole_values(0), whole_values(1));
+    let insert = "insert into lob_bound (id, b, t) values (1, :b, :t)";
+    assert_eq!(h.bound(insert, binds(&first, &["b", "t"])), Ok(Some(1)));
+    let update = "update lob_bound set b = :b, t = :t where id = 1";
+    assert_eq!(h.bound(update, binds(&second, &["b", "t"])), Ok(Some(1)));
+    let row = h.whole_row("select b, t from lob_bound");
+    assert!(unhex(row[0].as_deref().unwrap()) == second.0, "b");
+    assert!(row[1].as_deref() == Some(second.1.as_str()), "t");
 }

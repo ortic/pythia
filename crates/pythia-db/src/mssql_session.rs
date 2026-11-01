@@ -42,7 +42,7 @@ use crate::sql_text::{
 };
 use crate::ssh::Tunnel;
 use crate::types::{
-    Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
 
 pub(crate) type Tds = tiberius::Client<Compat<TcpStream>>;
@@ -390,7 +390,7 @@ impl Worker {
         id: u64,
         sql: &str,
         max_rows: usize,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
@@ -520,7 +520,7 @@ impl Worker {
     fn run_statement(
         &mut self,
         sql: &str,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, Failure> {
@@ -535,7 +535,7 @@ impl Worker {
     fn stream_statement(
         &mut self,
         sql: &str,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Ran, Failure> {
@@ -564,8 +564,14 @@ impl Worker {
                     format!("@P{n}")
                 });
                 let mut query = Query::new(sql);
+                // Text as nvarchar, bytes as varbinary: (max) past 4000
+                // characters and 8000 bytes (#293).
                 for value in values {
-                    query.bind(value);
+                    match value {
+                        Bind::Text(text) => query.bind(text),
+                        Bind::Bytes(bytes) => query.bind(bytes.to_vec()),
+                        Bind::LongText(text) => query.bind(text.to_string()),
+                    }
                 }
                 Box::pin(query.query(client))
             };

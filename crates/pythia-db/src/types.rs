@@ -76,8 +76,8 @@ pub enum DbRequest {
         id: u64,
         sql: String,
         max_rows: usize,
-        /// Values for `:name` bind variables, bound as strings (`None` = NULL).
-        binds: Vec<(String, Option<String>)>,
+        /// Values for `:name` bind variables.
+        binds: Vec<(String, Bind)>,
     },
     /// Executes a query as `Execute` does, for writing its rows into a file
     /// (*Execute to file*): binary values come whole rather than cut short
@@ -245,6 +245,36 @@ pub struct Column {
 
 /// A cell value rendered to text; `None` is SQL NULL.
 pub type Cell = Option<String>;
+
+/// The value of a `:name` bind variable.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Bind {
+    /// Text as entered (`None` = NULL), which the database reads as it
+    /// would a literal: as a number or a date where one is wanted.
+    Text(Option<String>),
+    /// Bytes, bound whole as the database's binary type (#293).
+    Bytes(Arc<[u8]>),
+    /// Text, bound whole as the database's long text type and kept as it
+    /// is (#293).
+    LongText(Arc<str>),
+}
+
+impl From<Option<String>> for Bind {
+    fn from(value: Option<String>) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl fmt::Debug for Bind {
+    // A value of megabytes as its size.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(value) => f.debug_tuple("Text").field(value).finish(),
+            Self::Bytes(bytes) => write!(f, "Bytes({} bytes)", bytes.len()),
+            Self::LongText(text) => write!(f, "LongText({} bytes)", text.len()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExecSummary {

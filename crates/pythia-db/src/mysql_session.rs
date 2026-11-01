@@ -31,7 +31,7 @@ use crate::sql_text::{
     statement_kind_in,
 };
 use crate::types::{
-    Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
 
 const DEFAULT_PORT: u16 = 3306;
@@ -203,7 +203,7 @@ impl Worker {
         id: u64,
         sql: &str,
         max_rows: usize,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
@@ -293,7 +293,7 @@ impl Worker {
     fn run_statement(
         conn: &mut Conn,
         sql: &str,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, mysql::Error> {
@@ -801,13 +801,16 @@ fn kill_query(opts: &Opts, id: u32) {
     }
 }
 
-/// Replaces `:name` binds by `?` with their values in order.
-fn positional(sql: &str, binds: &[(String, Option<String>)]) -> (String, Vec<Value>) {
+/// Replaces `:name` binds by `?` with their values in order: MySQL takes
+/// text and bytes alike, as the column's type wants them.
+fn positional(sql: &str, binds: &[(String, Bind)]) -> (String, Vec<Value>) {
     let mut values = Vec::new();
     let sql = replace_binds(sql, binds, |_, value| {
         values.push(match value {
-            Some(v) => Value::Bytes(v.clone().into_bytes()),
-            None => Value::NULL,
+            Bind::Text(Some(v)) => Value::Bytes(v.clone().into_bytes()),
+            Bind::Text(None) => Value::NULL,
+            Bind::Bytes(bytes) => Value::Bytes(bytes.to_vec()),
+            Bind::LongText(text) => Value::Bytes(text.as_bytes().to_vec()),
         });
         "?".into()
     });
@@ -1190,8 +1193,8 @@ mod tests {
     #[test]
     fn binds_become_positional() {
         let binds = vec![
-            ("id".to_owned(), Some("7".to_owned())),
-            ("n".to_owned(), None),
+            ("id".to_owned(), Some("7".to_owned()).into()),
+            ("n".to_owned(), Bind::Text(None)),
         ];
         let (sql, values) = positional(
             "select * from t where id = :ID or :n is null and x = ':id'",
