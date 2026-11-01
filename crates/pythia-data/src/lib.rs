@@ -8,7 +8,7 @@
 //! Oracle, `X'…'` binary on MySQL, …).
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::io::Write;
 
 pub mod import;
@@ -262,13 +262,14 @@ impl<W: Write> StreamWriter<W> {
             Format::Insert => inserts(&self.columns, rows, &options, &mut self.out)?,
             Format::Markdown => markdown_rows(rows, &mut self.out)?,
             Format::Json => {
+                let keys = json_keys(&self.columns);
                 for (i, row) in rows.iter().enumerate() {
                     let sep = if self.rows == 0 && i == 0 {
                         "\n"
                     } else {
                         ",\n"
                     };
-                    let object = json_object(&self.columns, row, self.options.dialect)?;
+                    let object = json_object(&keys, &self.columns, row, self.options.dialect)?;
                     let object = serde_json::to_string_pretty(&object)?;
                     write!(self.out, "{sep}{}", indent(&object))?;
                 }
@@ -334,27 +335,67 @@ fn json(
     dialect: Dialect,
     out: &mut dyn Write,
 ) -> Result<()> {
+    let keys = json_keys(columns);
     let array = rows
         .iter()
-        .map(|row| json_object(columns, row, dialect))
+        .map(|row| json_object(&keys, columns, row, dialect))
         .collect::<serde_json::Result<Vec<_>>>()?;
     serde_json::to_writer_pretty(&mut *out, &array)?;
     writeln!(out)?;
     Ok(())
 }
 
-/// A row as a JSON object, its keys sorted as a `serde_json::Value` has
-/// them. Numbers go in as raw JSON, every digit (#267): as an i64 or a
-/// double, 18446744073709551615 was written 1.8446744073709552e+19.
-fn json_object(
+/// A row as a JSON object: its members in the result's order.
+struct JsonObject<'a>(Vec<(&'a str, Box<RawValue>)>);
+
+impl serde::Serialize for JsonObject<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(key, value)| (key, value)))
+    }
+}
+
+/// The keys of the columns in a row's JSON object: their names, in the
+/// result's order. A name that comes again takes the first `_2`, `_3`, …
+/// that no column is called (#297): as one map, `select a.id, b.id` kept
+/// one `id`, and the keys came sorted.
+fn json_keys(columns: &[Column]) -> Vec<String> {
+    let names: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    columns
+        .iter()
+        .map(|col| {
+            let name = col.name.as_str();
+            let key = if taken.contains(name) {
+                (2..)
+                    .map(|n| format!("{name}_{n}"))
+                    .find(|k| !names.contains(k.as_str()) && !taken.contains(k))
+                    .unwrap_or_default()
+            } else {
+                name.to_owned()
+            };
+            taken.insert(key.clone());
+            key
+        })
+        .collect()
+}
+
+/// A row as a JSON object under `keys` (see [`json_keys`]). Numbers go in
+/// as raw JSON, every digit (#267): as an i64 or a double,
+/// 18446744073709551615 was written 1.8446744073709552e+19.
+fn json_object<'a>(
+    keys: &'a [String],
     columns: &[Column],
     row: &[Cell],
     dialect: Dialect,
-) -> serde_json::Result<BTreeMap<String, Box<RawValue>>> {
-    columns
+) -> serde_json::Result<JsonObject<'a>> {
+    let members = keys
         .iter()
+        .zip(columns)
         .zip(row)
-        .map(|(col, cell)| {
+        .map(|((key, col), cell)| {
             let typed = match cell {
                 Some(v) if col.numeric => json_number(v).map(RawValue::from_string),
                 Some(v) if is_boolean(dialect, col) => boolean(v).map(|b| to_raw_value(&b)),
@@ -362,9 +403,10 @@ fn json_object(
             };
             // NULL as null, the rest as strings.
             let value = typed.unwrap_or_else(|| to_raw_value(cell))?;
-            Ok((col.name.clone(), value))
+            Ok((key.as_str(), value))
         })
-        .collect()
+        .collect::<serde_json::Result<_>>()?;
+    Ok(JsonObject(members))
 }
 
 /// Columns of booleans (#217): PostgreSQL's and Oracle's `boolean`, SQL
@@ -1589,6 +1631,46 @@ mod tests {
         // PostgreSQL's bit is a string of bits.
         let bits = json(Dialect::POSTGRES, "bit", &[Some("101"), Some("1")]);
         assert_eq!(bits, [Text("101".into()), Text("1".into())]);
+    }
+
+    /// A row's object has a key for each column, in the result's order,
+    /// whole and streamed: a second `id` (`select a.id, b.id …`) is
+    /// `id_2`, or the next number no column takes; `ID` is another key.
+    #[test]
+    fn json_keeps_every_column() {
+        let col = |name: &str| Column {
+            name: name.into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        };
+        let columns: Vec<Column> = ["ZIP", "id", "NAME", "id", "id_2", "id", "ID"]
+            .into_iter()
+            .map(col)
+            .collect();
+        let rows: Vec<Vec<Cell>> = vec![(1..=7).map(|n| Some(n.to_string())).collect()];
+        let options = Options::default();
+        let whole = export_to_vec(Format::Json, &columns, &rows, &options).unwrap();
+        let mut stream =
+            StreamWriter::new(Format::Json, columns.clone(), options, Vec::new()).unwrap();
+        stream.write(&rows).unwrap();
+        let streamed = stream.finish().unwrap();
+        for bytes in [whole, streamed] {
+            let text = String::from_utf8(bytes).unwrap();
+            let members: Vec<(&str, &str)> = text
+                .lines()
+                .filter_map(|l| l.trim().trim_end_matches(',').split_once(": "))
+                .collect();
+            let expected = [
+                ("\"ZIP\"", "1"),
+                ("\"id\"", "2"),
+                ("\"NAME\"", "3"),
+                ("\"id_3\"", "4"),
+                ("\"id_2\"", "5"),
+                ("\"id_4\"", "6"),
+                ("\"ID\"", "7"),
+            ];
+            assert_eq!(members, expected, "{text}");
+        }
     }
 
     #[test]

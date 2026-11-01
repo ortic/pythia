@@ -671,6 +671,12 @@ All notable changes to Pythia are documented here. The format follows
   timers that can corrupt memory. rsa, which the SSH tunnels use, still
   has RUSTSEC-2023-0071 (a timing side channel), for which there is no
   fixed version yet.
+- JSON exports keep every column, in the result's order (#297). Each
+  row was an object keyed by the column names, sorted: of two columns
+  named `ID`, as in most joins, only the last one's value was written. A
+  name that comes again is now `ID_2` (or the next number no column is
+  called). *Copy as*, the grid's *Export*, *Execute to file* and *Export
+  tables* write JSON so.
 
 ## [0.10.0] - 2026-10-30
 
