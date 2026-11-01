@@ -26,7 +26,8 @@ pub enum Syntax {
     #[default]
     Oracle,
     /// MySQL and MariaDB: statements end as in SQL*Plus, lexed MySQL's way
-    /// ([`crate::tokenize_in`]).
+    /// ([`crate::tokenize_in`]), or as the `mysql` client's: after a line
+    /// `DELIMITER x`, at `x` (`DELIMITER ;` goes back).
     MySql,
     /// PostgreSQL: every statement ends at `;`. Routine bodies are
     /// (dollar-quoted) strings; `BEGIN ATOMIC … END` keeps its `;`.
@@ -255,6 +256,60 @@ impl<'a> Splitter<'a> {
         &self.src[line_start..line_end]
     }
 
+    /// The `mysql` client's `DELIMITER x` starting at token `idx`, on a
+    /// line of its own (#203): `x`, and where the line ends.
+    fn delimiter_command(&self, idx: usize) -> Option<(&'a str, usize)> {
+        let t = &self.tokens[idx];
+        if self.syntax != Syntax::MySql || !self.word_eq(t, &["DELIMITER"]) {
+            return None;
+        }
+        let line_end = self.src[t.span.end..]
+            .find('\n')
+            .map_or(self.src.len(), |i| t.span.end + i);
+        let rest = &self.src[t.span.end..line_end];
+        let before = self.src[..t.span.start].trim_end_matches([' ', '\t']);
+        if !(before.is_empty() || before.ends_with('\n')) || !rest.starts_with([' ', '\t']) {
+            return None;
+        }
+        Some((rest.split_whitespace().next()?, line_end))
+    }
+
+    /// Where `delimiter` starts in token `idx`, unless that is a string, a
+    /// quoted name or a comment. It may go on into the next tokens, and
+    /// start inside a word (`END$$`).
+    fn delimiter_in(&self, idx: usize, delimiter: &str) -> Option<usize> {
+        let t = &self.tokens[idx];
+        if t.kind.is_trivia()
+            || matches!(
+                t.kind,
+                TokenKind::String | TokenKind::QString | TokenKind::QuotedIdent | TokenKind::Hint
+            )
+        {
+            return None;
+        }
+        t.span
+            .clone()
+            .find(|&at| self.src.is_char_boundary(at) && self.src[at..].starts_with(delimiter))
+    }
+
+    /// The index of the token that starts at byte `at`. When a token runs
+    /// across it, the rest of the script is lexed again from there.
+    fn token_at(&mut self, at: usize) -> usize {
+        let idx = self.tokens.partition_point(|t| t.span.end <= at);
+        if self.tokens.get(idx).is_some_and(|t| t.span.start < at) {
+            self.tokens.truncate(idx);
+            self.tokens.extend(
+                tokenize_in(&self.src[at..], self.syntax)
+                    .into_iter()
+                    .map(|t| Token {
+                        kind: t.kind,
+                        span: t.span.start + at..t.span.end + at,
+                    }),
+            );
+        }
+        idx
+    }
+
     /// The first significant token after `idx`.
     fn next_word(&self, idx: usize) -> Option<&Token> {
         self.significant_from(idx + 1).next()
@@ -366,13 +421,61 @@ impl<'a> Splitter<'a> {
         StatementKind::Sql
     }
 
-    fn push(&mut self, kind: StatementKind, first: usize, last: usize) {
+    fn push(&mut self, kind: StatementKind, first: usize, mut last: usize) {
+        // SQL*Plus commands may carry a trailing `;` (e.g. `exec foo;`).
+        if kind == StatementKind::SqlPlus
+            && self.tokens[last].kind == TokenKind::Semicolon
+            && last > first
+        {
+            last -= 1;
+            while self.tokens[last].kind.is_trivia() {
+                last -= 1;
+            }
+        }
         let range = self.tokens[first].span.start..self.tokens[last].span.end;
         self.out.push(Statement { kind, range });
     }
 
+    /// Adds the statement from token `start` while `DELIMITER x` holds
+    /// (#203): it ends at `x`, a client command also at the end of its
+    /// line, and anything at `/` on a line of its own. Returns the index of
+    /// the token after it.
+    fn delimited(&mut self, start: usize, kind: StatementKind, delimiter: &str) -> usize {
+        let mut last = None;
+        let mut i = start;
+        while i < self.tokens.len() {
+            if let Some(at) = self.delimiter_in(i, delimiter) {
+                if at > self.tokens[i].span.start {
+                    let range = self.tokens[start].span.start..at;
+                    self.out.push(Statement { kind, range });
+                } else if let Some(last) = last {
+                    self.push(kind, start, last);
+                }
+                return self.token_at(at + delimiter.len());
+            }
+            if i > start {
+                match kind {
+                    StatementKind::SqlPlus if self.tokens[i].kind == TokenKind::Newline => break,
+                    StatementKind::Sql | StatementKind::PlSql if self.is_terminator_line(i) => {
+                        self.push(kind, start, last.unwrap_or(start));
+                        return self.line_end(i);
+                    }
+                    _ => {}
+                }
+            }
+            if !self.tokens[i].kind.is_trivia() {
+                last = Some(i);
+            }
+            i += 1;
+        }
+        self.push(kind, start, last.unwrap_or(start));
+        i
+    }
+
     fn run(mut self) -> Vec<Statement> {
         let mut i = 0;
+        // What ends statements instead of `;` after MySQL's `DELIMITER x`.
+        let mut delimiter = None;
         while i < self.tokens.len() {
             if self.tokens[i].kind.is_trivia() {
                 i += 1;
@@ -382,8 +485,17 @@ impl<'a> Splitter<'a> {
                 i = self.line_end(i);
                 continue;
             }
+            if let Some((new, line_end)) = self.delimiter_command(i) {
+                delimiter = (new != ";").then_some(new);
+                i = self.token_at(line_end);
+                continue;
+            }
             let start = i;
             let kind = self.classify(start);
+            if let Some(delimiter) = delimiter {
+                i = self.delimited(start, kind, delimiter);
+                continue;
+            }
             // Index of the last significant token that belongs to the statement.
             let mut last = start;
             // SQLite's `BEGIN` starting a statement begins a transaction.
@@ -412,16 +524,6 @@ impl<'a> Splitter<'a> {
                     last = i;
                 }
                 i += 1;
-            }
-            // SQL*Plus commands may carry a trailing `;` (e.g. `exec foo;`).
-            if kind == StatementKind::SqlPlus
-                && self.tokens[last].kind == TokenKind::Semicolon
-                && last > start
-            {
-                last -= 1;
-                while self.tokens[last].kind.is_trivia() {
-                    last -= 1;
-                }
             }
             self.push(kind, start, last);
         }
@@ -605,6 +707,57 @@ mod tests {
                 (StatementKind::Sql, "select E'it\\'s; here' as e"),
                 (StatementKind::Sql, "select 7"),
             ]
+        );
+    }
+
+    #[test]
+    fn mysql_delimiters() {
+        // `DELIMITER x` lines (#203): statements end at x, outside strings
+        // and comments, until `DELIMITER ;`.
+        let src = "DELIMITER $$\n\
+                   CREATE PROCEDURE p()\nBEGIN\n  INSERT INTO t VALUES (1);\n  \
+                   SELECT ';$$', `a$$` -- $$\n  # $$\n  ;\nEND$$\n\
+                   select 1$$ commit$$\n\
+                   DELIMITER ;\n\
+                   select 2; select 3;\n\
+                   delimiter ;;\n\
+                   CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN\n  SET NEW.a = 1;\nEND ;;\n\
+                   ;;\n\
+                   create procedure q() begin select 1; end\n/\n\
+                   DELIMITER ;\n\
+                   create procedure r() begin select 1; end\n/\n\
+                   select 4";
+        assert_eq!(
+            split_in(src, Syntax::MySql),
+            vec![
+                (
+                    StatementKind::PlSql,
+                    "CREATE PROCEDURE p()\nBEGIN\n  INSERT INTO t VALUES (1);\n  \
+                     SELECT ';$$', `a$$` -- $$\n  # $$\n  ;\nEND"
+                ),
+                (StatementKind::Sql, "select 1"),
+                (StatementKind::Sql, "commit"),
+                (StatementKind::Sql, "select 2"),
+                (StatementKind::Sql, "select 3"),
+                (
+                    StatementKind::PlSql,
+                    "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN\n  SET NEW.a = 1;\nEND"
+                ),
+                (
+                    StatementKind::PlSql,
+                    "create procedure q() begin select 1; end"
+                ),
+                (
+                    StatementKind::PlSql,
+                    "create procedure r() begin select 1; end"
+                ),
+                (StatementKind::Sql, "select 4"),
+            ]
+        );
+        // Other databases have no DELIMITER.
+        assert_eq!(
+            split_in("delimiter //\nselect 1//", Syntax::Postgres),
+            vec![(StatementKind::Sql, "delimiter //\nselect 1//")]
         );
     }
 

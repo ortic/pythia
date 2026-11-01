@@ -310,6 +310,55 @@ fn scripts_split_as_the_server_reads_them() {
     h.ok("drop table pythia_script");
 }
 
+/// A trigger and a procedure between `DELIMITER ;;` lines, as mysqldump
+/// writes them (#203): their bodies stay whole, and nothing of them runs
+/// on its own. While the binary log is on, a trigger takes SUPER (1419):
+/// without it, the procedure goes on alone.
+#[test]
+fn delimiters_as_mysqldump_writes_them() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let script = "DROP TABLE IF EXISTS `fs_dump`;\n\
+                  CREATE TABLE `fs_dump` (\n  `a` int DEFAULT NULL,\n  `b` varchar(20) DEFAULT NULL\n);\n\
+                  DELIMITER ;;\n\
+                  CREATE DEFINER=CURRENT_USER TRIGGER `fs_dump_t` BEFORE INSERT ON `fs_dump` \
+                  FOR EACH ROW begin\n  set new.b = concat(new.b, ';;', new.a * 2);\nend ;;\n\
+                  DELIMITER ;\n\
+                  DROP PROCEDURE IF EXISTS `fs_dump_p`;\n\
+                  DELIMITER ;;\n\
+                  CREATE DEFINER=CURRENT_USER PROCEDURE `fs_dump_p`()\n\
+                  begin\n  insert into fs_dump values (1, 'x');\n  insert into fs_dump values (2, 'y');\nend ;;\n\
+                  DELIMITER ;\n\
+                  select count(*) from fs_dump;\n\
+                  call fs_dump_p();";
+    let statements: Vec<&str> = pythia_plsql::split_statements_in(script, Dialect::MYSQL.syntax())
+        .iter()
+        .map(|s| s.text(script))
+        .collect();
+    assert_eq!(statements.len(), 7, "{statements:?}");
+    h.ok(statements[0]);
+    h.ok(statements[1]);
+    let triggered = match h.run(0, statements[2]) {
+        DbEvent::Failed { error, .. } if error.to_string().contains("1419") => false,
+        DbEvent::Failed { error, .. } => panic!("{}: {error}", statements[2]),
+        _ => true,
+    };
+    h.settle();
+    for statement in &statements[3..5] {
+        h.ok(statement);
+    }
+    assert_eq!(h.scalar(statements[5]).as_deref(), Some("0"));
+    h.ok(statements[6]);
+    assert_eq!(
+        h.scalar("select group_concat(b order by a separator '|') from fs_dump")
+            .as_deref(),
+        Some(if triggered { "x;;2|y;;4" } else { "x|y" })
+    );
+    h.ok("drop procedure fs_dump_p");
+    h.ok("drop table fs_dump");
+}
+
 /// Without a database in the address, the login statements pick it (the
 /// profile's default schema): `Connected` reports the one they leave the
 /// session in, then their failures (#103).

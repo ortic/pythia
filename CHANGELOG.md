@@ -120,6 +120,14 @@ All notable changes to Pythia are documented here. The format follows
   into a prepared statement"). A backslash escapes the next character in
   an `E'…'` string, so `E'it\'s; here'` no longer splits the script in
   two. The editor highlights both the same way.
+- MySQL scripts know the `mysql` client's `DELIMITER` (#203). A script
+  with `DELIMITER ;;` or `DELIMITER $$` around its routines and
+  triggers, as `mysqldump` and most tutorials write them, failed with
+  "ERROR 1064 … near 'DELIMITER'", and a routine was split at every `;`
+  of its body: under `WHENEVER SQLERROR CONTINUE`, the statements of the
+  body ran on their own. After a line `DELIMITER x`, statements now end
+  at `x` until `DELIMITER ;`, and the line itself isn't sent. `/` on a
+  line of its own still ends a routine.
 
 ## [0.10.0] - 2026-10-30
 

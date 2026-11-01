@@ -289,8 +289,10 @@ for Linux, Windows and macOS.
   statements and lock waits `SELECT` on `performance_schema`.
 - Everything built on Oracle's dictionary or PL/SQL — debugger, profiler,
   the rest of the monitor, reports, scheduler jobs, compare, import/export,
-  the other form editors — isn't offered on MySQL connections. As in SQL\*Plus,
-  end a routine with `/` on a line of its own (there is no `DELIMITER`).
+  the other form editors — isn't offered on MySQL connections. End a
+  routine with `/` on a line of its own, as in SQL\*Plus, or with a
+  `DELIMITER` of its own, as for the `mysql` client (`DELIMITER ;;` …
+  `END ;;` … `DELIMITER ;`).
 
 **PostgreSQL and SQL Server (experimental)**
 - *Type: PostgreSQL* with `host:5432/database` (`?sslmode=require` for TLS,
