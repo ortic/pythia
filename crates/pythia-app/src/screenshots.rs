@@ -8297,10 +8297,15 @@ fn a_new_database_file_is_made_once() {
         assert!(!file.exists(), "made again by a window");
 
         // Nor connecting again from the dialog, which shows the connection.
+        // Still connected to it, so only the dialog's error says it's over.
         h.state_mut()
             .test_command(crate::commands::Command::Connect);
         h.run_steps(2);
-        let error = connect(&mut h);
+        h.get_by_label("Connect").click();
+        wait_until(&mut h, "the connect error", |app| {
+            app.test_connect_dialog_error().is_some()
+        });
+        let error = h.state().test_connect_dialog_error().map(str::to_owned);
         assert!(missing(error.clone()), "{error:?}");
         assert!(!file.exists(), "made again by Connect");
     }
