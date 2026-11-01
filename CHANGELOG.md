@@ -1035,6 +1035,13 @@ All notable changes to Pythia are documented here. The format follows
   now fetched again, in a new session, with the changes from the one
   that failed on waiting for Apply. In a transaction, which the lost
   connection rolled back, all the changes still wait.
+- Oracle: BINARY_DOUBLE and BINARY_FLOAT values are written as literals
+  of their type (#339): `1e300d`, `2.5f`, `binary_double_infinity`,
+  `binary_float_nan`. As NUMBERs, values beyond NUMBER's range failed in
+  INSERT statements and on *Apply* of a change with ORA-01426 (`1e300`)
+  or were written as 0 (`2e-300`), and the check of an infinity or NaN
+  fetched compared it as text and reported the row as changed by
+  another session.
 
 ## [0.10.0] - 2026-10-30
 

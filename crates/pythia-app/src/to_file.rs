@@ -420,4 +420,82 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The rows of `sql` written to a file as INSERTs and run back into
+    /// `copy` instead of `table`: how many statements there were.
+    fn insert_into_copy(conn: &Connection, sql: &str, table: &str, copy: &str) -> usize {
+        let path = std::env::temp_dir().join(format!("pythia-{copy}-{}.sql", std::process::id()));
+        run(conn, sql, &path, &AtomicU64::new(0)).unwrap();
+        let script = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let statements = pythia_plsql::split_statements(&script);
+        for statement in &statements {
+            let sql = statement.text(&script).replacen(
+                &format!("insert into {table} "),
+                &format!("insert into {copy} "),
+                1,
+            );
+            conn.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        statements.len()
+    }
+
+    /// The rows of `sql` as the session shows them.
+    fn texts(conn: &Connection, sql: &str) -> Vec<Vec<Cell>> {
+        let mut rows = Vec::new();
+        pythia_db::stream_query(conn, sql, 100, |_, batch| {
+            rows.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        rows
+    }
+
+    /// The INSERTs of BINARY_DOUBLE and BINARY_FLOAT values beyond
+    /// NUMBER's range, the infinities and NaN (#339), run back into a copy
+    /// of their table, are the same values: 1e300 failed with ORA-01426,
+    /// -2e-300 was written as 0.
+    #[test]
+    fn writes_binary_floats() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_bf", "r76_bf_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, d binary_double, f binary_float)"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        for values in [
+            "1, 1e300d, 3.4028235e38f",
+            "2, -2e-300d, 1e-40f",
+            "3, binary_double_infinity, binary_float_infinity",
+            "4, -binary_double_infinity, -binary_float_infinity",
+            "5, binary_double_nan, binary_float_nan",
+            "6, 0.1d, 0.1f",
+            "7, null, null",
+        ] {
+            conn.execute(&format!("insert into r76_bf values ({values})"), &[])
+                .unwrap();
+        }
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_bf order by id",
+            "r76_bf",
+            "r76_bf_copy",
+        );
+        assert_eq!(n, 7);
+        let rows = texts(&conn, "select * from r76_bf order by id");
+        assert_eq!(rows[0][1].as_deref(), Some("1e300"));
+        assert_eq!(texts(&conn, "select * from r76_bf_copy order by id"), rows);
+        for table in ["r76_bf", "r76_bf_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

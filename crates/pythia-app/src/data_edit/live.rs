@@ -12,7 +12,7 @@ use std::time::Duration;
 use pythia_db::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbKind, DbRequest, Dialect, Session,
 };
-use pythia_ui::Changes;
+use pythia_ui::{Changes, Loaded, RowRef};
 
 use super::{Editable, RowKey, dml, edit_query, row_key, same};
 
@@ -1362,4 +1362,79 @@ fn oracle_values_past_their_literals() {
         conn.execute(&format!("drop table {table} purge"), &[])
             .unwrap();
     }
+}
+
+/// BINARY_DOUBLE and BINARY_FLOAT values beyond NUMBER's range, the
+/// infinities and NaN find their rows and are written back as they were,
+/// into new rows too (#339): as NUMBERs, 1e300 failed with ORA-01426,
+/// -2e-300 was 0, and Inf and NaN were compared as the text 'inf'. A
+/// file's text loaded into a cell is bound (#293), and read so too.
+#[test]
+fn oracle_binary_floats_find_their_rows() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r76_floats purge", &[]);
+    for sql in [
+        "create table r76_floats (id number primary key, d binary_double, f binary_float)",
+        "insert into r76_floats values (1, 1e300d, 3.4028235e38f)",
+        "insert into r76_floats values (2, -2e-300d, 1e-40f)",
+        "insert into r76_floats values (3, binary_double_infinity, binary_float_infinity)",
+        "insert into r76_floats values (4, -binary_double_infinity, -binary_float_infinity)",
+        "insert into r76_floats values (5, binary_double_nan, binary_float_nan)",
+        "insert into r76_floats values (6, 0.1d, 0.1f)",
+        // The window's session applies the changes.
+        "commit",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = Editable {
+        table: "r76_floats".into(),
+        source: "select * from r76_floats order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    // Each value set to itself, and each row again as a new one.
+    let mut changes = Changes::default();
+    for (r, row) in rows.iter().enumerate() {
+        changes.updates.insert(
+            r,
+            BTreeMap::from([(1, row[1].clone()), (2, row[2].clone())]),
+        );
+        changes.inserts.push(vec![
+            Some((r + 11).to_string()),
+            row[1].clone(),
+            row[2].clone(),
+            None,
+        ]);
+    }
+    changes
+        .loaded
+        .insert((RowRef::Existing(5), 1), Loaded::Text("-1e-300".into()));
+    // As the window runs them.
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+        let ran = db.apply(&statement);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    let (_, again) = fetch("select d, f from r76_floats order by id");
+    let mut values: Vec<Vec<Cell>> = rows.iter().map(|row| row[1..3].to_vec()).collect();
+    let copies = values.clone();
+    values[5][0] = Some("-1e-300".into());
+    assert_eq!(again, [values, copies].concat());
+    conn.execute("drop table r76_floats purge", &[]).unwrap();
 }

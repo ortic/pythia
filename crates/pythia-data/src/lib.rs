@@ -658,11 +658,37 @@ fn is_number(col: &Column, v: &str) -> bool {
     col.numeric && v.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
+/// A BINARY_DOUBLE's or BINARY_FLOAT's value as a literal of its type
+/// (#339): `1e300d`, `2.5f`, `binary_double_infinity`,
+/// `-binary_float_infinity`, `binary_double_nan`. As a NUMBER, 1e300
+/// overflows (ORA-01426) and 2e-300 is 0; as text, `'inf'` goes in but
+/// compares with `Inf` as text. `None` for other columns and for text
+/// that is no number.
+fn binary_float(col: &Column, v: &str) -> Option<String> {
+    let (suffix, name) = match col.type_name.as_str() {
+        "BINARY_DOUBLE" => ('d', "binary_double"),
+        "BINARY_FLOAT" => ('f', "binary_float"),
+        _ => return None,
+    };
+    let number = v.parse::<f64>().ok()?;
+    Some(if number.is_nan() {
+        format!("{name}_nan")
+    } else if number.is_infinite() && !v.bytes().any(|b| b.is_ascii_digit()) {
+        let sign = if number < 0.0 { "-" } else { "" };
+        format!("{sign}{name}_infinity")
+    } else {
+        format!("{v}{suffix}")
+    })
+}
+
 /// Renders a value as a SQL literal for `col` (Oracle's SQL).
 pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
+    if let Some(binary) = binary_float(col, v) {
+        return binary;
+    }
     if is_number(col, v) {
         return v.to_owned();
     }
@@ -1483,9 +1509,54 @@ mod tests {
         assert_eq!(ms(&col("float", true), Some(&tiny)), "2.5e-41");
         assert_eq!(ms(&col("float", true), Some("0.1")), "0.1");
         // Oracle too: a name isn't a number.
+        assert_eq!(sql_literal(&col("NUMBER", true), Some("Inf")), "'Inf'");
+    }
+
+    /// BINARY_DOUBLE and BINARY_FLOAT values are literals of their type
+    /// (#339): as NUMBERs, 1e300 overflowed (ORA-01426), 2e-300 was 0, and
+    /// 'inf' and 'NaN' compared as text with Inf and Nan.
+    #[test]
+    fn oracle_binary_floats_typed() {
+        let col = |t: &str| Column {
+            name: "C".into(),
+            type_name: t.into(),
+            numeric: true,
+        };
+        let double = |v| sql_literal(&col("BINARY_DOUBLE"), Some(v));
+        let float = |v| sql_literal(&col("BINARY_FLOAT"), Some(v));
+        assert_eq!(double("1e300"), "1e300d");
+        assert_eq!(double("-2e-300"), "-2e-300d");
+        assert_eq!(double("0.1"), "0.1d");
+        assert_eq!(double("100"), "100d");
+        assert_eq!(double("inf"), "binary_double_infinity");
+        assert_eq!(double("-inf"), "-binary_double_infinity");
+        assert_eq!(double("NaN"), "binary_double_nan");
+        assert_eq!(float("3.4028235e38"), "3.4028235e38f");
+        assert_eq!(float("1e-40"), "1e-40f");
+        assert_eq!(float("inf"), "binary_float_infinity");
+        assert_eq!(float("-inf"), "-binary_float_infinity");
+        assert_eq!(float("NaN"), "binary_float_nan");
+        // Typed as Oracle writes them, or in a form it reads.
+        assert_eq!(double("-Inf"), "-binary_double_infinity");
+        assert_eq!(float("Nan"), "binary_float_nan");
+        assert_eq!(double(".5E3"), ".5E3d");
+        // Anything else as text, for Oracle to read or reject.
+        assert_eq!(double(" 1.5"), "' 1.5'");
+        assert_eq!(double("1,5"), "'1,5'");
+        assert_eq!(sql_literal(&col("BINARY_DOUBLE"), None), "NULL");
+        // In INSERT statements too.
+        let columns = [col("BINARY_DOUBLE"), col("BINARY_FLOAT")];
+        let rows = vec![vec![Some("1e300".into()), Some("NaN".into())]];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text =
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap();
         assert_eq!(
-            sql_literal(&col("BINARY_DOUBLE", true), Some("Inf")),
-            "'Inf'"
+            text,
+            "insert into t (c, c) values (1e300d, binary_float_nan);\n"
         );
     }
 
