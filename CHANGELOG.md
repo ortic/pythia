@@ -267,6 +267,12 @@ All notable changes to Pythia are documented here. The format follows
   (the row is found by its key), and a cut value pasted into a cell is
   no longer written: MySQL and SQLite stored it as text, 8000 hex
   digits and the size.
+- Binary values of SQL Server (`varbinary`, `binary`, `image`), MySQL
+  (`VARBINARY`, `BINARY`) and PostgreSQL (`bytea`) show as binary in the
+  result grid (#224), as Oracle's and BLOBs did: their start and size in
+  the cell, a hex dump in *View value…*. They showed as hex text, without
+  their size, and a value over 4000 bytes didn't show that the grid holds
+  it cut short. So do SQLite columns declared `MEDIUMBLOB` or `LONGBLOB`.
 
 ## [0.10.0] - 2026-10-30
 

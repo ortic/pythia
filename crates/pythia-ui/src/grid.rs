@@ -14,7 +14,7 @@ use std::ops::RangeInclusive;
 use egui::{Align, Align2, Key, Layout, RichText, Sense, Ui};
 use egui_extras::{Column as TableColumn, TableBuilder};
 use pythia_data::Format;
-use pythia_db::{Cell, Column};
+use pythia_db::{Cell, Column, DbKind, Dialect};
 
 /// The characters of a value's first line a cell lays out at most: more
 /// than any column is wide, and a 10 MB line isn't laid out whole (#212).
@@ -1493,7 +1493,7 @@ fn data_cell(
         .and_then(|e| e.active.as_ref())
         .is_some_and(|(r, ec, _)| *r == view_row && *ec == c);
     // What the cell shows of the value, not a copy of all of it (#212).
-    let binary = is_binary(col);
+    let binary = is_binary(state.dialect, col);
     let shown = state.value(d.rows, view_row, c).map(|text| {
         if binary {
             binary_summary(text)
@@ -2100,9 +2100,9 @@ fn viewer(
     let name = columns.get(c).map_or("", |col| col.name.as_str());
     let bytes = columns
         .get(c)
-        .filter(|col| is_binary(col))
+        .filter(|col| is_binary(state.dialect, col))
         .and(value.as_deref())
-        .and_then(decode_hex);
+        .and_then(|v| decode_hex(hex_digits(v)));
     let pretty = value
         .as_deref()
         .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
@@ -2187,10 +2187,33 @@ fn record_text(text: &str) -> String {
     }
 }
 
-/// BLOB, RAW and LONG RAW values arrive as hex text.
-fn is_binary(col: &Column) -> bool {
-    let t = col.type_name.to_ascii_uppercase();
-    t.starts_with("BLOB") || t.starts_with("RAW") || t.starts_with("LONG RAW") || t == "BFILE"
+/// Columns whose values arrive as hex text, by the database's type names
+/// (#224): Oracle's BLOB, RAW, LONG RAW and BFILE; MySQL's BLOB, BINARY and
+/// VARBINARY; SQL Server's binary, varbinary and image (as `0x…`);
+/// PostgreSQL's bytea (as `\x…`); SQLite's columns of blobs (#209).
+fn is_binary(dialect: Dialect, col: &Column) -> bool {
+    let t = col.type_name.as_str();
+    match dialect.kind() {
+        DbKind::Oracle => {
+            let t = t.to_ascii_uppercase();
+            t.starts_with("BLOB")
+                || t.starts_with("RAW")
+                || t.starts_with("LONG RAW")
+                || t == "BFILE"
+        }
+        DbKind::MySql => matches!(t, "BLOB" | "BINARY" | "VARBINARY"),
+        DbKind::SqlServer => matches!(t, "binary" | "varbinary" | "image"),
+        DbKind::Postgres => t == "bytea",
+        DbKind::Sqlite => t.to_ascii_uppercase().contains("BLOB"),
+    }
+}
+
+/// The hex digits of a binary value, after SQL Server's `0x` or
+/// PostgreSQL's `\x`.
+fn hex_digits(text: &str) -> &str {
+    text.strip_prefix("0x")
+        .or_else(|| text.strip_prefix("\\x"))
+        .unwrap_or(text)
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -2214,7 +2237,8 @@ fn human_bytes(n: usize) -> String {
 
 /// `0x89504E47… · 12.3 KB` for a hex-encoded value; one held cut short has
 /// its size after the hex (#204).
-fn binary_summary(hex: &str) -> String {
+fn binary_summary(text: &str) -> String {
+    let hex = hex_digits(text);
     let head: String = hex.chars().take(16).collect();
     let more = if hex.len() > 16 { "…" } else { "" };
     let size = pythia_db::cut_size(hex).map_or(hex.len() / 2, |n| n as usize);
@@ -2722,6 +2746,87 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    /// A small PNG (2×2 pixels).
+    const PNG: &str = "89504E470D0A1A0A0000000D4948445200000002000000020802000000FDD49A73000000\
+                       1049444154789C63F8CFC000440C100A001FEE03FD8B5F14D40000000049454E44AE426082";
+
+    /// Binary values show as binary on every database: their start and
+    /// size in the cell, the image and a hex dump in the viewer. SQL
+    /// Server's, MySQL's VARBINARY and PostgreSQL's bytea showed as text.
+    #[test]
+    fn binary_values_of_every_database() {
+        use pythia_db::Dialect;
+        let cases = [
+            (Dialect::ORACLE, "BLOB", PNG.to_owned()),
+            (Dialect::ORACLE, "RAW(73)", PNG.to_owned()),
+            (Dialect::MYSQL, "BLOB", PNG.to_owned()),
+            (Dialect::MYSQL, "VARBINARY", PNG.to_owned()),
+            (Dialect::MYSQL, "BINARY", PNG.to_owned()),
+            (Dialect::SQLSERVER, "varbinary", format!("0x{PNG}")),
+            (Dialect::SQLSERVER, "binary", format!("0x{PNG}")),
+            (Dialect::SQLSERVER, "image", format!("0x{PNG}")),
+            (
+                Dialect::POSTGRES,
+                "bytea",
+                format!("\\x{}", PNG.to_lowercase()),
+            ),
+            (Dialect::SQLITE, "BLOB", PNG.to_owned()),
+            (Dialect::SQLITE, "MEDIUMBLOB", PNG.to_owned()),
+        ];
+        for (dialect, type_name, value) in cases {
+            let columns = vec![Column {
+                name: "IMG".into(),
+                type_name: type_name.into(),
+                numeric: false,
+            }];
+            let rows = vec![vec![Some(value)]];
+            let ctx = egui::Context::default();
+            let mut state = GridState {
+                dialect,
+                ..Default::default()
+            };
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let summary = if dialect == Dialect::POSTGRES {
+                "0x89504e470d0a1a0a… · 73 bytes"
+            } else {
+                "0x89504E470D0A1A0A… · 73 bytes"
+            };
+            assert!(
+                texts(&drawn).contains(&summary),
+                "{type_name}: {:?}",
+                texts(&drawn)
+            );
+            state.viewer = Some((0, 0));
+            // A window is laid out unseen first.
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            assert!(
+                texts(&drawn).contains(&"73 bytes · png"),
+                "{type_name}: {:?}",
+                texts(&drawn)
+            );
+        }
+        // Text in a column SQLite declares VARBINARY is text.
+        let columns = vec![Column {
+            name: "T".into(),
+            type_name: "VARBINARY".into(),
+            numeric: false,
+        }];
+        let rows = vec![vec![Some("CAFE".to_owned())]];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            ..Default::default()
+        };
+        let drawn = frame(
+            &egui::Context::default(),
+            &columns,
+            &rows,
+            &mut state,
+            vec![],
+        );
+        assert!(texts(&drawn).contains(&"CAFE"), "{:?}", texts(&drawn));
     }
 
     /// A cell lays out no more of a value than it can show (#212): 10 MB on
