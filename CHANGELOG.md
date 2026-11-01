@@ -1078,6 +1078,23 @@ All notable changes to Pythia are documented here. The format follows
   applied again, and an update stayed on the row's old value or was
   dropped with "… was changed by another session". The result is now
   fetched again, and the messages say auto-commit committed it.
+- Completion in a SQL window knows what the window's statements did to
+  its names (#320): after `alter session set current_schema` (Oracle),
+  `use db` (MySQL), `set search_path` (PostgreSQL), `use db` or `execute
+  as` (SQL Server) and `attach` (SQLite) it offers the tables and
+  columns those name, where it offered the connection's, also those of a
+  table of the same name there. Names are still looked up on the
+  connection's main session, by what the window's session reports, and
+  windows that share that share the answers. The window's temporary
+  tables complete too: SQLite's, PostgreSQL's, MySQL's and MariaDB's,
+  SQL Server's `#tables` and Oracle's private temporary tables, which
+  only its session sees, so they are looked up there while it is idle,
+  its transaction left as it was (on PostgreSQL after a savepoint, so
+  that a lookup that fails doesn't abort it). With a result of the
+  window open, completion goes on without them
+  rather than end the result's query (on Oracle, which keeps it open,
+  with them). SQL Server finds unqualified names in `dbo` after the
+  default schema, PostgreSQL in each schema of the search path.
 
 ## [0.10.0] - 2026-10-30
 

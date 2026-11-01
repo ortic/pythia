@@ -318,8 +318,9 @@ pub struct DocContext<'a> {
     pub fetch_size: usize,
     /// Display name of the document's connection.
     pub connection: Option<String>,
-    /// Dictionary cache of the connection, for code assistance.
-    pub catalog: Option<&'a pythia_lsp_core::CatalogCache>,
+    /// Dictionary data of the connection, for code assistance: a SQL
+    /// window's in its context (#320).
+    pub catalog: Option<&'a dyn pythia_lsp_core::Catalog>,
     /// Bumped whenever new dictionary data arrived.
     pub catalog_revision: u64,
     /// Names of all open connections.

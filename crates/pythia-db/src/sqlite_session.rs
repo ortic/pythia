@@ -27,7 +27,8 @@ use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{WHOLE_BATCH_BYTES, hex, release, replace_binds, row_bytes, statement_kind};
 use crate::types::{
-    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
+    NameContext, ServerInfo,
 };
 
 /// How long a statement waits for another session's lock on the file.
@@ -398,8 +399,25 @@ impl Worker {
             },
             version,
             current_schema: "main".into(),
+            context: self.context()?,
         };
         Ok((server, failed))
+    }
+
+    /// The attached databases (#320).
+    fn context(&self) -> Result<NameContext, DbError> {
+        let mut list = self.conn.prepare("pragma database_list")?;
+        let attached = list
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .filter_map(Result::ok)
+            .filter(|(name, _)| name != "main" && name != "temp")
+            .collect();
+        Ok(NameContext {
+            attached,
+            ..NameContext::default()
+        })
     }
 
     /// Whether a transaction is open, as SQLite says.
@@ -477,6 +495,17 @@ impl Worker {
                     error,
                     elapsed: started.elapsed(),
                 });
+            }
+        }
+        if matches!(
+            crate::sql_text::leading_words(&sql)
+                .first()
+                .map(String::as_str),
+            Some("ATTACH" | "DETACH")
+        ) {
+            match self.context() {
+                Ok(context) => self.events.send(DbEvent::Context(context)),
+                Err(e) => warn!("reading the attached databases: {e}"),
             }
         }
         self.report_transaction();

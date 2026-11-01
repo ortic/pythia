@@ -31,7 +31,8 @@ use crate::sql_text::{
     statement_kind_in,
 };
 use crate::types::{
-    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
+    NameContext, ServerInfo,
 };
 
 const DEFAULT_PORT: u16 = 3306;
@@ -190,6 +191,7 @@ impl Worker {
                 None => version.clone(),
             },
             version,
+            context: NameContext::schema(schema.as_deref().unwrap_or_default()),
             current_schema: schema.unwrap_or_default(),
         };
         Ok((server, failed))
@@ -278,13 +280,14 @@ impl Worker {
         // also of an INSERT of megabytes, and of mysqldump's /*!40103 SET
         // TIME_ZONE='+00:00' */ (#219).
         let head = sql.char_indices().nth(1000).map_or(sql, |(i, _)| &sql[..i]);
-        if matches!(
-            leading_words_in(head, Syntax::MySql)
-                .first()
-                .map(String::as_str),
-            Some("SET" | "CALL")
-        ) {
+        let words = leading_words_in(head, Syntax::MySql);
+        let words: Vec<&str> = words.iter().take(2).map(String::as_str).collect();
+        if matches!(words.first(), Some(&("SET" | "CALL"))) {
             self.report_time_zone();
+        }
+        // USE, or DROP DATABASE of the one in use (#320).
+        if matches!(words[..], ["USE", ..] | ["DROP", "DATABASE" | "SCHEMA"]) {
+            self.report_context();
         }
         self.report_transaction();
         next
@@ -360,6 +363,21 @@ impl Worker {
         if self.time_zone.as_ref() != Some(&zone) {
             self.events.send(DbEvent::TimeZone(zone.clone()));
             self.time_zone = Some(zone);
+        }
+    }
+
+    /// Reports the database unqualified names are in (#320).
+    fn report_context(&mut self) {
+        match self
+            .conn
+            .query_first::<Option<String>, _>("select database()")
+        {
+            Ok(database) => {
+                let database = database.flatten().unwrap_or_default();
+                self.events
+                    .send(DbEvent::Context(NameContext::schema(&database)));
+            }
+            Err(e) => warn!("reading the database: {e}"),
         }
     }
 

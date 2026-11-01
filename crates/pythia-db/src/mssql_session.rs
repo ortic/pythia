@@ -42,7 +42,8 @@ use crate::sql_text::{
 };
 use crate::ssh::Tunnel;
 use crate::types::{
-    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
+    NameContext, ServerInfo,
 };
 
 pub(crate) type Tds = tiberius::Client<Compat<TcpStream>>;
@@ -95,10 +96,12 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         release: (0, 0),
         autocommit: false,
         pending: false,
+        context: NameContext::default(),
     };
     match worker.prepare_session() {
         Ok((server, failed)) => {
             worker.release = server.release;
+            worker.context = server.context.clone();
             worker.events.send(DbEvent::Connected(server));
             for notice in failed {
                 worker.events.send(DbEvent::Notice(notice));
@@ -264,6 +267,8 @@ struct Worker {
     autocommit: bool,
     /// The server has an open transaction (`@@TRANCOUNT > 0`).
     pending: bool,
+    /// The database and default schema last reported (#320).
+    context: NameContext,
 }
 
 /// How [`Worker::stream_statement`] reads a query's rows.
@@ -327,7 +332,7 @@ impl Worker {
             .ms()
             .rows(
                 "select cast(serverproperty('ProductVersion') as nvarchar(128)), @@version, \
-                        schema_name()",
+                        schema_name(), db_name()",
                 &[],
             )?
             .into_iter()
@@ -336,12 +341,17 @@ impl Worker {
         let mut values = row.into_iter().map(Option::unwrap_or_default);
         let version = values.next().unwrap_or_default();
         let banner = values.next().unwrap_or_default();
+        let schema = values.next().unwrap_or_default();
         let server = ServerInfo {
             dialect: Dialect::SQLSERVER,
             release: release(&version),
             banner: banner.lines().next().unwrap_or_default().trim().to_owned(),
             version,
-            current_schema: values.next().unwrap_or_default(),
+            context: NameContext {
+                database: values.next().unwrap_or_default(),
+                ..NameContext::schema(&schema)
+            },
+            current_schema: schema,
         };
         Ok((server, failed))
     }
@@ -368,7 +378,10 @@ impl Worker {
         };
         self.pending = false;
         match prepared {
-            Ok((_, failed)) => {
+            Ok((server, failed)) => {
+                // A new session, without the temporary tables of the old one.
+                self.context = server.context;
+                self.events.send(DbEvent::Context(self.context.clone()));
                 for notice in failed {
                     self.events.send(DbEvent::Notice(notice));
                 }
@@ -501,11 +514,32 @@ impl Worker {
             // Nothing else to keep in a transaction of its own.
             let _ = self.ms().execute("if @@trancount > 0 rollback");
         }
-        if let Ok((_, open)) = self.counts() {
-            self.pending = open;
-        }
+        self.read_state();
         self.report_transaction();
         next
+    }
+
+    /// Whether a transaction is open, and the database and default schema,
+    /// reported when they changed (#320): after a USE, an EXECUTE AS.
+    fn read_state(&mut self) {
+        let row = self
+            .ms()
+            .rows("select @@trancount, db_name(), schema_name()", &[]);
+        let mut values = match row {
+            Ok(rows) => rows.into_iter().next().unwrap_or_default().into_iter(),
+            Err(e) => return warn!("reading the session's state: {e}"),
+        };
+        self.pending = values.next().flatten().is_some_and(|t| t != "0");
+        let database = values.next().flatten().unwrap_or_default();
+        let schema = values.next().flatten().unwrap_or_default();
+        let context = NameContext {
+            database,
+            ..NameContext::schema(&schema)
+        };
+        if context != self.context {
+            self.events.send(DbEvent::Context(context.clone()));
+            self.context = context;
+        }
     }
 
     /// `@@ROWCOUNT` of the last statement and whether a transaction is open.
@@ -729,9 +763,7 @@ impl Worker {
             )),
             Err(e) => self.events.send(DbEvent::Error(e)),
         }
-        if let Ok((_, open)) = self.counts() {
-            self.pending = open;
-        }
+        self.read_state();
         self.report_transaction();
     }
 

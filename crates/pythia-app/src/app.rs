@@ -75,6 +75,18 @@ enum DebugSqlLookup {
     Plan(String, i64),
 }
 
+/// Where a catalog lookup's answer goes.
+enum CatalogInflight {
+    /// The connection's, kept by the context it was looked up in (none:
+    /// the main session's).
+    Shared {
+        connection: String,
+        context: Option<pythia_db::NameContext>,
+    },
+    /// A SQL window's, of what only its session sees (#320).
+    Own(DocId, crate::catalog::OwnRequest),
+}
+
 /// Layout and documents, restored on the next start.
 #[derive(Serialize, Deserialize)]
 struct Workspace {
@@ -148,10 +160,12 @@ pub struct PythiaApp {
     queued_commands: Vec<Command>,
     assistant: crate::ai::Assistant,
     /// Dictionary caches for code assistance, by connection.
-    catalogs: HashMap<String, pythia_lsp_core::CatalogCache>,
+    catalogs: HashMap<String, crate::catalog::Catalogs>,
+    /// SQL windows' contexts and what only their sessions see (#320).
+    windows: HashMap<DocId, crate::catalog::Window>,
     catalog_revision: u64,
-    /// Catalog task request id → connection.
-    catalog_inflight: HashMap<u64, String>,
+    /// Catalog task request id → where its answer goes.
+    catalog_inflight: HashMap<u64, CatalogInflight>,
     /// Reading a schema's source to learn formatter settings from: request id.
     learn_inflight: Option<u64>,
     /// Statements the formatter keeps as written, being laid out by the AI.
@@ -169,8 +183,13 @@ pub struct PythiaApp {
     debug_session_task: Option<u64>,
     /// Lookups for the debugger's SQL panel: request id → what.
     debug_sql_inflight: HashMap<u64, DebugSqlLookup>,
-    /// Requests already sent (or answered) per connection, to avoid repeats.
-    catalog_requested: std::collections::HashSet<(String, pythia_lsp_core::CatalogRequest)>,
+    /// Requests already sent (or answered) per connection and context, to
+    /// avoid repeats.
+    catalog_requested: std::collections::HashSet<(
+        String,
+        Option<pythia_db::NameContext>,
+        pythia_lsp_core::CatalogRequest,
+    )>,
     log: Vec<String>,
     connect_dialog: ConnectDialog,
     palette: CommandPalette,
@@ -254,6 +273,7 @@ impl PythiaApp {
             queued_commands: Vec::new(),
             assistant: Default::default(),
             catalogs: HashMap::new(),
+            windows: HashMap::new(),
             catalog_revision: 0,
             catalog_inflight: HashMap::new(),
             learn_inflight: None,
@@ -625,11 +645,19 @@ impl PythiaApp {
         };
         conn.use_database(database, &self.notify);
         let names = name_style(conn.dialect());
+        let context = pythia_db::NameContext::schema(database);
         self.catalogs.insert(
             connection.to_owned(),
-            pythia_lsp_core::CatalogCache::new(database.to_owned()).with_names(names),
+            crate::catalog::Catalogs::new(context.clone(), database.to_owned(), names),
         );
-        self.catalog_requested.retain(|(c, _)| c != connection);
+        // The windows' sessions use it too, after what they run.
+        for window in self.windows.values_mut() {
+            if window.connection == connection {
+                window.context = context.clone();
+                window.clear();
+            }
+        }
+        self.catalog_requested.retain(|(c, ..)| c != connection);
         self.log(format!("{connection}: database {database}"));
     }
 
@@ -1257,6 +1285,7 @@ impl PythiaApp {
 
     fn close_doc(&mut self, id: DocId) {
         self.conns.close_doc(id);
+        self.windows.remove(&id);
         if let Some(doc) = self.docs.remove(&id) {
             self.closed_docs.push(doc);
             if self.closed_docs.len() > 20 {
@@ -1347,7 +1376,7 @@ impl PythiaApp {
             self.log(line);
         }
         if let Some(name) = &connection {
-            self.fetch_catalog(name, effects.catalog_requests);
+            self.fetch_catalog(doc, name, effects.catalog_requests);
         }
         for (unit, line) in effects.breakpoints {
             self.debug.toggle_breakpoint(unit, line);
@@ -2406,32 +2435,104 @@ impl PythiaApp {
         ))
     }
 
-    /// Fetches dictionary data for code assistance in the background.
-    fn fetch_catalog(&mut self, connection: &str, requests: Vec<pythia_lsp_core::CatalogRequest>) {
+    /// Fetches dictionary data for code assistance in the background: on
+    /// the main session, a SQL window's in its context, and what only its
+    /// session sees there (#320).
+    fn fetch_catalog(
+        &mut self,
+        doc: Option<DocId>,
+        connection: &str,
+        requests: Vec<pythia_lsp_core::CatalogRequest>,
+    ) {
+        use crate::catalog::Ask;
         let dialect = self.dialect_of(Some(connection));
-        if !dialect.supports(Feature::Completion) {
+        if !dialect.supports(Feature::Completion) || requests.is_empty() {
             return;
         }
-        for request in requests {
-            if !self
-                .catalog_requested
-                .insert((connection.to_owned(), request.clone()))
-            {
-                continue;
+        let window = doc.filter(|id| self.window(*id, connection).is_some());
+        let (asks, context) = match (window, self.catalogs.get(connection)) {
+            (Some(id), Some(catalogs)) => {
+                let live = self.takes_lookups(id);
+                let window = self.window(id, connection);
+                let catalog = crate::catalog::WindowCatalog::new(catalogs, window, dialect, live);
+                let asks: Vec<Ask> = requests.iter().flat_map(|r| catalog.asks(r)).collect();
+                let context = window.and_then(|w| catalogs.key(&w.context, dialect));
+                (asks, context)
             }
+            _ => (requests.into_iter().map(Ask::Main).collect(), None),
+        };
+        for ask in asks {
             let id = request_id();
-            self.catalog_inflight.insert(id, connection.to_owned());
-            self.conns
-                .send_main(connection, crate::catalog::request(id, request, dialect));
+            match ask {
+                Ask::Main(request) => {
+                    if !self.catalog_requested.insert((
+                        connection.to_owned(),
+                        context.clone(),
+                        request.clone(),
+                    )) {
+                        continue;
+                    }
+                    self.catalog_inflight.insert(
+                        id,
+                        CatalogInflight::Shared {
+                            connection: connection.to_owned(),
+                            context: context.clone(),
+                        },
+                    );
+                    let request = crate::catalog::request(id, request, dialect, context.clone());
+                    self.conns.send_main(connection, request);
+                }
+                Ask::Own(request) => {
+                    let Some(doc) = window else { continue };
+                    let Some(window) = self.windows.get_mut(&doc) else {
+                        continue;
+                    };
+                    let Some(session) = self.conns.get(connection).and_then(|c| c.docs.get(&doc))
+                    else {
+                        continue;
+                    };
+                    if !window.ask(&request) {
+                        continue;
+                    }
+                    self.catalog_inflight
+                        .insert(id, CatalogInflight::Own(doc, request.clone()));
+                    session
+                        .session
+                        .send(crate::catalog::own_request(id, request, dialect));
+                }
+            }
         }
+    }
+
+    /// The SQL window `id`'s context and what its session told, while it
+    /// has a session on `connection`.
+    fn window(&self, id: DocId, connection: &str) -> Option<&crate::catalog::Window> {
+        self.windows.get(&id).filter(|w| {
+            w.connection == connection
+                && self
+                    .conns
+                    .get(connection)
+                    .is_some_and(|c| c.docs.contains_key(&id))
+        })
+    }
+
+    /// Whether SQL window `id`'s session can be asked for what only it sees:
+    /// it is idle, with no result open (#320).
+    fn takes_lookups(&self, id: DocId) -> bool {
+        matches!(self.docs.get(&id).map(|d| &d.kind), Some(DocKind::Sql(w)) if w.takes_lookups())
     }
 
     /// Forgets cached dictionary data (after DDL, or on demand).
     fn invalidate_catalog(&mut self, connection: &str) {
-        if let Some(cache) = self.catalogs.get_mut(connection) {
-            cache.clear();
+        if let Some(catalogs) = self.catalogs.get_mut(connection) {
+            catalogs.clear();
         }
-        self.catalog_requested.retain(|(c, _)| c != connection);
+        for window in self.windows.values_mut() {
+            if window.connection == connection {
+                window.clear();
+            }
+        }
+        self.catalog_requested.retain(|(c, ..)| c != connection);
         self.catalog_revision += 1;
     }
 
@@ -2560,7 +2661,10 @@ impl PythiaApp {
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
-        let catalog = connection.as_ref().and_then(|c| self.catalogs.get(c));
+        let catalog = connection
+            .as_ref()
+            .and_then(|c| self.catalogs.get(c))
+            .map(|c| c.main() as &dyn pythia_lsp_core::Catalog);
         let cx = DocContext {
             id,
             settings: &settings,
@@ -3205,7 +3309,10 @@ impl PythiaApp {
         let Some(doc) = self.docs.get_mut(&id) else {
             return;
         };
-        let catalog = connection.as_ref().and_then(|c| self.catalogs.get(c));
+        let catalog = connection
+            .as_ref()
+            .and_then(|c| self.catalogs.get(c))
+            .map(|c| c.main() as &dyn pythia_lsp_core::Catalog);
         let cx = DocContext {
             id,
             settings: &settings,
@@ -3493,6 +3600,67 @@ impl PythiaApp {
 
     // ----- database events ------------------------------------------------
 
+    /// The answer of catalog lookup `id`: the main session's, kept by the
+    /// context it was looked up in, or a SQL window's session's (#320). One
+    /// that failed answers nothing, so that what waited for it goes on.
+    fn catalog_answered(&mut self, id: u64, result: pythia_db::TaskResult) {
+        let Some(inflight) = self.catalog_inflight.remove(&id) else {
+            return;
+        };
+        match inflight {
+            CatalogInflight::Shared {
+                connection,
+                context,
+            } => match result.map(|any| any.downcast::<crate::catalog::Answer>()) {
+                Ok(Ok(answer)) => {
+                    if let Some(catalogs) = self.catalogs.get_mut(&connection) {
+                        answer.apply(catalogs.get_mut(context.as_ref()));
+                        self.catalog_revision += 1;
+                    }
+                }
+                Ok(Err(_)) => warn!("unexpected catalog task result"),
+                Err(e) => warn!("catalog lookup failed: {e}"),
+            },
+            CatalogInflight::Own(doc, request) => {
+                let answer = match result.map(|any| any.downcast::<crate::catalog::OwnAnswer>()) {
+                    Ok(Ok(answer)) => *answer,
+                    Ok(Err(_)) => {
+                        warn!("unexpected catalog task result");
+                        request.nothing()
+                    }
+                    Err(e) => {
+                        warn!("catalog lookup in a window's session failed: {e}");
+                        request.nothing()
+                    }
+                };
+                if let Some(window) = self.windows.get_mut(&doc) {
+                    window.apply(answer);
+                    self.catalog_revision += 1;
+                }
+            }
+        }
+    }
+
+    /// A SQL window's session told what its names refer to (#320): when it
+    /// connected, or after a statement that changed that. What it told
+    /// before is forgotten, its temporary tables with a new session.
+    fn window_context(&mut self, id: DocId, connection: &str, context: pythia_db::NameContext) {
+        if !matches!(self.docs.get(&id).map(|d| &d.kind), Some(DocKind::Sql(_))) {
+            return;
+        }
+        let dialect = self.dialect_of(Some(connection));
+        let window = self.windows.entry(id).or_insert_with(|| {
+            crate::catalog::Window::new(connection.to_owned(), context.clone(), name_style(dialect))
+        });
+        window.connection = connection.to_owned();
+        window.context = context;
+        window.clear();
+        // Answers on their way are of what it told before.
+        self.catalog_inflight
+            .retain(|_, i| !matches!(i, CatalogInflight::Own(doc, _) if *doc == id));
+        self.catalog_revision += 1;
+    }
+
     fn pump_events(&mut self) {
         for (name, key, event) in self.conns.poll() {
             let lost = match &event {
@@ -3532,6 +3700,17 @@ impl PythiaApp {
                     // A SQL window's lookups for the assistant (#319).
                     DbEvent::TaskDone { id: task, result } if self.assistant.is_lookup(task) => {
                         self.looked_up(result);
+                    }
+                    // And for completion (#320).
+                    DbEvent::TaskDone { id: task, result }
+                        if self.catalog_inflight.contains_key(&task) =>
+                    {
+                        self.catalog_answered(task, result);
+                    }
+                    DbEvent::Context(context) => self.window_context(id, &name, context),
+                    DbEvent::Connected(server) => {
+                        self.window_context(id, &name, server.context.clone());
+                        self.deliver(id, DbEvent::Connected(server));
                     }
                     DbEvent::TaskDone { id: task, result }
                         if self.debug_session_task == Some(task) =>
@@ -3598,13 +3777,15 @@ impl PythiaApp {
                     server.dialect.name(),
                     server.version,
                 );
-                let schema = server.current_schema.clone();
                 self.catalogs.insert(
                     name.to_owned(),
-                    pythia_lsp_core::CatalogCache::new(schema.clone())
-                        .with_names(name_style(server.dialect)),
+                    crate::catalog::Catalogs::new(
+                        server.context.clone(),
+                        server.current_schema.clone(),
+                        name_style(server.dialect),
+                    ),
                 );
-                self.catalog_requested.retain(|(c, _)| c != name);
+                self.catalog_requested.retain(|(c, ..)| c != name);
                 if let Some(conn) = self.conns.get_mut(name) {
                     conn.status = crate::connections::Status::Connected(server);
                 }
@@ -3728,17 +3909,7 @@ impl PythiaApp {
                 }
             }
             DbEvent::TaskDone { id, result } if self.catalog_inflight.contains_key(&id) => {
-                let connection = self.catalog_inflight.remove(&id).unwrap_or_default();
-                match result.map(|any| any.downcast::<crate::catalog::Answer>()) {
-                    Ok(Ok(answer)) => {
-                        if let Some(cache) = self.catalogs.get_mut(&connection) {
-                            answer.apply(cache);
-                            self.catalog_revision += 1;
-                        }
-                    }
-                    Ok(Err(_)) => warn!("unexpected catalog task result"),
-                    Err(e) => warn!("catalog lookup failed: {e}"),
-                }
+                self.catalog_answered(id, result);
             }
             DbEvent::TaskDone { id, result } if self.assistant.is_lookup(id) => {
                 self.looked_up(result);
@@ -5002,6 +5173,12 @@ impl eframe::App for PythiaApp {
             .filter(|(_, d)| d.has_unapplied_edits())
             .map(|(id, _)| *id)
             .collect();
+        // A window's context holds while its session does (#320).
+        self.windows.retain(|id, w| {
+            self.conns
+                .get(&w.connection)
+                .is_some_and(|c| c.docs.contains_key(id))
+        });
         let mut viewer = Viewer {
             docs: &mut self.docs,
             browser: &mut self.browser,
@@ -5018,6 +5195,7 @@ impl eframe::App for PythiaApp {
             production: &production,
             connected: &connected,
             catalogs: &self.catalogs,
+            windows: &self.windows,
             catalog_revision: self.catalog_revision,
             debug: &mut self.debug,
             debug_actions: Vec::new(),
@@ -5349,7 +5527,10 @@ impl PythiaApp {
         let id = self.focused.expect("focused");
         let cx = self.doc_context(id);
         let (settings, connection) = (cx.settings.clone(), cx.connection.clone());
-        let catalog = connection.as_ref().and_then(|c| self.catalogs.get(c));
+        let catalog = connection
+            .as_ref()
+            .and_then(|c| self.catalogs.get(c))
+            .map(|c| c.main() as &dyn pythia_lsp_core::Catalog);
         let cx = DocContext {
             id,
             settings: &settings,
@@ -5696,6 +5877,16 @@ impl PythiaApp {
         self.conns.any_pending_tx()
     }
 
+    /// Whether window `id`'s session has a transaction open.
+    pub fn test_window_pending_tx(&self, id: DocId) -> bool {
+        self.has_pending_tx(id)
+    }
+
+    /// No dictionary lookup for code assistance is on its way.
+    pub fn test_catalog_settled(&self) -> bool {
+        self.catalog_inflight.is_empty()
+    }
+
     pub fn test_expand_table(&mut self, table: ObjectRef) {
         let effects = self.browser.expand_table(table);
         self.apply_browser(effects);
@@ -5830,7 +6021,9 @@ struct Viewer<'a> {
     /// Connections whose profile is marked as production.
     production: &'a HashSet<String>,
     connected: &'a HashMap<String, bool>,
-    catalogs: &'a HashMap<String, pythia_lsp_core::CatalogCache>,
+    catalogs: &'a HashMap<String, crate::catalog::Catalogs>,
+    /// SQL windows' contexts and what their sessions told (#320).
+    windows: &'a HashMap<DocId, crate::catalog::Window>,
     catalog_revision: u64,
     debug: &'a mut pythia_debugger::ui::DebugSession,
     debug_actions: Vec<pythia_debugger::ui::DebugAction>,
@@ -5985,13 +6178,40 @@ impl TabViewer for Viewer<'_> {
                     .and_then(|c| self.connected.get(c))
                     .copied()
                     .unwrap_or(false);
+                let dialect = doc
+                    .connection
+                    .as_ref()
+                    .and_then(|c| self.dialects.get(c))
+                    .copied()
+                    .unwrap_or_default();
+                // A SQL window's names are its session's (#320).
+                let catalogs = doc.connection.as_ref().and_then(|c| self.catalogs.get(c));
+                let window_catalog = match &doc.kind {
+                    DocKind::Sql(w) => catalogs.map(|catalogs| {
+                        let window = self
+                            .windows
+                            .get(id)
+                            .filter(|s| doc.connection.as_ref() == Some(&s.connection));
+                        crate::catalog::WindowCatalog::new(
+                            catalogs,
+                            window,
+                            dialect,
+                            w.takes_lookups(),
+                        )
+                    }),
+                    _ => None,
+                };
+                let catalog = match &window_catalog {
+                    Some(catalog) => Some(catalog as &dyn pythia_lsp_core::Catalog),
+                    None => catalogs.map(|c| c.main() as &dyn pythia_lsp_core::Catalog),
+                };
                 let cx = DocContext {
                     id: *id,
                     settings: self.settings,
                     connected,
                     fetch_size: self.settings.fetch_size,
                     connection: doc.connection.clone(),
-                    catalog: doc.connection.as_ref().and_then(|c| self.catalogs.get(c)),
+                    catalog,
                     catalog_revision: self.catalog_revision,
                     connections: self.connections,
                     debug: Some(&*self.debug),
@@ -6001,12 +6221,7 @@ impl TabViewer for Viewer<'_> {
                         .as_ref()
                         .and_then(|c| self.privileges.get(c))
                         .copied(),
-                    dialect: doc
-                        .connection
-                        .as_ref()
-                        .and_then(|c| self.dialects.get(c))
-                        .copied()
-                        .unwrap_or_default(),
+                    dialect,
                     mariadb: doc
                         .connection
                         .as_ref()

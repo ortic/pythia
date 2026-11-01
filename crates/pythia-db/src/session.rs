@@ -13,7 +13,7 @@ use crate::dialect::Dialect;
 use crate::meta::{self, MetaQuery, MetaResult};
 use crate::types::{
     Bind, Cell, Client, Column, Compiled, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
-    ServerInfo,
+    NameContext, ServerInfo,
 };
 
 /// Interrupts the statement a worker is running (from another thread).
@@ -272,6 +272,8 @@ struct Worker {
     events: Events,
     autocommit: bool,
     open_query: Option<OpenQuery>,
+    /// The current schema last reported (#320).
+    schema: String,
 }
 
 impl Worker {
@@ -298,9 +300,11 @@ impl Worker {
             events,
             autocommit: false,
             open_query: None,
+            schema: String::new(),
         };
         match worker.on_connect(&params.init_sql) {
             Ok((server, failed)) => {
+                worker.schema = server.current_schema.clone();
                 worker.events.send(DbEvent::Connected(server));
                 for notice in failed {
                     worker.events.send(DbEvent::Notice(notice));
@@ -395,12 +399,14 @@ impl Worker {
                 ));
             }
         }
+        let schema = current_schema(&self.conn)?;
         let server = ServerInfo {
             dialect: Dialect::ORACLE,
             version: version.to_string(),
             release: (version.major(), version.minor()),
             banner,
-            current_schema: current_schema(&self.conn)?,
+            context: NameContext::schema(&schema),
+            current_schema: schema,
         };
         Ok((server, failed))
     }
@@ -557,7 +563,7 @@ impl Worker {
     }
 
     /// Collects DBMS_OUTPUT and refreshes the transaction state.
-    fn after_statement(&self) {
+    fn after_statement(&mut self) {
         match self.read_output() {
             Ok(lines) if !lines.is_empty() => self.events.send(DbEvent::Output(lines)),
             Ok(_) => {}
@@ -566,15 +572,24 @@ impl Worker {
         self.report_transaction();
     }
 
-    /// Sends whether the session has an open transaction.
-    fn report_transaction(&self) {
-        match self.conn.query_row_as::<Option<String>>(
-            "select dbms_transaction.local_transaction_id from dual",
+    /// Sends whether the session has an open transaction, and its current
+    /// schema when that changed (#320), read with it.
+    fn report_transaction(&mut self) {
+        match self.conn.query_row_as::<(Option<String>, String)>(
+            "select dbms_transaction.local_transaction_id, \
+                    sys_context('USERENV', 'CURRENT_SCHEMA') from dual",
             &[],
         ) {
-            Ok(tx) => self.events.send(DbEvent::Transaction {
-                pending: tx.is_some(),
-            }),
+            Ok((tx, schema)) => {
+                if self.schema != schema {
+                    self.events
+                        .send(DbEvent::Context(NameContext::schema(&schema)));
+                    self.schema = schema;
+                }
+                self.events.send(DbEvent::Transaction {
+                    pending: tx.is_some(),
+                });
+            }
             Err(e) => warn!("reading transaction state: {e}"),
         }
     }

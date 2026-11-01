@@ -1006,6 +1006,17 @@ impl SqlWindow {
                 .any(|r| replaces(&r.internal))
     }
 
+    /// Whether code assistance can look up what only the window's session
+    /// sees there now (#320): it isn't busy, and has no result with rows
+    /// left, whose query a lookup would end where the session reads one
+    /// result at a time (all but Oracle).
+    pub fn takes_lookups(&self) -> bool {
+        !self.session_busy()
+            && self.state.prompt.is_none()
+            && (self.state.syntax == Syntax::Oracle
+                || !self.state.results.iter().any(|r| r.more && !r.ended))
+    }
+
     /// Whether the window's session is busy with a statement, a fetch or a
     /// tool of the window.
     fn session_busy(&self) -> bool {
