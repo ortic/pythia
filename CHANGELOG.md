@@ -963,6 +963,32 @@ All notable changes to Pythia are documented here. The format follows
   built twice, the second time by the clustered index. Hypothetical
   indexes, which have statistics and no rows, are left out: they were
   made as real ones.
+- *Search data* opens a hit of a quoted table or column by its name as
+  it is (#334). The query named schema, table and column in lowercase,
+  quotes and all, so a hit in `"R71_Data"` read `"r71_data"`: it failed
+  with ORA-00942, or read the rows of another table. Plain names still
+  read in lowercase.
+- *Import* into a new table creates the table and columns it inserts
+  into (#335). Its CREATE TABLE lowercased the quoted names too, so
+  `"R71_My Table"` was created as `"r71_my table"`, and a column read
+  from a header `Date` or `Café` as `"date"` or `"café"`, where the
+  INSERT names `"DATE"` and `"CAFé"`: the import failed with ORA-00942
+  or ORA-00904 and left the table behind. Plain names still read in
+  lowercase.
+- A package's subprograms read with their case in an editor's context
+  menu and in the program window (#336), as names do since #272. A
+  quoted `"MyProc"` read `myproc` in the menu's heading, its *Edit* and
+  "… not found", and `"myproc"` in the outline and "… isn't in the
+  body". They read quoted where they have lowercase letters, others in
+  lowercase.
+- The *Schema* of *Export tables*, *Search data* and *Search source*
+  takes a quoted name as written (#337): `"r71_schema"` finds the schema
+  `r71_schema`, `hr` still `HR`. They uppercased what was typed, quotes
+  and all, so a schema with lowercase letters couldn't be named and
+  nothing was found. So does a connection's *Default schema*, which gave
+  "Login script: ORA-01741" for `"r71_schema"` on Oracle, a schema
+  `"""sales"""` for `"Sales"` on PostgreSQL and failed for MySQL's
+  `` `my db` ``.
 
 ## [0.10.0] - 2026-10-30
 

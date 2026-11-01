@@ -313,11 +313,48 @@ impl Dialect {
             DbKind::MySql | DbKind::SqlServer | DbKind::Sqlite => name.to_owned(),
         }
     }
+
+    /// How the dictionary stores a name the user typed, as SQL reads it: in
+    /// quotes (`"Sales"`, `` `Sales` ``, `[Sales]`) as written, without
+    /// them, a doubled closing quote for one; others as
+    /// [`dictionary_name`](Self::dictionary_name) folds them. So a schema
+    /// `"my_schema"` can be named on Oracle (#337).
+    pub fn typed_name(self, name: &str) -> String {
+        let name = name.trim();
+        let close = match name.chars().next() {
+            Some('"') => '"',
+            Some('`') => '`',
+            Some('[') => ']',
+            _ => return self.dictionary_name(name),
+        };
+        match name[1..].strip_suffix(close) {
+            Some(inner) => inner.replace(&format!("{close}{close}"), &close.to_string()),
+            None => self.dictionary_name(name),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names typed in quotes are taken as written, others as the database
+    /// folds them (#337).
+    #[test]
+    fn typed_names() {
+        let o = Dialect::ORACLE;
+        assert_eq!(o.typed_name("\"my_schema\""), "my_schema");
+        assert_eq!(o.typed_name(" hr "), "HR");
+        assert_eq!(o.typed_name("\"say \"\"hi\"\"\""), "say \"hi\"");
+        assert_eq!(o.typed_name("\"open"), "\"OPEN");
+        assert_eq!(o.typed_name("\""), "\"");
+        assert_eq!(o.typed_name(""), "");
+        assert_eq!(Dialect::POSTGRES.typed_name("\"Sales\""), "Sales");
+        assert_eq!(Dialect::POSTGRES.typed_name("Sales"), "sales");
+        assert_eq!(Dialect::MYSQL.typed_name("`my db`"), "my db");
+        assert_eq!(Dialect::MYSQL.typed_name("Shop"), "Shop");
+        assert_eq!(Dialect::SQLSERVER.typed_name("[a]]b]"), "a]b");
+    }
 
     #[test]
     fn oracle_has_everything_but_ssh() {

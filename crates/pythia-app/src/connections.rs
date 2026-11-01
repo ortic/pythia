@@ -487,10 +487,14 @@ pub fn kept_profile(profile: &ConnectionProfile) -> ConnectionProfile {
 /// default schema.
 fn init_sql(profile: &ConnectionProfile, database: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
-    let schema = database.unwrap_or(profile.default_schema.trim());
+    let dialect = Dialect::from(profile.kind);
+    let schema = match database {
+        Some(database) => database.to_owned(),
+        // As typed: `"Sales"` as written, others folded (#337).
+        None => dialect.typed_name(&profile.default_schema),
+    };
     if !schema.is_empty() {
-        let dialect = Dialect::from(profile.kind);
-        let schema = dialect.quote_ident(&dialect.dictionary_name(schema));
+        let schema = dialect.quote_ident(&schema);
         match profile.kind {
             DbKind::Oracle => out.push(format!("alter session set current_schema = {schema}")),
             DbKind::MySql => out.push(format!("use {schema}")),
@@ -612,6 +616,91 @@ mod tests {
             };
             // Not lost: the app would open yet another session.
             assert!(!e.is_connection_lost(), "{e}");
+        }
+    }
+
+    /// A default schema typed in quotes is taken as written, without them,
+    /// one typed without as the database folds names (#337).
+    #[test]
+    fn default_schemas_are_taken_as_typed() {
+        let init = |kind, schema: &str| {
+            let profile = ConnectionProfile {
+                kind,
+                default_schema: schema.into(),
+                ..Default::default()
+            };
+            init_sql(&profile, None)
+        };
+        assert_eq!(
+            init(DbKind::Oracle, "\"r71_conn\""),
+            ["alter session set current_schema = \"r71_conn\""]
+        );
+        assert_eq!(
+            init(DbKind::Oracle, " hr "),
+            ["alter session set current_schema = HR"]
+        );
+        assert_eq!(
+            init(DbKind::Postgres, "\"R71_Sales\""),
+            ["set search_path to \"R71_Sales\""]
+        );
+        assert_eq!(
+            init(DbKind::Postgres, "R71_Sales"),
+            ["set search_path to r71_sales"]
+        );
+        assert_eq!(init(DbKind::MySql, "`r71 db`"), ["use `r71 db`"]);
+        assert_eq!(init(DbKind::MySql, "r71 db"), ["use `r71 db`"]);
+
+        // A session that runs them is in that schema.
+        let current = |env: &str, kind, typed: &str, query: &'static str| {
+            let statements = init(kind, typed);
+            crate::test_db::run_on(env, kind, move |c| {
+                for sql in &statements {
+                    c.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+                }
+                c.query(query, &[]).unwrap()[0][0].clone()
+            })
+            .flatten()
+        };
+        if let Some(dba) = crate::test_db::connect("PYTHIA_TEST_DB_DBA") {
+            let _ = dba.execute("drop user \"r71_conn\" cascade", &[]);
+            dba.execute("create user \"r71_conn\" no authentication", &[])
+                .unwrap();
+            let schema = current(
+                "PYTHIA_TEST_DB",
+                DbKind::Oracle,
+                "\"r71_conn\"",
+                "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual",
+            );
+            dba.execute("drop user \"r71_conn\" cascade", &[]).unwrap();
+            assert_eq!(schema.as_deref(), Some("r71_conn"));
+        }
+        let pg = "PYTHIA_TEST_POSTGRES";
+        let drop = "drop schema if exists \"R71_Sales\"";
+        let created = crate::test_db::execute_on(
+            pg,
+            DbKind::Postgres,
+            &[drop, "create schema \"R71_Sales\""],
+        );
+        if let Some(created) = created {
+            assert!(created.iter().all(Result::is_ok), "{created:?}");
+            let schema = current(
+                pg,
+                DbKind::Postgres,
+                "\"R71_Sales\"",
+                "select current_schema()",
+            );
+            crate::test_db::execute_on(pg, DbKind::Postgres, &[drop]);
+            assert_eq!(schema.as_deref(), Some("R71_Sales"));
+        }
+        let mysql = "PYTHIA_TEST_MYSQL_DBA";
+        let drop = "drop database if exists `r71 db`";
+        let created =
+            crate::test_db::execute_on(mysql, DbKind::MySql, &[drop, "create database `r71 db`"]);
+        if let Some(created) = created {
+            assert!(created.iter().all(Result::is_ok), "{created:?}");
+            let schema = current(mysql, DbKind::MySql, "`r71 db`", "select database()");
+            crate::test_db::execute_on(mysql, DbKind::MySql, &[drop]);
+            assert_eq!(schema.as_deref(), Some("r71 db"));
         }
     }
 }

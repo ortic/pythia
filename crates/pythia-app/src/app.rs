@@ -5391,6 +5391,24 @@ impl PythiaApp {
         }
     }
 
+    /// The focused Search data window, e.g. to set its schema.
+    pub fn test_data_search(&mut self) -> &mut crate::data_search::DataSearch {
+        let id = self.focused.expect("focused");
+        match self.docs.get_mut(&id).map(|d| &mut d.kind) {
+            Some(DocKind::DataSearch(s)) => s,
+            _ => panic!("not a data search"),
+        }
+    }
+
+    /// The focused Search source window, e.g. to set its schema.
+    pub fn test_source_search(&mut self) -> &mut crate::source_search::SourceSearch {
+        let id = self.focused.expect("focused");
+        match self.docs.get_mut(&id).map(|d| &mut d.kind) {
+            Some(DocKind::Search(s)) => s,
+            _ => panic!("not a search document"),
+        }
+    }
+
     pub fn test_search_source(&mut self, query: &str) {
         let id = self.focused.expect("focused");
         let Some(DocKind::Search(s)) = self.docs.get_mut(&id).map(|d| &mut d.kind) else {

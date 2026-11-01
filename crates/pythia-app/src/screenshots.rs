@@ -403,6 +403,90 @@ fn screenshots() {
     }
 }
 
+/// The Schema of Export tables, Search data and Search source takes a
+/// quoted name as written and others in uppercase, as Oracle reads names:
+/// a schema "r71_schema" is found by `"r71_schema"` (#337).
+#[test]
+fn schemas_are_taken_as_typed() {
+    let (Some((profile, password)), Some(dba)) =
+        (profile(), crate::test_db::connect("PYTHIA_TEST_DB_DBA"))
+    else {
+        eprintln!("PYTHIA_TEST_DB / PYTHIA_TEST_DB_DBA not set, skipping");
+        return;
+    };
+    let user = profile.username.to_uppercase();
+    let _ = dba.execute("drop user \"r71_schema\" cascade", &[]);
+    for sql in [
+        "create user \"r71_schema\" no authentication quota unlimited on users".to_owned(),
+        "create table \"r71_schema\".r71_t (name varchar2(20))".to_owned(),
+        "insert into \"r71_schema\".r71_t values ('r71_needle')".to_owned(),
+        "commit".to_owned(),
+        format!("grant select on \"r71_schema\".r71_t to {user}"),
+        "create procedure \"r71_schema\".r71_p is begin null; -- r71_needle\nend;".to_owned(),
+        format!("grant execute on \"r71_schema\".r71_p to {user}"),
+    ] {
+        dba.execute(&sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let typed = "\"r71_schema\"";
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    let folder = std::env::temp_dir().join(format!("pythia-r71-export-{}", std::process::id()));
+    let export = h.state_mut().test_export_tables();
+    export.owner = typed.into();
+    export.folder = Some(folder.clone());
+    h.get_by_label("Reload").click();
+    h.run_steps(3);
+    wait_until(&mut h, "tables of the schema", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(h.query_all_by_label("r71_t").count(), 1);
+    h.get_by_label("Select all").click();
+    h.run_steps(2);
+    let effects = h.state_mut().test_export_tables().start_now();
+    h.state_mut().test_apply_focused(effects);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let message = h.state_mut().test_export_tables().message().cloned();
+    assert!(
+        matches!(&message, Some((false, m)) if m.starts_with("Exported 1 rows from 1 table(s)")),
+        "{message:?}"
+    );
+    let csv = std::fs::read_to_string(folder.join("r71_t.csv")).unwrap();
+    assert!(csv.contains("r71_needle"), "{csv}");
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::SearchData);
+    h.run_steps(3);
+    h.state_mut().test_data_search().owner = typed.into();
+    h.state_mut().test_search_data("r71_needle", false);
+    wait_until(&mut h, "data search", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_data_hits(), ["R71_T.NAME=1"]);
+    h.state_mut().test_close_focused();
+
+    h.state_mut()
+        .test_command(crate::commands::Command::FindInSource);
+    h.run_steps(3);
+    h.state_mut().test_source_search().owner = typed.into();
+    h.state_mut().test_search_source("r71_needle");
+    wait_until(&mut h, "source search", |app| !app.test_focused_busy());
+    assert!(
+        h.query_by_label_contains("r71_schema.R71_P").is_some(),
+        "no hit in r71_p"
+    );
+    h.state_mut().test_close_focused();
+
+    dba.execute("drop user \"r71_schema\" cascade", &[])
+        .unwrap();
+    std::fs::remove_dir_all(folder).unwrap();
+}
+
 /// Edits a result in the grid, applies it, and checks that a row changed by
 /// another session in the meantime is reported as a conflict.
 #[test]
@@ -3370,6 +3454,73 @@ fn import_csv() {
     );
     conn.execute("drop table pythia_import_t purge", &[])
         .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Imports into new tables named as given: a quoted name keeps its case,
+/// and columns that read quoted (a reserved word, a letter that isn't
+/// ASCII) are created as they are inserted into (#335).
+#[test]
+fn import_keeps_quoted_names() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pythia-import-r71-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r71.csv");
+    std::fs::write(&path, "Id;Date;Café\n1;31.12.2024;x\n2;01.01.2025;y\n").unwrap();
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["r71_import", "\"R71_My Table\"", "\"r71_my table\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    for table in ["r71_import", "\"R71_My Table\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        let message = h.state().test_import_message();
+        assert!(
+            matches!(&message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{table}: {message:?}"
+        );
+        let rows: Vec<(i64, String, String)> = conn
+            .query_as(
+                &format!(
+                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), \"CAFé\" from {table} order by id"
+                ),
+                &[],
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (1, "2024-12-31".into(), "x".into()),
+                (2, "2025-01-01".into(), "y".into())
+            ],
+            "{table}"
+        );
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables \
+              where upper(table_name) in ('R71_IMPORT', 'R71_MY TABLE') order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(made, ["R71_IMPORT", "R71_My Table"]);
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -8401,6 +8552,111 @@ fn editor_context_menu() {
     }
     conn.execute("drop package pythia_menu_pkg", &[]).unwrap();
     conn.execute("drop table pythia_menu_t purge", &[]).unwrap();
+}
+
+/// A package's quoted subprogram reads as Oracle's SQL writes it, not in
+/// lowercase: in an editor's context menu, the program window's outline
+/// and its messages (#336).
+#[test]
+fn quoted_subprograms_keep_their_case() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R71_Pkg\" as\n  \
+                procedure \"R71_MyProc\" is begin null; end;\n  \
+                procedure r71_plain is begin null; end;\nend;";
+    for ddl in [
+        "create or replace package \"R71_Pkg\" as\n  procedure \"R71_MyProc\";\n  \
+         procedure r71_plain;\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R71_Pkg\".\"R71_MyProc\";\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R71_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R71_MyProc\"");
+    assert!(
+        h.query_by_label("pythia.\"R71_Pkg\".\"R71_MyProc\"")
+            .is_some()
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    h.state_mut().test_open(OpenRequest::ProgramMember {
+        connection: "pythia@FREEPDB1".into(),
+        object: ObjectRef {
+            owner: "PYTHIA".into(),
+            name: "R71_Pkg".into(),
+            object_type: pythia_db::ObjectType::Package,
+        },
+        member: "R71_Gone".into(),
+        parameter: None,
+    });
+    wait_until(&mut h, "source", |app| !app.test_focused_busy());
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_Gone\" not found".into()))
+    );
+    shown(&mut h, "\"R71_MyProc\"");
+    for label in ["r71_plain", "\"R71_Pkg\""] {
+        assert!(h.query_all_by_label(label).next().is_some(), "{label}");
+    }
+    // Go to body of a procedure the body (as edited) leaves out.
+    h.state_mut().test_program().parts[1]
+        .editor
+        .set_text(body.replace("\"R71_MyProc\"", "r71_other"));
+    h.run_steps(3);
+    h.get_by_label("\"R71_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Go to body").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state_mut().test_program().message(),
+        Some((false, "\"R71_MyProc\" isn't in the body".into()))
+    );
+    h.state_mut().test_program().parts[1].editor.set_text(body);
+    conn.execute("drop package \"R71_Pkg\"", &[]).unwrap();
 }
 
 /// Go to definition, Back/Forward, Switch Spec/Body, Go to Symbol and Find

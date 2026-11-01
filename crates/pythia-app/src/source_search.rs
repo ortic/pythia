@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use egui::text::{LayoutJob, TextFormat};
 use egui::{RichText, Ui};
 use pythia_db::oracle::Connection;
-use pythia_db::{DbError, DbEvent, DbRequest, ObjectType};
+use pythia_db::{DbError, DbEvent, DbRequest, Dialect, ObjectType};
 use serde::{Deserialize, Serialize};
 
 use crate::documents::{DocContext, Effects, ObjectRef, OpenRequest, Target, request_id};
@@ -141,7 +141,8 @@ impl SourceSearch {
         }
         let (regex, match_case, include_oracle, kind) =
             (self.regex, self.match_case, self.include_oracle, self.kind);
-        let owner = Some(self.owner.trim().to_uppercase()).filter(|o| !o.is_empty());
+        // As Oracle reads it: `"my_schema"` as written (#337).
+        let owner = Some(Dialect::ORACLE.typed_name(&self.owner)).filter(|o| !o.is_empty());
         let name = Some(self.name.trim())
             .filter(|n| !n.is_empty())
             .map(|n| n.replace('*', "%").replace('?', "_"));

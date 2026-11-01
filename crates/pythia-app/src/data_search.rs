@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use egui::{RichText, Ui};
 use pythia_db::oracle::Connection;
-use pythia_db::{DbError, DbEvent, DbRequest};
+use pythia_db::{DbError, DbEvent, DbRequest, Dialect};
 use serde::{Deserialize, Serialize};
 
+use crate::browser::{written, written_qualified};
 use crate::documents::{DocContext, Effects, OpenRequest, Target, quote_ident, request_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -158,7 +159,8 @@ impl DataSearch {
         if value.trim().is_empty() || self.is_busy() {
             return effects;
         }
-        let owner = Some(self.owner.trim().to_uppercase())
+        // As Oracle reads it: `"my_schema"` as written (#337).
+        let owner = Some(Dialect::ORACLE.typed_name(&self.owner))
             .filter(|o| !o.is_empty())
             .or_else(|| {
                 cx.catalog
@@ -333,26 +335,28 @@ impl DataSearch {
                     });
             });
         if let (Some(hit), Some(connection)) = (open, cx.connection.clone()) {
-            let table = format!(
-                "{}.{}",
-                quote_ident(&hit.owner).to_lowercase(),
-                quote_ident(&hit.table).to_lowercase()
-            );
-            let text = if hit.data_type.is_some() {
-                format!(
-                    "select {}, t.*\n  from {table} t",
-                    quote_ident(&hit.column).to_lowercase()
-                )
-            } else {
-                format!("select * from {table}\n where {}", hit.condition)
-            };
             effects.open.push(OpenRequest::Sql {
                 connection,
-                text,
+                text: hit_query(&hit),
                 run: true,
             });
         }
         effects
+    }
+}
+
+/// The query a hit opens: the rows that match, or for a column name the
+/// table with that column first. Plain names read in lowercase, quoted
+/// ones keep their case: "R71_Data" isn't "r71_data" (#334).
+fn hit_query(hit: &Hit) -> String {
+    let table = written_qualified(Dialect::ORACLE, &hit.owner, &hit.table);
+    if hit.data_type.is_some() {
+        format!(
+            "select {}, t.*\n  from {table} t",
+            written(Dialect::ORACLE, &hit.column)
+        )
+    } else {
+        format!("select * from {table}\n where {}", hit.condition)
     }
 }
 
@@ -568,5 +572,81 @@ mod tests {
         .unwrap();
         assert_eq!(hits(progress), ["R62_Data.Mixed=1", "R62_Data.PLAIN=1"]);
         conn.execute("drop table \"R62_Data\" purge", &[]).unwrap();
+    }
+
+    /// A hit opens the rows of its own table and column, also where their
+    /// names are quoted: "R71_Data" isn't "r71_data" (#334).
+    #[test]
+    fn hits_open_their_own_table() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        for t in ["\"R71_Data\"", "\"r71_data\""] {
+            let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+        }
+        for sql in [
+            "create table \"R71_Data\" (\"Mixed\" varchar2(10), plain varchar2(10))",
+            "insert into \"R71_Data\" values ('needle', 'needle')",
+            "create table \"r71_data\" (\"Mixed\" varchar2(10))",
+            "insert into \"r71_data\" values ('needle')",
+            "insert into \"r71_data\" values ('needle')",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        conn.commit().unwrap();
+        let owner = user.to_uppercase();
+        // Each hit, and what the query it opens reads: its rows, or the error.
+        let opened = |progress: Progress| {
+            let hits = progress.hits.lock().unwrap();
+            hits.iter()
+                .map(|h| {
+                    let read = match conn.query(&hit_query(h), &[]) {
+                        Ok(rows) => rows.count().to_string(),
+                        Err(e) => e.to_string().chars().take(9).collect(),
+                    };
+                    format!("{}.{}={} reads {read}", h.table, h.column, h.count)
+                })
+                .collect::<Vec<_>>()
+        };
+        let progress = Progress::default();
+        search(
+            &conn,
+            &owner,
+            "r71_d%",
+            "needle",
+            Match::Contains,
+            false,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            opened(progress),
+            [
+                "R71_Data.Mixed=1 reads 1",
+                "R71_Data.PLAIN=1 reads 1",
+                "r71_data.Mixed=2 reads 2"
+            ]
+        );
+        let progress = Progress::default();
+        find_columns(
+            &conn,
+            &owner,
+            "r71_d%",
+            "mixed",
+            Match::Exact,
+            false,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(
+            opened(progress),
+            ["R71_Data.Mixed=0 reads 1", "r71_data.Mixed=0 reads 2"]
+        );
+        for t in ["\"R71_Data\"", "\"r71_data\""] {
+            conn.execute(&format!("drop table {t} purge"), &[]).unwrap();
+        }
     }
 }

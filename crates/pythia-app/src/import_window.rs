@@ -12,11 +12,12 @@ use std::sync::mpsc::Receiver;
 use egui::{RichText, Ui};
 use pythia_data::import::{self, ColumnInfo, CsvOptions, Sheet};
 use pythia_db::oracle::Connection;
-use pythia_db::{Column, DbError, DbEvent, DbRequest, MetaQuery, MetaResult, TableColumn};
+use pythia_db::{Column, DbError, DbEvent, DbRequest, Dialect, MetaQuery, MetaResult, TableColumn};
 use pythia_ui::icons::{Icon, icon_text_button};
 use pythia_ui::{GridState, ResultGrid};
 use serde::{Deserialize, Serialize};
 
+use crate::browser::written;
 use crate::documents::{DocContext, Effects, Target, quote_ident, request_id};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -825,26 +826,35 @@ fn create_table_sql(table: &str, data: &Loaded) -> String {
             let null = if info.nullable { "" } else { " not null" };
             format!(
                 "  {} {}{null}",
-                quote_ident(&import::column_name(h)).to_lowercase(),
+                written(Dialect::ORACLE, &import::column_name(h)),
                 import::oracle_type(info).to_lowercase()
             )
         })
         .collect();
+    // Plain names in lowercase, quoted ones as the INSERT names them: a
+    // table "My Table" isn't "my table", a column "DATE" isn't "date"
+    // (#335).
     format!(
         "create table {} (\n{}\n)",
-        table_ident(table).to_lowercase(),
+        table_name(table, |n| written(Dialect::ORACLE, n)),
         columns.join(",\n")
     )
 }
 
 /// `owner.table` or `table`, uppercased unless quoted.
 fn table_ident(name: &str) -> String {
+    table_name(name, quote_ident)
+}
+
+/// `owner.table` or `table` with the parts typed in quotes as they are,
+/// the others uppercased and written by `write`.
+fn table_name(name: &str, write: impl Fn(&str) -> String) -> String {
     name.split('.')
         .map(|p| {
             if p.starts_with('"') {
                 p.to_owned()
             } else {
-                quote_ident(&p.trim().to_uppercase())
+                write(&p.trim().to_uppercase())
             }
         })
         .collect::<Vec<_>>()
