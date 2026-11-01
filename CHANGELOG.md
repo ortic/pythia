@@ -518,6 +518,10 @@ All notable changes to Pythia are documented here. The format follows
   9223372036854775807, goes in as text with all of them; a longer
   fraction rounds as Excel's own numbers do, so an average stays a
   number.
+- Oracle: a binary value typed into a result as the grid shows it,
+  `0x…`, is stored as those bytes (#271), as on the other databases
+  (#256). In a RAW, and in the RAW, BLOB or LONG RAW of a new row,
+  `0x171066e1` failed on *Apply* with ORA-01465 "invalid hex number".
 
 ## [0.10.0] - 2026-10-30
 

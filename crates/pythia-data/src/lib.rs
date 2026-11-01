@@ -636,7 +636,12 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS.FF TZR')")
         }
         Kind::TimestampTz => format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS TZR')"),
-        Kind::Binary => format!("hextoraw({quoted})"),
+        // Typed as the grid shows it, `0x…`, a value is the bytes of its
+        // digits (#256, #271).
+        Kind::Binary => match typed_hex(v) {
+            Some(hex) => format!("hextoraw('{hex}')"),
+            None => format!("hextoraw({quoted})"),
+        },
         Kind::Text => apart_from_ampersands(
             v,
             |p| format!("'{}'", p.replace('\'', "''")),
@@ -1179,6 +1184,12 @@ mod tests {
             typed(Dialect::SQLSERVER, "varbinary", "0x171066E1"),
             "0x171066E1"
         );
+        let ora = |t, v| typed(Dialect::ORACLE, t, v);
+        assert_eq!(ora("RAW(16)", "0x171066E1"), "hextoraw('171066E1')");
+        assert_eq!(ora("BLOB", "0xABC"), "hextoraw('0ABC')");
+        assert_eq!(ora("LONG RAW", "0x00ff"), "hextoraw('00ff')");
+        assert_eq!(ora("RAW(16)", "171066E1"), "hextoraw('171066E1')");
+        assert_eq!(ora("VARCHAR2(10)", "0x41"), "'0x41'");
     }
 
     /// No `&` in a literal: where scripts run it would be a substitution
