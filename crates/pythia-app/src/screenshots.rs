@@ -11223,7 +11223,8 @@ fn sessions(h: &mut Harness<'_, PythiaApp>, tag: &str) {
     h.run_steps(3);
     assert_eq!(h.state().test_focused_title().as_deref(), Some("Sessions"));
     assert!(h.query_by_label_contains(" sessions · ").is_some());
-    assert!(h.query_by_label("Blocking tree").is_some());
+    // "Blocking tree (1)" while another test holds a lock on the server.
+    assert!(h.query_by_label_contains("Blocking tree").is_some());
     save(h, &format!("{tag}-sessions"));
 }
 
