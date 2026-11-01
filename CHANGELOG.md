@@ -744,6 +744,14 @@ All notable changes to Pythia are documented here. The format follows
   named `bière` and `straße` no view `Straße`: SQLite's `upper()` and
   `LIKE` change ASCII letters only. Each letter of the filter now
   matches its cases, as the object browser's filter does.
+- Oracle: the filters of names find a quoted name by its lowercase
+  letters (#305): the object browser's (also *Favorites*, *Recent*,
+  users and roles), *Find Objects*, *Export tables*, *Invalid objects*,
+  *Search data*'s tables and column names, *Search source*'s name and
+  *Compare schemas*' name filter and list. They compared what was
+  typed, in uppercase, with the name as stored, so `case` found no
+  `"My_Case"`, only `MY_C` did. The names are compared in uppercase
+  too.
 
 ## [0.10.0] - 2026-10-30
 

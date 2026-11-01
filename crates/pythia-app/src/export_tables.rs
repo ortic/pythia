@@ -135,6 +135,11 @@ impl ExportTables {
     }
 
     #[cfg(test)]
+    pub fn set_filter(&mut self, filter: &str) {
+        self.state.filter = filter.to_owned();
+    }
+
+    #[cfg(test)]
     pub fn message(&self) -> Option<&(bool, String)> {
         self.state.message.as_ref()
     }
@@ -291,7 +296,10 @@ impl ExportTables {
             if let Some(Ok(tables)) = &mut self.state.tables {
                 let needle = self.state.filter.trim().to_uppercase();
                 if ui.small_button("Select all").clicked() {
-                    for t in tables.iter_mut().filter(|t| t.name.contains(&needle)) {
+                    for t in tables
+                        .iter_mut()
+                        .filter(|t| crate::browser::name_matches(&t.name, &needle))
+                    {
                         t.selected = true;
                     }
                 }
@@ -339,7 +347,10 @@ impl ExportTables {
                                 ui.strong("Rows (statistics)");
                                 ui.strong("WHERE");
                                 ui.end_row();
-                                for t in tables.iter_mut().filter(|t| t.name.contains(&needle)) {
+                                for t in tables
+                                    .iter_mut()
+                                    .filter(|t| crate::browser::name_matches(&t.name, &needle))
+                                {
                                     ui.checkbox(
                                         &mut t.selected,
                                         RichText::new(crate::browser::shown_name(

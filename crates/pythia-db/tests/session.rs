@@ -377,6 +377,88 @@ fn compile_errors_and_metadata() {
     exec(&mut h, 20, "drop table pythia_meta_t purge");
 }
 
+/// Object filters and Find find a quoted name with lowercase letters by any
+/// case of the filter (#305).
+#[test]
+fn filters_find_names_in_any_case() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let exec = |h: &mut Harness, sql: &str| {
+        h.session.send(DbRequest::Execute {
+            id: 1,
+            sql: sql.into(),
+            max_rows: 10,
+            binds: vec![],
+        });
+        if let DbEvent::Failed { error, .. } = h.next_result() {
+            panic!("{sql}: {error}");
+        }
+    };
+    let tables = ["\"R62_F_Case\"", "r62_f_upper", "\"R62_F_čaj\""];
+    let drops: Vec<String> = tables
+        .iter()
+        .map(|t| {
+            format!(
+                "begin execute immediate 'drop table {t} purge'; \
+                 exception when others then null; end;"
+            )
+        })
+        .collect();
+    for drop in &drops {
+        exec(&mut h, drop);
+    }
+    for table in tables {
+        exec(&mut h, &format!("create table {table} (a number)"));
+    }
+    let objects = |h: &mut Harness, query| -> Vec<String> {
+        h.session.send(DbRequest::Meta { id: 2, query });
+        match h.next_result() {
+            DbEvent::Meta {
+                result: Ok(MetaResult::Objects(objects)),
+                ..
+            } => objects.into_iter().map(|o| o.name).collect(),
+            other => panic!("expected objects, got {other:?}"),
+        }
+    };
+    let owner = params().unwrap().username.to_uppercase();
+    let mut filtered = |filter: &str| {
+        objects(
+            &mut h,
+            MetaQuery::Objects {
+                owner: owner.clone(),
+                object_type: ObjectType::Table,
+                filter: Some(filter.into()),
+            },
+        )
+    };
+    assert_eq!(filtered("r62_f_case"), ["R62_F_Case"]);
+    assert_eq!(filtered("R62_F_CASE"), ["R62_F_Case"]);
+    assert_eq!(filtered("r62_f_ca"), ["R62_F_Case"]);
+    assert_eq!(filtered("r62_f_?ase"), ["R62_F_Case"]);
+    assert_eq!(filtered("r62_f_čaj"), ["R62_F_čaj"]);
+    assert_eq!(filtered("R62_F_ČAJ"), ["R62_F_čaj"]);
+    assert_eq!(filtered("r62_f_upper"), ["R62_F_UPPER"]);
+    assert_eq!(
+        filtered("r62_f_"),
+        ["R62_F_Case", "R62_F_UPPER", "R62_F_čaj"]
+    );
+    let mut found = |pattern: &str| {
+        objects(
+            &mut h,
+            MetaQuery::Find {
+                pattern: pattern.into(),
+                limit: 10,
+            },
+        )
+    };
+    assert_eq!(found("r62_f_case"), ["R62_F_Case"]);
+    assert_eq!(found("R62_F_ČAJ"), ["R62_F_čaj"]);
+    for drop in &drops {
+        exec(&mut h, drop);
+    }
+}
+
 /// Users, roles and directories; roles fall back to the user's own without
 /// access to DBA_ROLES.
 #[test]

@@ -368,7 +368,7 @@ impl InvalidObjectsWindow {
                 self.object_type
                     .as_ref()
                     .is_none_or(|t| &o.id.object_type == t)
-                    && (filter.is_empty() || o.id.name.contains(&filter))
+                    && crate::browser::name_matches(&o.id.name, &filter)
             })
             .map(|(i, _)| i)
             .collect();

@@ -470,9 +470,11 @@ fn objects(
     if object_type == ObjectType::DatabaseLink {
         return links(conn, owner, &pattern);
     }
+    // A quoted name keeps its lowercase letters: compared in uppercase
+    // with the filter (#305).
     let sql = format!(
         "select {OBJECT_COLUMNS} from all_objects \
-         where owner = :1 and object_type = :2 and object_name like :3 escape '\\' \
+         where owner = :1 and object_type = :2 and upper(object_name) like :3 escape '\\' \
            and object_name not like 'BIN$%' and generated = 'N' \
          order by object_name"
     );
@@ -522,7 +524,7 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
         .collect();
     let sql = format!(
         "select {OBJECT_COLUMNS} from all_objects \
-         where object_name like :1 escape '\\' and object_type in ({}) \
+         where upper(object_name) like :1 escape '\\' and object_type in ({}) \
          order by case when owner = sys_context('USERENV', 'CURRENT_SCHEMA') then 0 else 1 end, \
                   length(object_name), object_name, owner",
         types.join(", ")

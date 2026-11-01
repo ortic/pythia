@@ -929,8 +929,7 @@ impl SchemaCompare {
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, o)| {
-                                    o.status == status
-                                        && (filter.is_empty() || o.key.name.contains(&filter))
+                                    o.status == status && name_matches(&o.key.name, &filter)
                                 })
                                 .map(|(i, _)| i)
                                 .collect();
@@ -1736,9 +1735,23 @@ fn changed_table(d: &DataDiff) -> (Vec<Column>, Vec<Vec<Cell>>) {
     (columns, rows)
 }
 
+/// Whether a name contains the (uppercase) filter, without case: a quoted
+/// name keeps its lowercase letters (#305).
+fn name_matches(name: &str, filter: &str) -> bool {
+    filter.is_empty() || name.to_uppercase().contains(filter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_match_without_case() {
+        assert!(name_matches("R62_Case", "CASE"));
+        assert!(name_matches("R62_CASE", "CASE"));
+        assert!(name_matches("R62_Case", ""));
+        assert!(!name_matches("R62_Case", "CASES"));
+    }
 
     #[test]
     fn ids_do_not_collide_with_host_ids() {
