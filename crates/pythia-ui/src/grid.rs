@@ -24,6 +24,13 @@ const SHOWN_CHARS: usize = 500;
 /// a few screens of it, wrapped (#220).
 const RECORD_CHARS: usize = 10_000;
 
+/// The characters of a value the viewer shows in one text field at most;
+/// a longer one shows in rows, laid out as they come into view (#284).
+const VIEWER_CHARS: usize = 100_000;
+
+/// The characters of a row of a long line in the viewer.
+const VIEWER_ROW_CHARS: usize = 1_000;
+
 /// The changes Ctrl+Z can take back at most, and the cells their states
 /// hold together, oldest left out first (#257).
 const UNDO_STEPS: usize = 100;
@@ -51,6 +58,8 @@ pub struct GridState {
     /// Rows must contain this text (case-insensitive) in some cell.
     filter: String,
     viewer: Option<(usize, usize)>,
+    /// What the viewer shows of its cell.
+    viewed: Option<Viewed>,
     scroll_to_cursor: bool,
     edit: Option<Editing>,
     /// Related rows reachable from a row (foreign keys), offered in the
@@ -2700,6 +2709,126 @@ fn value_editor(
     }
 }
 
+/// What the viewer shows of a cell, worked out when it opens on the cell
+/// and when the value changes, not on every frame (#284).
+struct Viewed {
+    key: ViewedKey,
+    value: Cell,
+    /// The value is a change not applied, which isn't copied (#250).
+    unapplied: bool,
+    chars: usize,
+    /// The value as formatted JSON, if it is an object or an array.
+    pretty: Option<String>,
+    /// Where the rows of a text over [`VIEWER_CHARS`] start, which are
+    /// laid out as they come into view, and whether a line was cut.
+    rows: Option<(Vec<usize>, bool)>,
+    binary: Option<ViewedBinary>,
+}
+
+/// What the viewer was worked out for: the cell, the rows (where they
+/// are, how many), their order and the pending changes.
+#[derive(PartialEq)]
+struct ViewedKey {
+    cell: (usize, usize),
+    rows: (usize, usize),
+    order: u64,
+    changes: u64,
+}
+
+/// A binary value as the viewer shows it.
+struct ViewedBinary {
+    bytes: Vec<u8>,
+    /// The size of a value held cut short (#232).
+    cut: Option<u64>,
+    /// Named by its bytes: egui keeps an image by its URI, and the next
+    /// value in this cell (of another result, or edited) would show this
+    /// one (#231).
+    image: Option<String>,
+    dump: String,
+}
+
+impl Viewed {
+    fn new(key: ViewedKey, columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Self {
+        let (value, unapplied) = state.viewed(rows, key.cell);
+        let binary = columns
+            .get(key.cell.1)
+            .is_some_and(|col| is_binary(state.dialect, col));
+        let binary = value.as_deref().filter(|_| binary).and_then(|v| {
+            let bytes = decode_hex(held_hex(v))?;
+            let cut = pythia_db::cut_size(v);
+            let image = image_kind(&bytes).filter(|_| cut.is_none()).map(|kind| {
+                format!(
+                    "bytes://pythia-grid/{:016x}.{kind}",
+                    egui::util::hash(&bytes)
+                )
+            });
+            let mut dump = hex_dump(&bytes, 4096);
+            if let Some(size) = cut {
+                let more = (size as usize).saturating_sub(bytes.len());
+                dump.push_str(&format!(
+                    "… {} more, not held by the grid",
+                    human_bytes(more)
+                ));
+            }
+            Some(ViewedBinary {
+                bytes,
+                cut,
+                image,
+                dump,
+            })
+        });
+        let pretty = value
+            .as_deref()
+            .filter(|_| binary.is_none())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
+            .filter(|j| j.is_object() || j.is_array())
+            .and_then(|j| serde_json::to_string_pretty(&j).ok());
+        let text = pretty.as_deref().or(value.as_deref()).unwrap_or_default();
+        let rows =
+            (binary.is_none() && text.chars().nth(VIEWER_CHARS).is_some()).then(|| text_rows(text));
+        Self {
+            key,
+            chars: value.as_deref().map_or(0, |v| v.chars().count()),
+            value,
+            unapplied,
+            pretty,
+            rows,
+            binary,
+        }
+    }
+
+    /// The text shown: the formatted JSON, or the value.
+    fn text(&self) -> &str {
+        self.pretty
+            .as_deref()
+            .or(self.value.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+/// Where the rows of a long text start: at each of its lines, and every
+/// [`VIEWER_ROW_CHARS`] characters of a longer line; and whether a line
+/// was cut so.
+fn text_rows(text: &str) -> (Vec<usize>, bool) {
+    let mut starts = vec![0];
+    let mut chars = 0;
+    let mut cut = false;
+    for (i, c) in text.char_indices() {
+        if c == '\n' {
+            starts.push(i + 1);
+            chars = 0;
+        } else {
+            if chars == VIEWER_ROW_CHARS {
+                starts.push(i);
+                chars = 0;
+                cut = true;
+            }
+            chars += 1;
+        }
+    }
+    (starts, cut)
+}
+
 fn viewer(
     ctx: &egui::Context,
     columns: &[Column],
@@ -2707,36 +2836,21 @@ fn viewer(
     state: &mut GridState,
     id: egui::Id,
 ) {
-    let Some((r, c)) = state.viewer else { return };
-    let (value, unapplied) = state.viewed(rows, (r, c));
+    let Some((r, c)) = state.viewer else {
+        state.viewed = None;
+        return;
+    };
+    let key = ViewedKey {
+        cell: (r, c),
+        rows: (rows.as_ptr().addr(), rows.len()),
+        order: state.order_revision,
+        changes: state.changes_revision,
+    };
+    if state.viewed.as_ref().is_none_or(|v| v.key != key) {
+        state.viewed = Some(Viewed::new(key, columns, rows, state));
+    }
+    let Some(viewed) = &state.viewed else { return };
     let name = columns.get(c).map_or("", |col| col.name.as_str());
-    let binary = columns
-        .get(c)
-        .is_some_and(|col| is_binary(state.dialect, col));
-    // A value held cut short shows its size and the bytes held (#232).
-    let cut = value
-        .as_deref()
-        .filter(|_| binary)
-        .and_then(pythia_db::cut_size);
-    let bytes = value
-        .as_deref()
-        .filter(|_| binary)
-        .and_then(|v| decode_hex(held_hex(v)));
-    let pretty = value
-        .as_deref()
-        .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
-        .filter(|j| j.is_object() || j.is_array())
-        .and_then(|j| serde_json::to_string_pretty(&j).ok());
-    let mut text = pretty.clone().or_else(|| value.clone()).unwrap_or_default();
-    // Named by its bytes: egui keeps an image by its URI, and the next value
-    // in this cell (of another result, or edited) would show this one (#231).
-    let image = bytes.as_ref().filter(|_| cut.is_none()).and_then(|b| {
-        let kind = image_kind(b)?;
-        Some(format!(
-            "bytes://pythia-grid/{:016x}.{kind}",
-            egui::util::hash(b)
-        ))
-    });
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2746,84 +2860,98 @@ fn viewer(
         .collapsible(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                match (&value, &bytes) {
+                match (&viewed.value, &viewed.binary) {
                     (None, _) => ui.weak("NULL"),
                     (_, Some(b)) => {
-                        let size = cut.map_or(b.len(), |n| n as usize);
+                        let size = b.cut.map_or(b.bytes.len(), |n| n as usize);
                         let mut header = format!(
                             "{} · {}",
                             human_bytes(size),
-                            image_kind(b).unwrap_or("binary")
+                            image_kind(&b.bytes).unwrap_or("binary")
                         );
-                        if cut.is_some() {
+                        if b.cut.is_some() {
                             header.push_str(&format!(
                                 " · the grid holds its first {} bytes",
-                                b.len()
+                                b.bytes.len()
                             ));
                         }
                         ui.weak(header)
                     }
-                    (Some(v), None) => ui.weak(format!("{} characters", v.chars().count())),
+                    (Some(_), None) => ui.weak(format!("{} characters", viewed.chars)),
                 };
-                if pretty.is_some() {
+                if viewed.pretty.is_some() {
                     ui.weak("· JSON, formatted");
                 }
-                if unapplied {
+                if viewed.rows.as_ref().is_some_and(|(_, cut)| *cut) {
+                    ui.weak(format!("· lines cut every {VIEWER_ROW_CHARS} characters"));
+                }
+                if viewed.unapplied {
                     ui.weak("· changed, not applied");
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let copy = ui
-                        .add_enabled(!unapplied, egui::Button::new("Copy"))
+                        .add_enabled(!viewed.unapplied, egui::Button::new("Copy"))
                         .on_disabled_hover_text("Apply or discard the change first");
                     if copy.clicked() {
-                        ctx.copy_text(value.clone().unwrap_or_default());
+                        ctx.copy_text(viewed.value.clone().unwrap_or_default());
                     }
                 });
             });
             ui.separator();
-            if let Some(b) = &bytes {
+            if let Some(b) = &viewed.binary {
                 egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    if let Some(uri) = &image {
+                    if let Some(uri) = &b.image {
                         ui.add(
-                            egui::Image::from_bytes(uri.clone(), b.clone())
+                            egui::Image::from_bytes(uri.clone(), b.bytes.clone())
                                 .max_width(ui.available_width())
                                 .max_height(480.0),
                         );
                         ui.separator();
-                    } else if cut.is_some() && image_kind(b).is_some() {
+                    } else if b.cut.is_some() && image_kind(&b.bytes).is_some() {
                         ui.weak(format!(
                             "The image can't be shown: the grid holds the first {} bytes of it. \
                              Execute to file writes such values whole.",
-                            b.len()
+                            b.bytes.len()
                         ));
                         ui.separator();
                     }
-                    let mut dump = hex_dump(b, 4096);
-                    if let Some(size) = cut {
-                        let more = (size as usize).saturating_sub(b.len());
-                        dump.push_str(&format!(
-                            "… {} more, not held by the grid",
-                            human_bytes(more)
-                        ));
-                    }
-                    ui.label(RichText::new(dump).monospace());
+                    ui.label(RichText::new(&b.dump).monospace());
                 });
                 return;
             }
-            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .frame(egui::Frame::NONE),
-                );
-            });
+            let text = viewed.text();
+            let Some((starts, _)) = &viewed.rows else {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut &*text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .frame(egui::Frame::NONE),
+                    );
+                });
+                return;
+            };
+            // A row at a time, those in view (#284).
+            let height = ui.text_style_height(&egui::TextStyle::Monospace);
+            egui::ScrollArea::both().auto_shrink(false).show_rows(
+                ui,
+                height,
+                starts.len(),
+                |ui, shown| {
+                    for row in shown {
+                        let end = starts.get(row + 1).copied().unwrap_or(text.len());
+                        let line = text[starts[row]..end].trim_end_matches(['\n', '\r']);
+                        ui.add(egui::Label::new(RichText::new(line).monospace()).extend());
+                    }
+                },
+            );
         });
     if !open {
-        state.viewer = None;
-        if let Some(uri) = &image {
+        if let Some(uri) = viewed.binary.as_ref().and_then(|b| b.image.as_ref()) {
             ctx.forget_image(uri);
         }
+        state.viewer = None;
+        state.viewed = None;
     }
 }
 
@@ -4583,5 +4711,110 @@ mod tests {
         rows.push(row("2", "b"));
         frame(&ctx, &columns, &rows, &mut state, vec![]);
         assert_eq!(state.cursor, Some((2, 0)));
+    }
+
+    /// The viewer of a value of megabytes keeps up, shows all of it and
+    /// copies all of it (#284): it worked the value out again on every
+    /// frame and laid it out whole, 1.9 s a frame for 10 MB on one line
+    /// in a test build.
+    #[test]
+    fn the_viewer_of_a_huge_value_keeps_up() {
+        let columns = vec![
+            Column {
+                name: "T".into(),
+                type_name: "text".into(),
+                numeric: false,
+            },
+            Column {
+                name: "B".into(),
+                type_name: "bytea".into(),
+                numeric: false,
+            },
+        ];
+        let json = format!("[{}{{\"end\": 1}}]", "{\"a\": 1}, ".repeat(400_000));
+        let cases = [
+            (format!("{}the end", "word ".repeat(2 << 20)), 0, "the end"),
+            (format!("{}the end", "line\n".repeat(2 << 20)), 0, "the end"),
+            (json, 0, "]"),
+            (
+                format!("\\x{}", "ab".repeat(10 << 20)),
+                1,
+                "10.0 MB · binary",
+            ),
+        ];
+        let ctx = egui::Context::default();
+        for (value, col, last) in cases {
+            let mut row = vec![None, None];
+            row[col] = Some(value.clone());
+            let rows = vec![row];
+            let mut state = GridState {
+                dialect: Dialect::POSTGRES,
+                viewer: Some((0, col)),
+                ..Default::default()
+            };
+            // A window is laid out unseen first.
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(elapsed < 2.0, "{last}: 5 frames took {elapsed} s");
+            let at = |drawn: &[(String, egui::Pos2)], text: &str| {
+                drawn
+                    .iter()
+                    .find(|(t, _)| t == text)
+                    .unwrap_or_else(|| panic!("{text} not in {:?}", texts(drawn)))
+                    .1
+            };
+            let copy = at(&drawn, "Copy");
+            if col == 0 {
+                // Scrolled to the end, the end shows.
+                let below = copy + egui::vec2(-100.0, 120.0);
+                let wheel = egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -1e9),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(
+                    &ctx,
+                    &columns,
+                    &rows,
+                    &mut state,
+                    vec![egui::Event::PointerMoved(below)],
+                );
+                frame(&ctx, &columns, &rows, &mut state, vec![wheel]);
+                let mut drawn = Vec::new();
+                for _ in 0..3 {
+                    drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+                }
+                assert!(
+                    drawn.iter().any(|(t, _)| t.ends_with(last)),
+                    "{last}: {:?}",
+                    texts(&drawn)
+                );
+            } else {
+                assert!(texts(&drawn).contains(&last), "{:?}", texts(&drawn));
+            }
+            // Copy copies all of it.
+            let button = |pressed| egui::Event::PointerButton {
+                pos: copy,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                &ctx,
+                &columns,
+                &rows,
+                &mut state,
+                vec![egui::Event::PointerMoved(copy)],
+            );
+            frame(&ctx, &columns, &rows, &mut state, vec![button(true)]);
+            let copied = copied(&ctx, &columns, &rows, &mut state, vec![button(false)]);
+            assert!(copied == Some(value), "{last}: not copied whole");
+        }
     }
 }

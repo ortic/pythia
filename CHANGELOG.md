@@ -542,6 +542,12 @@ All notable changes to Pythia are documented here. The format follows
   and the dialog editing a cell stayed where they were in the view, on
   other rows: a value being typed went into another row. They now stay
   on their rows, and so do new rows.
+- *View value…* no longer freezes Pythia on a value of megabytes (#284),
+  such as a PostgreSQL `text`, `json` or `bytea`: it worked the value out
+  again on every frame and laid all of it out, seconds a frame for 20 MB.
+  A text over 100,000 characters now shows in rows, a long line cut
+  every 1,000 characters, laid out as they come into view; all of it can
+  still be scrolled through, and *Copy* copies all of it.
 
 ## [0.10.0] - 2026-10-30
 
