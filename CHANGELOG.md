@@ -739,6 +739,11 @@ All notable changes to Pythia are documented here. The format follows
   views, but only their triggers had it, and the scripts that replace a
   view (`CREATE OR REPLACE`, `CREATE OR ALTER`, SQLite's and
   PostgreSQL's in a transaction of their own) were out of reach.
+- SQLite: *Find Objects* finds names by their non-ASCII letters in any
+  case (#292). `čaj`, `ČAJ` and `č` found no table `čaj`, `BIÈRE` none
+  named `bière` and `straße` no view `Straße`: SQLite's `upper()` and
+  `LIKE` change ASCII letters only. Each letter of the filter now
+  matches its cases, as the object browser's filter does.
 
 ## [0.10.0] - 2026-10-30
 

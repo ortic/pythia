@@ -8,7 +8,7 @@ use pythia_plsql::{Syntax, TokenKind, tokenize};
 use rusqlite::Connection;
 
 use crate::dialect::Dialect;
-use crate::meta::{DbObject, Detail, MetaQuery, MetaResult, ObjectType, TableColumn, like_pattern};
+use crate::meta::{DbObject, Detail, MetaQuery, MetaResult, ObjectType, TableColumn};
 use crate::sqlite_session::all_rows;
 use crate::types::{Cell, Column, DbError};
 
@@ -106,45 +106,95 @@ fn objects(
         return Ok(Vec::new());
     };
     let sql = format!(
-        "select name from {} where type = ? and upper(name) like ? escape '\\' and {NOT_INTERNAL} \
-         order by name",
+        "select name from {} where type = ? and {NOT_INTERNAL} order by name",
         schema_table(owner)
     );
-    let pattern = like_pattern(filter.unwrap_or(""));
+    let filter = filter.unwrap_or("");
     let mut statement = conn.prepare(&sql)?;
-    Ok(all_rows(&mut statement, &[kind, &pattern])?
+    Ok(all_rows(&mut statement, &[kind])?
         .into_iter()
-        .filter_map(|row| {
-            Some(DbObject {
-                owner: owner.to_owned(),
-                name: row.into_iter().next()??,
-                object_type,
-                valid: true,
-                // SQLite doesn't keep when an object changed.
-                last_ddl: String::new(),
-            })
+        .filter_map(|row| row.into_iter().next()?)
+        .filter(|name| filter_matches(filter, name))
+        .map(|name| DbObject {
+            owner: owner.to_owned(),
+            name,
+            object_type,
+            valid: true,
+            // SQLite doesn't keep when an object changed.
+            last_ddl: String::new(),
         })
         .collect())
+}
+
+/// Whether a name contains the filter, as in
+/// [`like_pattern`](crate::meta::like_pattern): `*` is any text, `?` any
+/// character, and each letter stands for its cases as Rust has them.
+/// SQLite's `upper()` and `LIKE` change ASCII letters only, `upper('čaj')`
+/// is `čAJ`, so the names are matched here.
+fn filter_matches(filter: &str, name: &str) -> bool {
+    // A letter's uppercase where that is one letter: ß stays ß.
+    let fold = |c: char| {
+        let mut upper = c.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        }
+    };
+    // Contains: `*pattern`, at the start of a name that goes on.
+    let pattern: Vec<char> = std::iter::once('*')
+        .chain(filter.trim().chars().map(fold))
+        .collect();
+    let name: Vec<char> = name.chars().map(fold).collect();
+    glob(&pattern, &name)
+}
+
+/// Whether `pattern` matches the start of `name`, `*` and `?` as wildcards.
+fn glob(pattern: &[char], name: &[char]) -> bool {
+    let (mut p, mut n) = (0, 0);
+    // The last `*` and the place in the name it took up to.
+    let mut star: Option<(usize, usize)> = None;
+    while p < pattern.len() {
+        match pattern[p] {
+            '*' => {
+                star = Some((p, n));
+                p += 1;
+            }
+            c if n < name.len() && (c == '?' || c == name[n]) => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((at, taken)) if taken < name.len() => {
+                    star = Some((at, taken + 1));
+                    p = at + 1;
+                    n = taken + 1;
+                }
+                _ => return false,
+            },
+        }
+    }
+    true
 }
 
 /// Tables, views, indexes and triggers of every database whose name
 /// matches: `main`'s first, then the shortest names.
 fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
-    let pattern = like_pattern(pattern);
     let mut found = Vec::new();
     for (order, schema) in schemas(conn)?.into_iter().enumerate() {
         let sql = format!(
             "select name, type from {} \
-              where type in ('table', 'view', 'index', 'trigger') \
-                and upper(name) like ? escape '\\' and {NOT_INTERNAL}",
+              where type in ('table', 'view', 'index', 'trigger') and {NOT_INTERNAL}",
             schema_table(&schema)
         );
         let mut statement = conn.prepare(&sql)?;
-        for row in all_rows(&mut statement, &[&pattern])? {
+        for row in all_rows(&mut statement, &[])? {
             let mut values = row.into_iter();
             let (Some(Some(name)), Some(Some(kind))) = (values.next(), values.next()) else {
                 continue;
             };
+            if !filter_matches(pattern, &name) {
+                continue;
+            }
             let Some(object_type) = ObjectType::from_dictionary(&kind.to_uppercase()) else {
                 continue;
             };
@@ -642,6 +692,37 @@ fn plan_object(detail: &str) -> Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filters_match() {
+        for (filter, name) in [
+            ("", "t"),
+            ("čaj", "r62_čaj"),
+            ("ČAJ", "r62_čaj"),
+            (" bière ", "BIÈRE"),
+            ("öl", "ÖL"),
+            ("σ", "Σίσυφος"),
+            ("ß", "Straße"),
+            ("a*b", "xaxxbx"),
+            ("a?c", "abc"),
+            ("*", ""),
+            ("100%", "r_100%"),
+            ("a_b", "A_B"),
+        ] {
+            assert!(filter_matches(filter, name), "{filter} {name}");
+        }
+        for (filter, name) in [
+            ("čaj", "caj"),
+            ("ss", "Straße"),
+            ("a?c", "ac"),
+            ("a*b", "ba"),
+            ("100%", "1000"),
+            ("a_b", "axb"),
+            ("x", ""),
+        ] {
+            assert!(!filter_matches(filter, name), "{filter} {name}");
+        }
+    }
 
     #[test]
     fn trigger_events() {
