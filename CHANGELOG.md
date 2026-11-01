@@ -721,6 +721,15 @@ All notable changes to Pythia are documented here. The format follows
   rows missing; on Oracle the window waited for rows that never came and
   could run nothing else. *Execute to file* fails in that case rather than
   end the file early as if it were complete.
+- SQL Server and PostgreSQL: a statement with several results shows
+  each in a tab of its own (#316), as on MySQL (#290): the SELECTs of a
+  T-SQL batch that `DECLARE`s, the result sets of a procedure
+  (`exec sp_help 't'`), the SELECTs rules add to an INSERT. SQL Server
+  showed the first with a notice that there were more; PostgreSQL showed
+  the rows of all under the first one's columns. An error after the
+  first result now fails the statement, which stops a script; it came as
+  a message only. *Execute to file* writes the first result and says how
+  many others there were.
 
 ## [0.10.0] - 2026-10-30
 

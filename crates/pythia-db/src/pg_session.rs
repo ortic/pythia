@@ -472,8 +472,9 @@ impl Worker {
         Ok(Outcome::Done { affected })
     }
 
-    /// Reports a query's rows while `FetchMore`s for it come in. Returns
-    /// whether the query failed (or was cancelled when abandoned).
+    /// Reports a statement's results, their rows while `FetchMore`s for
+    /// them come in. Returns whether the statement failed (or was cancelled
+    /// when abandoned).
     fn fetch(
         &mut self,
         mut stream: Stream,
@@ -482,14 +483,18 @@ impl Worker {
     ) -> bool {
         let Fetch {
             id,
-            mut max_rows,
+            max_rows: batch,
             whole,
             mut started,
             requests,
         } = fetch;
+        let mut max_rows = batch;
         loop {
             let mut rows = Vec::with_capacity(max_rows.min(10_000));
             let mut more = true;
+            // What follows the result: the next one's columns, or the error
+            // that ended the statement.
+            let mut after = None;
             let mut bytes = 0;
             while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match self.rt.block_on(stream.next()) {
@@ -500,7 +505,20 @@ impl Worker {
                         }
                         rows.push(cells);
                     }
-                    Some(Ok(SimpleQueryMessage::CommandComplete(_))) | None => {
+                    // A rule's next query, without a CommandComplete between.
+                    Some(Ok(SimpleQueryMessage::RowDescription(described))) => {
+                        after = Some(Ok(untyped(&described)));
+                        more = false;
+                        break;
+                    }
+                    Some(Ok(SimpleQueryMessage::CommandComplete(_))) => {
+                        more = false;
+                        if !whole {
+                            after = self.next_result(&mut stream);
+                        }
+                        break;
+                    }
+                    None => {
                         more = false;
                         break;
                     }
@@ -515,22 +533,45 @@ impl Worker {
                     }
                 }
             }
+            // A file has the first result only, and says how many others.
+            if whole && !more {
+                self.events.send(DbEvent::Rows {
+                    id,
+                    rows,
+                    more,
+                    elapsed: started.elapsed(),
+                });
+                return self.drop_rest(&mut stream, usize::from(after.is_some()), id, started);
+            }
+            // Several statements in one, or a rule's queries: each result is
+            // one, announced before the last rows of the one before, as on
+            // MySQL (#290, #316).
+            if after.is_some() {
+                self.events.send(DbEvent::MoreResults { id });
+            }
             self.events.send(DbEvent::Rows {
                 id,
                 rows,
                 more,
                 elapsed: started.elapsed(),
             });
-            if !more {
-                // Several statements in one: the rest runs unseen.
-                let mut failed = false;
-                while let Some(message) = self.rt.block_on(stream.next()) {
-                    if let Err(e) = message {
-                        self.events.send(DbEvent::Error(e.into()));
-                        failed = true;
-                    }
+            match after {
+                Some(Ok(columns)) => {
+                    self.events.send(DbEvent::QueryStarted { id, columns });
+                    max_rows = batch;
+                    started = Instant::now();
+                    continue;
                 }
-                return failed;
+                Some(Err(e)) => {
+                    self.events.send(DbEvent::Failed {
+                        id,
+                        error: e.into(),
+                        elapsed: started.elapsed(),
+                    });
+                    return true;
+                }
+                None if !more => return false,
+                None => {}
             }
             match requests.recv() {
                 Ok(DbRequest::FetchMore {
@@ -547,6 +588,52 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Reads on to the next result of the statement, past those of
+    /// statements without rows: its columns, or the error that ended the
+    /// statement; `None` at its end.
+    fn next_result(
+        &self,
+        stream: &mut Stream,
+    ) -> Option<Result<Vec<Column>, tokio_postgres::Error>> {
+        loop {
+            match self.rt.block_on(stream.next())? {
+                Ok(SimpleQueryMessage::RowDescription(described)) => {
+                    return Some(Ok(untyped(&described)));
+                }
+                Ok(_) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Reads the statement's results after the one written to a file (and
+    /// the `seen` of them read already), and says how many there were.
+    /// Returns whether one failed.
+    fn drop_rest(&self, stream: &mut Stream, seen: usize, id: u64, started: Instant) -> bool {
+        let mut results = seen;
+        while let Some(message) = self.rt.block_on(stream.next()) {
+            match message {
+                Ok(SimpleQueryMessage::RowDescription(_)) => results += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    self.events.send(DbEvent::Failed {
+                        id,
+                        error: e.into(),
+                        elapsed: started.elapsed(),
+                    });
+                    return true;
+                }
+            }
+        }
+        if results > 0 {
+            self.events.send(DbEvent::Notice(format!(
+                "The statement returned {results} more result(s); only the first was written \
+                 to the file"
+            )));
+        }
+        false
     }
 
     /// Closes a result with rows left: what has arrived is read, and a query
@@ -685,6 +772,12 @@ impl Client for PgClient<'_> {
     fn meta(&mut self, query: &MetaQuery) -> Result<MetaResult, DbError> {
         crate::pg_meta::run(&self.0, query)
     }
+}
+
+/// The columns of a result after the first: the simple protocol names
+/// them, not their types.
+fn untyped(described: &[tokio_postgres::SimpleColumn]) -> Vec<Column> {
+    described.iter().map(|c| column(c.name(), None)).collect()
 }
 
 fn cells(row: &SimpleQueryRow) -> Vec<Cell> {

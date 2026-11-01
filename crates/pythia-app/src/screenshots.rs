@@ -6897,6 +6897,108 @@ fn mysql_statements_show_every_result() {
     run_in_window(&mut h, "drop procedure r51_p");
 }
 
+/// On SQL Server and PostgreSQL a statement with several results shows
+/// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
+/// DECLAREs, a procedure's result sets, the SELECTs rules add to an
+/// INSERT. SQL Server showed the first with a notice, PostgreSQL the rows
+/// of all under the first one's columns; an error after the first didn't
+/// fail the statement, and now stops the script.
+#[test]
+fn batches_show_every_result() {
+    use pythia_config::DbKind;
+    // Each result's title, columns and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let columns: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+                let row: Vec<&str> = r.rows.first().map_or(Vec::new(), |row| {
+                    row.iter().map(|c| c.as_deref().unwrap_or("")).collect()
+                });
+                format!("{}: {} = {}", r.title, columns.join(" "), row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: a = 1", "Result 2: b c = x 2"];
+    let cases = [
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            vec![
+                "declare @n int = 1; select @n as a; select 'x' as b, @n + 1 as c",
+                "exec r66_p",
+            ],
+            "create or alter procedure r66_p as begin select 1 as a; select 'x' as b, 2 as c; end",
+            "declare @n int = 1; select @n as a; select 1 / 0 as b\nGO\nselect 2",
+            // The EXEC's transaction would take the DROP back.
+            "if @@trancount > 0 rollback;\ndrop procedure r66_p",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            vec!["insert into r66_r values (1)"],
+            "drop table if exists r66_r;\ndrop table if exists r66_f;\n\
+             create table r66_r (id int);\ncreate table r66_f (id int);\n\
+             create rule r66_a as on insert to r66_r do also select 1 as a;\n\
+             create rule r66_b as on insert to r66_r do also select 'x' as b, 2 as c;\n\
+             create rule r66_fa as on insert to r66_f do also select 1 as a;\n\
+             create rule r66_fb as on insert to r66_f do also select 1 / 0 as b;\ncommit",
+            "insert into r66_f values (1);\nselect 2",
+            "drop table r66_r;\ndrop table r66_f;\ncommit",
+        ),
+    ];
+    for (env, kind, two_results, setup, failing, cleanup) in cases {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        run_in_window(&mut h, setup);
+        for sql in two_results {
+            let (results, messages) = shown(&mut h, sql);
+            assert_eq!(results, two, "{sql}: {messages:?}");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains("1 row selected"))
+                    .count(),
+                2,
+                "{sql}: {messages:?}"
+            );
+            assert!(
+                !messages.iter().any(|m| m.contains("more result set")),
+                "{messages:?}"
+            );
+        }
+        let (results, messages) = shown(&mut h, failing);
+        assert!(
+            results.len() <= 2 && !results.iter().any(|r| r.ends_with("= 2")),
+            "{connection}: {results:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("Failed after"))
+                && messages
+                    .iter()
+                    .any(|m| m.contains("1 remaining statement(s) skipped")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(&mut h, cleanup);
+    }
+}
+
 /// On SQLite `&` is an operator: completion after `1&c.` offers the
 /// alias's columns (#287), which it didn't, reading `&c.` as a
 /// substitution variable. After `SET DEFINE ON` it is one.

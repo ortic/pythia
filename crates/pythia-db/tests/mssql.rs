@@ -585,27 +585,148 @@ fn long_statements_keep_the_transaction() {
     h.ok("drop table fx_long_t");
 }
 
+/// The events of statement `id` up to the transaction state that ends
+/// them, or up to rows that wait for a FetchMore.
+fn outline(h: &mut Harness, id: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        out.push(match h.next() {
+            DbEvent::Transaction { .. } => return out,
+            DbEvent::Notice(_) => continue,
+            DbEvent::QueryStarted { id: of, columns } if of == id => {
+                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                format!("cols {}", names.join(" "))
+            }
+            DbEvent::Rows {
+                id: of, rows, more, ..
+            } if of == id => format!("rows {} {more}", rows.len()),
+            DbEvent::Failed { id: of, error, .. } if of == id => {
+                format!("failed {}", error.code.unwrap_or_default())
+            }
+            other => format!("{other:?}"),
+        });
+        // Waiting for a FetchMore: no transaction state comes yet.
+        if out.last().is_some_and(|e| e.ends_with(" true")) {
+            return out;
+        }
+    }
+}
+
+/// Every result set of a batch is a result (#316): a DECLARE batch's
+/// SELECTs, a procedure's. Only the first showed, with a notice, and an
+/// error after it didn't fail the statement.
 #[test]
 fn several_result_sets() {
     let Some(mut h) = Harness::connect() else {
         return;
     };
-    h.execute(1, "select 1 as a; select 2 as b; select 3 as c", 10);
-    let mut notices = Vec::new();
-    let mut rows = None;
+    let id = 66;
+    let run = |h: &mut Harness, sql: &str, max_rows: usize| {
+        h.execute(id, sql, max_rows);
+        outline(h, id)
+    };
+    let more = "MoreResults { id: 66 }";
+    assert_eq!(
+        run(&mut h, "select 1 as a; select 2 as b; select 3 as c", 10),
+        [
+            "cols a",
+            more,
+            "rows 1 false",
+            "cols b",
+            more,
+            "rows 1 false",
+            "cols c",
+            "rows 1 false"
+        ]
+    );
+    assert_eq!(
+        run(
+            &mut h,
+            "declare @n int = 1; select @n as a; select @n + 1 as b, 'x' as c",
+            10
+        ),
+        ["cols a", more, "rows 1 false", "cols b c", "rows 1 false"]
+    );
+    // An empty result is one, a statement without rows isn't.
+    assert_eq!(
+        run(
+            &mut h,
+            "select 1 as a where 1 = 0; declare @x int; set @x = 1; select @x as x",
+            10
+        ),
+        ["cols a", more, "rows 0 false", "cols x", "rows 1 false"]
+    );
+    // An error after a result fails the batch, also one in the next
+    // result, which has its columns but no rows.
+    assert_eq!(
+        run(&mut h, "select 1 as a; select 1 / 0 as b", 10),
+        [
+            "cols a",
+            more,
+            "rows 1 false",
+            "cols b",
+            more,
+            "rows 0 false",
+            "failed 8134"
+        ]
+    );
+    assert_eq!(
+        run(&mut h, "select 1 as a; raiserror('r66 after', 16, 1)", 10),
+        ["cols a", more, "rows 1 false", "failed 50000"]
+    );
+    // A result fetched batch by batch: the next one comes after its last.
+    let paged = format!("{}; select 'end' as e", numbers(15));
+    assert_eq!(run(&mut h, &paged, 10), ["cols n label", "rows 10 true"]);
+    h.session.send(DbRequest::FetchMore { id, max_rows: 10 });
+    assert_eq!(
+        outline(&mut h, id),
+        [more, "rows 5 false", "cols e", "rows 1 false"]
+    );
+    // Fetch all of the first doesn't fetch all of the next.
+    let twice = format!("{0}; {0}", numbers(15));
+    assert_eq!(run(&mut h, &twice, 10), ["cols n label", "rows 10 true"]);
+    h.session.send(DbRequest::FetchMore {
+        id,
+        max_rows: usize::MAX,
+    });
+    assert_eq!(
+        outline(&mut h, id),
+        [more, "rows 5 false", "cols n label", "rows 10 true"]
+    );
+    h.session.send(DbRequest::Rollback);
+    let mut closed = false;
     loop {
         match h.next() {
-            DbEvent::Rows { rows: r, .. } => rows = Some(r),
-            DbEvent::Notice(n) => notices.push(n),
-            DbEvent::Transaction { .. } => break,
-            DbEvent::Failed { error, .. } => panic!("{error}"),
+            DbEvent::QueryClosed { id: 66 } => closed = true,
+            DbEvent::Notice(n) if n == "Rolled back" => break,
             _ => {}
         }
     }
-    assert_eq!(rows, Some(vec![vec![Some("1".to_owned())]]));
+    assert!(closed);
+    h.settle();
+    // One result, as before.
+    assert_eq!(run(&mut h, "select 1 as a", 10), ["cols a", "rows 1 false"]);
+    // A file has the first, and the others are said.
+    h.session.send(DbRequest::ExecuteWhole {
+        id,
+        sql: "select 1 as a; select 2 as b; select 3 as c".into(),
+        max_rows: 10,
+    });
+    let mut notices = Vec::new();
+    let mut shown = Vec::new();
+    loop {
+        match h.next() {
+            DbEvent::Transaction { .. } => break,
+            DbEvent::Notice(text) => notices.push(text),
+            DbEvent::QueryStarted { .. } => shown.push("cols"),
+            DbEvent::Rows { .. } => shown.push("rows"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(shown, ["cols", "rows"]);
     assert_eq!(
         notices,
-        ["The batch returned 2 more result set(s); only the first is shown"]
+        ["The batch returned 2 more result set(s); only the first was written to the file"]
     );
 }
 
