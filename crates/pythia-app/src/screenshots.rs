@@ -5021,6 +5021,59 @@ fn drag_object_into_editor() {
     );
 }
 
+/// A PostgreSQL table's columns show and drag as they are written in SQL,
+/// quoted where the name needs it: `"Order Date"`, and `"Id"` beside `id`.
+#[test]
+fn drag_column_into_editor() {
+    use pythia_db::ObjectType;
+    let connection = "pythia@postgres";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_POSTGRES",
+        connection,
+        pythia_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    run_script(
+        &mut h,
+        connection,
+        "drop table if exists drag_cols;\n\
+         create table drag_cols (\"Id\" int, \"Order Date\" date, id int);",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: "select  from drag_cols".into(),
+        run: false,
+    });
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.state_mut().test_expand_table(ObjectRef {
+        owner: "public".into(),
+        name: "drag_cols".into(),
+        object_type: ObjectType::Table,
+    });
+    wait_until(&mut h, "columns", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    for column in ["\"Id\"", "id"] {
+        assert!(h.query_by_label(column).is_some(), "{column}");
+    }
+    let from = h.get_by_label("\"Order Date\"").rect().center();
+    let to = egui::pos2(900.0, 250.0);
+    h.hover_at(from);
+    h.run_steps(1);
+    h.drag_at(from);
+    h.run_steps(1);
+    for i in 1..=10 {
+        h.hover_at(from + (to - from) * (i as f32 / 10.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to);
+    h.run_steps(3);
+    let text = h.state_mut().test_sql_window().editor.text().to_owned();
+    assert!(text.contains("\"Order Date\""), "{text:?}");
+    run_script(&mut h, connection, "drop table drag_cols");
+}
+
 /// Debug… on a subprogram's name in a program window: in the spec and in
 /// the body for what the spec declares, not for the body's private
 /// subprograms. It opens a SQL window with a block that calls the

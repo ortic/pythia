@@ -296,6 +296,16 @@ All notable changes to Pythia are documented here. The format follows
   as names. The INSERT statements of such a result (*Copy as*, *Export*,
   *Execute to file*) were written for `my_table`; they now name the
   table.
+- The object browser writes a table's columns as the database needs
+  them (#230). On PostgreSQL, a column `"Order Date"` dragged into an
+  editor became `order date` and `"Id"` became `id`, another column or
+  none; columns are now listed and dragged quoted where they need it,
+  and on Oracle a quoted name such as `"Mixed"` keeps its case instead
+  of becoming `"mixed"`. *Generate → INSERT* and *UPDATE statement*
+  named their binds after the columns as they are, so `:order date` or
+  `:e-mail` broke the statement, and two columns `Id` and `id` shared
+  `:id`; binds are now `:order_date`, `:e_mail`, `:id_2`. *SELECT
+  statement* no longer takes a digit for its alias.
 
 ## [0.10.0] - 2026-10-30
 

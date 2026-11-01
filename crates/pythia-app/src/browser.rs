@@ -1328,7 +1328,7 @@ impl Browser {
                         Icon::Column
                     };
                     ui.add(icon.sized(ui, small));
-                    let column = c.name.to_lowercase();
+                    let column = written(self.dialect, &c.name);
                     let label = ui.add(
                         egui::Label::new(name(column.clone()))
                             .sense(Sense::drag())
@@ -1584,15 +1584,9 @@ impl Browser {
     ) -> egui::Response {
         let dialect = self.dialect;
         let name = if Some(object.owner.as_str()) == self.schema.as_deref() {
-            dialect.quote_ident(&object.name)
+            written(dialect, &object.name)
         } else {
-            dialect.qualified(&object.owner, &object.name)
-        };
-        // Oracle's names read better in lowercase; MySQL's keep their case.
-        let name = if dialect == Dialect::ORACLE {
-            name.to_lowercase()
-        } else {
-            name
+            written_qualified(dialect, &object.owner, &object.name)
         };
         let response = add(ui);
         drag_text(ui, &response, name);
@@ -2349,19 +2343,58 @@ impl Template {
     }
 }
 
+/// `name` as the SQL of `dialect` writes it: quoted where it needs it,
+/// Oracle's plain names in lowercase, which read better. A quoted name
+/// keeps its case, the dictionary's (#230).
+fn written(dialect: Dialect, name: &str) -> String {
+    let quoted = dialect.quote_ident(name);
+    if dialect == Dialect::ORACLE && quoted == name {
+        quoted.to_lowercase()
+    } else {
+        quoted
+    }
+}
+
+/// `owner.name`, each [`written`].
+fn written_qualified(dialect: Dialect, owner: &str, name: &str) -> String {
+    format!("{}.{}", written(dialect, owner), written(dialect, name))
+}
+
+/// A bind for each column, named after it: in lowercase, `_` for what a
+/// bind can't hold (it ends at a space or `-`), `c` before a name that
+/// doesn't start with a letter, as a bind must, and a number where two
+/// columns would share one (#230).
+fn bind_names(cols: &[TableColumn]) -> Vec<String> {
+    let mut binds: Vec<String> = Vec::new();
+    for c in cols {
+        let mut name: String = c
+            .name
+            .to_lowercase()
+            .chars()
+            .map(|ch| if ch.is_alphanumeric() { ch } else { '_' })
+            .collect();
+        if !name.starts_with(char::is_alphabetic) {
+            name.insert(0, 'c');
+        }
+        let mut bind = format!(":{name}");
+        for n in 2.. {
+            if !binds.contains(&bind) {
+                break;
+            }
+            bind = format!(":{name}_{n}");
+        }
+        binds.push(bind);
+    }
+    binds
+}
+
 /// Builds the statement for `kind` with binds named after the columns.
 /// Oracle's names are written in lowercase; MySQL's keep their case.
 fn template(dialect: Dialect, kind: Template, object: &ObjectRef, cols: &[TableColumn]) -> String {
-    let case = |s: String| {
-        if dialect == Dialect::ORACLE {
-            s.to_lowercase()
-        } else {
-            s
-        }
-    };
-    let name = |c: &TableColumn| case(dialect.quote_ident(&c.name));
-    let table = case(dialect.qualified(&object.owner, &object.name));
+    let name = |c: &TableColumn| written(dialect, &c.name);
+    let table = written_qualified(dialect, &object.owner, &object.name);
     let names: Vec<String> = cols.iter().map(name).collect();
+    let binds = bind_names(cols);
     match kind {
         Template::ColumnList => names.join(", "),
         Template::Select => {
@@ -2369,36 +2402,33 @@ fn template(dialect: Dialect, kind: Template, object: &ObjectRef, cols: &[TableC
                 .name
                 .chars()
                 .next()
-                .unwrap_or('t')
-                .to_ascii_lowercase();
+                .filter(char::is_ascii_alphabetic)
+                .map_or('t', |c| c.to_ascii_lowercase());
             let list: Vec<String> = names.iter().map(|n| format!("{alias}.{n}")).collect();
             format!("select {}\n  from {table} {alias}", list.join(",\n       "))
         }
-        Template::Insert => {
-            let binds: Vec<String> = cols
-                .iter()
-                .map(|c| format!(":{}", c.name.to_lowercase()))
-                .collect();
-            format!(
-                "insert into {table}\n  ({})\nvalues\n  ({})",
-                names.join(", "),
-                binds.join(", ")
-            )
-        }
+        Template::Insert => format!(
+            "insert into {table}\n  ({})\nvalues\n  ({})",
+            names.join(", "),
+            binds.join(", ")
+        ),
         Template::Update => {
-            let mut keys: Vec<&TableColumn> =
-                cols.iter().filter(|c| c.pk_position.is_some()).collect();
-            keys.sort_by_key(|c| c.pk_position);
-            let sets: Vec<String> = cols
+            let columns: Vec<(&TableColumn, &String)> = cols.iter().zip(&binds).collect();
+            let mut keys: Vec<_> = columns
                 .iter()
-                .filter(|c| c.pk_position.is_none())
-                .map(|c| format!("{} = :{}", name(c), c.name.to_lowercase()))
+                .filter(|(c, _)| c.pk_position.is_some())
+                .collect();
+            keys.sort_by_key(|(c, _)| c.pk_position);
+            let sets: Vec<String> = columns
+                .iter()
+                .filter(|(c, _)| c.pk_position.is_none())
+                .map(|(c, bind)| format!("{} = {bind}", name(c)))
                 .collect();
             let wheres: Vec<String> = if keys.is_empty() {
                 vec!["1 = 0 -- TODO: no primary key".into()]
             } else {
                 keys.iter()
-                    .map(|c| format!("{} = :{}", name(c), c.name.to_lowercase()))
+                    .map(|(c, bind)| format!("{} = {bind}", name(c)))
                     .collect()
             };
             format!(
@@ -2711,6 +2741,65 @@ mod tests {
         assert_eq!(
             template(Dialect::MYSQL, Template::Select, &object, &cols),
             "select o.id,\n       o.Total,\n       o.`key`\n  from shop.`Order` o"
+        );
+    }
+
+    /// Names that need quotes give binds that are binds: a bind ends at a
+    /// space or `-`, and starts with a letter. Two columns never share one.
+    #[test]
+    fn templates_of_quoted_names() {
+        let object = ObjectRef {
+            owner: "public".into(),
+            name: "2024 Orders".into(),
+            object_type: ObjectType::Table,
+        };
+        let cols = [
+            col("Id", Some(1)),
+            col("Order Date", None),
+            col("_note", None),
+            col("e-mail", None),
+            col("id", None),
+        ];
+        let postgres = Dialect::POSTGRES;
+        assert_eq!(
+            template(postgres, Template::Insert, &object, &cols),
+            "insert into public.\"2024 Orders\"\n  \
+             (\"Id\", \"Order Date\", _note, \"e-mail\", id)\nvalues\n  \
+             (:id, :order_date, :c_note, :e_mail, :id_2)"
+        );
+        assert_eq!(
+            template(postgres, Template::Update, &object, &cols),
+            "update public.\"2024 Orders\"\n   set \"Order Date\" = :order_date,\n       \
+             _note = :c_note,\n       \"e-mail\" = :e_mail,\n       id = :id_2\n \
+             where \"Id\" = :id"
+        );
+        assert_eq!(
+            template(postgres, Template::Select, &object, &cols[..2]),
+            "select t.\"Id\",\n       t.\"Order Date\"\n  from public.\"2024 Orders\" t"
+        );
+        // Each bind is one to the SQL window.
+        let insert = template(postgres, Template::Insert, &object, &cols);
+        let binds: Vec<&str> = pythia_plsql::tokenize_in(&insert, postgres.syntax())
+            .into_iter()
+            .filter(|t| t.kind == pythia_plsql::TokenKind::BindVar)
+            .map(|t| &insert[t.span])
+            .collect();
+        assert_eq!(binds, [":id", ":order_date", ":c_note", ":e_mail", ":id_2"]);
+
+        // Oracle's plain names read in lowercase, its quoted ones as they are.
+        let object = ObjectRef {
+            owner: "HR".into(),
+            name: "Mixed".into(),
+            object_type: ObjectType::Table,
+        };
+        let cols = [col("ID", Some(1)), col("Name", None)];
+        assert_eq!(
+            template(Dialect::ORACLE, Template::Select, &object, &cols),
+            "select m.id,\n       m.\"Name\"\n  from hr.\"Mixed\" m"
+        );
+        assert_eq!(
+            template(Dialect::ORACLE, Template::Update, &object, &cols),
+            "update hr.\"Mixed\"\n   set \"Name\" = :name\n where id = :id"
         );
     }
 
