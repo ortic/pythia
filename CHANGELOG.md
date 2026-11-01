@@ -828,6 +828,15 @@ All notable changes to Pythia are documented here. The format follows
   case-sensitive or binary column compared without case, and a UTF-8
   column stored only the letters of the database's code page: `čaj 茶`
   became `caj ?`.
+- SQL Server: a temporal table's DDL makes a temporal table (#324): its
+  period columns are `generated always as row start` and `row end`,
+  `hidden` where they are, with `period for system_time (…)` and
+  `with (system_versioning = on (history_table = …,
+  history_retention_period = …))`. It made a plain table, which kept no
+  history and showed the hidden columns. A history table SQL Server
+  named is left out, so that a copy gets its own. Run elsewhere, SQL
+  Server makes the history table as it made the original's, or takes
+  the one the history table's DDL made before.
 
 ## [0.10.0] - 2026-10-30
 

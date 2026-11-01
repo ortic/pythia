@@ -1856,6 +1856,197 @@ fn column_collations() {
     drop_tables(&mut h, &schema, "r74_co");
 }
 
+/// The temporal tables of `owner` whose names start with `prefix`, as the
+/// catalog has them: their versioning, history table and retention, their
+/// periods, generated and hidden columns, and their history tables'
+/// columns and indexes. A history table SQL Server named, and its index,
+/// read with `N` for the table's object_id.
+fn catalog_temporal(h: &mut Harness, owner: &str, prefix: &str, retention: bool) -> Vec<String> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%' and temporal_type <> 1"
+    );
+    let retention = if retention {
+        "t.history_retention_period, t.history_retention_period_unit_desc"
+    } else {
+        "''"
+    };
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.temporal_type, \
+                                         replace(object_name(t.history_table_id), \
+                                                 cast(t.object_id as varchar(20)), 'N'), \
+                                         case when object_schema_name(t.history_table_id) \
+                                                   = schema_name(t.schema_id) then 'own' end, \
+                                         {retention}, \
+                                         p.name, col_name(p.object_id, p.start_column_id), \
+                                         col_name(p.object_id, p.end_column_id)) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t left join sys.periods p on p.object_id = t.object_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         type_name(c.user_type_id), c.scale, c.is_nullable, \
+                                         c.generated_always_type, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', t.name, c.name, type_name(c.user_type_id), c.scale, \
+                                         c.is_nullable, c.generated_always_type, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by t.name, c.column_id) \
+               from sys.tables t join sys.columns c on c.object_id = t.history_table_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', t.name, \
+                                         replace(i.name, cast(t.object_id as varchar(20)), 'N'), \
+                                         i.type_desc, p.data_compression_desc, cols.names) \
+                               collate database_default, '; ') within group (order by t.name, i.name) \
+               from sys.tables t join sys.indexes i on i.object_id = t.history_table_id \
+               join sys.partitions p on p.object_id = i.object_id and p.index_id = i.index_id \
+              outer apply (select string_agg(col_name(ic.object_id, ic.column_id), ',') \
+                                    within group (order by ic.key_ordinal) as names \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id) cols \
+              where t.object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .filter_map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A temporal table's DDL makes one (#324): its period for system_time, its
+/// generated always columns, hidden ones too, and its system versioning
+/// with its history table and retention. Run elsewhere, SQL Server makes
+/// the history table as it made the original's, or uses one the history
+/// table's DDL made before; a history table SQL Server named is named for
+/// the copy.
+#[test]
+fn temporal_tables() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_t", "r74_t");
+    h.ok("drop schema if exists r74_copy_t");
+    drop_tables(&mut h, &schema, "r74_t");
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // HISTORY_RETENTION_PERIOD came with SQL Server 2017.
+    let retention = major >= 14;
+    let keep = if retention {
+        ", history_retention_period = 6 months"
+    } else {
+        ""
+    };
+    for sql in [
+        "create table r74_tp (id int constraint r74_tp_pk primary key, v varchar(10), \
+           f datetime2 generated always as row start hidden not null, \
+           u datetime2 generated always as row end hidden not null, \
+           period for system_time (f, u)) \
+         with (system_versioning = on)"
+            .to_owned(),
+        format!(
+            "create table r74_tq (id int constraint r74_tq_pk primary key, \
+               f datetime2(3) generated always as row start not null \
+                 constraint r74_tq_df default sysutcdatetime(), \
+               u datetime2(3) generated always as row end not null \
+                 constraint r74_tq_du default '9999-12-31 23:59:59.999', \
+               period for system_time (f, u)) \
+             with (system_versioning = on (history_table = [{schema}].[r74_tq_hist]{keep}))"
+        ),
+        "create table r74_tr (id int, f datetime2 generated always as row start not null, \
+           u datetime2 generated always as row end not null, period for system_time (f, u))"
+            .to_owned(),
+    ] {
+        h.ok(&sql);
+    }
+    let tp = table_ddl(&mut h, &schema, "r74_tp");
+    assert_eq!(
+        tp,
+        format!(
+            "create table [{schema}].[r74_tp] (\n    \
+               [id] int not null,\n    \
+               [v] varchar(10) null,\n    \
+               [f] datetime2(7) generated always as row start hidden not null,\n    \
+               [u] datetime2(7) generated always as row end hidden not null,\n    \
+               constraint [r74_tp_pk] primary key clustered ([id]),\n    \
+               period for system_time ([f], [u])\n\
+             ) with (system_versioning = on);\nGO\n"
+        )
+    );
+    let tq = table_ddl(&mut h, &schema, "r74_tq");
+    assert_eq!(
+        tq,
+        format!(
+            "create table [{schema}].[r74_tq] (\n    \
+               [id] int not null,\n    \
+               [f] datetime2(3) generated always as row start not null \
+                 constraint [r74_tq_df] default (sysutcdatetime()),\n    \
+               [u] datetime2(3) generated always as row end not null \
+                 constraint [r74_tq_du] default ('9999-12-31 23:59:59.999'),\n    \
+               constraint [r74_tq_pk] primary key clustered ([id]),\n    \
+               period for system_time ([f], [u])\n\
+             ) with (system_versioning = on (history_table = [{schema}].[r74_tq_hist]{keep}));\
+             \nGO\n"
+        )
+    );
+    let tr = table_ddl(&mut h, &schema, "r74_tr");
+    assert_eq!(
+        tr,
+        format!(
+            "create table [{schema}].[r74_tr] (\n    \
+               [id] int null,\n    \
+               [f] datetime2(7) generated always as row start not null,\n    \
+               [u] datetime2(7) generated always as row end not null,\n    \
+               period for system_time ([f], [u])\n\
+             );\nGO\n"
+        )
+    );
+    // The history table's own DDL makes a table SQL Server takes for one.
+    let hist = table_ddl(&mut h, &schema, "r74_tq_hist");
+    assert!(
+        hist.starts_with(&format!(
+            "create table [{schema}].[r74_tq_hist] (\n    \
+               [id] int not null,\n    \
+               [f] datetime2(3) not null,\n    \
+               [u] datetime2(3) not null\n\
+             );"
+        )),
+        "{hist}"
+    );
+    let before = catalog_temporal(&mut h, &schema, "r74_t", retention);
+    assert_eq!(before.len(), 4, "{before:?}");
+    h.ok("create schema r74_copy_t");
+    let tables = ["r74_tp", "r74_tq", "r74_tq_hist", "r74_tr"];
+    for ddl in [&tp, &hist, &tq, &tr] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_t", &tables);
+    }
+    assert_eq!(
+        catalog_temporal(&mut h, "r74_copy_t", "r74_t", retention),
+        before
+    );
+    // The copy keeps the rows' versions.
+    h.ok("insert into r74_copy_t.r74_tp (id, v) values (1, 'a')");
+    h.ok("update r74_copy_t.r74_tp set v = 'b'");
+    assert_eq!(
+        h.scalar("select count(*) from r74_copy_t.r74_tp for system_time all")
+            .as_deref(),
+        Some("2")
+    );
+    drop_tables(&mut h, "r74_copy_t", "r74_t");
+    h.ok("drop schema r74_copy_t");
+    drop_tables(&mut h, &schema, "r74_t");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.

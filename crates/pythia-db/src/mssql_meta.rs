@@ -498,7 +498,9 @@ fn ddl(
 /// `CREATE TABLE` with its columns and constraints, then its other indexes;
 /// a memory-optimized table declares its indexes in it. A column's
 /// collation is written where it isn't the database's (#323), so that run
-/// elsewhere the others take that database's, as they were made.
+/// elsewhere the others take that database's, as they were made. A
+/// temporal table's period columns are `generated always`, hidden or not,
+/// and its period comes last (#324).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -514,6 +516,12 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                              + case when ic.object_id is not null \
                                  then ' identity(' + cast(ic.seed_value as varchar(40)) + ', ' \
                                       + cast(ic.increment_value as varchar(40)) + ')' else '' end \
+                             + case when c.generated_always_type in (1, 2) \
+                                 then ' generated always as row ' \
+                                      + case c.generated_always_type when 1 then 'start' \
+                                             else 'end' end \
+                                      + case when c.is_hidden = 1 then ' hidden' else '' end \
+                                 else '' end \
                              + case when c.is_nullable = 1 then ' null' else ' not null' end \
                              + coalesce(' constraint ' + quotename(dc.name) + ' default ' \
                                         + dc.definition, '') end \
@@ -532,45 +540,72 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
-    // A memory-optimized table's durability (#302): CREATE INDEX can't make
-    // its indexes, they are declared in CREATE TABLE. Its LOB data's
-    // filegroup where it isn't the table's, and whether the table is a heap
-    // (0) or its clustered index (1) holds its rows (#315).
-    let table = ms
-        .rows(
-            "select case when t.is_memory_optimized = 1 \
-                         then lower(t.durability_desc collate database_default) end, \
-                    case when t.lob_data_space_id not in (0, i.data_space_id) \
-                         then quotename(l.name) end, \
-                    i.index_id \
-               from sys.tables t \
-               join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
-               left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
-              where t.object_id = object_id(@P1)",
-            &[object],
-        )?
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    let mut table = table.into_iter();
-    let (durability, textimage, rows_in) = (
-        table.next().flatten(),
-        table.next().flatten(),
-        table.next().flatten().unwrap_or_default(),
-    );
     // Catalog columns of later versions: a columnstore index's ORDER
-    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019) and XML_COMPRESSION (2022).
+    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022) and
+    // a temporal table's HISTORY_RETENTION_PERIOD (2017).
     let later = ms
         .rows(
             "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
                     col_length('sys.indexes', 'optimize_for_sequential_key'), \
-                    col_length('sys.partitions', 'xml_compression')",
+                    col_length('sys.partitions', 'xml_compression'), \
+                    col_length('sys.tables', 'history_retention_period')",
             &[],
         )?
         .into_iter()
         .next()
         .unwrap_or_default();
     let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    let retention = if has(3) {
+        "case when t.history_retention_period > 0 \
+              then cast(t.history_retention_period as varchar(10)) + ' ' \
+                   + lower(t.history_retention_period_unit_desc collate database_default) \
+                   + case when t.history_retention_period > 1 then 's' else '' end end"
+    } else {
+        "null"
+    };
+    // A memory-optimized table's durability (#302): CREATE INDEX can't make
+    // its indexes, they are declared in CREATE TABLE. Its LOB data's
+    // filegroup where it isn't the table's, and whether the table is a heap
+    // (0) or its clustered index (1) holds its rows (#315). A temporal
+    // table's period, whether it is system-versioned (2), its history table
+    // where SQL Server didn't name it, MSSQL_TemporalHistoryFor_ and the
+    // table's object_id in its schema, so that a copy gets its own, and the
+    // history's retention where it isn't infinite (#324).
+    let table = ms
+        .rows(
+            &format!(
+                "select case when t.is_memory_optimized = 1 \
+                             then lower(t.durability_desc collate database_default) end, \
+                        case when t.lob_data_space_id not in (0, i.data_space_id) \
+                             then quotename(l.name) end, \
+                        i.index_id, \
+                        'period for system_time (' \
+                          + quotename(col_name(p.object_id, p.start_column_id)) + ', ' \
+                          + quotename(col_name(p.object_id, p.end_column_id)) + ')', \
+                        t.temporal_type, \
+                        case when h.schema_id <> t.schema_id \
+                               or h.name <> 'MSSQL_TemporalHistoryFor_' \
+                                            + cast(t.object_id as varchar(20)) \
+                             then quotename(schema_name(h.schema_id)) + '.' + quotename(h.name) \
+                        end, \
+                        {retention} \
+                   from sys.tables t \
+                   join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
+                   left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
+                   left join sys.periods p on p.object_id = t.object_id and p.period_type = 1 \
+                   left join sys.tables h on h.object_id = t.history_table_id \
+                  where t.object_id = object_id(@P1)"
+            ),
+            &[object],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let mut table = table.into_iter();
+    let mut next = || table.next().flatten();
+    let (durability, textimage, rows_in) = (next(), next(), next().unwrap_or_default());
+    let (period, versioned) = (next(), next().as_deref() == Some("2"));
+    let (history, retention) = (next(), next());
     let storage = index_storage(ms, object, has(1), has(2))?;
     let no_storage = Storage::default();
     let storage_of = |index: &str| storage.get(index).unwrap_or(&no_storage);
@@ -787,8 +822,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
             lists.clause(" order ", &name, "order"),
         ));
     }
+    lines.extend(period);
     // The table's filegroup or partition scheme, and its LOB data's, then
-    // its options: a memory-optimized table's, a heap's compression.
+    // its options: a memory-optimized table's, a heap's compression, a
+    // temporal table's versioning.
     let mut ddl = format!("create table {object} (\n    {}\n)", lines.join(",\n    "));
     if let Some(on) = table_storage.on.as_ref().filter(|_| !table_storage.default) {
         ddl.push_str(&format!(" on {on}"));
@@ -803,6 +840,20 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     }
     if rows_in == "0" {
         options.extend(table_storage.options.iter().cloned());
+    }
+    if versioned {
+        let history: Vec<String> = [
+            history.map(|history| format!("history_table = {history}")),
+            retention.map(|retention| format!("history_retention_period = {retention}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        options.push(if history.is_empty() {
+            "system_versioning = on".to_owned()
+        } else {
+            format!("system_versioning = on ({})", history.join(", "))
+        });
     }
     if !options.is_empty() {
         ddl.push_str(&format!(" with ({})", options.join(", ")));
