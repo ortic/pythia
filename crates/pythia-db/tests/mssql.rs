@@ -2047,6 +2047,69 @@ fn temporal_tables() {
     drop_tables(&mut h, &schema, "r74_t");
 }
 
+/// A table's DDL keeps its sparse columns and its column set (#325): run
+/// elsewhere, the columns are sparse again and `select *` reads them
+/// through the column set.
+#[test]
+fn sparse_columns_and_column_sets() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_s", "r74_s");
+    h.ok("drop schema if exists r74_copy_s");
+    drop_tables(&mut h, &schema, "r74_s");
+    for sql in [
+        "create table r74_sp (id int not null, a int sparse null, \
+         b varchar(10) collate Latin1_General_CS_AS sparse, \
+         cs xml column_set for all_sparse_columns)",
+        "create table r74_sq (id int, a datetime2(3) sparse null)",
+    ] {
+        h.ok(sql);
+    }
+    let sp = table_ddl(&mut h, &schema, "r74_sp");
+    assert_eq!(
+        sp,
+        format!(
+            "create table [{schema}].[r74_sp] (\n    \
+               [id] int not null,\n    \
+               [a] int sparse null,\n    \
+               [b] varchar(10) collate Latin1_General_CS_AS sparse null,\n    \
+               [cs] xml column_set for all_sparse_columns null\n\
+             );\nGO\n"
+        )
+    );
+    let sq = table_ddl(&mut h, &schema, "r74_sq");
+    assert!(sq.contains("    [a] datetime2(3) sparse null\n"), "{sq}");
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, c.is_sparse, \
+                                         c.is_column_set, c.is_nullable, c.collation_name) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c \
+              where c.object_id in (object_id('[{owner}].[r74_sp]'), object_id('[{owner}].[r74_sq]'))"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_s");
+    for ddl in [&sp, &sq] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_s", &["r74_sp", "r74_sq"]);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_s"), before);
+    // Rows go in and come out through the column set.
+    h.ok("insert into r74_copy_s.r74_sp (id, cs) values (1, '<a>5</a>')");
+    assert_eq!(
+        h.scalar("select concat(a, ' ', cast(cs as nvarchar(100))) from r74_copy_s.r74_sp")
+            .as_deref(),
+        Some("5 <a>5</a>")
+    );
+    drop_tables(&mut h, "r74_copy_s", "r74_s");
+    h.ok("drop schema r74_copy_s");
+    drop_tables(&mut h, &schema, "r74_s");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.

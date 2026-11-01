@@ -837,6 +837,12 @@ All notable changes to Pythia are documented here. The format follows
   named is left out, so that a copy gets its own. Run elsewhere, SQL
   Server makes the history table as it made the original's, or takes
   the one the history table's DDL made before.
+- SQL Server: a table's DDL keeps its sparse columns and its column set
+  (#325), `[a] int sparse null`, `[cs] xml column_set for
+  all_sparse_columns null`. They were made plain columns: run elsewhere,
+  rows written through the column set left the sparse columns NULL,
+  `select *` read every sparse column, and a table of more than 1,024
+  columns failed.
 
 ## [0.10.0] - 2026-10-30
 

@@ -500,7 +500,8 @@ fn ddl(
 /// collation is written where it isn't the database's (#323), so that run
 /// elsewhere the others take that database's, as they were made. A
 /// temporal table's period columns are `generated always`, hidden or not,
-/// and its period comes last (#324).
+/// and its period comes last (#324). Sparse columns and a column set are
+/// declared so (#325).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -513,6 +514,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                          <> cast(databasepropertyex(db_name(), 'Collation') \
                                                  as sysname) collate database_default \
                                  then ' collate ' + c.collation_name else '' end \
+                             + case when c.is_sparse = 1 then ' sparse' \
+                                    when c.is_column_set = 1 \
+                                      then ' column_set for all_sparse_columns' \
+                                    else '' end \
                              + case when ic.object_id is not null \
                                  then ' identity(' + cast(ic.seed_value as varchar(40)) + ', ' \
                                       + cast(ic.increment_value as varchar(40)) + ')' else '' end \
