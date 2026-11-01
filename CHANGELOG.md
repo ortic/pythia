@@ -822,6 +822,11 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL chooses, `orders_id_seq`, and what reads it by its name
   failed. A name PostgreSQL chose is still left out, so that a copy
   beside the table chooses its own.
+- *Search data* opens a hit of a quoted table or column by its name as
+  it is (#334). The query named schema, table and column in lowercase,
+  quotes and all, so a hit in `"R71_Data"` read `"r71_data"`: it failed
+  with ORA-00942, or read the rows of another table. Plain names still
+  read in lowercase.
 
 ## [0.10.0] - 2026-10-30
 

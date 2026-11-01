@@ -2537,7 +2537,7 @@ pub fn shown_qualified(dialect: Dialect, o: &ObjectRef) -> String {
 /// `name` as the SQL of `dialect` writes it: quoted where it needs it,
 /// Oracle's plain names in lowercase, which read better. A quoted name
 /// keeps its case, the dictionary's (#230).
-fn written(dialect: Dialect, name: &str) -> String {
+pub fn written(dialect: Dialect, name: &str) -> String {
     let quoted = dialect.quote_ident(name);
     if dialect == Dialect::ORACLE && quoted == name {
         quoted.to_lowercase()
@@ -2547,7 +2547,7 @@ fn written(dialect: Dialect, name: &str) -> String {
 }
 
 /// `owner.name`, each [`written`].
-fn written_qualified(dialect: Dialect, owner: &str, name: &str) -> String {
+pub fn written_qualified(dialect: Dialect, owner: &str, name: &str) -> String {
     format!("{}.{}", written(dialect, owner), written(dialect, name))
 }
 
