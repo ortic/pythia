@@ -128,7 +128,7 @@ pub(crate) fn hex(bytes: &[u8], whole: bool) -> String {
 /// plainly in between (`2.5`, `100`), without SQLite's `.0`. Written out,
 /// 1e-300 is 302 characters, which the grid shows cut short as
 /// `0.0000…` (#261).
-pub(crate) fn float_text<F: std::fmt::Debug + std::fmt::Display>(value: F) -> String {
+pub fn float_text<F: std::fmt::Debug + std::fmt::Display>(value: F) -> String {
     let shortest = format!("{value:?}");
     if shortest.contains('e') {
         shortest

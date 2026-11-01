@@ -2408,16 +2408,13 @@ fn decimal_text(units: i128, scale: u32) -> String {
     }
 }
 
+/// A sum or an average of doubles as floats are shown (#278): with an
+/// exponent below 1e-4 and from 1e16, plainly in between (#261), to 15
+/// significant digits, past which a double's digits aren't the numbers'.
+/// Rounded to four decimals, 2e-20 read 0.
 fn fmt_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{n:.0}")
-    } else if n.abs() >= 1e21 {
-        format!("{n:e}")
-    } else {
-        // Without the dot of 1e15 and more (#238).
-        let text = format!("{n:.4}");
-        text.trim_end_matches('0').trim_end_matches('.').to_owned()
-    }
+    let rounded = format!("{n:.14e}").parse().unwrap_or(n);
+    pythia_db::float_text(rounded)
 }
 
 /// One row at a time, a field per column. The fields edit like the grid's
@@ -4453,6 +4450,48 @@ mod tests {
         assert_eq!(
             summary(&mut state),
             "Count 2 · Sum 6 · Avg 3 · Min 1 · Max 5"
+        );
+    }
+
+    /// The sum and the average of very small or very large numbers keep
+    /// them (#278): 2e-20 and 3e-20 added up to "Sum 0 · Avg 0", and 1 and
+    /// 1e-5 to 1, rounded to four decimals.
+    #[test]
+    fn summary_keeps_small_and_large_numbers() {
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "FLOAT".into(),
+            numeric: true,
+        }];
+        let summary_of = |values: &[&str]| {
+            let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![Some((*v).into())]).collect();
+            let mut state = GridState::default();
+            state.sync(&rows, &columns);
+            state.select((0, 0), false);
+            state.select((rows.len() - 1, 0), true);
+            summary(&columns, &rows, &state).unwrap()
+        };
+        assert_eq!(
+            summary_of(&["2e-20", "3e-20"]),
+            "Count 2 · Sum 5e-20 · Avg 2.5e-20 · Min 2e-20 · Max 3e-20"
+        );
+        assert_eq!(
+            summary_of(&["1", "1e-5"]),
+            "Count 2 · Sum 1.00001 · Avg 0.500005 · Min 1e-5 · Max 1"
+        );
+        assert_eq!(
+            summary_of(&["1e300", "1e300", "1e299"]),
+            "Count 3 · Sum 2.1e300 · Avg 7e299 · Min 1e299 · Max 1e300"
+        );
+        // A double's last digits aren't the numbers'.
+        assert_eq!(
+            summary_of(&["1e-1", "2e-1"]),
+            "Count 2 · Sum 0.3 · Avg 0.15 · Min 1e-1 · Max 2e-1"
+        );
+        // Plain decimals add up exactly, as before (#238).
+        assert_eq!(
+            summary_of(&["0.1", "0.2", "2.5"]),
+            "Count 3 · Sum 2.8 · Avg 0.93333 · Min 0.1 · Max 2.5"
         );
     }
 }

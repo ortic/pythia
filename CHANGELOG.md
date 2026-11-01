@@ -529,6 +529,12 @@ All notable changes to Pythia are documented here. The format follows
   filter on, a new row's cells were those of a row the filter hid. They
   now take the changes waiting for *Apply* and leave out the rows to be
   deleted, and follow each change.
+- The summary of a selection no longer reads `Sum 0` for very small
+  numbers (#278). The sum and average of floats such as `2e-20` and
+  `3e-20` were rounded to four decimals, "Sum 0 · Avg 0", and those of
+  `1` and `1e-5` read 1 and 0.5. They now read as floats are shown,
+  `5e-20` and `2.5e-20`, `1.00001` and `0.500005`; plain decimals still
+  add up exactly.
 
 ## [0.10.0] - 2026-10-30
 
