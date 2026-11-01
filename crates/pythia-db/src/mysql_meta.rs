@@ -316,12 +316,18 @@ const KEY_PART: &str = "coalesce(column_name, concat('(', \
              concat(char(92 using utf8mb4), char(39 using utf8mb4)), char(39 using utf8mb4)), \
      ')'))";
 
-/// A table's indexes, with their key parts as `part` gives them.
+/// A table's indexes, with their key parts as `part` gives them, each with
+/// its prefix length and order as the DDL writes them, `name(5) DESC`
+/// (#283). A spatial index's part has a `sub_part` of 32, but no prefix.
 fn indexes_sql(part: &str) -> String {
     format!(
         "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
                 if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
-                group_concat({part} order by seq_in_index separator ', ') as COLUMNS \
+                group_concat(concat({part}, \
+                                    if(index_type = 'SPATIAL', '', \
+                                       coalesce(concat('(', sub_part, ')'), '')), \
+                                    if(`collation` = 'D', ' DESC', '')) \
+                             order by seq_in_index separator ', ') as COLUMNS \
            from information_schema.statistics \
           where table_schema = ? and table_name = ? \
           group by index_name, index_type, non_unique \

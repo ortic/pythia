@@ -536,6 +536,12 @@ All notable changes to Pythia are documented here. The format follows
   CREATE SEQUENCE`'s, *Find Objects* finds it as a sequence, and
   completion offers it in expressions, `nextval(order_no)`, no longer
   after `FROM`.
+- MySQL: a table's *Indexes* show a key part's prefix length and
+  order (#283), as the DDL has them. An index on `name(5)` read `name`,
+  as if it were on the whole column, and one on `(a desc, b)` read `a,
+  b`; they now read `name(5)` and `a DESC, b`, and an expression part
+  ``(lower(`name`)) DESC``. MariaDB's prefixes read the same way; it
+  keeps DESC from 10.8.
 
 ## [0.10.0] - 2026-10-30
 

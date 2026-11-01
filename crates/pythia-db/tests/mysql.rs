@@ -1292,12 +1292,68 @@ fn functional_index_parts() {
                     "(cast(json_unquote(json_extract(`j`,_utf8mb4'$.name')) as char(30) \
                      charset utf8mb4))"
                 ),
-                ("r41_mix", "id, (lower(`name`))"),
+                ("r41_mix", "id, (lower(`name`)) DESC"),
                 ("r41_q", r"(concat(`name`,_utf8mb4'a\\b\'c'))"),
             ]
         );
     }
     h.ok("drop table r41_fi");
+}
+
+/// An index's key parts read with their prefix length and order, as the
+/// DDL writes them: `name(5)` and `a DESC` read `name` and `a`, as if the
+/// index were on the whole column, in ascending order. A spatial index's
+/// part has no prefix, whatever information_schema says. MariaDB keeps
+/// DESC from 10.8; before, it ignores it.
+#[test]
+fn index_key_parts_as_defined() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let version = h.scalar("select version()").unwrap_or_default();
+    let release: Vec<u32> = version
+        .split(['.', '-'])
+        .take(2)
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let desc = if version.contains("MariaDB") && release < vec![10, 8] {
+        ""
+    } else {
+        " DESC"
+    };
+    h.ok("drop table if exists r53_ix");
+    h.ok(
+        "create table r53_ix (id int primary key, name varchar(30), a int, b int, t text, \
+         g geometry not null, \
+         index r53_p (name(5)), index r53_d (a desc, b), index r53_m (a, name(3) desc), \
+         index r53_t (t(10)), fulltext index r53_ft (t), spatial index r53_g (g))",
+    );
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "r53_ix".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let columns: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r[0].as_deref().unwrap(), r[3].as_deref().unwrap_or("")))
+        .collect();
+    let (d, m) = (format!("a{desc}, b"), format!("a, name(3){desc}"));
+    assert_eq!(
+        columns,
+        [
+            ("PRIMARY", "id"),
+            ("r53_d", d.as_str()),
+            ("r53_ft", "t"),
+            ("r53_g", "g"),
+            ("r53_m", m.as_str()),
+            ("r53_p", "name(5)"),
+            ("r53_t", "t(10)"),
+        ]
+    );
+    h.ok("drop table r53_ix");
 }
 
 /// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE
