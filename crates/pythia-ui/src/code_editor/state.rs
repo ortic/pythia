@@ -59,7 +59,7 @@ impl EditorState {
 
     pub fn set_text(&mut self, text: &str) {
         self.rope = Rope::from_str(text);
-        self.highlighter = Highlighter::with_syntax(&self.rope, self.highlighter.syntax());
+        self.highlighter.reset(&self.rope);
         self.sels = vec![Selection::caret(0)];
         self.primary = 0;
         self.history.clear();

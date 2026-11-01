@@ -742,6 +742,11 @@ All notable changes to Pythia are documented here. The format follows
 - The Output tab of a SQL window lays out only the lines in view
   (#321), as the Messages tab does since #291. It laid out every line of
   DBMS_OUTPUT in each frame: with 40,000 a frame took 101 ms.
+- The SQL window highlights `&name` as a substitution variable only
+  where it is one (#322): on Oracle unless `SET DEFINE OFF`, elsewhere
+  after `SET DEFINE ON` (#190). On MySQL, PostgreSQL, SQL Server and
+  SQLite `1&c.id` showed `&c.` as a variable, where `&` is an operator
+  and `c` the alias, as completion reads them since #287.
 
 ## [0.10.0] - 2026-10-30
 

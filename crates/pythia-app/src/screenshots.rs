@@ -7032,7 +7032,8 @@ fn batches_show_every_result() {
 
 /// On SQLite `&` is an operator: completion after `1&c.` offers the
 /// alias's columns (#287), which it didn't, reading `&c.` as a
-/// substitution variable. After `SET DEFINE ON` it is one.
+/// substitution variable. After `SET DEFINE ON` it is one, for the
+/// editor's highlighting too, whose setting this is (#322).
 #[test]
 fn completion_after_a_bitwise_and() {
     let connection = "r51_and.db";
