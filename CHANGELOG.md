@@ -522,6 +522,13 @@ All notable changes to Pythia are documented here. The format follows
   `0x…`, is stored as those bytes (#271), as on the other databases
   (#256). In a RAW, and in the RAW, BLOB or LONG RAW of a new row,
   `0x171066e1` failed on *Apply* with ORA-01465 "invalid hex number".
+- Oracle: INSERT statements name a column or a table called like a
+  reserved word in quotes (#274), `"LEVEL"` or `"SIZE"`. *Copy as*, the
+  grid's *Export*, *Execute to file* and *Export tables* wrote
+  `insert into t (id, level, size)`, which fails with ORA-03050.
+  `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` and `SUCCESSFUL` weren't
+  known as reserved words: they are now, also in the SQL that result
+  editing and the object editors write.
 
 ## [0.10.0] - 2026-10-30
 

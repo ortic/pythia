@@ -947,16 +947,14 @@ fn inserts(
     Ok(())
 }
 
-/// Lowercase plain identifiers; quote anything that needs it (Oracle).
+/// Lowercase plain identifiers; quote anything that needs it (Oracle), a
+/// reserved word too: `level` is no name, `"LEVEL"` is (#274).
 pub fn identifier(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "_$#".contains(c));
-    if plain {
+    let quoted = Dialect::ORACLE.quote_ident(name);
+    if quoted == name {
         name.to_lowercase()
     } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
+        quoted
     }
 }
 
@@ -1190,6 +1188,39 @@ mod tests {
         assert_eq!(ora("LONG RAW", "0x00ff"), "hextoraw('00ff')");
         assert_eq!(ora("RAW(16)", "171066E1"), "hextoraw('171066E1')");
         assert_eq!(ora("VARCHAR2(10)", "0x41"), "'0x41'");
+    }
+
+    /// Oracle's reserved words, also those the keyword list lacks, are
+    /// quoted where INSERTs name a table or a column; so are names stored
+    /// in lowercase or mixed case.
+    #[test]
+    fn oracle_inserts_quote_reserved_words() {
+        let col = |name: &str| Column {
+            name: name.into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        };
+        let columns = [
+            col("ID"),
+            col("LEVEL"),
+            col("SIZE"),
+            col("RESOURCE"),
+            col("level"),
+            col("Size"),
+        ];
+        let rows = [(1..=6).map(|n| Some(n.to_string())).collect::<Vec<_>>()];
+        let options = Options {
+            table: identifier("SIZE"),
+            ..Options::default()
+        };
+        assert_eq!(
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap(),
+            "insert into \"SIZE\" (id, \"LEVEL\", \"SIZE\", \"RESOURCE\", \"level\", \"Size\") \
+             values (1, 2, 3, 4, 5, 6);\n"
+        );
+        assert_eq!(identifier("DEMO_EMPLOYEES"), "demo_employees");
+        assert_eq!(identifier("Mixed Case"), "\"Mixed Case\"");
     }
 
     /// No `&` in a literal: where scripts run it would be a substitution

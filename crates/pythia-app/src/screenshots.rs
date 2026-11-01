@@ -3917,6 +3917,62 @@ commit;",
     grid_export_refuses("SQLite", &grid_rows(&mut h, connection, sql));
 }
 
+/// On Oracle, the INSERTs of *Copy as*, the grid's export and Execute to
+/// file name the columns called like reserved words (`"LEVEL"`, `"SIZE"`,
+/// `"RESOURCE"`) in quotes, as those stored in lowercase or mixed case, of
+/// a table named in quotes too: they run back into it.
+#[test]
+fn oracle_inserts_quote_reserved_words() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let conn = crate::test_db::connect("PYTHIA_TEST_DB").unwrap();
+    let _ = conn.execute("drop table \"R54_Words\" purge", &[]);
+    conn.execute(
+        "create table \"R54_Words\" (id number, \"LEVEL\" number, \"SIZE\" varchar2(10), \
+         \"RESOURCE\" number, \"level\" number, \"Size\" number)",
+        &[],
+    )
+    .unwrap();
+    conn.execute("insert into \"R54_Words\" values (1, 2, 'x', 3, 4, 5)", &[])
+        .unwrap();
+    conn.commit().unwrap();
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let sql = "select * from \"R54_Words\"";
+    let (columns, rows, options) = grid_rows(&mut h, "pythia@FREEPDB1", sql);
+    let copied =
+        pythia_data::export_to_vec(pythia_data::Format::Insert, &columns, &rows, &options).unwrap();
+    let copied = String::from_utf8(copied).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let written = insert_file(&mut h, sql, "r54-words");
+    let inserts: Vec<&str> = copied
+        .lines()
+        .map(|l| l.trim_end_matches(';'))
+        .chain(written.iter().map(String::as_str))
+        .collect();
+    assert_eq!(inserts.len(), 2, "{inserts:?}");
+    for insert in inserts {
+        conn.execute(insert, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{insert}"));
+    }
+    let copies: i64 = conn
+        .query_row_as(
+            "select count(*) from \"R54_Words\" where id = 1 and \"LEVEL\" = 2 and \"SIZE\" = 'x' \
+             and \"RESOURCE\" = 3 and \"level\" = 4 and \"Size\" = 5",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(copies, 3);
+    conn.execute("drop table \"R54_Words\" purge", &[]).unwrap();
+}
+
 /// MySQL shows a TIMESTAMP in the session's time zone. INSERT statements
 /// of such values, from Execute to file and from the grid, run in a
 /// session of another zone, keep their instant; a DATETIME has no zone.

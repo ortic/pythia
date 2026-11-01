@@ -594,6 +594,55 @@ mod tests {
         assert_eq!(target("guidelines-division"), "\"guidelines-division\"");
         assert_eq!(target("Foo"), "\"Foo\"");
         assert_eq!(target("MY TABLE"), "\"MY TABLE\"");
+        assert_eq!(target("LEVEL"), "\"LEVEL\"");
+        assert_eq!(target("RESOURCE"), "\"RESOURCE\"");
+        assert_eq!(target("size"), "\"size\"");
+    }
+
+    /// The INSERTs of a table name its columns called like reserved words
+    /// in quotes, and those stored in lowercase or mixed case: they run
+    /// back into it.
+    #[test]
+    fn inserts_quote_reserved_words() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let _ = conn.execute("drop table r54_exp_words purge", &[]);
+        conn.execute(
+            "create table r54_exp_words (id number, \"LEVEL\" number, \"SIZE\" varchar2(10), \
+             \"RESOURCE\" number, \"level\" number, \"Size\" number)",
+            &[],
+        )
+        .unwrap();
+        conn.execute("insert into r54_exp_words values (1, 2, 'x', 3, 4, 5)", &[])
+            .unwrap();
+        let folder = std::env::temp_dir().join(format!("pythia-r54-words-{}", std::process::id()));
+        let settings = Settings {
+            owner: String::new(),
+            folder: folder.clone(),
+            format: Format::Insert,
+            options: Options::default(),
+            include_ddl: false,
+        };
+        let jobs = [Job {
+            table: "R54_EXP_WORDS".into(),
+            filter: String::new(),
+        }];
+        export(&conn, &settings, &jobs, &Progress::default()).unwrap();
+        let text = std::fs::read_to_string(folder.join("r54_exp_words.sql")).unwrap();
+        let insert = text.trim_end().trim_end_matches(';');
+        conn.execute(insert, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{insert}"));
+        let copies: i64 = conn
+            .query_row_as(
+                "select count(*) from r54_exp_words where id = 1 and \"LEVEL\" = 2 \
+                 and \"SIZE\" = 'x' and \"RESOURCE\" = 3 and \"level\" = 4 and \"Size\" = 5",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(copies, 2);
+        conn.execute("drop table r54_exp_words purge", &[]).unwrap();
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
