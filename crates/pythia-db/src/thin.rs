@@ -1196,8 +1196,10 @@ impl SqlValue {
             Value::Null => return None,
             Value::Text(s) => s.clone(),
             Value::Number(n) => n.to_string(),
-            Value::Float(v) => v.to_string(),
-            Value::Double(v) => v.to_string(),
+            // With an exponent where it is long (1e300, 2e-20), as on the
+            // other databases (#304).
+            Value::Float(v) => crate::float_text(*v),
+            Value::Double(v) => crate::float_text(*v),
             Value::Timestamp(ts, kind, scale) => timestamp(ts, *kind, *scale),
             Value::IntervalDS(v, precision, scale) => interval_ds(v, *precision, *scale),
             Value::IntervalYM(v, precision) => interval_ym(v, *precision),

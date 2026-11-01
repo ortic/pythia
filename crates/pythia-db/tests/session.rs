@@ -153,6 +153,48 @@ fn errors_carry_ora_code() {
     assert_eq!(error.code, Some(942));
 }
 
+/// BINARY_DOUBLE and BINARY_FLOAT keep their exponent (#304), as floats
+/// do on the other databases (#261): 1e300 came as a 1 and 300 zeros,
+/// 2e-20 as 0.00000000000000000002.
+#[test]
+fn binary_floats_keep_their_exponent() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select 1e300d a, 2e-20d b, 3e15d c, -1e-300d d, 2.5e-7f e, 2.5d f, 100d g, \
+                0.0001d h, 1e16f i, 1e30f j from dual"
+            .into(),
+        max_rows: 10,
+        binds: vec![],
+    });
+    let DbEvent::QueryStarted { columns, .. } = h.next_result() else {
+        panic!("expected QueryStarted")
+    };
+    assert_eq!(columns[0].type_name, "BINARY_DOUBLE");
+    assert_eq!(columns[4].type_name, "BINARY_FLOAT");
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    let texts: Vec<&str> = rows[0].iter().map(|v| v.as_deref().unwrap()).collect();
+    assert_eq!(
+        texts,
+        [
+            "1e300",
+            "2e-20",
+            "3000000000000000",
+            "-1e-300",
+            "2.5e-7",
+            "2.5",
+            "100",
+            "0.0001",
+            "1e16",
+            "1e30"
+        ]
+    );
+}
+
 #[test]
 fn transaction_state() {
     let Some(mut h) = Harness::connect() else {

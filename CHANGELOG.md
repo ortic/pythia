@@ -681,6 +681,10 @@ All notable changes to Pythia are documented here. The format follows
   called `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` or `SUCCESSFUL`
   (#303), as INSERT statements do since #274: `create table words (id
   NUMBER, resource NUMBER)` failed with ORA-03050.
+- Oracle: BINARY_DOUBLE and BINARY_FLOAT values keep their exponent
+  (#304), as SQL Server's and MySQL's floats do since #261: `1e300d`
+  showed as a 1 and 300 zeros, `2e-20d` as `0.00000000000000000002`, in
+  the grid and in copies and exports, also with the Instant Client.
 
 ## [0.10.0] - 2026-10-30
 
