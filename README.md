@@ -371,7 +371,8 @@ for Linux, Windows and macOS.
   makes one). SQLite is built in: nothing to install. A path that doesn't
   exist fails instead of leaving an empty database behind; `?create` makes
   the file, `?ro` opens it read-only, `:memory:` is one in-memory database
-  for all windows, and a `file:` URI works as SQLite takes it.
+  for all windows, and a `file:` URI works as SQLite takes it, except that
+  it makes a missing file only with `mode=rwc`.
 - SQL windows with results, fetching on demand, Break, explain plan
   (`EXPLAIN QUERY PLAN`), *Execute to file* and completion. Each window
   has its own connection to the file, and transactions work as with

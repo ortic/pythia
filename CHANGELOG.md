@@ -508,6 +508,11 @@ All notable changes to Pythia are documented here. The format follows
   of a fetched row failed the same way, and a text column's NULL was
   replaced by `''`. *Set NULL* and the value editor's *Apply* work as
   before.
+- SQLite: a `file:` URI makes a missing database file only with
+  `mode=rwc` (#266), as a path does with `?create`. Without a `mode=`,
+  a URI whose file was mistyped, moved or deleted connected to a new,
+  empty database in its place. It now fails with "There is no database
+  file"; `mode=ro` and `mode=memory` work as before.
 
 ## [0.10.0] - 2026-10-30
 
