@@ -747,6 +747,14 @@ All notable changes to Pythia are documented here. The format follows
   after `SET DEFINE ON` (#190). On MySQL, PostgreSQL, SQL Server and
   SQLite `1&c.id` showed `&c.` as a variable, where `&` is an operator
   and `c` the alias, as completion reads them since #287.
+- *AI: Analyze Execution Plan* explains in the SQL window's own session
+  (#319), as *Explain Plan* does since #269, and the assistant describes
+  the window's tables by its current schema. On the connection's main
+  session a private temporary table of the window had no plan (ORA-00942),
+  and `alter session set current_schema` didn't count. The window's
+  transaction stays as it was. While the window runs a statement, the
+  plan analysis says so; the other requests are then looked up on the
+  main session as before.
 
 ## [0.10.0] - 2026-10-30
 

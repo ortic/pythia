@@ -1,6 +1,7 @@
-//! Dictionary lookups for assistant requests, run as a task on the
-//! connection's main session: the tables a statement uses (columns, keys,
-//! indexes, statistics), tables matching a description, and plans.
+//! Dictionary lookups for assistant requests, run as a task on the SQL
+//! window's own session, which sees what its statements did (#319), or on
+//! the connection's main session: the tables a statement uses (columns,
+//! keys, indexes, statistics), tables matching a description, and plans.
 //!
 //! Only definitions and statistics are read, never table data: column
 //! low/high values and histogram endpoints are left out because they are
@@ -507,24 +508,43 @@ pub fn render(info: &TableInfo) -> String {
     out
 }
 
-/// EXPLAIN PLAN for `sql`, as DBMS_XPLAN shows it.
+/// EXPLAIN PLAN for `sql`, as DBMS_XPLAN shows it. The session's
+/// transaction stays as it was, a SQL window's (#319): the plan's rows are
+/// rolled back to a savepoint when a transaction is open, with the
+/// transaction they started when none is.
 fn explain(conn: &Connection, sql: &str) -> Part {
     let id = format!("PYTHIA_AI{}", std::process::id());
     let sql = sql.trim().trim_end_matches(';');
     let plan = (|| -> Result<String, DbError> {
-        conn.execute("delete from plan_table where statement_id = :1", &[&id])?;
-        conn.execute(
-            &format!("explain plan set statement_id = '{id}' for {sql}"),
-            &[],
-        )?;
-        xplan(
-            conn,
-            "select plan_table_output from table(dbms_xplan.display('PLAN_TABLE', :1, 'TYPICAL'))",
-            &id,
-        )
+        let open = conn
+            .query_row_as::<Option<String>>(
+                "select dbms_transaction.local_transaction_id from dual",
+                &[],
+            )?
+            .is_some();
+        if open {
+            conn.execute("savepoint pythia_ai_explain", &[])?;
+        }
+        let plan = (|| -> Result<String, DbError> {
+            conn.execute("delete from plan_table where statement_id = :1", &[&id])?;
+            conn.execute(
+                &format!("explain plan set statement_id = '{id}' for {sql}"),
+                &[],
+            )?;
+            xplan(
+                conn,
+                "select plan_table_output from table(dbms_xplan.display('PLAN_TABLE', :1, 'TYPICAL'))",
+                &id,
+            )
+        })();
+        if open {
+            conn.execute("rollback to savepoint pythia_ai_explain", &[])?;
+        } else {
+            let _ = conn.execute("delete from plan_table where statement_id = :1", &[&id]);
+            let _ = conn.rollback();
+        }
+        plan
     })();
-    let _ = conn.execute("delete from plan_table where statement_id = :1", &[&id]);
-    let _ = conn.rollback();
     match plan {
         Ok(plan) => Part::text("Execution plan (EXPLAIN PLAN)", plan),
         Err(e) => Part::text("Execution plan", format!("EXPLAIN PLAN failed: {e}")),

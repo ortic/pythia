@@ -9207,6 +9207,85 @@ fn ai_with_database() {
         .unwrap();
 }
 
+/// AI: Analyze Execution Plan explains in the SQL window's own session
+/// (#319), as Explain plan does (#269): the window's private temporary
+/// table counts, which on the connection's main session failed with
+/// ORA-00942, and its transaction stays as it was. While the window runs
+/// a statement, it says so.
+#[test]
+fn ai_plans_in_the_windows_session() {
+    use std::sync::{Arc, Mutex};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = headless_harness();
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &pythia_ai::ChatRequest| {
+            let last = request.messages.last().unwrap().content.clone();
+            seen.lock().unwrap().push(last);
+            Ok("A full scan.".into())
+        }));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r66_ai_t purge'; \
+         exception when others then null; end;\n/\n\
+         create table r66_ai_t (id number);\n\
+         create private temporary table ora$ptt_r66 (id number) on commit preserve definition;\n\
+         insert into r66_ai_t values (1);",
+    );
+    assert!(h.state().test_pending_tx());
+    let analyze = |h: &mut Ui| {
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select * from ora$ptt_r66 where id = 1");
+        h.run_steps(2);
+        h.state_mut()
+            .test_command(crate::commands::Command::AiAnalyzePlan);
+    };
+    analyze(&mut h);
+    wait_until(&mut h, "the plan analysis", |app| {
+        app.test_ai_answers() == 1
+    });
+    {
+        let sent = &requests.lock().unwrap()[0];
+        assert!(sent.contains("## Execution plan (EXPLAIN PLAN)"), "{sent}");
+        assert!(sent.contains("ORA$PTT_R66"), "{sent}");
+        assert!(!sent.contains("EXPLAIN PLAN failed"), "{sent}");
+    }
+    assert!(h.state().test_pending_tx());
+    assert_eq!(
+        run_in_window(&mut h, "select count(*) from r66_ai_t").as_deref(),
+        Some("1")
+    );
+
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("begin dbms_session.sleep(3); end;");
+    h.state_mut().test_execute_focused();
+    h.run_steps(2);
+    assert!(h.state().test_focused_busy());
+    analyze(&mut h);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("running a statement").is_some());
+    assert_eq!(h.state().test_ai_answers(), 1);
+    wait_until(&mut h, "the block", |app| !app.test_focused_busy());
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    run_in_window(&mut h, "drop table r66_ai_t purge");
+}
+
 /// Settings → AI with a configured backend.
 #[test]
 fn settings_ai() {
