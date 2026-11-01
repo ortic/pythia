@@ -196,6 +196,18 @@ fn numbers(n: u32) -> String {
     )
 }
 
+/// `text` with the names starting with `prefix` made this checkout's own:
+/// `r43_ix` becomes `r43_5f3a_ix`. Two checkouts' runs at once that don't
+/// share the lock on the test databases (#100), as with a temp directory
+/// of their own or from another system, then leave each other's objects
+/// alone; a checkout's next run finds what its last one left.
+fn own(prefix: &str, text: &str) -> String {
+    let checkout = env!("CARGO_MANIFEST_DIR")
+        .bytes()
+        .fold(0u32, |hash, b| hash.wrapping_mul(31).wrapping_add(b.into()));
+    text.replace(prefix, &format!("{prefix}{:04x}_", checkout & 0xffff))
+}
+
 #[test]
 fn query_and_fetch_more() {
     let Some(mut h) = Harness::connect() else {
@@ -808,24 +820,27 @@ fn dictionary() {
     };
     let schema = h.schema.clone();
     h.session.send(DbRequest::SetAutocommit(true));
-    h.ok("drop view if exists meta_v");
-    h.ok("drop procedure if exists meta_p");
-    h.ok("drop table if exists meta_emp");
-    h.ok("drop table if exists meta_dept");
-    h.ok("create table meta_dept (deptno int primary key, name varchar(30) not null)");
-    h.ok(
+    let n = |text: &str| own("meta_", text);
+    h.ok(&n("drop view if exists meta_v"));
+    h.ok(&n("drop procedure if exists meta_p"));
+    h.ok(&n("drop table if exists meta_emp"));
+    h.ok(&n("drop table if exists meta_dept"));
+    h.ok(&n(
+        "create table meta_dept (deptno int primary key, name varchar(30) not null)",
+    ));
+    h.ok(&n(
         "exec sp_addextendedproperty 'MS_Description', 'Department', 'schema', 'dbo', \
          'table', 'meta_dept', 'column', 'name'",
-    );
-    h.ok(
+    ));
+    h.ok(&n(
         "create table meta_emp (empno int identity(1, 1) primary key, \
          deptno int constraint meta_emp_fk references meta_dept (deptno), \
          [Salary] decimal(8,2) not null constraint meta_emp_sal default 0, \
          note nvarchar(max))",
-    );
-    h.ok("create index meta_emp_dept on meta_emp (deptno)");
-    h.ok("create view meta_v as select e.empno, d.name from dbo.meta_emp e join dbo.meta_dept d on d.deptno = e.deptno");
-    h.ok("create procedure meta_p @p int as begin select @p; end");
+    ));
+    h.ok(&n("create index meta_emp_dept on meta_emp (deptno)"));
+    h.ok(&n("create view meta_v as select e.empno, d.name from dbo.meta_emp e join dbo.meta_dept d on d.deptno = e.deptno"));
+    h.ok(&n("create procedure meta_p @p int as begin select @p; end"));
 
     let MetaResult::Schemas(schemas) = h.meta(MetaQuery::Schemas) else {
         panic!("expected schemas")
@@ -836,18 +851,18 @@ fn dictionary() {
     let MetaResult::Objects(tables) = h.meta(MetaQuery::Objects {
         owner: schema.clone(),
         object_type: ObjectType::Table,
-        filter: Some("META_".into()),
+        filter: Some(n("meta_").to_uppercase()),
     }) else {
         panic!("expected objects")
     };
     let names: Vec<&str> = tables.iter().map(|o| o.name.as_str()).collect();
-    assert_eq!(names, ["meta_dept", "meta_emp"]);
+    assert_eq!(names, [n("meta_dept"), n("meta_emp")]);
     assert_eq!(tables[0].last_ddl.len(), 19, "{:?}", tables[0]);
 
     let MetaResult::Objects(procedures) = h.meta(MetaQuery::Objects {
         owner: schema.clone(),
         object_type: ObjectType::Procedure,
-        filter: Some("meta".into()),
+        filter: Some(n("meta_")),
     }) else {
         panic!("expected objects")
     };
@@ -856,7 +871,7 @@ fn dictionary() {
     // Code assistance asks in uppercase.
     let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
         owner: schema.clone(),
-        table: "META_DEPT".into(),
+        table: n("meta_dept").to_uppercase(),
         keys: true,
     }) else {
         panic!("expected columns")
@@ -872,34 +887,34 @@ fn dictionary() {
 
     let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
         owner: schema.clone(),
-        name: "meta_emp".into(),
+        name: n("meta_emp"),
         detail: Detail::Constraints,
     }) else {
         panic!("expected a table")
     };
     let fk = rows
         .iter()
-        .find(|r| r[0].as_deref() == Some("meta_emp_fk"))
+        .find(|r| r[0].as_deref() == Some(n("meta_emp_fk").as_str()))
         .expect("the foreign key");
     assert_eq!(fk[1].as_deref(), Some("Foreign key"));
-    assert_eq!(fk[3].as_deref(), Some("dbo.meta_dept"));
+    assert_eq!(fk[3].as_deref(), Some(n("dbo.meta_dept").as_str()));
 
     let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
         owner: schema.clone(),
-        name: "meta_emp".into(),
+        name: n("meta_emp"),
         detail: Detail::Indexes,
     }) else {
         panic!("expected a table")
     };
     let index = rows
         .iter()
-        .find(|r| r[0].as_deref() == Some("meta_emp_dept"))
+        .find(|r| r[0].as_deref() == Some(n("meta_emp_dept").as_str()))
         .expect("the index");
     assert_eq!(index[3].as_deref(), Some("deptno"));
 
     let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
         owner: schema.clone(),
-        name: "meta_dept".into(),
+        name: n("meta_dept"),
         detail: Detail::UsedBy,
     }) else {
         panic!("expected a table")
@@ -908,12 +923,12 @@ fn dictionary() {
         .iter()
         .map(|r| r[1].clone().unwrap_or_default())
         .collect();
-    assert!(used_by.contains(&"meta_v".to_owned()), "{used_by:?}");
-    assert!(used_by.contains(&"meta_emp".to_owned()), "{used_by:?}");
+    assert!(used_by.contains(&n("meta_v")), "{used_by:?}");
+    assert!(used_by.contains(&n("meta_emp")), "{used_by:?}");
 
     let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
         owner: schema.clone(),
-        name: "meta_v".into(),
+        name: n("meta_v"),
         detail: Detail::Uses,
     }) else {
         panic!("expected a table")
@@ -922,61 +937,68 @@ fn dictionary() {
 
     let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
         owner: schema.clone(),
-        name: "meta_emp".into(),
+        name: n("meta_emp"),
         object_type: ObjectType::Table,
     }) else {
         panic!("expected DDL")
     };
     assert!(
-        ddl.starts_with(&format!(
+        ddl.starts_with(&n(&format!(
             "create table [{schema}].[meta_emp] (\n    [empno] int identity(1, 1) not null,"
-        )),
+        ))),
         "{ddl}"
     );
     assert!(
-        ddl.contains("[Salary] decimal(8,2) not null constraint [meta_emp_sal] default ((0))"),
+        ddl.contains(&n(
+            "[Salary] decimal(8,2) not null constraint [meta_emp_sal] default ((0))"
+        )),
         "{ddl}"
     );
     assert!(ddl.contains("[note] nvarchar(max) null"), "{ddl}");
     assert!(
-        ddl.contains(
+        ddl.contains(&n(
             "constraint [meta_emp_fk] foreign key ([deptno]) references [dbo].[meta_dept] ([deptno])"
-        ),
+        )),
         "{ddl}"
     );
     assert!(
-        ddl.contains("create nonclustered index [meta_emp_dept] on"),
+        ddl.contains(&n("create nonclustered index [meta_emp_dept] on")),
         "{ddl}"
     );
     assert!(ddl.ends_with("\nGO\n"), "{ddl}");
     // The DDL runs: it rebuilds the table elsewhere.
-    h.ok("if schema_id('meta_copy') is null exec('create schema meta_copy')");
+    h.ok(&n(
+        "if schema_id('meta_copy') is null exec('create schema meta_copy')",
+    ));
     for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::TSql) {
         let sql = statement
             .text(&ddl)
-            .replace(&format!("[{schema}].[meta_emp]"), "[meta_copy].[meta_emp]")
-            .replace("[meta_emp_sal]", "[meta_copy_sal]")
-            .replace("[meta_emp_fk]", "[meta_copy_fk]")
+            .replace(
+                &n(&format!("[{schema}].[meta_emp]")),
+                &n("[meta_copy].[meta_emp]"),
+            )
+            .replace(&n("[meta_emp_sal]"), &n("[meta_copy_sal]"))
+            .replace(&n("[meta_emp_fk]"), &n("[meta_copy_fk]"))
             .replace("[PK__", "[PK_copy__");
         h.ok(&sql);
     }
-    h.ok("drop table meta_copy.meta_emp");
-    h.ok("drop schema meta_copy");
+    h.ok(&n("drop table meta_copy.meta_emp"));
+    h.ok(&n("drop schema meta_copy"));
 
     let MetaResult::Text(source) = h.meta(MetaQuery::Source {
         owner: schema.clone(),
-        name: "meta_p".into(),
+        name: n("meta_p"),
         object_type: ObjectType::Procedure,
     }) else {
         panic!("expected source")
     };
     assert_eq!(
         source,
-        "create procedure meta_p @p int as begin select @p; end"
+        n("create procedure meta_p @p int as begin select @p; end")
     );
 
     let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
-        pattern: "meta_*".into(),
+        pattern: n("meta_*"),
         limit: 10,
     }) else {
         panic!("expected objects")
@@ -984,31 +1006,33 @@ fn dictionary() {
     assert!(
         found
             .iter()
-            .any(|o| o.name == "meta_p" && o.object_type == ObjectType::Procedure)
+            .any(|o| o.name == n("meta_p") && o.object_type == ObjectType::Procedure)
     );
     assert_eq!(found[0].owner, schema, "the default schema comes first");
 
     let MetaResult::Table { columns, rows } = h.meta(MetaQuery::ExplainPlan {
-        sql: "select * from meta_emp e join meta_dept d on d.deptno = e.deptno \
-              where e.empno = :id"
-            .into(),
+        sql: n(
+            "select * from meta_emp e join meta_dept d on d.deptno = e.deptno \
+                where e.empno = :id",
+        ),
     }) else {
         panic!("expected a plan")
     };
     assert_eq!(columns[0].name, "ID");
     assert_eq!(rows[0][3].as_deref(), Some("SELECT"), "{rows:?}");
     assert!(
-        rows.iter()
-            .any(|r| r[4].as_deref().is_some_and(|o| o.starts_with("dbo.meta_"))),
+        rows.iter().any(|r| r[4]
+            .as_deref()
+            .is_some_and(|o| o.starts_with(&n("dbo.meta_")))),
         "{rows:?}"
     );
     // SHOWPLAN is off again: statements run.
     assert_eq!(h.scalar("select 'runs'").as_deref(), Some("runs"));
 
-    h.ok("drop view meta_v");
-    h.ok("drop procedure meta_p");
-    h.ok("drop table meta_emp");
-    h.ok("drop table meta_dept");
+    h.ok(&n("drop view meta_v"));
+    h.ok(&n("drop procedure meta_p"));
+    h.ok(&n("drop table meta_emp"));
+    h.ok(&n("drop table meta_dept"));
 }
 
 /// A table's indexes of the kinds CREATE INDEX makes: covering, filtered,
@@ -1021,9 +1045,12 @@ fn indexes_of_every_kind() {
     };
     h.session.send(DbRequest::SetAutocommit(true));
     let schema = h.schema.clone();
-    h.ok("drop table if exists r43_copy.r43_ix, r43_copy.r43_cs");
-    h.ok("drop schema if exists r43_copy");
-    h.ok("drop table if exists r43_ix, r43_cs");
+    // What the dictionary reads is compared with the names as written.
+    let n = |text: &str| own("r43_", text);
+    let written = |text: String| text.replace(&n("r43_"), "r43_");
+    h.ok(&n("drop table if exists r43_copy.r43_ix, r43_copy.r43_cs"));
+    h.ok(&n("drop schema if exists r43_copy"));
+    h.ok(&n("drop table if exists r43_ix, r43_cs"));
     for sql in [
         "create table r43_ix (id int constraint r43_ix_pk primary key, a int, b varchar(10), \
          c int not null)",
@@ -1035,12 +1062,12 @@ fn indexes_of_every_kind() {
         "create clustered columnstore index r43_cs_store on r43_cs",
         "create index r43_cs_b on r43_cs (b)",
     ] {
-        h.ok(sql);
+        h.ok(&n(sql));
     }
     let indexes = |h: &mut Harness, owner: &str, table: &str| -> Vec<Vec<String>> {
         let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
-            owner: owner.into(),
-            name: table.into(),
+            owner: n(owner),
+            name: n(table),
             detail: Detail::Indexes,
         }) else {
             panic!("expected a table")
@@ -1058,7 +1085,11 @@ fn indexes_of_every_kind() {
             ]
         );
         rows.into_iter()
-            .map(|r| r.into_iter().map(Option::unwrap_or_default).collect())
+            .map(|r| {
+                r.into_iter()
+                    .map(|v| written(v.unwrap_or_default()))
+                    .collect()
+            })
             .collect()
     };
     let ix = indexes(&mut h, &schema, "r43_ix");
@@ -1112,12 +1143,12 @@ fn indexes_of_every_kind() {
     let ddl = |h: &mut Harness, table: &str| {
         let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
             owner: schema.clone(),
-            name: table.into(),
+            name: n(table),
             object_type: ObjectType::Table,
         }) else {
             panic!("expected DDL")
         };
-        ddl
+        written(ddl)
     };
     let ix_ddl = ddl(&mut h, "r43_ix");
     for line in [
@@ -1139,21 +1170,21 @@ fn indexes_of_every_kind() {
     assert!(cs_ddl.contains(&line), "{line}\n{cs_ddl}");
     // The DDL runs: the tables built from it elsewhere have the same
     // indexes.
-    h.ok("create schema r43_copy");
+    h.ok(&n("create schema r43_copy"));
     for (table, ddl) in [("r43_ix", &ix_ddl), ("r43_cs", &cs_ddl)] {
         for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
             let sql = statement.text(ddl).replace(
                 &format!("[{schema}].[{table}]"),
                 &format!("[r43_copy].[{table}]"),
             );
-            h.ok(&sql);
+            h.ok(&n(&sql));
         }
     }
     assert_eq!(indexes(&mut h, "r43_copy", "r43_ix"), ix);
     assert_eq!(indexes(&mut h, "r43_copy", "r43_cs"), cs);
-    h.ok("drop table r43_copy.r43_ix, r43_copy.r43_cs");
-    h.ok("drop schema r43_copy");
-    h.ok("drop table r43_ix, r43_cs");
+    h.ok(&n("drop table r43_copy.r43_ix, r43_copy.r43_cs"));
+    h.ok(&n("drop schema r43_copy"));
+    h.ok(&n("drop table r43_ix, r43_cs"));
 }
 
 /// A table's DDL creates its XML and spatial indexes, with their options,
@@ -1170,9 +1201,12 @@ fn xml_spatial_and_ordered_indexes() {
         .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
         .and_then(|v| v.parse::<u32>().ok())
         .is_some_and(|major| major >= 16);
-    h.ok("drop table if exists r53_copy.r53_xg, r53_copy.r53_ord");
-    h.ok("drop schema if exists r53_copy");
-    h.ok("drop table if exists r53_xg, r53_ord");
+    // What the dictionary reads is compared with the names as written.
+    let n = |text: &str| own("r53_", text);
+    let written = |text: String| text.replace(&n("r53_"), "r53_");
+    h.ok(&n("drop table if exists r53_copy.r53_xg, r53_copy.r53_ord"));
+    h.ok(&n("drop schema if exists r53_copy"));
+    h.ok(&n("drop table if exists r53_xg, r53_ord"));
     for sql in [
         "create table r53_xg (id int constraint r53_xg_pk primary key, doc xml, \
          shape geometry, place geography)",
@@ -1187,22 +1221,22 @@ fn xml_spatial_and_ordered_indexes() {
         "create spatial index r53_xg_place on r53_xg (place)",
         "create table r53_ord (a int, b int, c int)",
     ] {
-        h.ok(sql);
+        h.ok(&n(sql));
     }
-    h.ok(if ordered {
+    h.ok(&n(if ordered {
         "create clustered columnstore index r53_ord_cs on r53_ord order (b, a)"
     } else {
         "create clustered columnstore index r53_ord_cs on r53_ord"
-    });
+    }));
     let ddl = |h: &mut Harness, table: &str| {
         let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
             owner: schema.clone(),
-            name: table.into(),
+            name: n(table),
             object_type: ObjectType::Table,
         }) else {
             panic!("expected DDL")
         };
-        ddl
+        written(ddl)
     };
     let xg_ddl = ddl(&mut h, "r53_xg");
     let on = format!("on [{schema}].[r53_xg]");
@@ -1235,7 +1269,7 @@ fn xml_spatial_and_ordered_indexes() {
     assert!(ord_ddl.contains(&line), "{line}\n{ord_ddl}");
     // The indexes as the catalog has them, built again from the DDL.
     let indexes = |h: &mut Harness, owner: &str| {
-        h.scalar(&format!(
+        h.scalar(&n(&format!(
             "select string_agg(concat_ws(' ', i.name, i.type_desc, x.secondary_type_desc, \
                                          s.tessellation_scheme, t.bounding_box_xmin, \
                                          t.bounding_box_ymin, t.bounding_box_xmax, \
@@ -1250,35 +1284,36 @@ fn xml_spatial_and_ordered_indexes() {
                left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
                 and t.index_id = i.index_id \
               where i.object_id in (object_id('[{owner}].[r53_xg]'), object_id('[{owner}].[r53_ord]'))"
-        ))
+        )))
+        .map(written)
     };
     let before = indexes(&mut h, &schema);
-    h.ok("create schema r53_copy");
+    h.ok(&n("create schema r53_copy"));
     for (table, ddl) in [("r53_xg", &xg_ddl), ("r53_ord", &ord_ddl)] {
         for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
             let sql = statement.text(ddl).replace(
                 &format!("[{schema}].[{table}]"),
                 &format!("[r53_copy].[{table}]"),
             );
-            h.ok(&sql);
+            h.ok(&n(&sql));
         }
     }
     assert_eq!(indexes(&mut h, "r53_copy"), before);
     if ordered {
         assert_eq!(
-            h.scalar(
+            h.scalar(&n(
                 "select string_agg(col_name(object_id, column_id), ', ') \
                           within group (order by column_store_order_ordinal) \
                    from sys.index_columns \
                   where object_id = object_id('r53_copy.r53_ord') and column_store_order_ordinal > 0"
-            )
+            ))
             .as_deref(),
             Some("b, a")
         );
     }
-    h.ok("drop table r53_copy.r53_xg, r53_copy.r53_ord");
-    h.ok("drop schema r53_copy");
-    h.ok("drop table r53_xg, r53_ord");
+    h.ok(&n("drop table r53_copy.r53_xg, r53_copy.r53_ord"));
+    h.ok(&n("drop schema r53_copy"));
+    h.ok(&n("drop table r53_xg, r53_ord"));
 }
 
 /// A database of the test's own, made afresh by `dba` and set up with
