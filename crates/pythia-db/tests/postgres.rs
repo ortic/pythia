@@ -1149,6 +1149,67 @@ fn owned_sequences_come_with_the_table() {
     h.ok("drop schema r53_seq, r53_seq_copy cascade");
 }
 
+/// Object filters find names without case whatever their letters: names
+/// collate as C, where upper() changes only ASCII letters, in the test
+/// database and in one whose lc_ctype is C.
+#[test]
+fn filters_match_any_letters_without_case() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop database if exists r53_c");
+    h.ok(
+        "create database r53_c with encoding 'UTF8' lc_collate 'C' lc_ctype 'C' \
+         template template0",
+    );
+    let mut params = params().expect("the test database");
+    let (server, _) = params.connect_string.rsplit_once('/').expect("a database");
+    params.connect_string = format!("{server}/r53_c");
+    let mut c = Harness::with(params);
+    c.session.send(DbRequest::SetAutocommit(true));
+    for h in [&mut h, &mut c] {
+        let schema = h.schema.clone();
+        let tables = "\"r53_čaj\", \"r53_bière\", \"r53_ÖL\", r53_tea";
+        h.ok(&format!("drop table if exists {tables}"));
+        h.ok("create table \"r53_čaj\" (x int)");
+        h.ok("create table \"r53_bière\" (x int)");
+        h.ok("create table \"r53_ÖL\" (x int)");
+        h.ok("create table r53_tea (x int)");
+        let mut filtered = |filter: &str| -> Vec<String> {
+            let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+                owner: schema.clone(),
+                object_type: ObjectType::Table,
+                filter: Some(filter.into()),
+            }) else {
+                panic!("expected objects")
+            };
+            objects.into_iter().map(|o| o.name).collect()
+        };
+        assert_eq!(filtered("čaj"), ["r53_čaj"]);
+        assert_eq!(filtered("ČAJ"), ["r53_čaj"]);
+        assert_eq!(filtered("r53_Č"), ["r53_čaj"]);
+        assert_eq!(filtered("BIÈRE"), ["r53_bière"]);
+        assert_eq!(filtered("öl"), ["r53_ÖL"]);
+        assert_eq!(filtered("R53_?A"), ["r53_čaj"]);
+        assert_eq!(filtered("r53_?EA"), ["r53_tea"]);
+        assert_eq!(filtered("r53*è"), ["r53_bière"]);
+        assert_eq!(filtered("r53%"), Vec::<String>::new());
+        assert_eq!(filtered("r53.t"), Vec::<String>::new());
+        let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+            pattern: "R53_ČA".into(),
+            limit: 10,
+        }) else {
+            panic!("expected objects")
+        };
+        let found: Vec<&str> = found.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(found, ["r53_čaj"]);
+        h.ok(&format!("drop table {tables}"));
+    }
+    drop(c);
+    h.ok("drop database r53_c with (force)");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();

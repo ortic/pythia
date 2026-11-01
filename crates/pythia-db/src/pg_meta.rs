@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::dialect::Dialect;
 use crate::meta::{
     CompileError, DbObject, Detail, MetaQuery, MetaResult, ObjectType, PlanStep, TableColumn,
-    like_pattern, plan_table,
+    plan_table,
 };
 use crate::pg_session::{Pg, literal};
 use crate::types::{Cell, Column, DbError};
@@ -130,24 +130,62 @@ fn objects(
     object_type: ObjectType,
     filter: Option<&str>,
 ) -> Result<Vec<DbObject>, DbError> {
-    let pattern = like_pattern(filter.unwrap_or(""));
+    let pattern = name_regex(filter.unwrap_or(""));
     let rows = pg.rows(
         &format!(
             "select owner, name, type from ({OBJECTS}) o \
-              where owner = $1 and type = $2 and upper(name) like $3 order by name"
+              where owner = $1 and type = $2 and name ~ $3 order by name"
         ),
         &[owner, object_type.dictionary_name(), &pattern],
     )?;
     Ok(object_rows(rows))
 }
 
+/// A filter as a regular expression that finds the names containing it,
+/// without case: `*` is any text, `?` any character, as in
+/// [`like_pattern`](crate::meta::like_pattern). Each letter stands for its cases, `[čČ]`, as names
+/// collate as C, where `upper()` and `ILIKE` change ASCII letters only, in
+/// any database (#264).
+fn name_regex(filter: &str) -> String {
+    let mut out = String::new();
+    for c in filter.trim().chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => {
+                let mut cases = vec![c];
+                for case in [c.to_lowercase().to_string(), c.to_uppercase().to_string()] {
+                    let mut chars = case.chars();
+                    if let (Some(one), None) = (chars.next(), chars.next())
+                        && !cases.contains(&one)
+                    {
+                        cases.push(one);
+                    }
+                }
+                if cases.len() == 1 {
+                    out.push(c);
+                } else {
+                    out.push('[');
+                    out.extend(cases);
+                    out.push(']');
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Objects of every schema whose name matches; the current schema's first,
 /// then the shortest names.
 fn find(pg: &Pg<'_>, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
-    let pattern = like_pattern(pattern);
+    let pattern = name_regex(pattern);
     let rows = pg.rows(
         &format!(
-            "select owner, name, type from ({OBJECTS}) o where upper(name) like $1 \
+            "select owner, name, type from ({OBJECTS}) o where name ~ $1 \
               order by (owner = current_schema()) desc, length(name), name, owner \
               limit {limit}"
         ),
@@ -811,6 +849,17 @@ fn plan_steps(node: &Value, parent: Option<usize>, depth: usize, steps: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_regexes() {
+        assert_eq!(name_regex(""), "");
+        assert_eq!(name_regex(" čaj "), "[čČ][aA][jJ]");
+        assert_eq!(name_regex("ÖL_1"), "[Öö][Ll]\\_1");
+        assert_eq!(name_regex("a*b?"), "[aA].*[bB].");
+        assert_eq!(name_regex("x.%$("), "[xX]\\.\\%\\$\\(");
+        // Without a single other case, a letter stands for itself.
+        assert_eq!(name_regex("ß表"), "ß表");
+    }
 
     #[test]
     fn plan_nodes() {
