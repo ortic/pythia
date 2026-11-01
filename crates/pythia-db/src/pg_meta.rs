@@ -178,6 +178,34 @@ fn stored(pg: &Pg<'_>, owner: &str, name: &str) -> Result<(String, String), DbEr
     })
 }
 
+/// Runs `f` with the session's search path set to `path`, then sets the
+/// session's own back. PostgreSQL leaves the schema out of the names it
+/// writes (`pg_get_constraintdef`, `format_type`, `::regclass`) where the
+/// path finds them: on the session's path, a key from `tenant.note` to
+/// `public.users` read `REFERENCES users` beside a `tenant.users` (#226).
+fn on_path<T>(
+    pg: &Pg<'_>,
+    path: &str,
+    f: impl FnOnce() -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    let own = pg
+        .first("select current_setting('search_path')", &[])?
+        .and_then(first)
+        .unwrap_or_default();
+    let set = |path: &str| {
+        pg.execute(&format!(
+            "select set_config('search_path', {}, false)",
+            literal(path)
+        ))
+    };
+    set(path)?;
+    let result = f();
+    let restored = set(&own);
+    let value = result?;
+    restored?;
+    Ok(value)
+}
+
 /// The column's default as written in DDL, identity and generated columns
 /// included (`a` is `pg_attribute`, `d` is `pg_attrdef`).
 const DEFAULT: &str = "case when a.attidentity = 'a' then 'generated always as identity' \
@@ -304,7 +332,9 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
         ),
         Detail::Link => return Err(DbError::unsupported("Database links", Dialect::POSTGRES)),
     };
-    let (names, rows) = pg.query(&sql, &[owner, name])?;
+    // Names as seen from the object's schema: others' with their schema.
+    let path = Dialect::POSTGRES.quote_ident(owner);
+    let (names, rows) = on_path(pg, &path, || pg.query(&sql, &[owner, name]))?;
     let columns = names
         .into_iter()
         .map(|name| Column {
@@ -334,7 +364,9 @@ fn ddl(
     };
     let dialect = Dialect::POSTGRES;
     match object_type {
-        ObjectType::Table => table_ddl(pg, owner, name),
+        // Every name with its schema, as pg_dump writes them: run with
+        // another search path, the DDL still means the same tables (#226).
+        ObjectType::Table => on_path(pg, "", || table_ddl(pg, owner, name)),
         ObjectType::View | ObjectType::MaterializedView => {
             let (owner, name) = stored(pg, owner, name)?;
             let definition = pg

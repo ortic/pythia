@@ -711,17 +711,30 @@ fn dictionary() {
     );
     assert!(ddl.contains("\"Salary\" numeric(8,2) default 0"), "{ddl}");
     assert!(
-        ddl.contains("constraint meta_emp_fk FOREIGN KEY (deptno) REFERENCES meta_dept(deptno)"),
+        ddl.contains(&format!(
+            "constraint meta_emp_fk FOREIGN KEY (deptno) REFERENCES {schema}.meta_dept(deptno)"
+        )),
         "{ddl}"
     );
     assert!(ddl.contains("CREATE INDEX meta_emp_dept ON"), "{ddl}");
-    // The DDL runs: it rebuilds the table elsewhere.
-    h.ok("create schema if not exists meta_copy");
-    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
-        let sql = statement
-            .text(&ddl)
-            .replace(&format!("{schema}."), "meta_copy.");
-        h.ok(&sql);
+    // The DDL runs: it rebuilds the tables elsewhere, the key referencing
+    // the copy's department.
+    h.ok("drop schema if exists meta_copy cascade");
+    h.ok("create schema meta_copy");
+    for table in ["meta_dept", "meta_emp"] {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+            let sql = statement
+                .text(&ddl)
+                .replace(&format!("{schema}."), "meta_copy.");
+            h.ok(&sql);
+        }
     }
     h.ok("drop schema meta_copy cascade");
 
@@ -778,6 +791,111 @@ fn dictionary() {
     h.ok("drop table meta_emp");
     h.ok("drop table meta_dept");
     h.ok("drop function meta_f(int)");
+}
+
+/// Tables of the same name in several schemas: a foreign key names the
+/// table it references with its schema unless it's the table's own, in the
+/// constraints and whatever the session's search path; the DDL names every
+/// schema, so that it builds the table again elsewhere with its own
+/// references.
+#[test]
+fn foreign_keys_name_their_schema() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists fk_same_one, fk_same_two, fk_same_copy cascade");
+    h.ok("drop table if exists fk_same_users");
+    h.ok("create table fk_same_users (id int primary key)");
+    for tenant in ["fk_same_one", "fk_same_two", "fk_same_copy"] {
+        h.ok(&format!("create schema {tenant}"));
+        h.ok(&format!(
+            "create table {tenant}.fk_same_users (id int primary key)"
+        ));
+    }
+    h.ok(
+        "create table fk_same_one.fk_same_note (id int primary key, \
+         own int constraint fk_own references fk_same_one.fk_same_users, \
+         shared int constraint fk_shared references public.fk_same_users)",
+    );
+    h.ok(
+        "create table fk_same_two.fk_same_note (id int primary key, \
+         other int constraint fk_other references fk_same_one.fk_same_users)",
+    );
+    let foreign_keys = |h: &mut Harness, owner: &str| -> Vec<[String; 3]> {
+        let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+            owner: owner.into(),
+            name: "fk_same_note".into(),
+            detail: Detail::Constraints,
+        }) else {
+            panic!("expected a table")
+        };
+        rows.into_iter()
+            .filter(|r| r[1].as_deref() == Some("Foreign key"))
+            .map(|r| [0, 2, 3].map(|i| r[i].clone().unwrap_or_default()))
+            .collect()
+    };
+    assert_eq!(
+        foreign_keys(&mut h, "fk_same_one"),
+        [
+            [
+                "fk_own",
+                "FOREIGN KEY (own) REFERENCES fk_same_users(id)",
+                "fk_same_users"
+            ],
+            [
+                "fk_shared",
+                "FOREIGN KEY (shared) REFERENCES public.fk_same_users(id)",
+                "public.fk_same_users"
+            ],
+        ]
+    );
+    // The session's path finds fk_same_one's table first: the reference
+    // from fk_same_two still says whose it is.
+    h.ok("set search_path = fk_same_one, public");
+    assert_eq!(
+        foreign_keys(&mut h, "fk_same_two"),
+        [[
+            "fk_other",
+            "FOREIGN KEY (other) REFERENCES fk_same_one.fk_same_users(id)",
+            "fk_same_one.fk_same_users"
+        ]]
+    );
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: "fk_same_one".into(),
+        name: "fk_same_note".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    for constraint in [
+        "constraint fk_own FOREIGN KEY (own) REFERENCES fk_same_one.fk_same_users(id)",
+        "constraint fk_shared FOREIGN KEY (shared) REFERENCES public.fk_same_users(id)",
+    ] {
+        assert!(ddl.contains(constraint), "{ddl}");
+    }
+    assert_eq!(
+        h.scalar("select current_setting('search_path')").as_deref(),
+        Some("fk_same_one, public"),
+        "the session keeps its path"
+    );
+    // Run in another schema, the table references that schema's users.
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+        h.ok(&statement
+            .text(&ddl)
+            .replace("fk_same_one.", "fk_same_copy."));
+    }
+    assert_eq!(
+        h.scalar(
+            "select confrelid::regclass::text from pg_constraint \
+              where conname = 'fk_own' and conrelid = 'fk_same_copy.fk_same_note'::regclass"
+        )
+        .as_deref(),
+        Some("fk_same_copy.fk_same_users")
+    );
+    h.ok("reset search_path");
+    h.ok("drop schema fk_same_one, fk_same_two, fk_same_copy cascade");
+    h.ok("drop table fk_same_users");
 }
 
 /// Waits for a session's connect to fail.

@@ -267,6 +267,14 @@ All notable changes to Pythia are documented here. The format follows
   (the row is found by its key), and a cut value pasted into a cell is
   no longer written: MySQL and SQLite stored it as text, 8000 hex
   digits and the size.
+- PostgreSQL: a foreign key to a table of the same name in another
+  schema no longer reads as one to the table's own (#226). With
+  `tenant.users` and `public.users`, a key of `tenant.note` to
+  `public.users` read `REFERENCES users(id)`, by the session's search
+  path, in the object view's *Constraints* and in the DDL. A table's
+  details now name the tables of other schemas with their schema, and
+  its DDL names every schema, as `pg_dump` does: run in another schema
+  or with another search path, it no longer makes keys to other tables.
 
 ## [0.10.0] - 2026-10-30
 
