@@ -361,7 +361,7 @@ fn not_found(e: pythia_db::oracle::Error, object: &ObjectRef) -> DbError {
     }
 }
 
-// ----- MySQL, PostgreSQL, SQL Server ----------------------------------------
+// ----- MySQL, PostgreSQL, SQL Server, SQLite --------------------------------
 
 /// A table (or PostgreSQL's materialized view) of another database.
 pub fn other(client: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
@@ -369,8 +369,120 @@ pub fn other(client: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbErr
         DbKind::Postgres => postgres(client, object),
         DbKind::MySql => mysql(client, object),
         DbKind::SqlServer => sqlserver(client, object),
+        DbKind::Sqlite => sqlite(client, object),
         DbKind::Oracle => Err(DbError::new("Oracle's state comes from oracle()")),
     }
+}
+
+/// A SQLite table or index: its rows (from the statistics, else counted),
+/// its pages and those of its indexes, whether ANALYZE ever ran on it, and
+/// the space of the whole file that VACUUM would give back.
+fn sqlite(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
+    let mut f = Facts::default();
+    let d = pythia_db::Dialect::SQLITE;
+    let schema = d.quote_ident(&object.owner);
+    let table = if object.object_type == ObjectType::Index {
+        let rows = c.query(
+            &format!(
+                "select tbl_name from {schema}.sqlite_schema where type = 'index' \
+                  and name = ? collate nocase"
+            ),
+            &[&object.name],
+        )?;
+        text(&first_row(rows, object)?, 0).unwrap_or_default()
+    } else {
+        object.name.clone()
+    };
+    let stats = c
+        .query(
+            &format!(
+                "select stat from {schema}.sqlite_stat1 where tbl = ? collate nocase \
+                  order by idx is not null limit 1"
+            ),
+            &[&table],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next());
+    let estimate = stats
+        .as_ref()
+        .and_then(|row| text(row, 0))
+        .and_then(|stat| stat.split_whitespace().next()?.parse::<i64>().ok());
+    match estimate {
+        Some(rows) => f.add("Rows (statistics)", grouped(rows), false),
+        None => {
+            let counted = c.query(
+                &format!(
+                    "select count(*) from {}",
+                    d.qualified(&object.owner, &table)
+                ),
+                &[],
+            )?;
+            if let Some(rows) = counted.first().and_then(|r| int(r, 0)) {
+                f.add("Rows", grouped(rows), false);
+            }
+        }
+    }
+    // dbstat sums each object's pages (its first parameter: the schema).
+    let size = |c: &mut dyn Client, names: &str, name: &str| -> Option<f64> {
+        let sql = format!("select sum(pgsize) from dbstat(?, 1) where name in ({names})");
+        c.query(&sql, &[&object.owner, name])
+            .ok()?
+            .first()
+            .and_then(|r| num(r, 0))
+    };
+    let indexes = format!(
+        "select name from {schema}.sqlite_schema where type = 'index' and tbl_name = ? \
+          collate nocase"
+    );
+    if object.object_type == ObjectType::Index {
+        if let Some(bytes_used) = size(c, "?", &object.name) {
+            f.add("Size", bytes(bytes_used), false);
+        }
+    } else {
+        if let Some(data) = size(c, "?", &table) {
+            f.add("Data", bytes(data), false);
+        }
+        if let Some(index) = size(c, &indexes, &table) {
+            f.add("Indexes", bytes(index), false);
+        }
+        let count = c.query(&format!("select count(*) from ({indexes})"), &[&table])?;
+        f.indexes = count
+            .first()
+            .and_then(|r| int(r, 0))
+            .unwrap_or_default()
+            .max(0) as usize;
+    }
+    f.add(
+        "Statistics",
+        if stats.is_some() {
+            "gathered (ANALYZE)"
+        } else {
+            "never gathered"
+        },
+        stats.is_none() && f.indexes > 0,
+    );
+    let pages = |c: &mut dyn Client, pragma: &str| -> Option<f64> {
+        c.query(&format!("pragma {schema}.{pragma}"), &[])
+            .ok()?
+            .first()
+            .and_then(|r| num(r, 0))
+    };
+    if let (Some(free), Some(total), Some(page)) = (
+        pages(c, "freelist_count"),
+        pages(c, "page_count"),
+        pages(c, "page_size"),
+    ) {
+        f.add(
+            "Free in the file",
+            format!(
+                "{} of {} (VACUUM gives it back)",
+                bytes(free * page),
+                bytes(total * page)
+            ),
+            free * page >= 32.0 * 1024.0 * 1024.0 && free > 0.2 * total,
+        );
+    }
+    Ok(f)
 }
 
 fn int(row: &[Cell], i: usize) -> Option<i64> {

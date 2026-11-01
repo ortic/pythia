@@ -343,7 +343,9 @@ impl Browser {
                 &self.schemas,
                 Some(Loaded::Ready(schemas)) if schemas.contains(&account.name)
             ),
-            pythia_db::DbKind::MySql | pythia_db::DbKind::SqlServer => false,
+            pythia_db::DbKind::MySql | pythia_db::DbKind::SqlServer | pythia_db::DbKind::Sqlite => {
+                false
+            }
         }
     }
 
@@ -2042,7 +2044,8 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
 /// no `CREATE OR REPLACE` for routines: drop, then create, ended by `/` like
 /// a PL/SQL unit so the body's `;` stay in it. PostgreSQL's routines and
 /// views come with `CREATE OR REPLACE`, its triggers get it; SQL Server's
-/// get `CREATE OR ALTER`.
+/// get `CREATE OR ALTER`. SQLite has neither: drop, then create, a
+/// trigger's body keeping its `;` without a `/`.
 pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
     let ddl = ddl.trim_end();
     let qualified = dialect.qualified(&o.owner, &o.name);
@@ -2055,6 +2058,12 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str) -> String {
         }
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => format!("{}\n", create_or(ddl, "or alter", "")),
+        (pythia_db::DbKind::Sqlite, _) => format!(
+            "drop {} if exists {qualified};\n\n{}{}\n",
+            o.object_type.dictionary_name().to_lowercase(),
+            ddl,
+            if ddl.ends_with(';') { "" } else { ";" }
+        ),
         _ => format!(
             "drop {} if exists {qualified};\n\n{ddl}\n/\n",
             o.object_type.dictionary_name().to_lowercase(),
@@ -2725,6 +2734,27 @@ mod tests {
         assert_eq!(
             drop_sql(Dialect::SQLSERVER, &o("my proc", ObjectType::Procedure)),
             "drop procedure app.[my proc]"
+        );
+
+        let lite = |name: &str, object_type| ObjectRef {
+            owner: "main".into(),
+            name: name.into(),
+            object_type,
+        };
+        let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;\n";
+        let script = replace_script(Dialect::SQLITE, &lite("t", ObjectType::Trigger), trigger);
+        assert_eq!(
+            script,
+            "drop trigger if exists main.t;\n\nCREATE TRIGGER t AFTER INSERT ON x BEGIN\n  \
+             update x set n = 1;\nEND;\n"
+        );
+        assert_eq!(
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
+            2
+        );
+        assert_eq!(
+            drop_sql(Dialect::SQLITE, &lite("order", ObjectType::Table)),
+            "drop table main.\"order\""
         );
     }
 }

@@ -44,7 +44,8 @@ for Linux, Windows and macOS.
   against the fetched values when applied, so concurrent modifications are
   reported instead of overwritten. "Show SQL" previews the DML.
 - **Execute to file** streams a query of any size into CSV, TSV, JSON,
-  INSERT statements or Markdown, with live row count and cancel.
+  INSERT statements or Markdown, with live row count and cancel, on every
+  database.
 - Explain plan (F5), DBMS_OUTPUT, statement history (Ctrl+E).
 - **Errors lead to the code**: each line of a PL/SQL error stack
   (`ORA-06512`) is a link to its package, procedure or trigger at the line,
@@ -256,8 +257,9 @@ for Linux, Windows and macOS.
   or Windows' OpenSSH agent). Host keys come from `~/.ssh/known_hosts`; an
   unknown one is shown with its fingerprint to trust once.
 - SQL windows with results, fetching on demand, Break, explain plan,
-  completion with columns and comments, and transactions that work as with
-  Oracle: queries see what others committed, changes wait for Commit.
+  *Execute to file*, completion with columns and comments, and
+  transactions that work as with Oracle: queries see what others
+  committed, changes wait for Commit.
   Warnings show as messages.
 - *Edit* on a result of one table changes its rows in place, as on
   Oracle. Rows are found by the table's primary key (or a unique key on
@@ -305,8 +307,14 @@ for Linux, Windows and macOS.
   role memberships and permissions granted, grantable or denied.
   Transactions work as with
   Oracle; on PostgreSQL a failing statement doesn't abort the transaction,
-  and notices (`RAISE NOTICE`) show as messages. Results can't be edited
-  in place yet.
+  and notices (`RAISE NOTICE`) show as messages.
+- *Edit* on a result of one table changes its rows in place, as on
+  MySQL: rows are found by the table's primary key (or a unique key on
+  NOT NULL columns), which Pythia adds to the result if the query doesn't
+  select it; views and tables without such a key stay read-only. Applying
+  checks the values as they were shown, also json, xml, arrays and
+  floats on PostgreSQL and `text`, `xml` and CLR types (`geometry`,
+  `hierarchyid`) on SQL Server; a `sql_variant` isn't checked.
 - PostgreSQL's monitoring dashboard (Monitor → Dashboard): findings first
   (who blocks whom, sessions idle in transaction, connections near the
   limit, cache hit ratio, deadlocks, replication lag and inactive slots,
@@ -350,6 +358,38 @@ for Linux, Windows and macOS.
   so changes that weren't committed are rolled back. The driver is our
   fork of [tiberius](https://github.com/ortic/tiberius) (branch `pythia`),
   which passes those messages on.
+
+**SQLite (experimental)**
+- *Type: SQLite* with the database file's path (*…* picks one, *New…*
+  makes one). SQLite is built in: nothing to install. A path that doesn't
+  exist fails instead of leaving an empty database behind; `?create` makes
+  the file, `?ro` opens it read-only, `:memory:` is one in-memory database
+  for all windows, and a `file:` URI works as SQLite takes it.
+- SQL windows with results, fetching on demand, Break, explain plan
+  (`EXPLAIN QUERY PLAN`), *Execute to file* and completion. Each window
+  has its own connection to the file, and transactions work as with
+  Oracle: changes wait for Commit, and DDL outside a transaction is
+  committed at once. While one window has uncommitted changes, another one
+  that writes waits up to five seconds for the file's lock, then asks to
+  commit or roll back in the other one. Foreign keys are checked (`pragma
+  foreign_keys = off` in the login script turns that off).
+- The object browser lists tables, views, indexes and triggers, with the
+  attached databases as schemas (`attach database` in the login script
+  attaches one for every window). Object views show columns, indexes,
+  constraints, triggers, what uses a table and what a view uses, and the
+  DDL as written, a table's with its indexes. *Edit* opens a view or
+  trigger as a script that drops and creates it again.
+- *Edit* on a result of one table changes its rows in place, as on the
+  other databases. Rows are found by the table's primary key, a unique
+  index on NOT NULL columns, or else its `rowid`, so every table can be
+  edited (a view can't). Applying checks the values that were fetched; a
+  number is found whether the column holds it as a number or as text.
+- Scripts end each statement at `;`; a trigger's `BEGIN … END` keeps its
+  own.
+- *Maintenance* of a table or index: `ANALYZE`, `REINDEX` and an integrity
+  check, after its rows, size and whether it has statistics. The
+  *Maintenance Scan* finds free pages that `VACUUM` gives back and indexed
+  tables without statistics.
 
 ## Installing
 
@@ -468,6 +508,9 @@ of a run takes a lock (`pythia-test-databases.lock` in the temp
 directory) that the test process keeps, so a second run, e.g. in another
 worktree, waits for it instead of failing on the same objects.
 
+The SQLite tests need no server and always run: each makes its database
+files in the temp directory.
+
 | Variable | Used by |
 |---|---|
 | `PYTHIA_TEST_DB` | integration tests (app user) |
@@ -500,7 +543,7 @@ fresh Oracle Free container.
 |---|---|
 | `pythia-app` | the application: documents, docking, commands, dialogs |
 | `pythia-ui` | code editor, data grid, icon set |
-| `pythia-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
+| `pythia-db` | sessions on worker threads (Oracle, MySQL, PostgreSQL, SQL Server, SQLite), dictionary queries, what each database supports (`Dialect`, `Feature`), SSH tunnels |
 | `pythia-plsql` | lexer, statement splitter, error-tolerant parser |
 | `pythia-lsp-core` | completion, hover, navigation, outline, diagnostics |
 | `pythia-data` | export and import |

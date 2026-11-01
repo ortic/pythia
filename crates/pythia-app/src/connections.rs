@@ -404,8 +404,8 @@ fn init_sql(profile: &ConnectionProfile, database: Option<&str>) -> Vec<String> 
             DbKind::Oracle => out.push(format!("alter session set current_schema = {schema}")),
             DbKind::MySql => out.push(format!("use {schema}")),
             DbKind::Postgres => out.push(format!("set search_path to {schema}")),
-            // The default schema is the database user's.
-            DbKind::SqlServer => {}
+            // The default schema is the database user's; SQLite's is `main`.
+            DbKind::SqlServer | DbKind::Sqlite => {}
         }
     }
     let script = &profile.login_script;

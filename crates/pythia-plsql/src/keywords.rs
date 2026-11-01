@@ -523,6 +523,78 @@ const TSQL_RESERVED: &[&str] = &[
     "WRITETEXT",
 ];
 
+/// SQLite's keywords that can't name anything unquoted (the others fall
+/// back to identifiers), and the date keywords, which would be read as
+/// values. Sorted, uppercase.
+const SQLITE_RESERVED: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "AS",
+    "AUTOINCREMENT",
+    "BETWEEN",
+    "CASE",
+    "CHECK",
+    "COLLATE",
+    "COMMIT",
+    "CONSTRAINT",
+    "CREATE",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DELETE",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "ESCAPE",
+    "EXCEPT",
+    "EXISTS",
+    "FILTER",
+    "FOREIGN",
+    "FROM",
+    "GROUP",
+    "HAVING",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "LIMIT",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "ON",
+    "OR",
+    "ORDER",
+    "OVER",
+    "PRIMARY",
+    "REFERENCES",
+    "RETURNING",
+    "ROLLBACK",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRANSACTION",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+];
+
 /// Case-insensitive keyword check.
 pub fn is_keyword(word: &str) -> bool {
     contains(KEYWORDS, word)
@@ -536,6 +608,7 @@ pub fn is_reserved(word: &str, syntax: crate::Syntax) -> bool {
         crate::Syntax::Oracle => is_keyword(word),
         crate::Syntax::Postgres => contains(POSTGRES_RESERVED, word),
         crate::Syntax::TSql => contains(TSQL_RESERVED, word),
+        crate::Syntax::Sqlite => contains(SQLITE_RESERVED, word),
     }
 }
 
@@ -559,7 +632,7 @@ mod tests {
 
     #[test]
     fn sorted() {
-        for list in [KEYWORDS, POSTGRES_RESERVED, TSQL_RESERVED] {
+        for list in [KEYWORDS, POSTGRES_RESERVED, TSQL_RESERVED, SQLITE_RESERVED] {
             assert!(
                 list.windows(2).all(|w| w[0] < w[1]),
                 "lists must be sorted: {:?}",
@@ -570,6 +643,8 @@ mod tests {
         assert!(!is_reserved("public", crate::Syntax::Postgres));
         assert!(is_reserved("Public", crate::Syntax::TSql));
         assert!(!is_reserved("name", crate::Syntax::TSql));
+        assert!(is_reserved("Order", crate::Syntax::Sqlite));
+        assert!(!is_reserved("key", crate::Syntax::Sqlite));
     }
 
     #[test]

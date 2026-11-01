@@ -798,6 +798,330 @@ fn mysql_data_editing() {
     );
 }
 
+/// A database for [`keyed_data_editing`].
+struct Keyed {
+    /// The variable with its account (`user/password@connect string`).
+    env: &'static str,
+    kind: pythia_config::DbKind,
+    /// Creates `pythia_edit_t` (an identity key, name, born, doc, price)
+    /// with two rows, `pythia_edit_k` (a unique key on NOT NULL `a`, `b`)
+    /// and `pythia_edit_n` (no key), and commits.
+    create: &'static str,
+    drop: &'static str,
+    /// Cells of `pythia_edit_t`'s rows changed (row, column, value), and
+    /// what they read once applied.
+    edits: &'static [(usize, usize, &'static str, &'static str)],
+    screenshot: &'static str,
+}
+
+/// Edits results of a database that finds rows by key, as MySQL does
+/// ([`mysql_data_editing`]): the key, selected or not, is added; values
+/// are found again as they were shown; an identity fills a new row's key;
+/// a row changed by another session is a conflict; tables without a key
+/// and grouped results stay read-only.
+fn keyed_data_editing(db: &Keyed) {
+    let Some(spec) = std::env::var(db.env).ok() else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: db.kind,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    keyed_data_editing_on(db, profile, password.into());
+}
+
+/// [`keyed_data_editing`] on the connection `profile` (named `shop`).
+fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: String) {
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let run = |h: &mut Harness<'_, PythiaApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| &m.text)
+            .collect();
+        assert!(errors.is_empty(), "{sql}: {errors:?}");
+        h.state_mut().test_close_focused();
+    };
+    run(&mut h, db.drop);
+    run(&mut h, db.create);
+    let query = |h: &mut Harness<'_, PythiaApp>, sql: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: "shop".into(),
+            text: sql.into(),
+            run: true,
+        });
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+    };
+    let apply = |h: &mut Harness<'_, PythiaApp>| {
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        wait_until(h, "apply", |app| !app.test_focused_busy());
+    };
+    let messages = |h: &mut Harness<'_, PythiaApp>| -> Vec<String> {
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+
+    // The key isn't selected: Pythia adds it, read-only, at the end.
+    query(
+        &mut h,
+        "select name, born, doc, price from pythia_edit_t order by id",
+    );
+    let grid_window = h.state().test_focused();
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(
+            r.grid.is_editable(),
+            "{:?}",
+            w.state.messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["name", "born", "doc", "price", "pythia$id"]);
+        let rows = r.rows.clone();
+        for &(row, col, value, _) in db.edits {
+            r.grid.edit_cell(&rows, row, col, Some(value.into()));
+        }
+        r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
+    }
+    save(&mut h, db.screenshot);
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("Changes applied")),
+        "{texts:?}"
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        for &(row, col, _, shown) in db.edits {
+            assert_eq!(r.rows[row][col].as_deref(), Some(shown), "column {col}");
+        }
+        assert_eq!(
+            r.rows[1][4].as_deref(),
+            Some("2"),
+            "the key can't be edited"
+        );
+        // A new row (the key from the identity) and a deleted one.
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 2, 0, Some("three".into()));
+        r.grid.delete_row(&rows, 1);
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(!texts.iter().any(|m| m.contains("Conflict")), "{texts:?}");
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        let names: Vec<Option<&str>> = r.rows.iter().map(|row| row[0].as_deref()).collect();
+        assert_eq!(names, [Some(db.edits[0].3), Some("three")]);
+        assert_eq!(r.rows[1][4].as_deref(), Some("3"));
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+
+    // Another session changes the row behind our back.
+    run(
+        &mut h,
+        "update pythia_edit_t set name = 'theirs' where name = 'three';\ncommit;",
+    );
+    h.state_mut().test_focus(grid_window);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("mine".into()));
+    }
+    apply(&mut h);
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.starts_with("Conflict on row 2")),
+        "{texts:?}"
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // A unique key on NOT NULL columns does, too.
+    query(
+        &mut h,
+        "select v from pythia_edit_k k where a = 1 order by b",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["v", "pythia$a", "pythia$b"]);
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 0, Some("21".into()));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let values: Vec<Option<&str>> = w.state.results[0]
+            .rows
+            .iter()
+            .map(|r| r[0].as_deref())
+            .collect();
+        assert_eq!(values, [Some("10"), Some("21")]);
+    }
+    h.state_mut().test_commit();
+    wait_until(&mut h, "commit", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
+    // Without a key, rows can't be found again.
+    query(&mut h, "select * from pythia_edit_n");
+    let texts = messages(&mut h);
+    assert!(
+        texts
+            .iter()
+            .any(|m| m.starts_with("The rows of pythia_edit_n can't be edited")),
+        "{texts:?}"
+    );
+    assert!(
+        !h.state_mut().test_sql_window().state.results[0]
+            .grid
+            .is_editable()
+    );
+    h.state_mut().test_close_focused();
+
+    // A count isn't a row of the table.
+    query(&mut h, "select count(*) from pythia_edit_t");
+    let texts = messages(&mut h);
+    assert!(
+        texts.iter().any(|m| m.contains("can't be edited")),
+        "{texts:?}"
+    );
+    h.state_mut().test_close_focused();
+
+    run(&mut h, db.drop);
+}
+
+/// Edits PostgreSQL results (`PYTHIA_TEST_POSTGRES`): json compares as
+/// its text, a real as shown.
+#[test]
+fn postgres_data_editing() {
+    keyed_data_editing(&Keyed {
+        env: "PYTHIA_TEST_POSTGRES",
+        kind: pythia_config::DbKind::Postgres,
+        create: "create table pythia_edit_t (id integer generated by default as identity \
+                   primary key, name text, born timestamp, doc json, price real);\n\
+                 insert into pythia_edit_t (name, born, doc, price) values \
+                   ('one', '2020-01-01 00:00:00', '{\"a\":  1}', 123456.79), \
+                   ('two', null, null, 0.1);\n\
+                 create table pythia_edit_k (a int not null, b varchar(5) not null, v int, \
+                   unique (a, b));\n\
+                 insert into pythia_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                 create table pythia_edit_n (x int);\n\
+                 insert into pythia_edit_n values (1);\n\
+                 commit;\n",
+        drop: "drop table if exists pythia_edit_t, pythia_edit_k, pythia_edit_n;",
+        edits: &[
+            (0, 0, r"C:\new 'one' & more", r"C:\new 'one' & more"),
+            (0, 2, r#"{"a": [1, "é"]}"#, r#"{"a": [1, "é"]}"#),
+            (0, 3, "2.5", "2.5"),
+            (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06"),
+            (1, 3, "0.3", "0.3"),
+        ],
+        screenshot: "postgres-editing",
+    });
+}
+
+/// Edits SQLite results, on a file of its own: the key from the table (a
+/// view has none), text with a backslash, a quote and `&`, and reals.
+#[test]
+fn sqlite_data_editing() {
+    let path = std::env::temp_dir().join(format!("pythia-editing-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        ..Default::default()
+    };
+    keyed_data_editing_on(
+        &Keyed {
+            env: "",
+            kind: pythia_config::DbKind::Sqlite,
+            // AUTOINCREMENT: a deleted row's id isn't given out again.
+            create: "create table pythia_edit_t (id integer primary key autoincrement, \
+                       name text, born timestamp, doc json, price real);\n\
+                     insert into pythia_edit_t (name, born, doc, price) values \
+                       ('one', '2020-01-01 00:00:00', '{\"a\":  1}', 123456.79), \
+                       ('two', null, null, 0.1);\n\
+                     create table pythia_edit_k (a int not null, b varchar(5) not null, v int, \
+                       unique (a, b));\n\
+                     insert into pythia_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                     create view pythia_edit_n as select 1 as x;\n\
+                     commit;\n",
+            drop: "drop view if exists pythia_edit_n;\n\
+                   drop table if exists pythia_edit_t;\n\
+                   drop table if exists pythia_edit_k;",
+            edits: &[
+                (0, 0, r"C:\new 'one' & more", r"C:\new 'one' & more"),
+                (0, 2, r#"{"a": [1, "é"]}"#, r#"{"a": [1, "é"]}"#),
+                (0, 3, "2.5", "2.5"),
+                (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06"),
+                (1, 3, "0.3", "0.3"),
+            ],
+            screenshot: "sqlite-editing",
+        },
+        profile,
+        String::new(),
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Edits SQL Server results (`PYTHIA_TEST_MSSQL`): Unicode as N'…', xml
+/// compared as its text.
+#[test]
+fn sqlserver_data_editing() {
+    keyed_data_editing(&Keyed {
+        env: "PYTHIA_TEST_MSSQL",
+        kind: pythia_config::DbKind::SqlServer,
+        create: "create table pythia_edit_t (id int identity primary key, name nvarchar(40), \
+                   born datetime, doc xml, price real);\n\
+                 insert into pythia_edit_t (name, born, doc, price) values \
+                   (N'one', '2020-01-01T00:00:00', N'<a>1</a>', 123456.79), \
+                   (N'two', null, null, 0.1);\n\
+                 create table pythia_edit_k (a int not null, b varchar(5) not null, v int, \
+                   unique (a, b));\n\
+                 insert into pythia_edit_k values (1, 'x', 10), (1, 'y', 20);\n\
+                 create table pythia_edit_n (x int);\n\
+                 insert into pythia_edit_n values (1);\n\
+                 commit;\n",
+        drop: "drop table if exists pythia_edit_t, pythia_edit_k, pythia_edit_n;",
+        edits: &[
+            (0, 0, "grüße 'one' & 日本", "grüße 'one' & 日本"),
+            (0, 2, "<a>é</a>", "<a>é</a>"),
+            (0, 3, "2.5", "2.5"),
+            (1, 1, "2021-02-03 04:05:06", "2021-02-03 04:05:06.000"),
+            (1, 3, "0.3", "0.3"),
+        ],
+        screenshot: "sqlserver-editing",
+    });
+}
+
 /// Types `.` after a table alias in a real editor and waits for the
 /// completion popup, which needs a round trip to the dictionary.
 #[test]
@@ -2358,6 +2682,151 @@ fn execute_to_file() {
     assert!(last.contains("ORA-01013"), "{last}");
     assert!(!path.exists());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Execute to file" on a database other than Oracle (here a SQLite file,
+/// so it runs everywhere): the window fetches the result batch by batch
+/// into the file, INSERTs in SQLite's SQL; Break removes the incomplete
+/// file, and a statement that isn't a query writes nothing.
+#[test]
+fn execute_to_file_sqlite() {
+    let connection = "export.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let dir = std::env::temp_dir().join(format!("pythia-to-file-sqlite-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let start_export = |h: &mut Harness<'_, PythiaApp>, sql: &str, path: &std::path::Path| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.to_owned())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+    };
+    let last_message = |h: &mut Harness<'_, PythiaApp>| {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default()
+    };
+    let series = |n: u32| {
+        format!(
+            "with recursive s(id) as (select 1 union all select id + 1 from s where id < {n}) \
+             select id, 'item ' || id as name from s"
+        )
+    };
+
+    let path = dir.join("rows.json");
+    start_export(&mut h, &series(5000), &path);
+    wait_until(&mut h, "export", |app| !app.test_focused_busy());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 5000);
+    assert_eq!(json[4999]["id"], 5000);
+    let message = last_message(&mut h);
+    assert!(message.starts_with("5000 rows written to"), "{message}");
+
+    // INSERT statements in SQLite's SQL, into the table the query reads.
+    run_script(
+        &mut h,
+        connection,
+        "create table notes (id integer primary key, note text);
+insert into notes values (1, 'it''s'), (2, null);
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let path = dir.join("notes.sql");
+    start_export(&mut h, "select * from notes order by id", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into notes (id, note) values (1, 'it''s');\n\
+         insert into notes (id, note) values (2, NULL);\n"
+    );
+
+    // Break: the incomplete file is removed.
+    let path = dir.join("huge.csv");
+    start_export(&mut h, &series(100_000_000), &path);
+    wait_until(&mut h, "rows", |app| {
+        app.test_sql_window_ref()
+            .and_then(|w| w.state.to_file.as_ref())
+            .is_some_and(|t| t.rows.load(std::sync::atomic::Ordering::Relaxed) > 0)
+    });
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "cancel", |app| !app.test_focused_busy());
+    let message = last_message(&mut h);
+    assert_eq!(message, "Execute to file failed: Cancelled");
+    assert!(!path.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// "Execute to file" on MySQL, PostgreSQL and SQL Server, those of their
+/// variables that are set: 5000 rows fetched batch by batch into a JSON
+/// file.
+#[test]
+fn execute_to_file_servers() {
+    use pythia_config::DbKind;
+    // 5000 numbered rows in each database's SQL.
+    let databases = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "select a.n + b.n * 100 + 1 as id from \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 99) \
+                select n from s) a, \
+               (with recursive s(n) as (select 0 union all select n + 1 from s where n < 49) \
+                select n from s) b order by 1",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select id from generate_series(1, 5000) id",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "with s(id) as (select 1 union all select id + 1 from s where id < 5000) \
+             select id from s option (maxrecursion 0)",
+        ),
+    ];
+    for (env, kind, sql) in databases {
+        let connection = format!("export@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let path = std::env::temp_dir().join(format!(
+            "pythia-to-file-{}-{}.json",
+            std::process::id(),
+            kind.label().replace(' ', "")
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(path.clone())).unwrap();
+        h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+        h.run_steps(2);
+        wait_until(&mut h, "export", |app| !app.test_focused_busy());
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap_or_default())
+                .unwrap_or_else(|e| panic!("{env}: {e}"));
+        let rows = json.as_array().map(Vec::len);
+        assert_eq!(rows, Some(5000), "{env}");
+        assert_eq!(json[4999]["id"], 5000, "{env}");
+        std::fs::remove_file(&path).unwrap();
+    }
 }
 
 /// Tables in the browser show their indexes, constraints and triggers.
@@ -5845,9 +6314,17 @@ fn sessions(h: &mut Harness<'_, PythiaApp>, tag: &str) {
     use crate::commands::Command;
     h.state_mut().test_command(Command::MonitorSessions);
     // The header counts sessions before the list is in: wait for the
-    // table (#137).
+    // table (#137). Until the tab is drawn, the dashboard's running and
+    // top statements, there when other sessions are busy, have a
+    // Statement column too.
     let start = Instant::now();
-    while h.query_by_label("Statement").is_none() {
+    loop {
+        h.step();
+        if h.state().test_focused_title().as_deref() == Some("Sessions")
+            && h.query_all_by_label("Statement").next().is_some()
+        {
+            break;
+        }
         assert!(
             h.query_by_label_contains("Sessions are not available")
                 .is_none(),
@@ -5857,7 +6334,6 @@ fn sessions(h: &mut Harness<'_, PythiaApp>, tag: &str) {
             start.elapsed() < Duration::from_secs(60),
             "timed out waiting for the sessions"
         );
-        h.step();
         std::thread::sleep(Duration::from_millis(15));
     }
     h.run_steps(3);
@@ -6493,6 +6969,134 @@ select id, customer, total, @limit as limit from app_orders where total < @limit
     wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
 }
 
+/// A SQLite database file of its own, on any machine: a script with a
+/// trigger, the change waiting for Commit, Oracle's and the servers' menus
+/// gone, the browser's folders (no users or roles), an object view, and
+/// completion after an alias.
+#[test]
+fn sqlite_connection() {
+    use crate::commands::Command;
+    use pythia_db::ObjectType;
+    let path = std::env::temp_dir().join(format!("pythia-ui-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let profile = ConnectionProfile {
+        name: "shop.db".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", path.display()),
+        color: Some([0x14, 0xb8, 0xa6]),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    assert!(
+        h.state()
+            .test_log()
+            .iter()
+            .any(|l| l.starts_with("Connected to shop.db (SQLite 3.")),
+        "{:?}",
+        h.state().test_log()
+    );
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "create table app_orders (
+  id integer primary key,
+  customer varchar(30) not null,
+  total decimal(8,2),
+  ordered text default current_timestamp
+);
+create table app_audit (order_id integer references app_orders (id), total decimal(8,2));
+create trigger app_orders_audit after insert on app_orders
+begin
+  insert into app_audit values (new.id, new.total);
+end;
+create index app_orders_customer on app_orders (customer);
+insert into app_orders (id, customer, total) values (1, 'Ada', 12.50), (2, 'Linus', 99.00), (3, 'Grace', 250.00);
+select o.id, o.customer, o.total, a.total as audited
+  from app_orders o join app_audit a on a.order_id = o.id
+ where o.total < 100 order by o.id;
+"
+        .into(),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let errors: Vec<&str> = w
+        .state
+        .messages
+        .iter()
+        .filter(|m| m.level == crate::sql_window::Level::Error)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let result = w.state.results.last().expect("a result");
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "customer", "total", "audited"]);
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(
+        h.state().test_transaction_state(),
+        Ok(()),
+        "the insert waits for commit"
+    );
+    save(&mut h, "sqlite-sql-window");
+    h.state_mut().test_command(Command::Commit);
+    wait_until(&mut h, "commit", |app| {
+        app.test_transaction_state() == Err("No transaction")
+    });
+
+    // No debugger, reports or monitor for a file.
+    for menu in ["Debug", "Reports", "Monitor"] {
+        assert!(h.query_by_label(menu).is_none(), "{menu}");
+    }
+
+    h.state_mut()
+        .test_expand_browser(&[ObjectType::Table, ObjectType::Index, ObjectType::Trigger]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    save(&mut h, "sqlite-browser");
+    for folder in pythia_db::Dialect::SQLITE.browser_types() {
+        assert!(h.query_by_label(folder.plural()).is_some(), "{folder:?}");
+    }
+    for absent in ["Packages", "Users", "Roles"] {
+        assert!(h.query_by_label(absent).is_none(), "{absent}");
+    }
+    assert!(h.query_by_label_contains("app_orders_audit").is_some());
+    assert!(h.query_by_label_contains("app_orders_customer").is_some());
+
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: "shop.db".into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "app_orders".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(2);
+    wait_until(&mut h, "object view", |app| !app.test_focused_busy());
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 4);
+    assert!(h.query_by_label("Constraints").is_some());
+    assert!(h.query_by_label("Grants").is_none());
+    save(&mut h, "sqlite-object-view");
+
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop.db".into(),
+        text: "select o\n  from app_orders o".into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut().test_sql_window().editor.select(8..8);
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("customer"))
+    });
+    save(&mut h, "sqlite-completion");
+    drop(h);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// The SQL Server dashboard (`PYTHIA_TEST_MSSQL_DBA`, a login with VIEW
 /// SERVER STATE): server KPIs, trends, waits and storage on the
 /// connection's own session.
@@ -6988,6 +7592,126 @@ commit;",
         );
     }
     run_script(&mut h, connection, "drop table pythia_mt_orders;");
+}
+
+/// A harness connected to a new SQLite file in the temp directory, named
+/// `connection`; the file is removed on drop of the returned guard.
+fn sqlite_file(connection: &str) -> (Ui, SqliteFile) {
+    let file = SqliteFile(std::env::temp_dir().join(format!(
+        "pythia-ui-{}-{}.db",
+        std::process::id(),
+        connection.replace('.', "-")
+    )));
+    let _ = std::fs::remove_file(&file.0);
+    let profile = ConnectionProfile {
+        name: connection.into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: format!("{}?create", file.0.display()),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    (h, file)
+}
+
+struct SqliteFile(PathBuf);
+
+impl Drop for SqliteFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Maintenance of a SQLite table: its rows, pages and missing statistics,
+/// then ANALYZE (after which it has them), REINDEX and the integrity check.
+#[test]
+fn maintenance_sqlite() {
+    use crate::maintenance::Task;
+    use pythia_db::{Dialect, ObjectType};
+    let connection = "maintenance.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table orders (id integer primary key, note text);
+create index orders_note on orders (note);
+insert into orders values (1, 'one'), (2, 'two'), (3, 'three');
+commit;",
+    );
+    let table = ObjectRef {
+        owner: "main".into(),
+        name: "orders".into(),
+        object_type: ObjectType::Table,
+    };
+    open_maintenance(&mut h, connection, table);
+    assert_eq!(maintenance_fact(&mut h, "Rows"), Some(("3".into(), false)));
+    assert!(maintenance_fact(&mut h, "Data").is_some());
+    assert!(maintenance_fact(&mut h, "Indexes").is_some());
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("never gathered".into(), true))
+    );
+    for task in [Task::Analyze, Task::Reindex, Task::Check] {
+        let (text, ok, messages) = run_maintenance(&mut h, Dialect::SQLITE, task, |_| {});
+        assert!(ok, "{task:?}: {text}");
+        if task == Task::Check {
+            assert!(
+                messages[0].iter().any(|m| m.contains("ok")),
+                "{task:?}: {messages:?}"
+            );
+        }
+    }
+    assert_eq!(
+        maintenance_fact(&mut h, "Statistics"),
+        Some(("gathered (ANALYZE)".into(), false))
+    );
+    assert_eq!(
+        maintenance_fact(&mut h, "Rows (statistics)"),
+        Some(("3".into(), false))
+    );
+}
+
+/// The maintenance scan of a SQLite database: free pages after a large
+/// delete (with the line lowered for a small file) and an indexed table
+/// without statistics; the batch vacuums and analyzes, and the scan after
+/// finds neither.
+#[test]
+fn maintenance_scan_sqlite() {
+    let connection = "scan.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table big (id integer primary key, pad text);
+create index big_pad on big (pad);
+insert into big
+  with recursive n(i) as (select 1 union all select i + 1 from n where i < 2000)
+  select i, printf('%.500c', 'x') from n;
+delete from big where id > 10;
+commit;",
+    );
+    let everything = crate::maintenance::Limits {
+        free_bytes: 0.0,
+        free_share: 0.0,
+        ..Default::default()
+    };
+    open_scan(&mut h, Some(everything));
+    save(&mut h, "maintenance-scan-sqlite");
+    let mut found = scan_findings(&mut h, "");
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("database main".into(), "Reclaimable space".into(), true),
+            ("main.big".into(), "No statistics".into(), true),
+        ]
+    );
+    assert!(scan_note(&mut h, "File").is_some());
+    let (text, ok, statuses) = run_scan(&mut h, "", |_| true);
+    assert!(ok, "{text}: {statuses:?}");
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert!(scan_findings(&mut h, "").is_empty());
 }
 
 /// Maintenance of a SQL Server table (#144): statistics with a full scan,

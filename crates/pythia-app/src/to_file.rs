@@ -1,17 +1,21 @@
 //! "Execute to file": streams a query's rows straight into a file, for
-//! results too large for the grid.
+//! results too large for the grid. On Oracle a task on the session reads
+//! them; on the other databases the window fetches the result batch by
+//! batch, as for the grid, and hands each to a [`Sink`].
 
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use pythia_data::{Format, Options, StreamWriter};
-use pythia_db::DbError;
 use pythia_db::oracle::Connection;
+use pythia_db::{Cell, Column, DbError, Dialect};
 
 /// Rows fetched per round trip and written per batch.
-const BATCH: usize = 1000;
+pub const BATCH: usize = 1000;
 
 /// A running export, polled by the window for progress.
 pub struct ToFile {
@@ -20,6 +24,83 @@ pub struct ToFile {
     pub sql: String,
     pub rows: Arc<AtomicU64>,
     pub started: Instant,
+    /// Where the window writes the rows it fetches (databases other than
+    /// Oracle); `None` while a task writes them.
+    pub sink: Option<Sink>,
+}
+
+/// Writes a query's rows into a file as they come: its columns first, then
+/// batches of rows. The file is removed unless it is finished.
+pub struct Sink {
+    path: PathBuf,
+    format: Format,
+    options: Options,
+    out: Option<BufWriter<File>>,
+    writer: Option<StreamWriter<BufWriter<File>>>,
+}
+
+impl Sink {
+    /// Creates the file for the rows of `sql`; INSERT statements go into
+    /// the table a one-table query reads (#158), in `dialect`'s SQL.
+    pub fn create(path: &Path, sql: &str, dialect: Dialect) -> Result<Self, DbError> {
+        let file =
+            File::create(path).map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
+        let defaults = Options::default();
+        Ok(Self {
+            path: path.to_owned(),
+            format: format_for(path),
+            options: Options {
+                table: crate::data_edit::single_table(sql).unwrap_or(defaults.table.clone()),
+                dialect,
+                ..defaults
+            },
+            out: Some(BufWriter::with_capacity(1 << 20, file)),
+            writer: None,
+        })
+    }
+
+    fn io(&self, e: pythia_data::Error) -> DbError {
+        DbError::new(format!("{}: {e}", self.path.display()))
+    }
+
+    /// The result's columns: writes the header.
+    pub fn columns(&mut self, columns: &[Column]) -> Result<(), DbError> {
+        if let Some(out) = self.out.take() {
+            let writer =
+                StreamWriter::new(self.format, columns.to_vec(), self.options.clone(), out)
+                    .map_err(|e| self.io(e))?;
+            self.writer = Some(writer);
+        }
+        Ok(())
+    }
+
+    /// Writes rows; returns how many were written so far.
+    pub fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<u64, DbError> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err(DbError::new("Rows before the columns"));
+        };
+        let written = writer.write(rows).map(|()| writer.rows());
+        written.map_err(|e| self.io(e))
+    }
+
+    /// Completes the file (a JSON array's end, an Excel sheet).
+    pub fn finish(mut self) -> Result<(), DbError> {
+        let result = match self.writer.take() {
+            Some(writer) => writer.finish().map(|_| ()).map_err(|e| self.io(e)),
+            None => Ok(()),
+        };
+        if result.is_err() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        result
+    }
+
+    /// Gives up: the incomplete file is removed.
+    pub fn abandon(mut self) {
+        self.writer = None;
+        self.out = None;
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// The format for a file name; CSV when the extension isn't a streaming one.
@@ -44,42 +125,23 @@ pub fn run(
     path: &Path,
     progress: &AtomicU64,
 ) -> Result<u64, DbError> {
-    let format = format_for(path);
-    let file = std::fs::File::create(path)
-        .map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
-    let out = std::io::BufWriter::with_capacity(1 << 20, file);
-    let mut out = Some(out);
-    let mut writer: Option<StreamWriter<std::io::BufWriter<std::fs::File>>> = None;
-    let io = |e: pythia_data::Error| DbError::new(format!("{}: {e}", path.display()));
-    let result = pythia_db::stream_query(conn, sql, BATCH, |columns, rows| {
-        if writer.is_none()
-            && let Some(out) = out.take()
-        {
-            // INSERTs into the table a one-table query reads (#158).
-            let defaults = Options::default();
-            let options = Options {
-                table: crate::data_edit::single_table(sql).unwrap_or(defaults.table.clone()),
-                ..defaults
-            };
-            writer = Some(StreamWriter::new(format, columns.to_vec(), options, out).map_err(io)?);
+    let mut sink = Sink::create(path, sql, Dialect::ORACLE)?;
+    let mut started = false;
+    let streamed = pythia_db::stream_query(conn, sql, BATCH, |columns, rows| {
+        if !started {
+            sink.columns(columns)?;
+            started = true;
         }
-        if let Some(w) = writer.as_mut() {
-            w.write(rows).map_err(io)?;
-            progress.store(w.rows(), Ordering::Relaxed);
-        }
+        progress.store(sink.rows(rows)?, Ordering::Relaxed);
         Ok(())
-    })
-    .and_then(|count| {
-        if let Some(w) = writer.take() {
-            w.finish().map_err(io)?;
-        }
-        Ok(count)
     });
-    if result.is_err() {
-        drop(writer);
-        let _ = std::fs::remove_file(path);
+    match streamed {
+        Ok(count) => sink.finish().map(|()| count),
+        Err(e) => {
+            sink.abandon();
+            Err(e)
+        }
     }
-    result
 }
 
 /// Asks for the target file on a background thread (the dialog blocks).
@@ -104,6 +166,48 @@ mod tests {
         assert_eq!(format_for(Path::new("a.json")), Format::Json);
         assert_eq!(format_for(Path::new("a.SQL")), Format::Insert);
         assert_eq!(format_for(Path::new("a.txt")), Format::Csv);
+    }
+
+    /// The rows as the window hands them over, batch by batch, in another
+    /// database's SQL; a sink given up leaves no file.
+    #[test]
+    fn sink_writes_batches() {
+        let path = std::env::temp_dir().join(format!("pythia-sink-{}.sql", std::process::id()));
+        let columns = vec![
+            Column {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                numeric: true,
+            },
+            Column {
+                name: "note".into(),
+                type_name: "TEXT".into(),
+                numeric: false,
+            },
+        ];
+        let mut sink = Sink::create(&path, "select id, note from notes", Dialect::SQLITE).unwrap();
+        sink.columns(&columns).unwrap();
+        assert_eq!(
+            sink.rows(&[vec![Some("1".into()), Some("it's".into())]])
+                .unwrap(),
+            1
+        );
+        assert_eq!(sink.rows(&[vec![Some("2".into()), None]]).unwrap(), 2);
+        sink.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "insert into notes (id, note) values (1, 'it''s');",
+                "insert into notes (id, note) values (2, NULL);"
+            ]
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        let sink = Sink::create(&path, "select 1", Dialect::SQLITE).unwrap();
+        assert!(path.exists());
+        sink.abandon();
+        assert!(!path.exists());
     }
 
     #[test]

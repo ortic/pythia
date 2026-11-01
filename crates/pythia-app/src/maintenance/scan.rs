@@ -532,14 +532,105 @@ fn notes_ui(ui: &mut Ui, notes: &[Note]) {
 
 // ----- the scans ------------------------------------------------------------
 
-/// Scans `schema` (Oracle, MySQL) or the database.
+/// Scans `schema` (Oracle, MySQL, SQLite's attached database) or the
+/// database.
 pub fn scan(client: &mut dyn Client, schema: &str, limits: &Limits) -> Result<Scan, DbError> {
     match client.dialect().kind() {
         DbKind::Oracle => oracle(client, schema),
         DbKind::Postgres => postgres(client, limits),
         DbKind::MySql => mysql(client, schema, limits),
         DbKind::SqlServer => sqlserver(client, limits),
+        DbKind::Sqlite => sqlite(client, schema, limits),
     }
+}
+
+/// A SQLite database (`main` or an attached one): free pages VACUUM would
+/// give back, and tables with indexes the planner has no statistics of.
+fn sqlite(c: &mut dyn Client, schema: &str, limits: &Limits) -> Result<Scan, DbError> {
+    let d = Dialect::SQLITE;
+    let schema = if schema.is_empty() { "main" } else { schema };
+    let quoted = d.quote_ident(schema);
+    let mut scan = Scan {
+        scope: format!("database {schema}"),
+        ..Scan::default()
+    };
+    let pragma = |c: &mut dyn Client, name: &str| -> Result<f64, DbError> {
+        let rows = c.query(&format!("pragma {quoted}.{name}"), &[])?;
+        Ok(rows.first().and_then(|r| num(r, 0)).unwrap_or(0.0))
+    };
+    let page = pragma(c, "page_size")?;
+    let free = pragma(c, "freelist_count")? * page;
+    let total = pragma(c, "page_count")? * page;
+    scan.notes.push(Note {
+        label: "File".to_owned(),
+        value: format!("{} of which {} free", bytes(total), bytes(free)),
+        warn: false,
+    });
+    if free >= limits.free_bytes && free > limits.free_share * total {
+        let database = object(schema, schema, ObjectType::Table);
+        scan.findings.push(Finding {
+            object: None,
+            name: format!("database {schema}"),
+            problem: "Reclaimable space".to_owned(),
+            evidence: format!(
+                "{} of the file's {} are free pages",
+                bytes(free),
+                bytes(total)
+            ),
+            statements: statements(
+                d,
+                &database,
+                Task::Vacuum,
+                &Options::default(),
+                &Facts::default(),
+            ),
+            target: None,
+            // It rewrites the whole file, holding a write lock.
+            blocks: true,
+            picked: true,
+        });
+    }
+    // Statistics only matter where there are indexes to choose from.
+    let stats = c
+        .query(
+            &format!("select distinct tbl from {quoted}.sqlite_stat1"),
+            &[],
+        )
+        .unwrap_or_default();
+    let analyzed: BTreeSet<String> = stats.iter().map(|r| text(r, 0).to_lowercase()).collect();
+    for row in c.query(
+        &format!(
+            "select t.name from {quoted}.sqlite_schema t \
+              where t.type = 'table' and t.name not like 'sqlite!_%' escape '!' \
+                and exists (select 1 from {quoted}.sqlite_schema i \
+                             where i.type = 'index' and i.tbl_name = t.name) \
+              order by t.name"
+        ),
+        &[],
+    )? {
+        let name = text(&row, 0);
+        if analyzed.contains(&name.to_lowercase()) {
+            continue;
+        }
+        let table = object(schema, &name, ObjectType::Table);
+        scan.findings.push(Finding {
+            name: shown(d, schema, &name),
+            problem: "No statistics".to_owned(),
+            evidence: "ANALYZE never ran on it: the planner guesses which index to use".to_owned(),
+            statements: statements(
+                d,
+                &table,
+                Task::Analyze,
+                &Options::default(),
+                &Facts::default(),
+            ),
+            target: None,
+            object: Some(table),
+            blocks: false,
+            picked: true,
+        });
+    }
+    Ok(scan)
 }
 
 fn text(row: &[Cell], i: usize) -> String {

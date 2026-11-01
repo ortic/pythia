@@ -2463,13 +2463,15 @@ impl PythiaApp {
     /// PostgreSQL and SQL Server scan the database (none).
     fn scan_schema(&self, connection: &str) -> String {
         match self.dialect_of(Some(connection)).kind() {
-            pythia_db::DbKind::Oracle | pythia_db::DbKind::MySql => self
-                .browser
-                .schema()
-                .filter(|_| self.browser.connection.as_deref() == Some(connection))
-                .map(str::to_owned)
-                .or_else(|| self.conns.get(connection).map(|c| c.current_schema()))
-                .unwrap_or_default(),
+            // SQLite: the attached database picked in the browser.
+            pythia_db::DbKind::Oracle | pythia_db::DbKind::MySql | pythia_db::DbKind::Sqlite => {
+                self.browser
+                    .schema()
+                    .filter(|_| self.browser.connection.as_deref() == Some(connection))
+                    .map(str::to_owned)
+                    .or_else(|| self.conns.get(connection).map(|c| c.current_schema()))
+                    .unwrap_or_default()
+            }
             _ => String::new(),
         }
     }
@@ -6155,5 +6157,6 @@ fn name_style(dialect: pythia_db::Dialect) -> pythia_lsp_core::NameStyle {
         pythia_db::DbKind::Postgres => pythia_lsp_core::NameStyle::Lower,
         pythia_db::DbKind::MySql => pythia_lsp_core::NameStyle::Backticks,
         pythia_db::DbKind::SqlServer => pythia_lsp_core::NameStyle::Brackets,
+        pythia_db::DbKind::Sqlite => pythia_lsp_core::NameStyle::AsWritten,
     }
 }

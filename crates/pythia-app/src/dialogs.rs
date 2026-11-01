@@ -33,6 +33,9 @@ pub struct ConnectDialog {
     host_key: Option<HostKey>,
     /// The key file being chosen in a file dialog.
     picking_key: Option<Receiver<Option<PathBuf>>>,
+    /// A SQLite database file being chosen: an existing one, or (`true`) a
+    /// new one.
+    picking_file: Option<Receiver<(bool, Option<PathBuf>)>>,
     /// Display name of the saved profile being edited, if any.
     editing: Option<String>,
     search: String,
@@ -112,6 +115,12 @@ impl Hints {
                 tunnel: Some("localhost:1433/database, as the SSH server sees it (no \\instance)"),
                 schema: None,
                 login_script: "set dateformat ymd;",
+            },
+            DbKind::Sqlite => Hints {
+                database: "path of the database file, ?create to make it, ?ro to only read",
+                tunnel: None,
+                schema: None,
+                login_script: "attach database 'archive.db' as archive;",
             },
         }
     }
@@ -292,6 +301,15 @@ impl ConnectDialog {
         ui.add_space(6.0);
         let mut submit = false;
         let oracle = self.form.kind == DbKind::Oracle;
+        // A database file: no user, no password.
+        let file = self.form.kind == DbKind::Sqlite;
+        if let Some((new, picked)) = self.picking_file.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.picking_file = None;
+            if let Some(path) = picked {
+                let path = path.display().to_string();
+                self.form.connect_string = if new { format!("{path}?create") } else { path };
+            }
+        }
         egui::Grid::new("connect-form")
             .num_columns(2)
             .spacing([10.0, 8.0])
@@ -306,45 +324,53 @@ impl ConnectDialog {
                     });
                 ui.end_row();
 
-                ui.label("Username");
-                let user = ui.add(
-                    egui::TextEdit::singleline(&mut self.form.username)
-                        .hint_text(if oracle {
-                            "user, or proxy[target] for proxy authentication"
-                        } else {
-                            "user"
-                        })
-                        .desired_width(280.0),
-                );
-                if !self.focus_requested {
-                    if self.form.username.is_empty() {
-                        user.request_focus();
+                if !file {
+                    ui.label("Username");
+                    let user = ui.add(
+                        egui::TextEdit::singleline(&mut self.form.username)
+                            .hint_text(if oracle {
+                                "user, or proxy[target] for proxy authentication"
+                            } else {
+                                "user"
+                            })
+                            .desired_width(280.0),
+                    );
+                    if !self.focus_requested {
+                        if self.form.username.is_empty() {
+                            user.request_focus();
+                        }
+                        self.focus_requested = true;
                     }
-                    self.focus_requested = true;
-                }
-                ui.end_row();
+                    ui.end_row();
 
-                ui.label("Password");
-                let pw = ui.add(
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(true)
-                        .desired_width(280.0),
-                );
-                if self.focus_requested
-                    && !self.form.username.is_empty()
-                    && self.password.is_empty()
-                    && !pw.has_focus()
-                    && ui.memory(|m| m.focused().is_none())
-                {
-                    pw.request_focus();
+                    ui.label("Password");
+                    let pw = ui.add(
+                        egui::TextEdit::singleline(&mut self.password)
+                            .password(true)
+                            .desired_width(280.0),
+                    );
+                    if self.focus_requested
+                        && !self.form.username.is_empty()
+                        && self.password.is_empty()
+                        && !pw.has_focus()
+                        && ui.memory(|m| m.focused().is_none())
+                    {
+                        pw.request_focus();
+                    }
+                    submit |= pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    ui.end_row();
                 }
-                submit |= pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                ui.end_row();
 
-                ui.label("Database");
+                ui.label(if file { "File" } else { "Database" });
                 ui.horizontal(|ui| {
                     let aliases = oracle && !self.tns_aliases.is_empty();
-                    let width = if aliases { 250.0 } else { 280.0 };
+                    let width = if aliases {
+                        250.0
+                    } else if file {
+                        200.0
+                    } else {
+                        280.0
+                    };
                     let db = ui.add(
                         egui::TextEdit::singleline(&mut self.form.connect_string)
                             .hint_text({
@@ -362,7 +388,39 @@ impl ConnectDialog {
                             })
                             .desired_width(width),
                     );
+                    if file && !self.focus_requested {
+                        db.request_focus();
+                        self.focus_requested = true;
+                    }
                     submit |= db.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if file {
+                        let idle = self.picking_file.is_none();
+                        let open = ui
+                            .add_enabled(idle, egui::Button::new("…"))
+                            .on_hover_text("Choose a database file");
+                        let new = ui
+                            .add_enabled(idle, egui::Button::new("New…"))
+                            .on_hover_text("Make a new database file");
+                        if open.clicked() || new.clicked() {
+                            let new = new.clicked();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let dialog = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "SQLite databases",
+                                        &["db", "sqlite", "sqlite3", "db3"],
+                                    )
+                                    .add_filter("All files", &["*"]);
+                                let picked = if new {
+                                    dialog.set_file_name("database.db").save_file()
+                                } else {
+                                    dialog.pick_file()
+                                };
+                                let _ = tx.send((new, picked));
+                            });
+                            self.picking_file = Some(rx);
+                        }
+                    }
                     if aliases {
                         ui.menu_button("▾", |ui| {
                             ui.set_max_height(320.0);
@@ -452,8 +510,10 @@ impl ConnectDialog {
                 .on_hover_text("Red marker everywhere and confirmation before commit");
             ui.checkbox(&mut self.form.read_only, "Read-only")
                 .on_hover_text("Only queries are allowed");
-            ui.checkbox(&mut self.form.save_password, "Save password")
-                .on_hover_text("Stored in the operating system's keychain");
+            if !file {
+                ui.checkbox(&mut self.form.save_password, "Save password")
+                    .on_hover_text("Stored in the operating system's keychain");
+            }
         });
         if Dialect::from(self.form.kind).supports(Feature::SshTunnel) {
             submit |= self.ssh_ui(ui);
@@ -688,6 +748,11 @@ impl ConnectDialog {
         if profile.kind != DbKind::Oracle {
             // Hidden for other databases: don't keep one chosen before.
             profile.privilege = Privilege::Normal;
+        }
+        if profile.kind == DbKind::Sqlite {
+            // A file has no users: the fields are hidden.
+            profile.username.clear();
+            profile.save_password = false;
         }
         let ssh = &mut profile.ssh;
         ssh.host = ssh.host.trim().to_owned();

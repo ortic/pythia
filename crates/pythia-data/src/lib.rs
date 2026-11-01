@@ -465,6 +465,7 @@ pub fn literal(dialect: Dialect, col: &Column, value: Option<&str>) -> String {
         DbKind::MySql => mysql_literal(col, value),
         DbKind::Postgres => postgres_literal(col, value),
         DbKind::SqlServer => sqlserver_literal(col, value),
+        DbKind::Sqlite => sqlite_literal(col, value),
     }
 }
 
@@ -515,22 +516,40 @@ fn postgres_literal(col: &Column, value: Option<&str>) -> String {
     }
 }
 
-/// SQL Server: Unicode text as `N'…'`, binary as the `0x…` it is shown
-/// as. `datetime` text with a `T` (ISO 8601) is read the same under every
-/// `DATEFORMAT`; with a space, `dmy` swaps month and day.
+/// SQL Server: Unicode text as `N'…'`, binary (also CLR types such as
+/// `geometry`) as the `0x…` it is shown as. `datetime` text with a `T` (ISO
+/// 8601) is read the same under every `DATEFORMAT`; with a space, `dmy`
+/// swaps month and day.
+///
+/// ASCII text for a `varchar` or `char` column goes without the `N`: it
+/// means the same in every code page, and compared with `N'…'` SQL Server
+/// converts the column, which under a SQL collation scans its index
+/// instead of seeking. A number past the 38 digits of a decimal literal (a
+/// `float` like 1e300, shown in full) is written with an exponent.
 fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
     if is_number(col, v) {
+        if v.chars().filter(char::is_ascii_digit).count() > 38
+            && let Ok(n) = v.parse::<f64>()
+        {
+            return format!("{n:e}");
+        }
         return v.to_owned();
     }
     let hex = v
         .strip_prefix("0x")
         .is_some_and(|h| h.chars().all(|c| c.is_ascii_hexdigit()));
     match col.type_name.as_str() {
-        "binary" | "varbinary" | "image" if hex => v.to_owned(),
+        "binary" | "varbinary" | "image" | "udt" if hex => v.to_owned(),
         "datetime" | "smalldatetime" => format!("'{}'", v.replacen(' ', "T", 1)),
+        "varchar" | "char" if v.is_ascii() => apart_from_ampersands(
+            v,
+            |p| format!("'{}'", p.replace('\'', "''")),
+            "CHAR(38)",
+            " + ",
+        ),
         _ => apart_from_ampersands(
             v,
             |p| format!("N'{}'", p.replace('\'', "''")),
@@ -538,6 +557,41 @@ fn sqlserver_literal(col: &Column, value: Option<&str>) -> String {
             " + ",
         ),
     }
+}
+
+/// Whether SQLite would write a number as `text`: `7`, `-12`, `1.5`, not
+/// `007` or `1.50`. Such a number goes into SQLite as one: a column without
+/// a type keeps what it is given, and one with a type converts it as it
+/// needs.
+pub fn sqlite_number(text: &str) -> bool {
+    text.parse::<i64>().is_ok_and(|i| i.to_string() == text)
+        || text
+            .parse::<f64>()
+            .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
+}
+
+/// SQLite: numbers as SQLite writes them unquoted (see [`sqlite_number`]),
+/// a blob as the `X'…'` of the hex it is shown as, text quoted (no
+/// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
+/// read `&name` as a substitution variable even in a literal (#159).
+fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
+    let Some(v) = value else {
+        return "NULL".into();
+    };
+    if is_number(col, v) || sqlite_number(v) {
+        return v.to_owned();
+    }
+    // An empty blob is shown empty too.
+    let hex = v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
+    if hex && col.type_name.contains("BLOB") {
+        return format!("X'{v}'");
+    }
+    apart_from_ampersands(
+        v,
+        |p| format!("'{}'", p.replace('\'', "''")),
+        "char(38)",
+        " || ",
+    )
 }
 
 fn inserts(
@@ -795,6 +849,10 @@ mod tests {
             literal(Dialect::SQLSERVER, &col("nvarchar"), Some("H&L")),
             "N'H' + NCHAR(38) + N'L'"
         );
+        assert_eq!(
+            literal(Dialect::SQLITE, &col("TEXT"), Some("H&L")),
+            "'H' || char(38) || 'L'"
+        );
     }
 
     #[test]
@@ -816,6 +874,16 @@ mod tests {
             ),
             "'2026-01-02 03:04:05+01'"
         );
+        let lite = |c: &Column, v| literal(Dialect::SQLITE, c, v);
+        assert_eq!(lite(&col("INTEGER", true), Some("7")), "7");
+        assert_eq!(lite(&col("BLOB", false), Some("00FF")), "X'00FF'");
+        assert_eq!(lite(&col("TEXT", false), Some("00FF")), "'00FF'");
+        // Numbers as SQLite writes them go in as numbers, others as text.
+        assert_eq!(lite(&col("", false), Some("7")), "7");
+        assert_eq!(lite(&col("TEXT", false), Some("007")), "'007'");
+        assert_eq!(lite(&col("TEXT", false), Some("1.50")), "'1.50'");
+        assert_eq!(lite(&col("TEXT", false), Some(r"it's \n")), r"'it''s \n'");
+        assert_eq!(lite(&col("DATE", false), None), "NULL");
         let ms = |c: &Column, v| literal(Dialect::SQLSERVER, c, v);
         assert_eq!(
             ms(&col("nvarchar", false), Some("grüße 'x'")),
@@ -831,6 +899,17 @@ mod tests {
             "'2026-01-02T03:04:05.123'"
         );
         assert_eq!(ms(&col("date", false), Some("2026-01-02")), "N'2026-01-02'");
+        // ASCII needs no N for varchar, which keeps an index on it usable.
+        assert_eq!(ms(&col("varchar", false), Some("it's")), "'it''s'");
+        assert_eq!(ms(&col("char", false), Some("H&L")), "'H' + CHAR(38) + 'L'");
+        assert_eq!(ms(&col("varchar", false), Some("grüße")), "N'grüße'");
+        assert_eq!(ms(&col("udt", false), Some("0x0101")), "0x0101");
+        // Past a decimal literal's 38 digits, a float takes an exponent.
+        let big = format!("1{}", "0".repeat(300));
+        assert_eq!(ms(&col("float", true), Some(&big)), "1e300");
+        let tiny = format!("0.{}25", "0".repeat(40));
+        assert_eq!(ms(&col("float", true), Some(&tiny)), "2.5e-41");
+        assert_eq!(ms(&col("float", true), Some("0.1")), "0.1");
         // Oracle too: a name isn't a number.
         assert_eq!(
             sql_literal(&col("BINARY_DOUBLE", true), Some("Inf")),

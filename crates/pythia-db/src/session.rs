@@ -54,6 +54,11 @@ impl Session {
                     DbKind::MySql => crate::mysql_session::run(params, req_rx, events, shared),
                     DbKind::Postgres => crate::pg_session::run(params, req_rx, events, shared),
                     DbKind::SqlServer => crate::mssql_session::run(params, req_rx, events, shared),
+                    // A file: nothing to tunnel to.
+                    DbKind::Sqlite if params.ssh.is_some() => events.send(DbEvent::ConnectFailed(
+                        DbError::unsupported("Connecting through SSH", Dialect::SQLITE),
+                    )),
+                    DbKind::Sqlite => crate::sqlite_session::run(params, req_rx, events, shared),
                 }
             })
             .expect("spawning db worker thread");
@@ -76,7 +81,7 @@ impl Session {
 
     /// Interrupts the statement currently running on this session (OCIBreak
     /// on Oracle, `KILL QUERY` on MySQL, a cancel request on PostgreSQL,
-    /// the attention signal on SQL Server).
+    /// the attention signal on SQL Server, an interrupt on SQLite).
     pub fn cancel(&self) {
         let cancel = self.cancel.lock().expect("cancel mutex").clone();
         if let Some(cancel) = cancel {

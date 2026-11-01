@@ -99,6 +99,9 @@ pub enum NameStyle {
     /// SQL Server: names are stored as written and compared without case;
     /// square brackets quote names that need it.
     Brackets,
+    /// SQLite: names are stored as written and compared without case;
+    /// double quotes quote names that need it.
+    AsWritten,
 }
 
 pub trait Catalog {

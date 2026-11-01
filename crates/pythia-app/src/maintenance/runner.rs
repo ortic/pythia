@@ -486,7 +486,9 @@ pub fn answer(columns: &[String], rows: &[Vec<pythia_db::Cell>]) -> (Vec<String>
 /// where it reports nothing (MySQL) or the target is unknown.
 fn progress(dialect: Dialect, target: Option<ObjectRef>, sql: String) -> Option<pythia_db::RunFn> {
     let kind = dialect.kind();
-    if kind == DbKind::MySql || (target.is_none() && kind != DbKind::SqlServer) {
+    if matches!(kind, DbKind::MySql | DbKind::Sqlite)
+        || (target.is_none() && kind != DbKind::SqlServer)
+    {
         return None;
     }
     Some(Box::new(move |client: &mut dyn Client| {

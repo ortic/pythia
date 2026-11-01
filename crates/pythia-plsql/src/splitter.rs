@@ -32,6 +32,10 @@ pub enum Syntax {
     /// that `DECLARE` variables need a batch of their own, so they run up to
     /// the next `GO` (or `/`); `BEGIN … END` blocks keep their `;`.
     TSql,
+    /// SQLite: every statement ends at `;`, but a trigger's `BEGIN … END`
+    /// keeps its `;`. `BEGIN` and `END` starting a statement are
+    /// transaction control.
+    Sqlite,
 }
 
 /// The client commands of SQL*Plus that Pythia runs itself; the rest of
@@ -247,8 +251,8 @@ impl<'a> Splitter<'a> {
     }
 
     /// How the token changes the nesting of blocks whose `;` don't end the
-    /// statement: `BEGIN … END` (T-SQL), `BEGIN ATOMIC … END` (PostgreSQL)
-    /// and the `CASE … END` inside them.
+    /// statement: `BEGIN … END` (T-SQL, a SQLite trigger's body), `BEGIN
+    /// ATOMIC … END` (PostgreSQL) and the `CASE … END` inside them.
     fn depth_change(&self, idx: usize, depth: usize) -> isize {
         let t = &self.tokens[idx];
         if self.syntax == Syntax::Oracle || !t.kind.is_word() {
@@ -264,6 +268,8 @@ impl<'a> Splitter<'a> {
             let next = self.next_word(idx);
             let block = match self.syntax {
                 Syntax::TSql => !next.is_some_and(|n| self.word_eq(n, TSQL_BEGIN_STATEMENTS)),
+                // Inside a statement: a trigger's body (see `run`).
+                Syntax::Sqlite => true,
                 _ => next.is_some_and(|n| self.word_eq(n, &["ATOMIC"])),
             };
             return isize::from(block);
@@ -359,7 +365,12 @@ impl<'a> Splitter<'a> {
             let kind = self.classify(start);
             // Index of the last significant token that belongs to the statement.
             let mut last = start;
-            let mut depth = self.depth_change(start, 0).max(0) as usize;
+            // SQLite's `BEGIN` starting a statement begins a transaction.
+            let mut depth = if self.syntax == Syntax::Sqlite {
+                0
+            } else {
+                self.depth_change(start, 0).max(0) as usize
+            };
             i += 1;
             while i < self.tokens.len() {
                 let t = &self.tokens[i];
@@ -550,6 +561,39 @@ mod tests {
                 (StatementKind::Sql, "begin"),
                 (StatementKind::SqlPlus, "prompt done"),
                 (StatementKind::Sql, "show work_mem"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_scripts() {
+        let src = "pragma foreign_keys = on;\n\
+                   begin;\n\
+                   create trigger t_audit after update of name on t for each row\n\
+                   when new.name <> old.name\n\
+                   begin\n  insert into audit values (old.id, case when new.name is null then 'x' end);\n  \
+                   update t set changed = 1 where id = new.id;\nend;\n\
+                   select case when a then 1 else 2 end from t;\n\
+                   end transaction;\n\
+                   prompt done";
+        assert_eq!(
+            split_in(src, Syntax::Sqlite),
+            vec![
+                (StatementKind::Sql, "pragma foreign_keys = on"),
+                (StatementKind::Sql, "begin"),
+                (
+                    StatementKind::Sql,
+                    "create trigger t_audit after update of name on t for each row\n\
+                     when new.name <> old.name\n\
+                     begin\n  insert into audit values (old.id, case when new.name is null then 'x' end);\n  \
+                     update t set changed = 1 where id = new.id;\nend"
+                ),
+                (
+                    StatementKind::Sql,
+                    "select case when a then 1 else 2 end from t"
+                ),
+                (StatementKind::Sql, "end transaction"),
+                (StatementKind::SqlPlus, "prompt done"),
             ]
         );
     }
