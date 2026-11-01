@@ -267,6 +267,13 @@ All notable changes to Pythia are documented here. The format follows
   (the row is found by its key), and a cut value pasted into a cell is
   no longer written: MySQL and SQLite stored it as text, 8000 hex
   digits and the size.
+- MySQL scripts end `SET`, `SHOW`, `DESC`, `EXECUTE` and `START
+  TRANSACTION` at their `;`, as MySQL does (#225). They ended at the end
+  of their line, so what followed on it went to the server with them and
+  ran unseen: `select 1; set @x = 3; select @x;` never showed the result
+  of `select @x`, and a `SET` over two lines failed. `BEGIN` took in the
+  rest of the script, up to a `/`; it now starts a transaction, and
+  MariaDB's `BEGIN NOT ATOMIC` still opens a block.
 
 ## [0.10.0] - 2026-10-30
 

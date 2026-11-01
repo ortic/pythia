@@ -366,7 +366,7 @@ impl<'a> Splitter<'a> {
         if self.text(first) == "@" || self.text(first) == "@@" {
             return StatementKind::SqlPlus;
         }
-        if !self.syntax.sqlplus() {
+        if self.syntax != Syntax::Oracle {
             if self.word_eq(first, CLIENT_COMMANDS) {
                 return StatementKind::SqlPlus;
             }
@@ -381,6 +381,8 @@ impl<'a> Splitter<'a> {
                     StatementKind::Sql
                 };
             }
+        }
+        if !self.syntax.sqlplus() {
             if self.syntax == Syntax::TSql {
                 if self.word_eq(first, &["DECLARE"]) {
                     return StatementKind::PlSql;
@@ -398,19 +400,33 @@ impl<'a> Splitter<'a> {
             }
             return StatementKind::Sql;
         }
+        if self.syntax == Syntax::MySql && self.word_eq(first, &["BEGIN"]) {
+            // `BEGIN [WORK]` starts a transaction; MariaDB's `BEGIN NOT
+            // ATOMIC` opens a block (#225).
+            let block = words.next().is_some_and(|n| self.word_eq(n, &["NOT"]));
+            return if block {
+                StatementKind::PlSql
+            } else {
+                StatementKind::Sql
+            };
+        }
         if self.word_eq(first, &["DECLARE", "BEGIN"]) || self.text(first) == "<<" {
             return StatementKind::PlSql;
         }
-        if self.word_eq(first, &["SET"]) {
-            let next = words.next();
-            return if next.is_some_and(|n| self.word_eq(n, SQL_SET_TARGETS)) {
-                StatementKind::Sql
-            } else {
-                StatementKind::SqlPlus
-            };
-        }
-        if self.word_eq(first, SQLPLUS_COMMANDS) {
-            return StatementKind::SqlPlus;
+        // SQL*Plus's other words are MySQL's statements (`SHOW`, `DESC`,
+        // `START TRANSACTION`, `EXECUTE`), which end at `;` (#225).
+        if self.syntax == Syntax::Oracle {
+            if self.word_eq(first, &["SET"]) {
+                let next = words.next();
+                return if next.is_some_and(|n| self.word_eq(n, SQL_SET_TARGETS)) {
+                    StatementKind::Sql
+                } else {
+                    StatementKind::SqlPlus
+                };
+            }
+            if self.word_eq(first, SQLPLUS_COMMANDS) {
+                return StatementKind::SqlPlus;
+            }
         }
         if self.word_eq(first, &["CREATE"]) {
             // MySQL's `DEFINER = user@host` (quoted any way) may come first.
@@ -868,6 +884,47 @@ mod tests {
                     StatementKind::PlSql,
                     "create procedure p() begin select 'x\\';'; end;"
                 ),
+            ]
+        );
+    }
+
+    /// SQL*Plus's words are MySQL's statements, ended by `;` like the
+    /// others; `BEGIN` starts a transaction, MariaDB's `BEGIN NOT ATOMIC` a
+    /// block (#225).
+    #[test]
+    fn mysql_statements_of_sqlplus_words() {
+        let src = "select 1; set @x = 3; select @x;\n\
+                   show tables; desc t;\n\
+                   set @a = 1,\n    @b = 2;\n\
+                   show\n  full processlist;\n\
+                   prepare s from 'select 1'; execute s; deallocate prepare s;\n\
+                   start transaction; begin; begin work;\n\
+                   insert into t values (1);\ncommit;\n\
+                   begin not atomic select 1; end;\n/\n\
+                   prompt done; really\nset define off\n@more.sql\nselect 2;";
+        assert_eq!(
+            split_in(src, Syntax::MySql),
+            vec![
+                (StatementKind::Sql, "select 1"),
+                (StatementKind::Sql, "set @x = 3"),
+                (StatementKind::Sql, "select @x"),
+                (StatementKind::Sql, "show tables"),
+                (StatementKind::Sql, "desc t"),
+                (StatementKind::Sql, "set @a = 1,\n    @b = 2"),
+                (StatementKind::Sql, "show\n  full processlist"),
+                (StatementKind::Sql, "prepare s from 'select 1'"),
+                (StatementKind::Sql, "execute s"),
+                (StatementKind::Sql, "deallocate prepare s"),
+                (StatementKind::Sql, "start transaction"),
+                (StatementKind::Sql, "begin"),
+                (StatementKind::Sql, "begin work"),
+                (StatementKind::Sql, "insert into t values (1)"),
+                (StatementKind::Sql, "commit"),
+                (StatementKind::PlSql, "begin not atomic select 1; end;"),
+                (StatementKind::SqlPlus, "prompt done; really"),
+                (StatementKind::SqlPlus, "set define off"),
+                (StatementKind::SqlPlus, "@more.sql"),
+                (StatementKind::Sql, "select 2"),
             ]
         );
     }
