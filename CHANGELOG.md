@@ -521,6 +521,13 @@ All notable changes to Pythia are documented here. The format follows
   `BIÈRE` one named `bière`, in any database: PostgreSQL's names collate
   as C, where `upper()` changes ASCII letters only. Each letter of the
   filter now matches its cases, as the object browser's filter does.
+- SQL Server: a table's DDL has its XML and spatial indexes, and an
+  ordered columnstore index's `ORDER` (#265). They were left out, so
+  that run elsewhere the DDL made a table without its XML and spatial
+  indexes, and a clustered columnstore index `order (b, a)` of SQL
+  Server 2022 without the order its rows are kept in. Spatial indexes
+  keep their tessellation, bounding box, grids and cells per object.
+  Selective XML indexes are still left out.
 
 ## [0.10.0] - 2026-10-30
 
