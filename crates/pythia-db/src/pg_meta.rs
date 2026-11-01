@@ -574,7 +574,7 @@ fn ddl(
         }
         ObjectType::Sequence => {
             let (owner, name) = stored(pg, owner, name)?;
-            sequence_ddl(pg, &owner, &name, end)?.ok_or_else(missing)
+            sequence_ddl(pg, &owner, &name, true, end)?.ok_or_else(missing)
         }
         other => Err(DbError::new(format!(
             "PostgreSQL has no {}",
@@ -583,26 +583,44 @@ fn ddl(
     }
 }
 
-/// `CREATE SEQUENCE` of a sequence as stored, if there is one.
+/// `CREATE SEQUENCE` of a sequence as stored, if there is one. `owned`
+/// names the column that owns it (`serial`, `OWNED BY`), so that a copy
+/// goes with the copy's column (#307); a table's DDL makes the column the
+/// owner after the table.
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
     name: &str,
+    owned: bool,
     end: &str,
 ) -> Result<Option<String>, DbError> {
     let row = pg.first(
         "select format_type(s.seqtypid, null), s.seqincrement, s.seqmin, s.seqmax, \
-                s.seqstart, s.seqcache, s.seqcycle \
+                s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
            from pg_sequence s join pg_class c on c.oid = s.seqrelid \
            join pg_namespace n on n.oid = c.relnamespace \
+           left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
+                and d.refclassid = 'pg_class'::regclass and d.deptype = 'a' \
+           left join pg_class t on t.oid = d.refobjid \
+           left join pg_namespace tn on tn.oid = t.relnamespace \
+           left join pg_attribute a on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
           where n.nspname = $1 and c.relname = $2",
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let v: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+        let (v, column) = row.split_at(7);
+        let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
+        let owned_by = match column {
+            [Some(schema), Some(table), Some(column)] if owned => format!(
+                "\n  owned by {}.{}",
+                Dialect::POSTGRES.qualified(schema, table),
+                Dialect::POSTGRES.quote_ident(column)
+            ),
+            _ => String::new(),
+        };
         format!(
             "create sequence {} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
-             start with {} cache {}{}{end}",
+             start with {} cache {}{}{owned_by}{end}",
             Dialect::POSTGRES.qualified(owner, name),
             v[0],
             v[1],
@@ -690,7 +708,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
     for (sequence, _) in &sequences {
-        if let Some(create) = sequence_ddl(pg, &owner, sequence, ";")? {
+        if let Some(create) = sequence_ddl(pg, &owner, sequence, false, ";")? {
             ddl.push_str(&format!("{create}\n\n"));
         }
     }

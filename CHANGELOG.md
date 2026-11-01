@@ -758,6 +758,11 @@ All notable changes to Pythia are documented here. The format follows
   `SS`, which no database's `upper()` writes, so `straße` found no table
   `straße`. A letter whose uppercase is more than one letter now stays
   as it is.
+- PostgreSQL: the DDL of a sequence that a column owns, a `serial`
+  column's or one made `owned by` it, names that column (#307), `owned
+  by shop.orders.id`. Run elsewhere, the copy was owned by no column:
+  `pg_get_serial_sequence` didn't find it, and dropping the copy's
+  table left it behind.
 
 ## [0.10.0] - 2026-10-30
 

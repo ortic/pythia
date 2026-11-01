@@ -1149,6 +1149,73 @@ fn owned_sequences_come_with_the_table() {
     h.ok("drop schema r53_seq, r53_seq_copy cascade");
 }
 
+/// Runs the statements of `ddl` one by one, `from` replaced by `to` in each.
+fn run_ddl(h: &mut Harness, ddl: &str, from: &str, to: &str) {
+    for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::Postgres) {
+        let sql = statement.text(ddl).replace(from, to);
+        h.execute(0, &sql, 100);
+        if let DbEvent::Failed { error, .. } = h.next_result() {
+            panic!("{sql}: {error}\n\n{ddl}");
+        }
+        h.settle();
+    }
+}
+
+/// A sequence a column owns names that column in its DDL (#307): run
+/// elsewhere, the copy goes with the copy's column, as the original does.
+#[test]
+fn a_sequence_names_the_column_that_owns_it() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r62_seq, r62_seq_copy cascade");
+    h.ok("create schema r62_seq");
+    h.ok("create schema r62_seq_copy");
+    h.ok("create table r62_seq.r62_t (id serial, \"N\" int)");
+    h.ok("create sequence r62_seq.r62_n start 100 owned by r62_seq.r62_t.\"N\"");
+    h.ok("create sequence r62_seq.r62_free");
+    let ddl = |h: &mut Harness, name: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "r62_seq".into(),
+            name: name.into(),
+            object_type: ObjectType::Sequence,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let id = ddl(&mut h, "r62_t_id_seq");
+    assert!(id.ends_with("\n  owned by r62_seq.r62_t.id;"), "{id}");
+    let n = ddl(&mut h, "r62_n");
+    assert!(n.ends_with("\n  owned by r62_seq.r62_t.\"N\";"), "{n}");
+    let free = ddl(&mut h, "r62_free");
+    assert!(!free.contains("owned by"), "{free}");
+    h.ok("create table r62_seq_copy.r62_t (id int, \"N\" int)");
+    for ddl in [&id, &n, &free] {
+        run_ddl(&mut h, ddl, "r62_seq.", "r62_seq_copy.");
+    }
+    assert_eq!(
+        h.scalar(
+            "select pg_get_serial_sequence('r62_seq_copy.r62_t', 'id') || ' ' \
+                    || pg_get_serial_sequence('r62_seq_copy.r62_t', 'N')"
+        )
+        .as_deref(),
+        Some("r62_seq_copy.r62_t_id_seq r62_seq_copy.r62_n")
+    );
+    // They go with the copy's table.
+    h.ok("drop table r62_seq_copy.r62_t");
+    assert_eq!(
+        h.scalar(
+            "select string_agg(relname, ' ') from pg_class \
+              where relnamespace = 'r62_seq_copy'::regnamespace"
+        )
+        .as_deref(),
+        Some("r62_free")
+    );
+    h.ok("drop schema r62_seq, r62_seq_copy cascade");
+}
+
 /// Object filters find names without case whatever their letters: names
 /// collate as C, where upper() changes only ASCII letters, in the test
 /// database and in one whose lc_ctype is C.
