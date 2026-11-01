@@ -72,6 +72,11 @@ pub struct RunState {
     pub continue_on_error: bool,
     /// The statement currently running.
     pub running: Option<Running>,
+    /// Statements sent after it, in order: a script's statements go to the
+    /// session ahead, so it runs them without waiting for a frame (#291).
+    pub ahead: VecDeque<Running>,
+    /// The run's statements, which the session skips once it stopped.
+    pub script: Option<pythia_db::Script>,
     /// Request id of a "fetch more" in flight.
     pub fetching: Option<u64>,
     pub results: Vec<QueryResult>,
@@ -98,6 +103,8 @@ pub struct RunState {
     /// "Profile": request id and the DBMS_HPROF profile.
     pub profile: Option<(u64, Option<Result<crate::profiler::Profile, String>>)>,
     pub messages: Vec<Message>,
+    /// Where they end in the Messages tab.
+    message_rows: MessageRows,
     pub output: Vec<String>,
     pub bottom: BottomTab,
     pub line_col: (usize, usize),
@@ -229,6 +236,70 @@ pub struct Message {
     pub jump: Option<Range<usize>>,
     /// The lines of an Oracle error's PL/SQL stack that lead to code.
     pub stack: Vec<Frame>,
+}
+
+/// Where each message of the Messages tab ends, laid out at a width: the
+/// tab lays out only those in view (#291), which with tens of thousands
+/// of messages took most of a frame.
+#[derive(Default)]
+struct MessageRows {
+    width: f32,
+    ends: Vec<f32>,
+}
+
+impl MessageRows {
+    /// Measures the messages not measured yet, and all of them again at
+    /// another width.
+    fn measure(&mut self, ui: &Ui, messages: &[Message], width: f32, gap: f32) {
+        if self.width != width || self.ends.len() > messages.len() {
+            self.width = width;
+            self.ends.clear();
+        }
+        for m in &messages[self.ends.len()..] {
+            let top = self.ends.last().map_or(0.0, |end| end + gap);
+            self.ends.push(top + message_height(ui, m, width));
+        }
+    }
+
+    fn height(&self) -> f32 {
+        self.ends.last().copied().unwrap_or(0.0)
+    }
+
+    /// The messages `range` of the tab's height shows.
+    fn shown(&self, range: egui::Rangef) -> Range<usize> {
+        let first = self.ends.partition_point(|&end| end < range.min);
+        let last = self.ends.partition_point(|&end| end < range.max);
+        first..(last + 1).min(self.ends.len())
+    }
+
+    /// Where message `i` starts.
+    fn top(&self, i: usize, gap: f32) -> f32 {
+        match i {
+            0 => 0.0,
+            i => self.ends[i - 1] + gap,
+        }
+    }
+}
+
+/// The height of a message as the Messages tab lays it out at `width`: a
+/// label, or a stack's lines one below the other.
+fn message_height(ui: &Ui, m: &Message, width: f32) -> f32 {
+    let height = |text: &str| {
+        egui::WidgetText::from(RichText::new(text).monospace())
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Wrap),
+                width,
+                egui::FontSelection::Default,
+            )
+            .size()
+            .y
+    };
+    if m.stack.is_empty() {
+        height(&m.text)
+    } else {
+        m.text.lines().map(height).sum()
+    }
 }
 
 /// An `ORA-06512` line of an error, and the code it points at (#112).
@@ -460,6 +531,7 @@ impl SqlWindow {
         state.results.clear();
         state.plan = None;
         state.messages.clear();
+        state.message_rows = MessageRows::default();
         state.output.clear();
         state.bottom = BottomTab::Messages;
         self.editor.set_markers(Vec::new());
@@ -471,6 +543,7 @@ impl SqlWindow {
         self.state.done = 0;
         self.state.continue_on_error = false;
         self.state.queue = statements.into();
+        self.state.script = Some(pythia_db::Script::new());
         self.run_next(cx)
     }
 
@@ -883,9 +956,17 @@ impl SqlWindow {
     }
 
     /// Sends the next queued statement, handling SQL*Plus commands locally.
+    /// While statements run, those that need nothing of the window are sent
+    /// after them, up to [`AHEAD`], so the session runs a script at its own
+    /// pace rather than one statement per frame (#291); the others wait
+    /// until the statements before them have run.
     fn run_next(&mut self, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
-        while let Some(mut stmt) = self.state.queue.pop_front() {
+        while let Some(next) = self.state.queue.front() {
+            if self.state.running.is_some() && !self.goes_ahead(next, cx) {
+                break;
+            }
+            let mut stmt = self.state.queue.pop_front().expect("a statement");
             if let Some(internal) = stmt.internal.take() {
                 self.send_internal(stmt.start, stmt.sql, internal, cx, &mut effects);
                 return effects;
@@ -916,9 +997,50 @@ impl SqlWindow {
             }
             let (sql, binds) = self.with_values(&stmt.sql);
             self.send(stmt.start, sql, binds, cx, &mut effects);
-            return effects;
         }
         effects
+    }
+
+    /// Whether `stmt` can go to the session after the statements still
+    /// running: it needs nothing of the window (no values, no command it
+    /// carries out, no refusal whose message would come before their
+    /// results), and not too many are on their way.
+    fn goes_ahead(&self, stmt: &PendingStatement, cx: &DocContext) -> bool {
+        let command = stmt.kind == StatementKind::SqlPlus
+            && (cx.dialect == pythia_db::Dialect::ORACLE || client_command(&stmt.sql));
+        stmt.internal.is_none()
+            && !command
+            && self.state.script.is_some()
+            && self.state.ahead.len() < AHEAD
+            && (!cx.read_only || is_query(&stmt.sql))
+            && !self.needs_values(&stmt.sql)
+    }
+
+    /// The statement that ended; the one sent after it runs now.
+    fn finish_running(&mut self) -> Option<Running> {
+        let ended = self.state.running.take();
+        self.state.running = self.state.ahead.pop_front();
+        ended
+    }
+
+    /// Drops the statements sent ahead, which the session skips once the
+    /// run stopped; returns how many there were.
+    fn drop_ahead(&mut self) -> usize {
+        if let Some(script) = &self.state.script {
+            script.stop();
+        }
+        let dropped = self.state.ahead.len() + usize::from(self.state.running.is_some());
+        self.state.ahead.clear();
+        self.state.running = None;
+        dropped
+    }
+
+    /// Forgets the run: its session is closed or ended (the window moved
+    /// to another connection, or was disconnected).
+    pub fn forget_run(&mut self) {
+        self.drop_ahead();
+        self.state.fetching = None;
+        self.state.queue.clear();
     }
 
     /// Whether `&name` is a substitution variable: on Oracle, SQL*Plus's,
@@ -1044,15 +1166,27 @@ impl SqlWindow {
             return;
         }
         let id = request_id();
-        self.state.running = Some(Running {
+        let running = Running {
             id,
             internal: None,
             start,
             sql: sql.clone(),
             continues: false,
-        });
+        };
+        if self.state.running.is_some() {
+            self.state.ahead.push_back(running);
+        } else {
+            self.state.running = Some(running);
+        }
+        let target = match &self.state.script {
+            Some(script) => {
+                script.continue_on_error(self.state.continue_on_error);
+                Target::Script(script.clone())
+            }
+            None => Target::Own,
+        };
         effects.request(
-            Target::Own,
+            target,
             DbRequest::Execute {
                 id,
                 sql,
@@ -1243,6 +1377,7 @@ impl SqlWindow {
             applied: Vec::new(),
         });
         self.state.messages.clear();
+        self.state.message_rows = MessageRows::default();
         for dml in statements {
             self.state.queue.push_back(PendingStatement {
                 origin: None,
@@ -1612,7 +1747,11 @@ impl SqlWindow {
                 // Another result of the statement whose result `id` is
                 // (#290), in a tab of its own.
                 let earlier = self.state.results.iter().rev().find(|r| r.id == id);
-                let running = self.state.running.as_ref().filter(|_| earlier.is_none());
+                let running = self
+                    .state
+                    .running
+                    .as_ref()
+                    .filter(|r| r.id == id && earlier.is_none());
                 let sql = match earlier {
                     Some(result) => result.sql.clone(),
                     None => running.map(|r| r.sql.clone()).unwrap_or_default(),
@@ -1828,7 +1967,7 @@ impl SqlWindow {
                     return effects;
                 }
                 self.state.done += 1;
-                if let Some(running) = self.state.running.take()
+                if let Some(running) = self.finish_running()
                     && running.internal.is_none()
                 {
                     effects.executed.push(running.sql);
@@ -1847,7 +1986,7 @@ impl SqlWindow {
             DbEvent::Executed {
                 summary, elapsed, ..
             } => {
-                let running = self.state.running.take();
+                let running = self.finish_running();
                 self.state.done += 1;
                 if let Some(Internal::Dml {
                     expect_rows,
@@ -1909,9 +2048,11 @@ impl SqlWindow {
                     return effects;
                 }
                 self.error(&error);
-                let running = self.state.running.take();
+                let running = self.finish_running();
                 self.state.done += 1;
-                if self.state.continue_on_error && !self.state.queue.is_empty() {
+                if self.state.continue_on_error
+                    && (self.state.running.is_some() || !self.state.queue.is_empty())
+                {
                     self.info(format!(
                         "Failed after {} — continuing (WHENEVER SQLERROR CONTINUE)",
                         fmt_duration(elapsed)
@@ -1923,11 +2064,14 @@ impl SqlWindow {
                 // all stay pending, on the rows as they were.
                 let applying = !error.is_connection_lost()
                     && matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
-                let dropped = if applying {
-                    self.stop_applying()
-                } else {
-                    std::mem::take(&mut self.state.queue).len()
-                };
+                // The session skips those sent ahead.
+                let ahead = self.drop_ahead();
+                let dropped = ahead
+                    + if applying {
+                        self.stop_applying()
+                    } else {
+                        std::mem::take(&mut self.state.queue).len()
+                    };
                 self.info(format!("Failed after {}", fmt_duration(elapsed)));
                 if dropped > 0 {
                     self.info(format!("{dropped} remaining statement(s) skipped"));
@@ -1972,9 +2116,7 @@ impl SqlWindow {
             DbEvent::Connected(_) => self.state.time_zone = None,
             DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
-                self.state.running = None;
-                self.state.fetching = None;
-                self.state.queue.clear();
+                self.forget_run();
                 self.error(&error);
             }
             DbEvent::TaskDone { id, result }
@@ -2598,34 +2740,47 @@ impl SqlWindow {
                         }
                     });
                 }
+                // Only the messages in view are laid out (#291).
+                let rows = &mut state.message_rows;
+                let messages = &state.messages;
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for m in &state.messages {
-                            let color = match m.level {
-                                Level::Error => ui.visuals().error_fg_color,
-                                Level::Warning => ui.visuals().warn_fg_color,
-                                Level::Info => ui.visuals().text_color(),
-                            };
-                            if !m.stack.is_empty() {
-                                if let Some(target) = stack_message_ui(ui, m, color, &mut jump) {
-                                    open = Some(target);
+                    .show_viewport(ui, |ui, viewport| {
+                        let gap = ui.spacing().item_spacing.y;
+                        rows.measure(ui, messages, ui.available_width(), gap);
+                        ui.set_height(rows.height());
+                        let shown = rows.shown(viewport.y_range());
+                        let mut rect = ui.max_rect();
+                        rect.min.y += rows.top(shown.start, gap);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.skip_ahead_auto_ids(shown.start);
+                            for m in &messages[shown] {
+                                let color = match m.level {
+                                    Level::Error => ui.visuals().error_fg_color,
+                                    Level::Warning => ui.visuals().warn_fg_color,
+                                    Level::Info => ui.visuals().text_color(),
+                                };
+                                if !m.stack.is_empty() {
+                                    if let Some(target) = stack_message_ui(ui, m, color, &mut jump)
+                                    {
+                                        open = Some(target);
+                                    }
+                                    continue;
                                 }
-                                continue;
-                            }
-                            let text = RichText::new(&m.text).monospace().color(color);
-                            match &m.jump {
-                                Some(range) => {
-                                    if ui.link(text).on_hover_text("Go to error").clicked() {
-                                        jump = Some(range.clone());
+                                let text = RichText::new(&m.text).monospace().color(color);
+                                match &m.jump {
+                                    Some(range) => {
+                                        if ui.link(text).on_hover_text("Go to error").clicked() {
+                                            jump = Some(range.clone());
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(text);
                                     }
                                 }
-                                None => {
-                                    ui.label(text);
-                                }
                             }
-                        }
+                        });
                     });
                 match open {
                     Some(FrameTarget::Program { object, line, .. }) => {
@@ -3086,6 +3241,11 @@ fn rows_text(rows: usize) -> String {
         format!("{rows} rows")
     }
 }
+
+/// How many statements of a script go to the session ahead of those
+/// running at most (#291): enough that it doesn't wait for the window,
+/// few enough that a frame handles their answers quickly.
+const AHEAD: usize = 1000;
 
 /// Whether `sql` holds more than comments, blank space and `;`.
 fn has_code(sql: &str, syntax: Syntax) -> bool {
@@ -3926,6 +4086,53 @@ mod tests {
                 .iter()
                 .any(|m| m.text.starts_with("Result 1 shows the 100 rows fetched")),
         );
+    }
+
+    /// The Messages tab places the messages in view by their measured
+    /// heights (#291): they are those the messages take when laid out, also
+    /// wrapped, on several lines and with a stack.
+    #[test]
+    fn message_heights_are_as_laid_out() {
+        let long = "word ".repeat(300);
+        let message = |text: &str, stack: bool| Message {
+            level: Level::Error,
+            text: text.into(),
+            jump: None,
+            stack: if stack {
+                vec![Frame {
+                    text_line: 1,
+                    target: FrameTarget::Hidden("no code".into()),
+                }]
+            } else {
+                Vec::new()
+            },
+        };
+        let mut checked = 0;
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let width = ui.available_width();
+            for m in [
+                message("one line", false),
+                message(&long, false),
+                message("two\nlines", false),
+                message(&format!("ORA-06502\nORA-06512: at line 2\n{long}"), true),
+            ] {
+                let expected = message_height(ui, &m, width);
+                let laid_out = if m.stack.is_empty() {
+                    ui.label(RichText::new(&m.text).monospace()).rect.height()
+                } else {
+                    let color = ui.visuals().error_fg_color;
+                    ui.scope(|ui| stack_message_ui(ui, &m, color, &mut None))
+                        .response
+                        .rect
+                        .height()
+                };
+                assert_eq!(expected, laid_out, "{:?}", &m.text[..m.text.len().min(20)]);
+                checked += 1;
+            }
+        });
+        harness.run();
+        drop(harness);
+        assert!(checked >= 4);
     }
 
     /// Explain plan of a selection without a statement says so, as Execute

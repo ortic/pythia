@@ -32,6 +32,9 @@ pub enum Target {
     Meta,
     /// The document's own session on another connection (compare tools).
     Connection(String),
+    /// The document's own session, a statement of a SQL window's script
+    /// that the session runs without waiting for the window (#291).
+    Script(pythia_db::Script),
 }
 
 /// A stored object, as documents and the browser refer to it.

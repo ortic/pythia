@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 use crate::compat::Release;
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
-use crate::session::{CancelSlot, Canceller, Events};
+use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{
     WHOLE_BATCH_BYTES, char_offset, has_inner_semicolon, has_word, leading_words, release,
     replace_binds, row_bytes, statement_kind, word_followed_by,
@@ -60,12 +60,7 @@ const CANCEL_WAIT: Duration = Duration::from_secs(15);
 /// The savepoint each statement in a transaction runs after.
 const SAVEPOINT: &str = "pythia_statement";
 
-pub(crate) fn run(
-    params: ConnectParams,
-    requests: Receiver<DbRequest>,
-    events: Events,
-    shared: CancelSlot,
-) {
+pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let connected = runtime()
         .map_err(|e| DbError::new(format!("Can't start the PostgreSQL client: {e}")))
@@ -341,7 +336,7 @@ impl Worker {
         sql: &str,
         max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
+        requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
@@ -631,7 +626,7 @@ struct Fetch<'a> {
     /// For a file: batches kept to [`WHOLE_BATCH_BYTES`] (#204).
     whole: bool,
     started: Instant,
-    requests: &'a Receiver<DbRequest>,
+    requests: &'a Requests,
 }
 
 /// A session's connection for queries of its own (dictionary lookups,

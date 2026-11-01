@@ -539,6 +539,16 @@ All notable changes to Pythia are documented here. The format follows
   script went on; a SELECT after a `DO` didn't show at all. Such an error
   now fails the statement. *Execute to file* writes the first result and
   says how many others there were.
+- A script in a SQL window runs at its database's pace (#291). It ran
+  one statement per frame the window drew: 4,000 short statements took
+  at least 67 s at 60 Hz, and longer while the window was in the
+  background. The window now sends a script's statements ahead to its
+  session, all but those it has to handle itself (variables to ask for,
+  `PROMPT`, `DEFINE`, `WHENEVER`, `@file`), which wait for the ones before
+  them. An error, Break's too, still stops the script unless `WHENEVER
+  SQLERROR CONTINUE`, and each statement keeps its message and its
+  result. The Messages tab lays out only the messages in view: with
+  40,000 of them a frame took a quarter of a second.
 
 ## [0.10.0] - 2026-10-30
 

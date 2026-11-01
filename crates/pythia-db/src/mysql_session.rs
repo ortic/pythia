@@ -14,7 +14,6 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use mysql::consts::{CapabilityFlags, ColumnFlags, ColumnType};
@@ -26,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
-use crate::session::{CancelSlot, Canceller, Events};
+use crate::session::{CancelSlot, Canceller, Events, Requests};
 use crate::sql_text::{
     WHOLE_BATCH_BYTES, float_text, hex, leading_words_in, release, replace_binds, row_bytes,
     statement_kind_in,
@@ -40,12 +39,7 @@ const DEFAULT_PORT: u16 = 3306;
 /// How long `KILL QUERY` waits for each answer of the server.
 const KILL_WAIT: Duration = Duration::from_secs(10);
 
-pub(crate) fn run(
-    params: ConnectParams,
-    requests: Receiver<DbRequest>,
-    events: Events,
-    shared: CancelSlot,
-) {
+pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let connected = options(&params)
         .and_then(|opts| connect(&opts).map_err(|e| params.explain(connect_error(e))));
@@ -215,7 +209,7 @@ impl Worker {
         sql: &str,
         max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
+        requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
@@ -398,7 +392,7 @@ struct Fetch<'a> {
     whole: bool,
     started: Instant,
     events: &'a Events,
-    requests: &'a Receiver<DbRequest>,
+    requests: &'a Requests,
     kill: &'a Canceller,
 }
 

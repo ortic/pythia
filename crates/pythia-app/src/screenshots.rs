@@ -5853,6 +5853,157 @@ fn explain_case(h: &mut Ui, connection: &str, case: &ExplainCase) {
     wait_until(h, "rollback", |app| !app.test_pending_tx());
 }
 
+/// Runs `sql` in a new window on `connection` and steps frames, as the app
+/// draws them, until it is done: the frames it took, and the messages.
+fn frames_to_run(h: &mut Ui, connection: &str, sql: String) -> (usize, Vec<String>) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql,
+        run: true,
+    });
+    let mut frames = 0;
+    loop {
+        h.step();
+        frames += 1;
+        if !h.state().test_focused_busy() {
+            break;
+        }
+        assert!(frames < 1000, "still running after {frames} frames");
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages = w.state.messages.iter().map(|m| m.text.clone()).collect();
+    (frames, messages)
+}
+
+/// A script runs at the session's pace, not a statement per frame (#291):
+/// 4,000 statements took 4,001 frames, 55 s here, and in the app as long
+/// as the window took to draw them. What a script does stays: a message
+/// per statement, its results, stopping at an error or going on after
+/// WHENEVER SQLERROR CONTINUE, and Break.
+#[test]
+fn scripts_run_at_the_sessions_pace() {
+    let connection = "r51_script.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key)",
+    );
+    let inserts = |from: usize, to: usize| {
+        (from..=to)
+            .map(|i| format!("insert into r51_t values ({i});\n"))
+            .collect::<String>()
+    };
+    // In the script's window, its transaction.
+    let count = |h: &mut Ui| run_in_window(h, "select count(*) from r51_t");
+
+    let script = format!(
+        "{}select count(*) from r51_t;\nselect max(id) from r51_t;\n",
+        inserts(1, 4000)
+    );
+    let (frames, messages) = frames_to_run(&mut h, connection, script);
+    assert!(frames < 200, "{frames} frames");
+    let inserted = messages
+        .iter()
+        .filter(|m| m.starts_with("INSERT: 1 row affected in "))
+        .count();
+    assert_eq!(inserted, 4000);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<(&str, Option<&str>)> = w
+        .state
+        .results
+        .iter()
+        .map(|r| (r.title.as_str(), r.rows[0][0].as_deref()))
+        .collect();
+    assert_eq!(
+        results,
+        [("Result 1", Some("4000")), ("Result 2", Some("4000"))]
+    );
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // An error stops the script: the statements after it don't run.
+    let script = format!(
+        "{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed"))
+            && messages.contains(&"1990 remaining statement(s) skipped".to_owned()),
+        "{:?}",
+        &messages[messages.len().saturating_sub(4)..]
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("10"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // After WHENEVER SQLERROR CONTINUE, they do.
+    let script = format!(
+        "whenever sqlerror continue\n{}insert into r51_t values (1);\n{}",
+        inserts(1, 10),
+        inserts(11, 2000)
+    );
+    let (_, messages) = frames_to_run(&mut h, connection, script);
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("UNIQUE constraint failed")),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("2000"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+
+    // Break stops the statement running and skips the others.
+    let slow = "with recursive r (n) as (select 1 union all select n + 1 from r) \
+                select count(*) from r;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("{slow}{}", inserts(1, 100)),
+        run: true,
+    });
+    h.run_steps(5);
+    assert!(h.state().test_focused_busy());
+    h.state_mut().test_command(crate::commands::Command::Cancel);
+    wait_until(&mut h, "break", |app| !app.test_focused_busy());
+    let w = h.state().test_sql_window_ref().unwrap();
+    let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        messages.contains(&"100 remaining statement(s) skipped"),
+        "{messages:?}"
+    );
+    assert_eq!(count(&mut h).as_deref(), Some("0"));
+}
+
+/// The Messages tab lays out the messages it shows, not all of them
+/// (#291): with 40,000 a frame took 268 ms. The last one shows, at the
+/// bottom.
+#[test]
+fn messages_lay_out_what_shows() {
+    let connection = "r51_messages.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    for i in 0..40_000 {
+        h.state_mut()
+            .test_sql_window()
+            .info(format!("message {i:05}"));
+    }
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("message ").count();
+    assert!(laid_out < 200, "{laid_out} messages laid out");
+    assert!(h.query_by_label("message 39999").is_some());
+}
+
 /// On MySQL a statement with several results shows each in a tab of its
 /// own (#290): a procedure's SELECTs, and statements kept together after
 /// DELIMITER, also with an error after the first. Only the first showed,
