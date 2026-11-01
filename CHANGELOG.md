@@ -645,6 +645,13 @@ All notable changes to Pythia are documented here. The format follows
   stay on their rows; a selection of several rows keeps the cursor's
   row. Where the filter hides their row, the viewer and the dialog close
   and the value being typed is kept.
+- Ctrl+Z that takes back a new row no longer leaves *View value…*, the
+  dialog editing a cell and a cell being typed into on another row
+  (#299). They stayed where they were in the view: past the rows, where
+  the dialog's *Apply* did nothing or went into the next new row, or on
+  a new row Ctrl+Z brought back in between. They now stay on their rows;
+  on the row taken back, the viewer and the dialog close and the edit
+  ends, which also no longer keeps the keys from the grid.
 
 ## [0.10.0] - 2026-10-30
 

@@ -682,8 +682,28 @@ impl GridState {
         let Some(before) = edit.undo.pop() else {
             return;
         };
+        let kept = kept_new_rows(&edit.changes.inserts, &before.inserts);
         edit.changes = before;
         self.changes_revision += 1;
+        // The viewer, the dialog and an edit on a new row stay on it, or go
+        // with it (#299).
+        let fetched = self.order.len();
+        let to = |view_row: usize| match view_row.checked_sub(fetched) {
+            Some(i) => Some(fetched + kept.get(i).copied().flatten()?),
+            None => Some(view_row),
+        };
+        let at = |(view_row, col): (usize, usize)| Some((to(view_row)?, col));
+        self.viewer = self.viewer.and_then(at);
+        self.value_editor = self.value_editor.take().and_then(|mut editor| {
+            editor.view_row = to(editor.view_row)?;
+            Some(editor)
+        });
+        if let Some(edit) = &mut self.edit {
+            edit.active = edit
+                .active
+                .take()
+                .and_then(|(view_row, col, text)| Some((to(view_row)?, col, text)));
+        }
         // Rows inserted may be gone again.
         let last = self.view_len(rows).saturating_sub(1);
         for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
@@ -1028,6 +1048,27 @@ fn edit_end(i: &egui::InputState, lost_focus: bool) -> Option<EditEnd> {
 /// breaks, and long text goes to the dialog.
 fn fits_inline(value: Option<&str>) -> bool {
     value.is_none_or(|v| !v.contains('\n') && v.chars().count() <= 200)
+}
+
+/// Where the new rows `now` are among `then`, the new rows Ctrl+Z puts
+/// back, or `None` for one it takes back (#299). A step that added rows
+/// (Insert row, Paste) added them last, and taking it back leaves the
+/// rows before them in their places; one that removed new rows left the
+/// others as they were, and taking it back puts them in between.
+fn kept_new_rows(now: &[Vec<Cell>], then: &[Vec<Cell>]) -> Vec<Option<usize>> {
+    if then.len() <= now.len() {
+        return (0..now.len())
+            .map(|i| (i < then.len()).then_some(i))
+            .collect();
+    }
+    let mut from = 0;
+    now.iter()
+        .map(|row| {
+            let at = from + then[from..].iter().position(|r| r == row)?;
+            from = at + 1;
+            Some(at)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4909,5 +4950,73 @@ mod tests {
         state.set_filter("");
         frame(&ctx, &columns, &rows, &mut state, vec![]);
         assert_eq!(state.viewer, Some((2, 1)));
+    }
+
+    /// Ctrl+Z that takes a new row back closes the viewer and the dialog on
+    /// it and ends the edit of its cell; on the other new rows they stay on
+    /// their rows (#299). They stayed at their places: past the rows, where
+    /// the next new row came, or on a row Ctrl+Z brought back.
+    #[test]
+    fn undo_takes_what_is_on_a_new_row_with_it() {
+        let (c, r) = (cols(), rows());
+        let undo = egui::Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        click(&ctx, &c, &r, &mut state, "x", 1);
+        // Two new rows, the viewer and the dialog on the second.
+        state.add_row(&r, 2);
+        state.add_row(&r, 2);
+        state.viewer = Some((4, 1));
+        state.open_value_editor(&r, (4, 1));
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert_eq!(state.changes().unwrap().inserts.len(), 1);
+        assert_eq!(state.cursor, Some((3, 0)));
+        assert_eq!(state.viewer, None);
+        assert!(state.value_editor.is_none());
+
+        // p, q and r; q deleted, the viewer and the dialog on r, then q
+        // brought back: they stay on r.
+        let mut state = GridState::default();
+        state.set_editable(None);
+        click(&ctx, &c, &r, &mut state, "x", 1);
+        for (view_row, b) in [(3, "p"), (4, "q"), (5, "r")] {
+            state.add_row(&r, 2);
+            state.edit_cell(&r, view_row, 1, Some(b.into()));
+        }
+        state.select((4, 0), false);
+        state.delete_rows(2);
+        state.viewer = Some((4, 1));
+        state.open_value_editor(&r, (4, 1));
+        frame(&ctx, &c, &r, &mut state, vec![undo]);
+        let inserted = |state: &GridState| -> Vec<Cell> {
+            let inserts = &state.changes().unwrap().inserts;
+            inserts.iter().map(|row| row[1].clone()).collect()
+        };
+        let pqr =
+            |r: &str| -> Vec<Cell> { vec![Some("p".into()), Some("q".into()), Some(r.into())] };
+        assert_eq!(inserted(&state), pqr("r"));
+        assert_eq!(state.viewer, Some((5, 1)));
+        state.viewer = None;
+        state.value_editor.as_mut().unwrap().text = "dialog".into();
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        click(&ctx, &c, &r, &mut state, "Apply", 1);
+        assert_eq!(inserted(&state), pqr("dialog"));
+
+        // A value being typed into a row taken back (the context menu's
+        // Undo) goes with it, and the keys reach the grid again.
+        state.add_row(&r, 2);
+        state.start_edit(&r, (6, 1), Some("typed".into()));
+        state.undo(&r);
+        assert!(state.edit.as_ref().unwrap().active.is_none());
+        click(&ctx, &c, &r, &mut state, "x", 1);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::ArrowDown)]);
+        assert_eq!(state.cursor, Some((1, 1)));
     }
 }
