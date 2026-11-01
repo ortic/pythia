@@ -112,6 +112,14 @@ All notable changes to Pythia are documented here. The format follows
   what changed. The open windows are the first Pythia's; one started
   while it runs keeps its own as long as it runs. Two saves at the same
   moment no longer share a temporary file, where one of them failed.
+- PostgreSQL scripts are read the way PostgreSQL reads them (#201,
+  #202). A dollar-quoted body may start with a word: `AS $$BEGIN
+  RETURN 3; END$$` was split at its first `;` and failed with
+  "unterminated dollar-quoted string", and `SELECT $$abc$$ AS e;` ran
+  together with the next statement ("cannot insert multiple commands
+  into a prepared statement"). A backslash escapes the next character in
+  an `E'…'` string, so `E'it\'s; here'` no longer splits the script in
+  two. The editor highlights both the same way.
 
 ## [0.10.0] - 2026-10-30
 

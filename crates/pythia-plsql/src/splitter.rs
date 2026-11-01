@@ -587,6 +587,28 @@ mod tests {
     }
 
     #[test]
+    fn postgres_quotes() {
+        // A dollar-quoted body may start with a word (#201); `E'…'` takes
+        // backslash escapes (#202).
+        let src = "create or replace function f() returns int language plpgsql as $$BEGIN RETURN 3; END$$;\n\
+                   select $$abc$$ as e;\nselect 5;\n\
+                   select E'it\\'s; here' as e;\nselect 7;";
+        assert_eq!(
+            split_in(src, Syntax::Postgres),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "create or replace function f() returns int language plpgsql as $$BEGIN RETURN 3; END$$"
+                ),
+                (StatementKind::Sql, "select $$abc$$ as e"),
+                (StatementKind::Sql, "select 5"),
+                (StatementKind::Sql, "select E'it\\'s; here' as e"),
+                (StatementKind::Sql, "select 7"),
+            ]
+        );
+    }
+
+    #[test]
     fn sqlite_scripts() {
         let src = "pragma foreign_keys = on;\n\
                    begin;\n\

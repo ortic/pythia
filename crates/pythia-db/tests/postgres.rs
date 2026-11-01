@@ -308,6 +308,32 @@ fn errors_carry_sqlstate_and_position() {
     assert_eq!(error.offset, Some(11), "{}", error.message);
 }
 
+/// Scripts split where PostgreSQL ends their statements: a dollar-quoted
+/// body may start with a word (#201), and `E'…'` takes backslash
+/// escapes (#202).
+#[test]
+fn scripts_split_as_the_server_reads_them() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let script = "create or replace function fs_three() returns int language plpgsql \
+                  as $$BEGIN RETURN 3; END$$;\n\
+                  select $$abc$$ || fs_three() as e;\n\
+                  select E'it\\'s; here' as e;\n\
+                  select 5;";
+    let statements: Vec<&str> =
+        pythia_plsql::split_statements_in(script, Dialect::POSTGRES.syntax())
+            .iter()
+            .map(|s| s.text(script))
+            .collect();
+    assert_eq!(statements.len(), 4, "{statements:?}");
+    h.ok(statements[0]);
+    assert_eq!(h.scalar(statements[1]).as_deref(), Some("abc3"));
+    assert_eq!(h.scalar(statements[2]).as_deref(), Some("it's; here"));
+    assert_eq!(h.scalar(statements[3]).as_deref(), Some("5"));
+    h.ok("drop function fs_three()");
+}
+
 #[test]
 fn transactions_and_autocommit() {
     let Some(mut h) = Harness::connect() else {
