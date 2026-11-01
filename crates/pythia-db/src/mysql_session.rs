@@ -43,7 +43,7 @@ pub(crate) fn run(
 ) {
     info!(?params, "connecting");
     let connected = options(&params).and_then(|opts| {
-        let conn = Conn::new(opts.clone()).map_err(|e| params.explain(e.into()))?;
+        let conn = Conn::new(opts.clone()).map_err(|e| params.explain(connect_error(e)))?;
         Ok((opts, conn))
     });
     let (opts, conn) = match connected {
@@ -565,6 +565,26 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
         database: database.map(str::to_owned),
         tls,
     })
+}
+
+/// A failed connect, with what to do about a certificate that isn't
+/// trusted (#211): it read "Lost connection to the MySQL server: IO error:
+/// `invalid peer certificate: UnknownIssuer'".
+fn connect_error(e: mysql::Error) -> DbError {
+    let certificate = match &e {
+        mysql::Error::IoError(io) | mysql::Error::CodecError(PacketCodecError::Io(io)) => io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .filter(|tls| matches!(tls, rustls::Error::InvalidCertificate(_))),
+        _ => None,
+    };
+    match certificate {
+        Some(certificate) => DbError::new(format!(
+            "The server's certificate isn't trusted ({certificate}). For a self-signed one, \
+             connect with ?tls=skip-verify, like localhost:3306/shop?tls=skip-verify."
+        )),
+        None => e.into(),
+    }
 }
 
 /// Stops the statement running on connection `id` from a connection of its

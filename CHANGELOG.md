@@ -139,6 +139,12 @@ All notable changes to Pythia are documented here. The format follows
   "1 row selected"; now "Warning 1365: Division by 0" follows among the
   messages once the rows are read, as it did for statements without a
   result.
+- MySQL: connecting with `?tls` to a server whose certificate isn't
+  trusted, such as a self-signed one, failed with "Lost connection to
+  the MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
+  (#211). It now says that the certificate isn't trusted and that
+  `?tls=skip-verify` connects to a self-signed one; the connect
+  dialog's hint mentions it too.
 
 ## [0.10.0] - 2026-10-30
 

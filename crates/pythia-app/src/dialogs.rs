@@ -99,7 +99,7 @@ impl Hints {
                 login_script: "alter session set nls_date_format = 'YYYY-MM-DD HH24:MI:SS';",
             },
             DbKind::MySql => Hints {
-                database: "host:3306/database, ?tls for TLS",
+                database: "host:3306/database, ?tls for TLS (?tls=skip-verify for a self-signed certificate)",
                 tunnel: Some("localhost:3306/database, as the SSH server sees it"),
                 schema: Some("database to use after connecting"),
                 login_script: "set session time_zone = '+00:00';",

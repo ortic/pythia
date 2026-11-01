@@ -949,6 +949,32 @@ fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     }
 }
 
+/// A certificate that isn't trusted (the test server's is self-signed)
+/// says so and how to connect anyway, instead of "Lost connection to the
+/// MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
+/// (#211).
+#[test]
+fn untrusted_certificates_say_so() {
+    let Some(params) = params() else {
+        return;
+    };
+    let with = |options: &str| ConnectParams {
+        connect_string: format!("{}?{options}", params.connect_string),
+        ..params.clone()
+    };
+    let error = connect_error(with("tls"));
+    assert!(
+        error
+            .message
+            .starts_with("The server's certificate isn't trusted (invalid peer certificate: "),
+        "{error}"
+    );
+    assert!(error.message.contains("?tls=skip-verify"), "{error}");
+    assert!(!error.is_connection_lost());
+    let mut h = Harness::with(with("tls=skip-verify"));
+    assert_eq!(h.scalar("select 1").as_deref(), Some("1"));
+}
+
 #[test]
 fn through_an_ssh_tunnel() {
     let dir = std::env::temp_dir().join(format!("pythia-mysql-ssh-{}", std::process::id()));
