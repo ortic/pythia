@@ -595,12 +595,17 @@ impl Seen {
         (self.integer || self.real) && !self.text && !self.blob
     }
 
-    /// The storage class most of them had, for a column without a declared
-    /// type.
+    /// A value that isn't NULL.
+    fn any(self) -> bool {
+        self.integer || self.real || self.text || self.blob
+    }
+
+    /// The storage class of the values: BLOB if one is a blob, else the
+    /// one most of them had.
     fn type_name(self) -> &'static str {
         match self {
-            Seen { text: true, .. } => "TEXT",
             Seen { blob: true, .. } => "BLOB",
+            Seen { text: true, .. } => "TEXT",
             Seen { real: true, .. } => "REAL",
             Seen { integer: true, .. } => "INTEGER",
             _ => "",
@@ -609,12 +614,15 @@ impl Seen {
 }
 
 /// A result column: its declared type, or the values' when it has none (an
-/// expression). Numbers are right aligned: a column with INTEGER or REAL
-/// affinity, or one whose values were all numbers.
+/// expression) or they say otherwise about blobs (#209): blobs in an
+/// `image` or `binary(16)` column make it BLOB, and a BLOB column of text
+/// is TEXT, so that exports and edits write each as what it is. Numbers
+/// are right aligned: a column with INTEGER or REAL affinity, or one whose
+/// values were all numbers.
 fn column(name: &str, declared: Option<&str>, seen: &Seen) -> Column {
-    let type_name = match declared {
-        Some(declared) => declared.to_ascii_uppercase(),
-        None => seen.type_name().to_owned(),
+    let type_name = match declared.map(str::to_ascii_uppercase) {
+        Some(declared) if !seen.any() || seen.blob == declared.contains("BLOB") => declared,
+        _ => seen.type_name().to_owned(),
     };
     let numeric = match affinity(&type_name) {
         Affinity::Integer | Affinity::Real => !seen.text && !seen.blob,
@@ -892,6 +900,42 @@ mod tests {
         let expression = column("count(*)", None, &numbers);
         assert_eq!(expression.type_name, "INTEGER");
         assert!(expression.numeric);
+    }
+
+    /// Whether a column holds blobs is the values' to say, not the
+    /// declared type's: blobs in an `image` column are blobs, text in a
+    /// BLOB column is text; without values, the declared type decides.
+    #[test]
+    fn blob_columns_by_their_values() {
+        let seen = |values: &[ValueRef<'_>]| {
+            let mut seen = Seen::default();
+            for v in values {
+                seen.note(*v);
+            }
+            seen
+        };
+        let blobs = seen(&[ValueRef::Blob(b"\xca\xfe"), ValueRef::Null]);
+        let text = seen(&[ValueRef::Text(b"hello world")]);
+        let mixed = seen(&[ValueRef::Text(b"x"), ValueRef::Blob(b"1")]);
+        let numbers = seen(&[ValueRef::Integer(7)]);
+        let none = Seen::default();
+        for (declared, seen, type_name) in [
+            (Some("image"), &blobs, "BLOB"),
+            (Some("binary(16)"), &blobs, "BLOB"),
+            (None, &blobs, "BLOB"),
+            (Some("BLOB"), &blobs, "BLOB"),
+            (Some("blob"), &text, "TEXT"),
+            (Some("BLOB"), &numbers, "INTEGER"),
+            (Some("BLOB"), &none, "BLOB"),
+            (Some("image"), &text, "IMAGE"),
+            (Some("image"), &none, "IMAGE"),
+            (Some("text"), &mixed, "BLOB"),
+            (None, &mixed, "BLOB"),
+        ] {
+            let col = column("c", declared, seen);
+            assert_eq!(col.type_name, type_name, "{declared:?} {seen:?}");
+            assert_eq!(col.numeric, type_name == "INTEGER", "{declared:?} {seen:?}");
+        }
     }
 
     #[test]

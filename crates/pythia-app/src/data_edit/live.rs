@@ -584,3 +584,33 @@ fn sqlite_values_find_their_rows() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A blob is one whatever the column's declared type (`image`,
+/// `binary(16)`, none), also when its hex is all digits, and text in a
+/// BLOB column is text: each is found by the check an edit makes and
+/// written back as what it was.
+#[test]
+fn sqlite_blobs_by_their_values() {
+    let (mut db, path) = Live::sqlite("blobs");
+    db.script(&[
+        "create table stored (id integer primary key, im image, bn binary(16), nt, bt blob, \
+           digits blob)",
+        "insert into stored values (1, x'cafe', x'00ff', x'cafe', 'hello world', x'313233')",
+        "insert into stored values (2, x'10', x'', x'12', '00ff', x'10')",
+    ]);
+    let (_, columns, _) = db.editable("stored", "id");
+    let types: Vec<&str> = columns.iter().map(|c| c.type_name.as_str()).collect();
+    assert_eq!(
+        types,
+        ["INTEGER", "BLOB", "BLOB", "BLOB", "TEXT", "BLOB", "INTEGER"]
+    );
+    assert!(db.rewrite_all("stored", "id", &[]).is_empty());
+    let (_, rows) = db
+        .query("select typeof(im), typeof(bn), typeof(nt), typeof(bt), typeof(digits) from stored");
+    for row in rows {
+        let kinds: Vec<&str> = row.iter().map(|v| v.as_deref().unwrap_or("")).collect();
+        assert_eq!(kinds, ["blob", "blob", "blob", "text", "blob"]);
+    }
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}

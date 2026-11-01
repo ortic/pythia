@@ -119,6 +119,12 @@ All notable changes to Pythia are documented here. The format follows
   grid still hold such a value cut short, and *Export* and *Copy as* now
   refuse it, naming its column, instead of writing part of it; the grid
   shows its real size (it showed 3.9 KB for 10 MB).
+- SQLite: blobs are told by their values, not the column's declared type
+  (#209). A blob whose hex is all digits (`x'313233'`) was exported as
+  the number 313233, typing `1234` into a BLOB cell stored a number, and
+  a blob in an `image`, `binary(16)` or untyped column was exported as
+  text, showed as text and gave a false conflict when its row was
+  edited. Text in a BLOB column no longer shows as `0xhello world`.
 
 ## [0.10.0] - 2026-10-30
 

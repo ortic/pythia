@@ -672,21 +672,23 @@ pub fn sqlite_number(text: &str) -> bool {
             .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
 }
 
-/// SQLite: numbers as SQLite writes them unquoted (see [`sqlite_number`]),
-/// a blob as the `X'…'` of the hex it is shown as, text quoted (no
+/// SQLite: a blob as the `X'…'` of the hex it is shown as, numbers as
+/// SQLite writes them unquoted (see [`sqlite_number`]), text quoted (no
 /// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
-/// read `&name` as a substitution variable even in a literal (#159).
+/// read `&name` as a substitution variable even in a literal (#159). The
+/// session types a column of blobs BLOB (#209); there hex is a blob, also
+/// when it is all digits (`x'313233'`).
 fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
-    if is_number(col, v) || sqlite_number(v) {
-        return v.to_owned();
-    }
     // An empty blob is shown empty too.
     let hex = v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
     if hex && col.type_name.contains("BLOB") {
         return format!("X'{v}'");
+    }
+    if is_number(col, v) || sqlite_number(v) {
+        return v.to_owned();
     }
     apart_from_ampersands(
         v,
@@ -980,6 +982,10 @@ mod tests {
         assert_eq!(lite(&col("INTEGER", true), Some("7")), "7");
         assert_eq!(lite(&col("BLOB", false), Some("00FF")), "X'00FF'");
         assert_eq!(lite(&col("TEXT", false), Some("00FF")), "'00FF'");
+        // A blob's hex may be all digits: x'313233' and x'10' are no numbers.
+        assert_eq!(lite(&col("BLOB", false), Some("313233")), "X'313233'");
+        assert_eq!(lite(&col("BLOB", false), Some("10")), "X'10'");
+        assert_eq!(lite(&col("BLOB", false), Some("hello")), "'hello'");
         // Numbers as SQLite writes them go in as numbers, others as text.
         assert_eq!(lite(&col("", false), Some("7")), "7");
         assert_eq!(lite(&col("TEXT", false), Some("007")), "'007'");

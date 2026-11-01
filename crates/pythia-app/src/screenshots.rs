@@ -2736,6 +2736,8 @@ fn execute_to_file_sqlite() {
         connection,
         "create table notes (id integer primary key, note text);
 insert into notes values (1, 'it''s'), (2, null);
+create table files (id integer primary key, data blob, image image, memo blob);
+insert into files values (1, x'313233', x'cafe', 'hello world');
 commit;",
     );
     h.state_mut().test_open(OpenRequest::Sql {
@@ -2751,6 +2753,15 @@ commit;",
         std::fs::read_to_string(&path).unwrap(),
         "insert into notes (id, note) values (1, 'it''s');\n\
          insert into notes (id, note) values (2, NULL);\n"
+    );
+    // Blobs as blobs, by their values: all digits, in an `image` column;
+    // text in a BLOB column as text.
+    start_export(&mut h, "select * from files", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into files (id, data, image, memo) values \
+         (1, X'313233', X'CAFE', 'hello world');\n"
     );
 
     // Break: the incomplete file is removed.
