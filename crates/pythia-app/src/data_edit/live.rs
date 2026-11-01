@@ -825,3 +825,49 @@ fn cut_values_are_neither_checked_nor_written() {
         }
     }
 }
+
+/// MySQL's BIT values, shown as hex (#253): each one typed again as shown
+/// finds its row and writes itself, also on MariaDB, which compared the
+/// `X'…'` check with the BIT as a decimal and refused the UPDATE ("Truncated
+/// incorrect DECIMAL value"); and `1` typed into a BIT(1), `5` into a
+/// BIT(8), as hex, which went as `X'1'`, a syntax error.
+#[test]
+fn mysql_bits() {
+    let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+        return;
+    };
+    db.script(&[
+        "drop table if exists r41_bits",
+        "create table r41_bits (id int primary key, b1 bit(1), b8 bit(8), b64 bit(64))",
+        "insert into r41_bits values (1, b'0', b'10000001', 18446744073709551615), \
+           (2, b'1', b'0', 0), (3, null, null, null)",
+    ]);
+    assert!(db.rewrite_all("r41_bits", "id", &[]).is_empty());
+    let (edit, columns, rows) = db.editable("r41_bits", "id");
+    assert_eq!(
+        rows[0][1..4],
+        [
+            Some("00".into()),
+            Some("81".into()),
+            Some("FFFFFFFFFFFFFFFF".into())
+        ]
+    );
+    let changes = Changes {
+        updates: BTreeMap::from([(
+            0,
+            BTreeMap::from([(1, Some("1".into())), (2, Some("5".into()))]),
+        )]),
+        ..Changes::default()
+    };
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    let (_, _, rows) = db.editable("r41_bits", "id");
+    assert_eq!(rows[0][1..3], [Some("01".into()), Some("05".into())]);
+    db.ok("drop table r41_bits");
+}

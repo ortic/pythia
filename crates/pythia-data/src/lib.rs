@@ -628,8 +628,10 @@ pub fn literal(dialect: Dialect, col: &Column, value: Option<&str>) -> String {
     }
 }
 
-/// MySQL converts text to dates and times itself; binary values (also BIT
-/// and GEOMETRY) are shown as hex and written as `X'…'`. Text with a
+/// MySQL converts text to dates and times itself; binary values (also
+/// GEOMETRY) are shown as hex and written as `X'…'`. A BIT, shown as hex
+/// too, is written as the number it stands for (#253): `X'1'` is a syntax
+/// error, and MariaDB compares a BIT with `X'…'` as a decimal. Text with a
 /// backslash goes as hex too: a quoted `\` means one thing with
 /// `NO_BACKSLASH_ESCAPES` and another without, `_utf8mb4 X'…'` the same
 /// either way. So does text with a `&`, which Pythia's SQL windows read as
@@ -641,11 +643,18 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
     if is_number(col, v) {
         return v.to_owned();
     }
+    let hex = v.chars().all(|c| c.is_ascii_hexdigit());
+    if col.type_name == "BIT"
+        && hex
+        && let Ok(n) = u64::from_str_radix(v, 16)
+    {
+        return n.to_string();
+    }
     let binary = matches!(
         col.type_name.as_str(),
         "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
     );
-    if binary && v.chars().all(|c| c.is_ascii_hexdigit()) {
+    if binary && hex {
         format!("X'{v}'")
     } else if v.contains(['\\', '\0', '&']) {
         let hex: String = v.bytes().map(|b| format!("{b:02X}")).collect();
@@ -1042,8 +1051,16 @@ mod tests {
         assert_eq!(my(&col("DATE", false), Some("2026-01-02")), "'2026-01-02'");
         assert_eq!(my(&col("VARBINARY", false), Some("00ff")), "X'00ff'");
         assert_eq!(my(&col("BLOB", false), Some("")), "X''");
-        assert_eq!(my(&col("BIT", false), Some("05")), "X'05'");
         assert_eq!(my(&col("BLOB", false), Some("no hex")), "'no hex'");
+        // A BIT is shown as hex and written as its number (#253): X'1' is
+        // a syntax error, and MariaDB compares X'…' with a BIT as a decimal.
+        let bit = col("BIT", false);
+        assert_eq!(my(&bit, Some("05")), "5");
+        assert_eq!(my(&bit, Some("1")), "1");
+        assert_eq!(my(&bit, Some("00")), "0");
+        assert_eq!(my(&bit, Some("81")), "129");
+        assert_eq!(my(&bit, Some("FFFFFFFFFFFFFFFF")), "18446744073709551615");
+        assert_eq!(my(&bit, Some("2x")), "'2x'");
         // Oracle's stay as they were.
         assert_eq!(
             literal(

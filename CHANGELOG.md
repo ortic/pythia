@@ -439,6 +439,12 @@ All notable changes to Pythia are documented here. The format follows
   session's own schema and left its own as it was: Oracle keeps a unit's
   source without its schema. The window now names the unit's schema, and
   a trigger's table's, when the text doesn't.
+- MySQL: a BIT value can be edited in a result (#253). `1` typed into a
+  BIT(1), which shows as `00` or `01`, was written as `X'1'`, a syntax
+  error, and on MariaDB every BIT edit was refused ("Truncated incorrect
+  DECIMAL value"), also of a value typed as it is shown. A BIT is now
+  written as the number its hex stands for (`81` as 129), in INSERT
+  exports too.
 
 ## [0.10.0] - 2026-10-30
 
