@@ -433,6 +433,12 @@ All notable changes to Pythia are documented here. The format follows
   rows. Rows with changes not applied now aren't copied until the
   changes are applied or discarded, and the messages say so; other rows
   copy as before. *View value…* shows a changed cell as the grid does.
+- A program window compiles a unit of another schema in that schema
+  (#251). Opened from the object browser, Favorites or Recent as a DBA,
+  a package, procedure, function, type or trigger compiled into the
+  session's own schema and left its own as it was: Oracle keeps a unit's
+  source without its schema. The window now names the unit's schema, and
+  a trigger's table's, when the text doesn't.
 
 ## [0.10.0] - 2026-10-30
 
