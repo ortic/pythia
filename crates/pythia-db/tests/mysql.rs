@@ -310,6 +310,43 @@ fn values_types_and_binds() {
     assert_eq!(rows[0][2].as_deref(), Some("41"));
 }
 
+/// A table's columns have the types its DDL gives them (#221); MariaDB flags a
+/// TIMESTAMP and an INET6 unsigned, which they aren't.
+#[test]
+fn column_types_as_in_ddl() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let mariadb = h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"));
+    let inet6 = if mariadb { ", ip inet6" } else { "" };
+    h.ok("drop table if exists fd_types");
+    h.ok(&format!(
+        "create table fd_types (ts timestamp null, ts6 timestamp(6) null, y year, \
+           u int unsigned, d decimal(5,2) unsigned, b bit(3){inet6})"
+    ));
+    let DbEvent::QueryStarted { columns, .. } = h.run(1, "select * from fd_types") else {
+        panic!("expected QueryStarted")
+    };
+    h.settle();
+    h.ok("drop table fd_types");
+    let types: Vec<&str> = columns.iter().map(|c| c.type_name.as_str()).collect();
+    let mut expected = vec![
+        "TIMESTAMP",
+        "TIMESTAMP",
+        "YEAR",
+        "INT UNSIGNED",
+        "DECIMAL UNSIGNED",
+        "BIT",
+    ];
+    if mariadb {
+        // The client gets it as a string.
+        expected.push("CHAR");
+    }
+    assert_eq!(types, expected);
+}
+
 #[test]
 fn errors_carry_mysql_code_and_position() {
     let Some(mut h) = Harness::connect() else {

@@ -785,6 +785,11 @@ fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
 /// SQL that holds while column `name` (of type `col`) still has `value`;
 /// `None` if the column can't be compared with what was fetched.
 fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Option<String> {
+    // A binary value held cut short (`… (5000 bytes)`) is only its first
+    // 4000 bytes: no row has it (#223).
+    if value.is_some_and(|v| pythia_db::cut_size(v).is_some()) {
+        return None;
+    }
     let name = dialect.quote_ident(name);
     let lit = literal(dialect, col, value);
     if dialect.kind() == DbKind::Oracle {
@@ -839,8 +844,6 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         // 0.1 is a decimal, which a real takes as the real 0.1; as a float
         // (1E-1) the real would be widened instead.
         (DbKind::SqlServer, "real") => format!("{name} = cast({lit} as real)"),
-        // A long blob is shown cut short (`… (5000 bytes)`).
-        (DbKind::Sqlite, t) if t.contains("BLOB") && v.contains("… (") => return None,
         // A blob is shown as its hex, which text could be too.
         (DbKind::Sqlite, t)
             if t.contains("BLOB")
@@ -854,6 +857,13 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         (DbKind::Sqlite, _) if pythia_data::sqlite_number(v) => format!("{name} in ({v}, '{v}')"),
         _ => format!("{name} = {lit}"),
     })
+}
+
+/// A binary value held cut short: written, it would be its first 4000
+/// bytes as text (#223). A cell set to one, pasted from a row, is left as
+/// it is.
+fn cut(value: &Cell) -> bool {
+    value.as_deref().and_then(pythia_db::cut_size).is_some()
 }
 
 /// Generates the DML for `changes` to the rows of `edit`, in `dialect`'s
@@ -907,7 +917,10 @@ pub fn dml(
         let Some(found) = row_is(row) else {
             continue;
         };
-        let cells: Vec<_> = cells.iter().filter(|(c, _)| editable(**c)).collect();
+        let cells: Vec<_> = cells
+            .iter()
+            .filter(|(c, v)| editable(**c) && !cut(v))
+            .collect();
         if cells.is_empty() {
             continue;
         }
@@ -947,7 +960,7 @@ pub fn dml(
         let cells: Vec<(usize, &str)> = row
             .iter()
             .enumerate()
-            .filter(|(c, _)| editable(*c))
+            .filter(|(c, v)| editable(*c) && !cut(v))
             .filter_map(|(c, v)| Some((c, v.as_deref()?)))
             .collect();
         if cells.is_empty() {
@@ -1384,24 +1397,72 @@ mod tests {
             col("big", "BLOB", false),
             col("pythia$id", "INTEGER", true),
         ];
-        let row = ["7", r"C:\temp", "42", "00FF", "0000… (5000 bytes)", "7"]
+        let big = format!("{}… (5000 bytes)", "00".repeat(4000));
+        let row = ["7", r"C:\temp", "42", "00FF", &big, "7"]
             .map(|v| Some(v.to_owned()))
             .to_vec();
         let sql = dml_for(
             Dialect::SQLITE,
             &columns,
             row,
-            &["it's & co", "042", "CAFE", "0000… (5000 bytes)"],
+            &["it's & co", "042", "CAFE", &big],
         );
         assert_eq!(
             sql,
             [
-                "update t set Note = 'it''s ' || char(38) || ' co', n = '042', b = X'CAFE', \
-                 big = '0000… (5000 bytes)' where id in (7, '7') and Note = 'C:\\temp' \
-                 and n in (42, '42') and b in (X'00FF', '00FF')",
+                "update t set Note = 'it''s ' || char(38) || ' co', n = '042', b = X'CAFE' \
+                 where id in (7, '7') and Note = 'C:\\temp' and n in (42, '42') \
+                 and b in (X'00FF', '00FF')",
                 "delete from t where id in (7, '7')",
             ]
         );
+    }
+
+    /// A binary value held cut short is neither compared nor written, on
+    /// any database (#223): its row is found by the key.
+    #[test]
+    fn cut_values_are_left_alone() {
+        let cut = format!("{}… (5000 bytes)", "AB".repeat(4000));
+        for (dialect, binary, value, new) in [
+            (Dialect::MYSQL, "BLOB", cut.clone(), "CAFE"),
+            (
+                Dialect::SQLSERVER,
+                "varbinary",
+                format!("0x{cut}"),
+                "0xCAFE",
+            ),
+            (Dialect::SQLITE, "BLOB", cut.clone(), "CAFE"),
+        ] {
+            let columns = vec![
+                col("id", "INT", true),
+                col("b", binary, false),
+                col("pythia$id", "INT", true),
+            ];
+            let row = vec![
+                Some("1".to_owned()),
+                Some(value.clone()),
+                Some("1".to_owned()),
+            ];
+            assert_eq!(same(dialect, "b", &columns[1], Some(&value)), None);
+            let edit = |b: &str| dml_for(dialect, &columns, row.clone(), &[b])[0].clone();
+            assert!(edit(&value).starts_with("delete"), "{dialect:?}");
+            let update = edit(new);
+            assert!(update.contains(&format!("b = {}", literal(dialect, &columns[1], Some(new)))));
+            assert!(!update.contains(" bytes)"), "{update}");
+            // Pasted into a new row, it is left out too.
+            let changes = Changes {
+                inserts: vec![vec![Some("2".into()), Some(value.clone()), None]],
+                ..Changes::default()
+            };
+            let edit = Editable {
+                table: "t".into(),
+                source: "select id, b from t".into(),
+                key: RowKey::Columns(vec!["id".into()]),
+            };
+            let rows = vec![row.clone()];
+            let inserts = dml(dialect, &edit, &columns, &rows, &changes);
+            assert!(!inserts[0].sql.contains(" bytes)"), "{}", inserts[0].sql);
+        }
     }
 
     #[test]
