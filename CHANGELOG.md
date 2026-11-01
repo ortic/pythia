@@ -692,6 +692,14 @@ All notable changes to Pythia are documented here. The format follows
   `dbms_lob.compare`; a LONG or LONG RAW, which SQL can't compare, is
   left out of the check, and so is a LOB with the pure-Rust driver,
   which types it as one.
+- Oracle: INSERT statements of a BLOB over 2000 bytes run (#314). They
+  wrote it as one `hextoraw('…')`, which takes no more than 4000 hex
+  digits: ORA-01704. *Execute to file* and *Export tables* failed so on
+  any larger BLOB, *Copy as* and the grid's *Export* on one of 2001 to
+  4000 bytes. Such a row is now written as a PL/SQL block that makes the
+  BLOB from parts of 1000 bytes and inserts it; Oracle compiles it in
+  some seconds a megabyte. With the Instant Client, a change to a
+  fetched BLOB of that size no longer fails on the check of its value.
 
 ## [0.10.0] - 2026-10-30
 

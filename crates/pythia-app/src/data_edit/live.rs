@@ -1135,3 +1135,55 @@ fn oracle_lobs_of_fetched_rows() {
             .unwrap();
     }
 }
+
+/// The check of a fetched BLOB over the 2000 bytes a `hextoraw` takes,
+/// typed BLOB as the Instant Client types it (#314): it finds the value,
+/// and not one with another byte or fewer; with the value in one literal
+/// it failed with ORA-01704.
+#[test]
+fn oracle_long_blobs_are_checked() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r65_long_blob purge", &[]);
+    for sql in [
+        "create table r65_long_blob (id number primary key, b blob)",
+        "declare
+           v blob;
+         begin
+           dbms_lob.createtemporary(v, true);
+           dbms_lob.writeappend(v, 2000, utl_raw.copies(hextoraw('0102'), 1000));
+           dbms_lob.writeappend(v, 1000, utl_raw.copies(hextoraw('0304'), 500));
+           insert into r65_long_blob values (1, v);
+         end;",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let count = |sql: &str| {
+        let mut count = None;
+        pythia_db::stream_query(&conn, sql, 10, |_, rows| {
+            if let Some(row) = rows.first() {
+                count = row[0].clone();
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        count.unwrap()
+    };
+    let hex = count("select b from r65_long_blob");
+    assert_eq!(hex.len(), 6000);
+    let col = Column {
+        name: "B".into(),
+        type_name: "BLOB".into(),
+        numeric: false,
+    };
+    let found = |value: &str| {
+        let check = same(Dialect::ORACLE, "B", &col, Some(value)).unwrap();
+        count(&format!("select count(*) from r65_long_blob where {check}"))
+    };
+    assert_eq!(found(&hex), "1");
+    let other = format!("{}05", &hex[..5998]);
+    assert_eq!(found(&other), "0");
+    assert_eq!(found(&hex[..5000]), "0");
+    conn.execute("drop table r65_long_blob purge", &[]).unwrap();
+}

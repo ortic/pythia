@@ -281,4 +281,71 @@ mod tests {
         assert!(run(&conn, "select * from no_such_table_xyz", &path, &progress).is_err());
         assert!(!path.exists());
     }
+
+    /// The INSERTs of BLOBs over the 2000 bytes a `hextoraw` takes (#314),
+    /// run back into a copy of their table, are the same values; they
+    /// failed with ORA-01704.
+    #[test]
+    fn writes_long_binary_values() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r65_lv", "r65_lv_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!("create table {table} (id number primary key, b blob)"),
+                &[],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "declare
+               v blob;
+               w blob;
+             begin
+               dbms_lob.createtemporary(v, true);
+               for i in 1 .. 50 loop
+                 dbms_lob.writeappend(v, 2000,
+                   utl_raw.copies(utl_raw.cast_from_binary_integer(i), 500));
+               end loop;
+               insert into r65_lv values (1, v);
+               insert into r65_lv values (2, empty_blob()) returning b into w;
+               dbms_lob.copy(w, v, 3000);
+               insert into r65_lv values (3, hextoraw('CAFE'));
+               insert into r65_lv values (4, null);
+             end;",
+            &[],
+        )
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("pythia-long-binary-{}.sql", std::process::id()));
+        let progress = AtomicU64::new(0);
+        let n = run(&conn, "select * from r65_lv order by id", &path, &progress).unwrap();
+        assert_eq!(n, 4);
+        let script = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let statements = pythia_plsql::split_statements(&script);
+        assert_eq!(statements.len(), 4, "{script}");
+        for statement in statements {
+            let sql = statement.text(&script).replacen(
+                "insert into r65_lv ",
+                "insert into r65_lv_copy ",
+                1,
+            );
+            conn.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let same: i64 = conn
+            .query_row_as(
+                "select count(*) from r65_lv a join r65_lv_copy c on c.id = a.id \
+                  where dbms_lob.compare(a.b, c.b) = 0 or (a.b is null and c.b is null)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(same, 4);
+        for table in ["r65_lv", "r65_lv_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

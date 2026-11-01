@@ -979,6 +979,12 @@ fn inserts(
     };
     let head = format!("insert into {target} ({}) values (", names.join(", "));
     for row in rows {
+        if dialect.kind() == DbKind::Oracle
+            && let Some(block) = oracle_block(&head, columns, row)
+        {
+            write!(out, "{block}")?;
+            continue;
+        }
         let values: Vec<String> = columns
             .iter()
             .zip(row)
@@ -987,6 +993,66 @@ fn inserts(
         writeln!(out, "{head}{});", values.join(", "))?;
     }
     Ok(())
+}
+
+/// The most bytes one `hextoraw('…')` takes: a literal holds 4000
+/// characters (ORA-01704).
+const HEX_LITERAL_BYTES: usize = 2000;
+
+/// The bytes of each part an INSERT's PL/SQL block appends: the block's
+/// compile time grows faster than the length of its literals.
+const BLOCK_CHUNK_BYTES: usize = 1000;
+
+/// The hex digits of a BLOB's value too long for one `hextoraw` (#314), as
+/// shown or typed as `0x…`; a LONG RAW's too, as the pure-Rust driver
+/// types BLOB columns so. A RAW holds 2000 bytes, unless MAX_STRING_SIZE
+/// is EXTENDED, where a literal takes 32767.
+fn long_binary(col: &Column, value: &str) -> Option<String> {
+    if !matches!(col.type_name.as_str(), "BLOB" | "LONG RAW") {
+        return None;
+    }
+    let hex = typed_hex(value).unwrap_or_else(|| value.to_owned());
+    let digits = hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    (digits && hex.len() > 2 * HEX_LITERAL_BYTES).then_some(hex)
+}
+
+/// An Oracle INSERT of a row with a binary value too long for a literal
+/// (#314), as a PL/SQL block that makes each such value in a temporary BLOB
+/// from parts of hex and inserts the row with it. No SQL makes a BLOB
+/// over 2000 bytes from literals: `to_blob(…) || to_blob(…)` is an empty
+/// one, `utl_raw.concat` stops at 2000 bytes. `None` for a row without
+/// such a value.
+fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> {
+    let mut declare = String::new();
+    let mut body = String::new();
+    let mut values = Vec::with_capacity(columns.len());
+    for (col, cell) in columns.iter().zip(row) {
+        let Some(hex) = cell.as_deref().and_then(|v| long_binary(col, v)) else {
+            values.push(sql_literal(col, cell.as_deref()));
+            continue;
+        };
+        let var = format!("pythia${}", values.len() + 1);
+        declare.push_str(&format!("  {var} blob;\n"));
+        body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
+        // The hex goes to writeappend's RAW as hextoraw would take it,
+        // which compiles in half the time; its digits are ASCII, so each
+        // chunk is whole characters.
+        for chunk in hex.as_bytes().chunks(2 * BLOCK_CHUNK_BYTES) {
+            let digits = std::str::from_utf8(chunk).unwrap_or_default();
+            body.push_str(&format!(
+                "  dbms_lob.writeappend({var}, {}, '{digits}');\n",
+                chunk.len() / 2
+            ));
+        }
+        values.push(var);
+    }
+    if declare.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "declare\n{declare}begin\n{body}  {head}{});\nend;\n/\n",
+        values.join(", ")
+    ))
 }
 
 /// Lowercase plain identifiers; quote anything that needs it (Oracle), a
@@ -1671,6 +1737,73 @@ mod tests {
             ];
             assert_eq!(members, expected, "{text}");
         }
+    }
+
+    /// An Oracle INSERT of a binary value over the 2000 bytes a `hextoraw`
+    /// literal takes is a PL/SQL block that makes it in 1000-byte parts
+    /// (#314); other rows, and a value of 2000 bytes, stay INSERTs.
+    #[test]
+    fn oracle_long_binary_values() {
+        let col = |name: &str, ty: &str, numeric| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric,
+        };
+        let columns = [
+            col("ID", "NUMBER", true),
+            col("B", "BLOB", false),
+            col("L", "LONG RAW", false),
+            col("R", "RAW(16)", false),
+        ];
+        let long = "AB".repeat(2001);
+        let rows = vec![
+            vec![
+                Some("1".into()),
+                Some(long.clone()),
+                None,
+                Some("CAFE".into()),
+            ],
+            vec![Some("2".into()), Some("CD".repeat(2000)), None, None],
+            vec![
+                Some("3".into()),
+                Some(format!("0x{long}")),
+                Some(long.clone()),
+                None,
+            ],
+        ];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text =
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap();
+        let part = |var: &str, bytes: usize| {
+            format!(
+                "  dbms_lob.writeappend({var}, {bytes}, '{}');\n",
+                "AB".repeat(bytes)
+            )
+        };
+        let parts = |var: &str| {
+            format!(
+                "  dbms_lob.createtemporary({var}, true);\n{}{}{}",
+                part(var, 1000),
+                part(var, 1000),
+                part(var, 1)
+            )
+        };
+        let expected = format!(
+            "declare\n  pythia$2 blob;\nbegin\n{}  insert into t (id, b, l, r) values \
+             (1, pythia$2, NULL, hextoraw('CAFE'));\nend;\n/\n\
+             insert into t (id, b, l, r) values (2, hextoraw('{}'), NULL, NULL);\n\
+             declare\n  pythia$2 blob;\n  pythia$3 blob;\nbegin\n{}{}  insert into t \
+             (id, b, l, r) values (3, pythia$2, pythia$3, NULL);\nend;\n/\n",
+            parts("pythia$2"),
+            "CD".repeat(2000),
+            parts("pythia$2"),
+            parts("pythia$3"),
+        );
+        assert_eq!(text, expected);
     }
 
     #[test]

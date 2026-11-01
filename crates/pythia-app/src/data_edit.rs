@@ -933,9 +933,39 @@ fn oracle_same(name: &str, col: &Column, value: Option<&str>, lit: &str) -> Opti
         ("LONG" | "LONG RAW", _) => return None,
         ("CLOB" | "NCLOB" | "BLOB", None) => format!("{name} is null"),
         ("CLOB" | "NCLOB" | "BLOB", Some("")) => format!("dbms_lob.getlength({name}) = 0"),
+        ("BLOB", Some(v)) if v.len() > 2 * HEX_LITERAL_BYTES => long_blob_same(name, v)?,
         ("CLOB" | "NCLOB" | "BLOB", Some(_)) => format!("dbms_lob.compare({name}, {lit}) = 0"),
         _ => format!("decode({name}, {lit}, 1, 0) = 1"),
     })
+}
+
+/// The bytes a `hextoraw('…')` takes at most: its literal holds 4000
+/// characters (ORA-01704).
+const HEX_LITERAL_BYTES: usize = 2000;
+
+/// SQL that holds while BLOB `name` still has the hex `value` of more
+/// bytes than one `hextoraw` takes (#314): its length and its parts of
+/// 2000 bytes, which `dbms_lob.substr` gives as RAWs. `None` for text
+/// that isn't hex.
+fn long_blob_same(name: &str, value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let parts: Vec<String> = value
+        .as_bytes()
+        .chunks(2 * HEX_LITERAL_BYTES)
+        .enumerate()
+        .map(|(i, hex)| {
+            let hex = std::str::from_utf8(hex).unwrap_or_default();
+            let offset = i * HEX_LITERAL_BYTES + 1;
+            format!("dbms_lob.substr({name}, {HEX_LITERAL_BYTES}, {offset}) = hextoraw('{hex}')")
+        })
+        .collect();
+    Some(format!(
+        "dbms_lob.getlength({name}) = {} and {}",
+        value.len() / 2,
+        parts.join(" and ")
+    ))
 }
 
 /// SQL that holds while column `name` (of type `col`) still has `value`;
