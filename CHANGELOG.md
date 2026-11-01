@@ -88,6 +88,13 @@ All notable changes to Pythia are documented here. The format follows
   or Z. Recording one now says so and waits for another key; such a
   shortcut in `settings.toml` is ignored. Function keys, Alt and the
   other Ctrl shortcuts are free.
+- *Export → Excel (xlsx)* keeps a timestamp's fraction of a second
+  (#192): `23:09:48.167` became `23:09:48`. It shows as
+  `yyyy-mm-dd hh:mm:ss.000`, and a date without a time as `yyyy-mm-dd`.
+  MySQL's `DATETIME`, SQL Server's `datetime`, `datetime2` and
+  `smalldatetime`, and SQLite's columns declared so are Excel dates
+  now, not text (#193). Types with a time zone, and dates before 1900,
+  which Excel has no day for, stay text.
 
 ## [0.10.0] - 2026-10-30
 
