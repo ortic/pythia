@@ -528,6 +528,14 @@ All notable changes to Pythia are documented here. The format follows
   Server 2022 without the order its rows are kept in. Spatial indexes
   keep their tessellation, bounding box, grids and cells per object.
   Selective XML indexes are still left out.
+- MariaDB: sequences are listed under *Sequences* in the object
+  browser, no longer under *Tables* (#270). They opened as tables, with
+  the sequence's state for columns, and their DDL, `CREATE TABLE …
+  SEQUENCE=1`, made a sequence that starts at 1 and goes up by 1,
+  whatever the sequence's own values. A sequence's DDL is now `SHOW
+  CREATE SEQUENCE`'s, *Find Objects* finds it as a sequence, and
+  completion offers it in expressions, `nextval(order_no)`, no longer
+  after `FROM`.
 
 ## [0.10.0] - 2026-10-30
 

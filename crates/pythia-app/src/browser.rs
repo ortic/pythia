@@ -187,9 +187,27 @@ enum Pending {
 }
 
 /// The folders of a schema; Oracle's `PUBLIC` only owns synonyms and links.
-fn folders(dialect: Dialect, owner: &str) -> &'static [ObjectType] {
+fn folders(dialect: Dialect, mariadb: bool, owner: &str) -> &'static [ObjectType] {
     if owner == "PUBLIC" && dialect == Dialect::ORACLE {
         ObjectType::PUBLIC
+    } else {
+        browser_types(dialect, mariadb)
+    }
+}
+
+/// The folders of the database's schemas: MariaDB has sequences, which
+/// MySQL doesn't (#270).
+fn browser_types(dialect: Dialect, mariadb: bool) -> &'static [ObjectType] {
+    const MARIADB: &[ObjectType] = &[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::Procedure,
+        ObjectType::Function,
+        ObjectType::Trigger,
+        ObjectType::Sequence,
+    ];
+    if mariadb && dialect == Dialect::MYSQL {
+        MARIADB
     } else {
         dialect.browser_types()
     }
@@ -402,7 +420,7 @@ impl Browser {
             ObjectType::TypeBody => ObjectType::Type,
             t => t,
         };
-        if !self.dialect.browser_types().contains(&object_type) {
+        if !browser_types(self.dialect, self.mariadb).contains(&object_type) {
             effects.log.push(format!(
                 "{} objects aren't listed in the object browser",
                 object_type.dictionary_name().to_lowercase()
@@ -1037,7 +1055,7 @@ impl Browser {
                 && cutoff.as_deref().is_none_or(|c| o.last_ddl.as_str() >= c)
         };
         let filtering = !filter.is_empty() || self.invalid_only || cutoff.is_some();
-        for &object_type in folders(self.dialect, owner) {
+        for &object_type in folders(self.dialect, self.mariadb, owner) {
             let node = Node::Folder(owner.to_owned(), object_type);
             let open = self.expanded.contains(&node);
             let folder = self.folders.get(&(owner.to_owned(), object_type));
@@ -2697,7 +2715,24 @@ mod tests {
             drop_sql(Dialect::ORACLE, &o("HR", "NIGHTLY", ObjectType::Job)),
             "begin dbms_scheduler.drop_job('HR.NIGHTLY', force => true); end;"
         );
-        assert_eq!(folders(Dialect::ORACLE, "PUBLIC"), ObjectType::PUBLIC);
+        assert_eq!(
+            folders(Dialect::ORACLE, false, "PUBLIC"),
+            ObjectType::PUBLIC
+        );
+    }
+
+    /// MariaDB's sequences have a folder of their own; MySQL has none
+    /// (#270).
+    #[test]
+    fn mariadb_has_sequences() {
+        let has =
+            |mariadb| folders(Dialect::MYSQL, mariadb, "shop").contains(&ObjectType::Sequence);
+        assert!(has(true));
+        assert!(!has(false));
+        assert_eq!(
+            folders(Dialect::MYSQL, true, "shop")[..5],
+            *Dialect::MYSQL.browser_types()
+        );
     }
 
     /// A PostgreSQL function of several argument lists is dropped whole,

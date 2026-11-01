@@ -1365,6 +1365,84 @@ fn column_defaults_read_as_sql() {
     h.ok("drop table r41_df");
 }
 
+/// MariaDB's sequences are sequences, not tables: listed and found as
+/// such, with their DDL, which creates them again.
+#[test]
+fn mariadb_sequences_as_sequences() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    if !h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"))
+    {
+        return;
+    }
+    let schema = h.schema.clone();
+    h.ok("drop sequence if exists r53_sq");
+    h.ok("drop table if exists r53_sq_tab");
+    h.ok("create sequence r53_sq start with 10 increment by 5 cache 20");
+    h.ok("create table r53_sq_tab (id int)");
+    let objects = |h: &mut Harness, object_type| -> Vec<(String, ObjectType)> {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: schema.clone(),
+            object_type,
+            filter: Some("r53_sq".into()),
+        }) else {
+            panic!("expected objects")
+        };
+        objects
+            .into_iter()
+            .map(|o| (o.name, o.object_type))
+            .collect()
+    };
+    assert_eq!(
+        objects(&mut h, ObjectType::Table),
+        [("r53_sq_tab".to_owned(), ObjectType::Table)]
+    );
+    assert_eq!(
+        objects(&mut h, ObjectType::Sequence),
+        [("r53_sq".to_owned(), ObjectType::Sequence)]
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "r53_sq".into(),
+        limit: 10,
+    }) else {
+        panic!("expected objects")
+    };
+    let found: Vec<(&str, ObjectType)> = found
+        .iter()
+        .map(|o| (o.name.as_str(), o.object_type))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("r53_sq", ObjectType::Sequence),
+            ("r53_sq_tab", ObjectType::Table)
+        ]
+    );
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "r53_sq".into(),
+        object_type: ObjectType::Sequence,
+    }) else {
+        panic!("expected DDL")
+    };
+    assert!(
+        ddl.starts_with("CREATE SEQUENCE `r53_sq` start with 10 ") && ddl.ends_with(';'),
+        "{ddl}"
+    );
+    h.ok("drop sequence r53_sq");
+    h.ok(&ddl);
+    assert_eq!(
+        h.scalar("select concat_ws(' ', nextval(r53_sq), nextval(r53_sq))")
+            .as_deref(),
+        Some("10 15")
+    );
+    h.ok("drop sequence r53_sq");
+    h.ok("drop table r53_sq_tab");
+}
+
 #[test]
 fn accounts() {
     let Some(mut h) = Harness::connect() else {

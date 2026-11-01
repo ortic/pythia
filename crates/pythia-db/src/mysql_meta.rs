@@ -48,7 +48,7 @@ pub(crate) fn run(conn: &mut Conn, query: &MetaQuery) -> Result<MetaResult, DbEr
             let ddl = show_create(conn, owner, name, *object_type)?;
             MetaResult::Text(match object_type {
                 // Routine and trigger bodies have `;` of their own.
-                ObjectType::Table | ObjectType::View => format!("{ddl};"),
+                ObjectType::Table | ObjectType::View | ObjectType::Sequence => format!("{ddl};"),
                 _ => ddl,
             })
         }
@@ -126,22 +126,25 @@ fn object_rows(rows: Vec<(String, String, String, Option<String>)>) -> Vec<DbObj
         .collect()
 }
 
+/// The type of a row of `information_schema.tables`: MariaDB lists its
+/// sequences there too (#270).
+const TABLE_TYPE: &str = "case table_type when 'VIEW' then 'VIEW' \
+                                         when 'SEQUENCE' then 'SEQUENCE' else 'TABLE' end";
+
 /// The objects of `object_type` in a schema (the first parameter) whose
 /// uppercase name is like the second, as `(owner, name, type, last change)`.
 fn object_sql(object_type: ObjectType) -> Option<String> {
     Some(match object_type {
-        ObjectType::Table | ObjectType::View => format!(
-            "select table_schema, table_name, \
-                    if(table_type = 'VIEW', 'VIEW', 'TABLE'), \
+        ObjectType::Table | ObjectType::View | ObjectType::Sequence => format!(
+            "select table_schema, table_name, {TABLE_TYPE}, \
                     date_format(coalesce(update_time, create_time), {DDL_TIME}) \
                from information_schema.tables \
-              where table_schema = ? and upper(table_name) like ? \
-                and table_type {} 'VIEW' \
+              where table_schema = ? and upper(table_name) like ? and {} \
               order by table_name",
-            if object_type == ObjectType::View {
-                "="
-            } else {
-                "<>"
+            match object_type {
+                ObjectType::View => "table_type = 'VIEW'",
+                ObjectType::Sequence => "table_type = 'SEQUENCE'",
+                _ => "table_type not in ('VIEW', 'SEQUENCE')",
             }
         ),
         ObjectType::Procedure | ObjectType::Function => format!(
@@ -175,13 +178,12 @@ fn objects(
     Ok(object_rows(conn.exec(sql, (owner, pattern))?))
 }
 
-/// Tables, views, routines and triggers of every schema whose name matches;
-/// the current schema's first, then the shortest names.
+/// Tables, views, sequences, routines and triggers of every schema whose
+/// name matches; the current schema's first, then the shortest names.
 fn find(conn: &mut Conn, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
     let sql = format!(
         "select owner, name, type, changed from ( \
-           select table_schema as owner, table_name as name, \
-                  if(table_type = 'VIEW', 'VIEW', 'TABLE') as type, \
+           select table_schema as owner, table_name as name, {TABLE_TYPE} as type, \
                   date_format(coalesce(update_time, create_time), {DDL_TIME}) as changed \
              from information_schema.tables where upper(table_name) like ? \
            union all \
@@ -488,6 +490,7 @@ fn show_create(
         ObjectType::Procedure => ("procedure", 2),
         ObjectType::Function => ("function", 2),
         ObjectType::Trigger => ("trigger", 2),
+        ObjectType::Sequence => ("sequence", 1),
         other => {
             return Err(DbError::new(format!(
                 "MySQL has no {}",
