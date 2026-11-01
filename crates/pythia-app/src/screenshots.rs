@@ -1531,6 +1531,42 @@ fn debugger_session() {
     wait_until(&mut h, "finish", |app| !app.test_debug_running());
 }
 
+/// The Variables panel keeps its width (#197): its header and NULL boxes
+/// were wider than the widths it laid out, the panel took the extra width,
+/// and the next frame laid out from that, until the editor was gone.
+#[test]
+fn variables_panel_keeps_its_width() {
+    for (text, scale) in [
+        ("select :x from dual", 1.0),
+        ("select :x from dual", 1.25),
+        (
+            "select :a_rather_long_bind_name, &some_substitution from dual",
+            1.5,
+        ),
+    ] {
+        let mut h = headless_harness();
+        h.ctx.set_pixels_per_point(scale);
+        h.run_steps(2);
+        h.get_by_label("New SQL").click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(3);
+        let first = h.get_by_label("Value").rect().left();
+        for i in 0..60 {
+            h.event(egui::Event::PointerMoved(egui::pos2(
+                400.0 + i as f32,
+                300.0,
+            )));
+            h.run_steps(1);
+        }
+        let last = h.get_by_label("Value").rect().left();
+        assert!(
+            (first - last).abs() < 1.0,
+            "{text} at {scale}: {first} → {last}"
+        );
+    }
+}
+
 /// *New SQL* puts the keyboard focus into the new window's editor: typing
 /// right away goes there, from the toolbar button and from Ctrl+N (#157).
 #[test]
@@ -7679,6 +7715,146 @@ impl Drop for SqliteFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Completion forgets what the object browser changed or read again
+/// (#198): after the browser dropped a table, completion still offered its
+/// columns; after a column was added from outside, Refresh didn't make
+/// completion offer it.
+#[test]
+fn completion_follows_the_browser() {
+    use pythia_db::ObjectType;
+    let connection = "completion.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table cb_t (id integer, name text)",
+    );
+    // The columns completion offers after `x.` of `from cb_t x`.
+    let columns = |h: &mut Ui| -> Vec<String> {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select x\n  from cb_t x".into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(8..8);
+        h.run_steps(3);
+        h.event(egui::Event::Text(".".into()));
+        let mut labels = Vec::new();
+        for _ in 0..50 {
+            h.run_steps(1);
+            labels = h
+                .state_mut()
+                .test_sql_window()
+                .editor
+                .completion_labels()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if !labels.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+        labels
+    };
+    assert!(columns(&mut h).contains(&"name".to_owned()));
+
+    rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .execute("alter table cb_t add column extra integer", [])
+        .unwrap();
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.state_mut().test_refresh_browser();
+    h.run_steps(2);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    assert!(
+        columns(&mut h).contains(&"extra".to_owned()),
+        "after Refresh"
+    );
+
+    h.get_by_label("cb_t").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("cb_t") && l.ends_with("dropped"))
+    });
+    h.run_steps(2);
+    assert_eq!(columns(&mut h), Vec::<String>::new(), "after Drop");
+}
+
+/// A table's object view doesn't stay as if it were there after the table
+/// is dropped (#200): a Drop in the object browser closes it, and Refresh
+/// after a DROP elsewhere says the table is gone instead of showing no
+/// columns.
+#[test]
+fn object_view_of_a_dropped_table() {
+    use pythia_db::ObjectType;
+    let connection = "views.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table dv_a (id integer, name text);\ncreate table dv_b (id integer)",
+    );
+    let open = |h: &mut Ui, name: &str, columns: usize| {
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: crate::documents::ObjectRef {
+                owner: "main".into(),
+                name: name.into(),
+                object_type: ObjectType::Table,
+            },
+        });
+        wait_until(h, "columns", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_object_view().loaded_for_test().1, columns);
+    };
+    open(&mut h, "dv_a", 2);
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.get_by_label("dv_a").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("dv_a") && l.ends_with("dropped"))
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("main.dv_a").is_none(), "its view closed");
+
+    open(&mut h, "dv_b", 1);
+    run_script(&mut h, connection, "drop table dv_b");
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: crate::documents::ObjectRef {
+            owner: "main".into(),
+            name: "dv_b".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(3);
+    h.get_by_label("Refresh").click();
+    wait_until(&mut h, "refresh", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("There is no table main.dv_b")
+            .is_some(),
+        "Refresh says it's gone"
+    );
 }
 
 /// Maintenance of a SQLite table: its rows, pages and missing statistics,

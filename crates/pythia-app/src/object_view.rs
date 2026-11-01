@@ -197,6 +197,16 @@ impl ObjectView {
         };
         let failed = |e: pythia_db::DbError| e.to_string();
         match (tab, result) {
+            // The dictionaries list no columns for a table that isn't
+            // there (any more): say so rather than show an empty list (#200).
+            (Tab::Columns, Ok(MetaResult::Columns(cols))) if cols.is_empty() => {
+                self.state.columns = Some(Loaded::Failed(format!(
+                    "There is no {} {}.{}, or it has no columns",
+                    self.object.object_type.dictionary_name().to_lowercase(),
+                    self.object.owner,
+                    self.object.name
+                )))
+            }
             (Tab::Columns, Ok(MetaResult::Columns(cols))) => {
                 self.state.columns = Some(Loaded::Ready(cols))
             }
@@ -240,6 +250,7 @@ impl ObjectView {
                 };
                 if ui.button("Refresh").clicked() {
                     effects.extend(self.load());
+                    effects.catalog_changed = true;
                 }
                 if self.object.object_type.has_source() {
                     if self.dialect.supports(Feature::PlSql) {

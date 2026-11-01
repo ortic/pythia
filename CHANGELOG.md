@@ -112,6 +112,19 @@ All notable changes to Pythia are documented here. The format follows
   what changed. The open windows are the first Pythia's; one started
   while it runs keeps its own as long as it runs. Two saves at the same
   moment no longer share a temporary file, where one of them failed.
+- The Variables panel of a SQL window no longer widens by itself
+  (#197). With a bind variable such as `:x` it grew on every frame, at
+  each caret blink or mouse move, until the editor was gone: its header
+  and NULL boxes were wider than the columns it laid out.
+- Completion follows changes made through the object browser (#198):
+  after a Drop there it still offered the table and its columns, and a
+  column added from outside didn't show up after Refresh. The browser's
+  actions and Refresh, the object view's Refresh and the object editors'
+  changes now make completion read the dictionary again.
+- A table's object view no longer goes on showing it after it's dropped
+  (#200). *Drop* in the object browser closes the object's views, and
+  *Refresh* in a view whose table was dropped elsewhere says there is no
+  such table instead of showing an empty column list.
 
 ## [0.10.0] - 2026-10-30
 
