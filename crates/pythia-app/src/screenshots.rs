@@ -213,6 +213,15 @@ fn wait_until(harness: &mut Harness<'_, PythiaApp>, what: &str, done: impl Fn(&P
     harness.run_steps(3);
 }
 
+/// Clicks `label`, a button that connects, and runs the frames that take
+/// the click. The first session of a test run may wait there, in the UI
+/// thread, while another run has the test databases (#100): that wait
+/// isn't one of [`wait_until`]'s, whose 60 s it used up.
+fn click_to_connect(harness: &mut Harness<'_, PythiaApp>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.step();
+}
+
 /// The test database's profile (`PYTHIA_TEST_DB`), with the demo schema in
 /// place.
 fn profile() -> Option<(ConnectionProfile, String)> {
@@ -9130,7 +9139,7 @@ fn connections_are_saved_under_their_own_name() {
     assert!(!refused(&h));
     assert_eq!(in_file(), [("Super".into(), 1), ("other".into(), 2)]);
     rename(&mut h, "Super", "super");
-    h.get_by_label("Connect").click();
+    click_to_connect(&mut h, "Connect");
     wait_until(&mut h, "connection", |app| app.test_connected_to("super"));
     assert_eq!(in_file(), [("super".into(), 1), ("other".into(), 2)]);
     let names: Vec<&str> = h
@@ -9193,7 +9202,7 @@ fn a_new_database_file_is_made_once() {
     };
     // Connect, and what the dialog says about it.
     let connect = |h: &mut Harness<'_, PythiaApp>| {
-        h.get_by_label("Connect").click();
+        click_to_connect(h, "Connect");
         wait_until(h, "connect", |app| {
             app.test_connected_to("once.db") || app.test_connect_dialog_error().is_some()
         });
@@ -9244,7 +9253,7 @@ fn a_new_database_file_is_made_once() {
         h.state_mut()
             .test_command(crate::commands::Command::Connect);
         h.run_steps(2);
-        h.get_by_label("Connect").click();
+        click_to_connect(&mut h, "Connect");
         wait_until(&mut h, "the connect error", |app| {
             app.test_connect_dialog_error().is_some()
         });
