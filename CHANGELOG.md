@@ -412,6 +412,27 @@ All notable changes to Pythia are documented here. The format follows
   they are; the changes that weren't applied wait for *Apply*, but for
   those on a row another session changed meanwhile, which the messages
   name.
+- *Edit* creates the object where it was, also when another database or
+  schema is current (#248). On MySQL the script dropped a routine or
+  trigger in its database and created it in the current one, or failed
+  after the drop, so a trigger was lost; it now starts with `use` of the
+  object's database. On SQLite the same went for the views, triggers and
+  indexes of an attached database, which went to `main`, and on SQL
+  Server a routine stored without its schema was created in the default
+  one. Both scripts now name the schema.
+- Copies and exports of a result being edited leave out the key column
+  Pythia adds to find its rows (#249). *Copy as*, *Export*, *Copy all*
+  and *Copy* wrote `pythia$id` (Oracle's `PYTHIA$ROWID`) as one of the
+  table's columns, so their INSERT statements failed with "Unknown
+  column 'pythia$id'". A selection of only that column copies nothing
+  and says why.
+- Copies and exports of a result being edited no longer write values
+  other than the grid shows (#250). With changes waiting for *Apply*,
+  *Copy*, *Copy as*, *Export* and *Copy all* wrote the rows as fetched:
+  the old value of a changed cell, rows marked to be deleted, no new
+  rows. Rows with changes not applied now aren't copied until the
+  changes are applied or discarded, and the messages say so; other rows
+  copy as before. *View value…* shows a changed cell as the grid does.
 
 ## [0.10.0] - 2026-10-30
 

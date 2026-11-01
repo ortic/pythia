@@ -1000,6 +1000,236 @@ fn mysql_edit_keeps_what_fails() {
     });
 }
 
+/// *Edit* of an object outside the current database or schema creates it
+/// again where it was (#248). MySQL's script dropped a routine or trigger
+/// in its database and created it in the current one; SQLite's dropped a
+/// view, trigger or index of an attached database and created it in
+/// `main`; SQL Server's created a routine stored without its schema in
+/// the default one. A new version (`select 2`) runs where the old one was.
+/// PostgreSQL's DDL names the schema already.
+#[test]
+fn edit_creates_the_object_where_it_was() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Edits `object` on `connection`: runs its script with `old` made
+    // `new`, and gives the messages.
+    let edit = |h: &mut Harness<'_, PythiaApp>,
+                connection: &str,
+                object: ObjectRef,
+                old: &str,
+                new: &str|
+     -> Vec<String> {
+        let name = object.name.clone();
+        h.state_mut()
+            .test_object_action(connection, ObjectAction::Edit(object));
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(&name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        assert!(script.contains(old), "{script}");
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text(script.replace(old, new));
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the script to run", |app| !app.test_focused_busy());
+        let messages = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        h.state_mut().test_close_focused();
+        messages
+    };
+    let object = |owner: &str, name: &str, object_type| ObjectRef {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    };
+    let first = |rows: Vec<Vec<pythia_db::Cell>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect()
+    };
+
+    // MySQL, as a DBA (creating a trigger takes SUPER where the server
+    // logs binary): a routine and a trigger in a database that isn't the
+    // current one.
+    let mysql = "PYTHIA_TEST_MYSQL_DBA";
+    if let Some(mut h) = connect_to(mysql, "dba", DbKind::MySql) {
+        crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+            for sql in [
+                "drop database if exists r4_edit",
+                "drop procedure if exists r4_p",
+                "create database r4_edit",
+                "create table r4_edit.r4_t (n int)",
+                "create procedure r4_edit.r4_p() select 1",
+                "create trigger r4_edit.r4_g before insert on r4_edit.r4_t for each row \
+                 set new.n = 1",
+            ] {
+                c.execute(sql).unwrap();
+            }
+        });
+        for (o, old, new) in [
+            (
+                object("r4_edit", "r4_p", ObjectType::Procedure),
+                "select 1",
+                "select 2",
+            ),
+            (object("r4_edit", "r4_g", ObjectType::Trigger), "= 1", "= 2"),
+        ] {
+            let messages = edit(&mut h, "dba", o, old, new);
+            assert!(
+                !messages.iter().any(|m| m.contains("ERROR")),
+                "{messages:?}"
+            );
+        }
+        let found = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+            let rows = c
+                .query(
+                    "select concat(routine_schema, ' ', routine_definition) \
+                       from information_schema.routines where routine_name = 'r4_p' \
+                     union all \
+                     select concat(trigger_schema, ' ', action_statement) \
+                       from information_schema.triggers where trigger_name = 'r4_g'",
+                    &[],
+                )
+                .unwrap();
+            for sql in ["drop database r4_edit", "drop procedure if exists r4_p"] {
+                c.execute(sql).unwrap();
+            }
+            rows
+        })
+        .unwrap();
+        assert_eq!(first(found), ["r4_edit select 2", "r4_edit set new.n = 2"]);
+    }
+
+    // SQL Server: a procedure, a view and a trigger of a schema that isn't
+    // the default one, written without it (by a user whose default schema
+    // it is).
+    let mssql = "PYTHIA_TEST_MSSQL";
+    if let Some(mut h) = connect_to(mssql, "ms", DbKind::SqlServer) {
+        let drops = [
+            "drop trigger if exists r4s.r4_g",
+            "drop view if exists r4s.r4_v",
+            "drop procedure if exists r4s.r4_p",
+            "drop view if exists dbo.r4_v",
+            "drop procedure if exists dbo.r4_p",
+            "drop table if exists r4s.r4_t",
+            "drop user if exists r4_u",
+            "drop schema if exists r4s",
+        ];
+        crate::test_db::run_on(mssql, DbKind::SqlServer, move |c| {
+            for sql in drops {
+                let _ = c.execute(sql);
+            }
+            for sql in [
+                "create schema r4s",
+                "create table r4s.r4_t (n int)",
+                "create user r4_u without login with default_schema = r4s",
+                "grant create procedure, create view to r4_u",
+                "grant alter, select on schema::r4s to r4_u",
+                "execute as user = 'r4_u'",
+                "create procedure r4_p as select 1",
+                "create view r4_v as select n from r4_t where 1 = 1",
+                "create trigger r4_g on r4_t after insert as select 1",
+                "revert",
+            ] {
+                c.execute(sql).unwrap();
+            }
+        });
+        for o in [
+            object("r4s", "r4_p", ObjectType::Procedure),
+            object("r4s", "r4_v", ObjectType::View),
+            object("r4s", "r4_g", ObjectType::Trigger),
+        ] {
+            let messages = edit(&mut h, "ms", o, "1", "2");
+            assert!(!messages.iter().any(|m| m.contains("Msg ")), "{messages:?}");
+        }
+        let found = crate::test_db::run_on(mssql, DbKind::SqlServer, move |c| {
+            let rows = c
+                .query(
+                    "select schema_name(o.schema_id) + ' ' + o.name + ' ' \
+                            + right(rtrim(object_definition(o.object_id)), 1) \
+                       from sys.objects o where o.name in ('r4_p', 'r4_v', 'r4_g') \
+                      order by o.name",
+                    &[],
+                )
+                .unwrap();
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+            rows
+        })
+        .unwrap();
+        assert_eq!(first(found), ["r4s r4_g 2", "r4s r4_p 2", "r4s r4_v 2"]);
+    }
+
+    // SQLite: a view, a trigger and an index of an attached database.
+    let dir = std::env::temp_dir().join(format!("pythia-edit-where-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let aux = dir.join("aux.db");
+    let profile = ConnectionProfile {
+        name: "lite".into(),
+        kind: DbKind::Sqlite,
+        connect_string: format!("{}?create", dir.join("main.db").display()),
+        login_script: format!("attach database '{}' as aux;", aux.display()),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    run_script(
+        &mut h,
+        "lite",
+        "create table aux.r4_t (n int);
+create view aux.r4_v as select n, 1 as m from r4_t;
+create trigger aux.r4_g after insert on r4_t begin select 1; end;
+create index aux.r4_i on r4_t (n);",
+    );
+    for (o, old, new) in [
+        (object("aux", "r4_v", ObjectType::View), "1 as m", "2 as m"),
+        (
+            object("aux", "r4_g", ObjectType::Trigger),
+            "select 1",
+            "select 2",
+        ),
+        (object("aux", "r4_i", ObjectType::Index), "(n)", "(n desc)"),
+    ] {
+        let messages = edit(&mut h, "lite", o, old, new);
+        assert!(
+            !messages.iter().any(|m| m.contains("no such")),
+            "{messages:?}"
+        );
+    }
+    drop(h);
+    let found = crate::test_db::run_with(DbKind::Sqlite, "", "", &aux.display().to_string(), |c| {
+        c.query(
+            "select name, sql from sqlite_master where name like 'r4%' order by name",
+            &[],
+        )
+        .unwrap()
+    });
+    let found: Vec<String> = found
+        .into_iter()
+        .map(|r| r[1].clone().unwrap_or_default())
+        .collect();
+    assert_eq!(found.len(), 4, "{found:?}");
+    assert!(
+        found[0].contains("r4_g") && found[0].contains("select 2"),
+        "{found:?}"
+    );
+    assert!(found[1].contains("(n desc)"), "{found:?}");
+    assert!(found[3].contains("2 as m"), "{found:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote
 /// the value it had found out again to check it, so a value of more than
 /// half of max_allowed_packet made a statement the driver refused, which
@@ -1218,11 +1448,20 @@ fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: Strin
         );
         let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["name", "born", "doc", "price", "pythia$id"]);
+        // Copies and exports leave that key out (#249).
+        let (copied, _) = pythia_ui::selection_data(&r.columns, &r.rows, &r.grid).unwrap();
+        let copied: Vec<&str> = copied.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(copied, ["name", "born", "doc", "price"]);
         let rows = r.rows.clone();
         for &(row, col, value, _) in db.edits {
             r.grid.edit_cell(&rows, row, col, Some(value.into()));
         }
         r.grid.edit_cell(&rows, 1, 4, Some("99".into()));
+        // Nothing is copied of rows with changes not applied (#250).
+        assert!(matches!(
+            pythia_ui::shown_data(&r.columns, &r.rows, &r.grid),
+            Err(pythia_ui::NotCopied::Unapplied(_))
+        ));
     }
     save(&mut h, db.screenshot);
     apply(&mut h);
@@ -5315,7 +5554,7 @@ fn grid_columns() {
     // Copies and exports go by the order shown.
     let w = h.state().test_sql_window_ref().unwrap();
     let r = &w.state.results[0];
-    let (columns, _) = pythia_ui::shown_data(&r.columns, &r.rows, &r.grid);
+    let (columns, _) = pythia_ui::shown_data(&r.columns, &r.rows, &r.grid).unwrap();
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["ID", "CREATED", "NAME_COL", "AMOUNT"]);
 }
