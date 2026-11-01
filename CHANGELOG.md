@@ -1013,6 +1013,14 @@ All notable changes to Pythia are documented here. The format follows
   "Login script: ORA-01741" for `"r71_schema"` on Oracle, a schema
   `"""sales"""` for `"Sales"` on PostgreSQL and failed for MySQL's
   `` `my db` ``.
+- *Delete / undelete rows* on a new row and *Discard* no longer leave
+  *View value…*, the dialog editing a cell and a cell being typed into
+  on another row (#328). They stayed where they were in the view: on the
+  next new row, where the dialog's *Apply* wrote, or past the rows, where
+  the value typed was lost and the next *Insert row* came. They now
+  follow their rows, and on a row taken away the viewer and the dialog
+  close and the edit ends. The selection stays on the rows there are:
+  a Paste past them added empty new rows up to it.
 
 ## [0.10.0] - 2026-10-30
 
