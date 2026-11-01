@@ -290,6 +290,13 @@ All notable changes to Pythia are documented here. The format follows
   named without its schema (#236), as SQLite reads such a name: in
   `temp`, `main`, then the attached databases in the order they were
   attached. It looked in `temp` and `main` only and offered nothing.
+- The result grid sorts and adds up numbers of any size exactly (#238).
+  Numbers past the 15 to 17 digits of a double, such as BIGINT keys or
+  `NUMBER(38)` values, sorted out of order (9223372036854775807 before
+  …806), and the selection's summary rounded them: "Min
+  9223372036854775808." for 9223372036854775806, with a stray dot after
+  every number of 1e15 and more. The summary now shows the smallest and
+  largest value as they are, and the sum and average exactly.
 
 ## [0.10.0] - 2026-10-30
 

@@ -679,10 +679,7 @@ fn sort_order(order: &mut [usize], rows: &[Vec<Cell>], col: usize, numeric: bool
             (None, None) => Ordering::Equal,
             (None, Some(_)) => return Ordering::Greater,
             (Some(_), None) => return Ordering::Less,
-            (Some(x), Some(y)) if numeric => match (x.parse::<f64>(), y.parse::<f64>()) {
-                (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-                _ => x.cmp(y),
-            },
+            (Some(x), Some(y)) if numeric => compare_numbers(x, y).unwrap_or_else(|| x.cmp(y)),
             (Some(x), Some(y)) => x.cmp(y),
         };
         if asc { ord } else { ord.reverse() }
@@ -1796,10 +1793,8 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
         for &ci in &c {
             if let Some(Some(v)) = row.get(ci) {
                 non_null += 1;
-                if columns.get(ci).is_some_and(|col| col.numeric)
-                    && let Ok(n) = v.parse::<f64>()
-                {
-                    numbers.push(n);
+                if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
+                    numbers.push(v.as_str());
                 }
             }
         }
@@ -1807,23 +1802,100 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
     if numbers.is_empty() {
         return Some(format!("{cells} cells · {non_null} not null"));
     }
-    let sum: f64 = numbers.iter().sum();
-    let min = numbers.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // The smallest and largest as they are, not as doubles (#238).
+    let pick = |keep: Ordering| {
+        numbers
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                if compare_numbers(b, a) == Some(keep) {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or_default()
+    };
+    let (min, max) = (pick(Ordering::Less), pick(Ordering::Greater));
+    let (sum, avg) = exact_sum(&numbers).unwrap_or_else(|| {
+        let sum: f64 = numbers.iter().filter_map(|n| n.parse::<f64>().ok()).sum();
+        (fmt_num(sum), fmt_num(sum / numbers.len() as f64))
+    });
     Some(format!(
-        "Count {non_null} · Sum {} · Avg {} · Min {} · Max {}",
-        fmt_num(sum),
-        fmt_num(sum / numbers.len() as f64),
-        fmt_num(min),
-        fmt_num(max)
+        "Count {non_null} · Sum {sum} · Avg {avg} · Min {min} · Max {max}"
     ))
+}
+
+/// Two numbers in order: plain decimals exactly, whatever their size
+/// (#238), others (`1e300`) as doubles; `None` if one isn't a number.
+fn compare_numbers(x: &str, y: &str) -> Option<Ordering> {
+    pythia_data::compare_decimals(x, y)
+        .or_else(|| x.parse::<f64>().ok()?.partial_cmp(&y.parse::<f64>().ok()?))
+}
+
+/// The sum and the average (with four more decimals) of plain decimals,
+/// exact while the sum fits an `i128` of their smallest unit (#238).
+fn exact_sum(numbers: &[&str]) -> Option<(String, String)> {
+    let units: Vec<(i128, u32)> = numbers
+        .iter()
+        .map(|n| decimal_units(n))
+        .collect::<Option<_>>()?;
+    let scale = units.iter().map(|&(_, s)| s).max()?;
+    let mut sum: i128 = 0;
+    for (value, s) in units {
+        sum = sum.checked_add(value.checked_mul(10i128.checked_pow(scale - s)?)?)?;
+    }
+    let n = numbers.len() as i128;
+    // Rounded half away from zero.
+    let scaled = sum.checked_mul(10_000)?;
+    let half = if scaled < 0 { -(n / 2) } else { n / 2 };
+    let avg = scaled.checked_add(half)? / n;
+    Some((decimal_text(sum, scale), decimal_text(avg, scale + 4)))
+}
+
+/// A plain decimal as a count of its smallest unit and the digits after
+/// the point: `12.50` is (125, 1). `None` for other numbers (`1e300`) and
+/// past what an `i128` holds.
+fn decimal_units(text: &str) -> Option<(i128, u32)> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let decimal = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !decimal(whole) || !decimal(fraction) {
+        return None;
+    }
+    let fraction = fraction.trim_end_matches('0');
+    let all = format!("{whole}{fraction}");
+    let value: i128 = if all.is_empty() { 0 } else { all.parse().ok()? };
+    Some((if negative { -value } else { value }, fraction.len() as u32))
+}
+
+/// `units` of 10^-`scale` as a decimal without trailing zeros: (125, 1) is
+/// `12.5`.
+fn decimal_text(units: i128, scale: u32) -> String {
+    let scale = scale as usize;
+    let digits = format!("{:0>width$}", units.unsigned_abs(), width = scale + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - scale);
+    let fraction = fraction.trim_end_matches('0');
+    let sign = if units < 0 { "-" } else { "" };
+    if fraction.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction}")
+    }
 }
 
 fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         format!("{n:.0}")
+    } else if n.abs() >= 1e21 {
+        format!("{n:e}")
     } else {
-        format!("{n:.4}").trim_end_matches('0').to_owned()
+        // Without the dot of 1e15 and more (#238).
+        let text = format!("{n:.4}");
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
 
@@ -2457,6 +2529,82 @@ mod tests {
         assert_eq!(
             summary(&c, &r, &s).unwrap(),
             "Count 4 · Sum 19 · Avg 9.5 · Min 9 · Max 10"
+        );
+    }
+
+    /// Numbers sort and add up as the numbers they are, also past the 15
+    /// to 17 digits a double holds (#238): 9223372036854775806 sorted after
+    /// 9223372036854775807, and the summary of both read "Min
+    /// 9223372036854775808." and "Sum 18446744073709551616.".
+    #[test]
+    fn big_numbers_sort_and_add_up_exactly() {
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        }];
+        let values = [
+            "9223372036854775807",
+            "9223372036854775806",
+            "-9223372036854775808",
+            "9007199254740993",
+            "9007199254740992",
+            "12345678901234567890.5",
+            "12345678901234567890.25",
+            "1e300",
+            "0.1",
+            "0.2",
+        ];
+        let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![Some(v.to_string())]).collect();
+        let mut s = GridState::default();
+        s.sync(&rows, &columns);
+        s.set_sort(0, &rows, &columns);
+        let sorted: Vec<&str> = s.order.iter().map(|&i| values[i]).collect();
+        assert_eq!(
+            sorted,
+            [
+                "-9223372036854775808",
+                "0.1",
+                "0.2",
+                "9007199254740992",
+                "9007199254740993",
+                "9223372036854775806",
+                "9223372036854775807",
+                "12345678901234567890.25",
+                "12345678901234567890.5",
+                "1e300",
+            ]
+        );
+        let summary_of = |from: usize, to: usize| {
+            let mut s = GridState::default();
+            s.sync(&rows, &columns);
+            s.select((from, 0), false);
+            s.select((to, 0), true);
+            summary(&columns, &rows, &s).unwrap()
+        };
+        assert_eq!(
+            summary_of(0, 1),
+            "Count 2 · Sum 18446744073709551613 · Avg 9223372036854775806.5 · \
+             Min 9223372036854775806 · Max 9223372036854775807"
+        );
+        assert_eq!(
+            summary_of(3, 4),
+            "Count 2 · Sum 18014398509481985 · Avg 9007199254740992.5 · \
+             Min 9007199254740992 · Max 9007199254740993"
+        );
+        assert_eq!(
+            summary_of(5, 6),
+            "Count 2 · Sum 24691357802469135780.75 · Avg 12345678901234567890.375 · \
+             Min 12345678901234567890.25 · Max 12345678901234567890.5"
+        );
+        assert_eq!(
+            summary_of(8, 9),
+            "Count 2 · Sum 0.3 · Avg 0.15 · Min 0.1 · Max 0.2"
+        );
+        // Past what an exact sum holds, a double's, without a stray dot.
+        assert_eq!(
+            summary_of(6, 7),
+            "Count 2 · Sum 1e300 · Avg 5e299 · Min 12345678901234567890.25 · Max 1e300"
         );
     }
 
