@@ -989,6 +989,34 @@ fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: Strin
     wait_until(&mut h, "commit", |app| !app.test_pending_tx());
     h.state_mut().test_close_focused();
 
+    // Renamed, a column under another's name is read-only, as is an
+    // expression; the table's columns as they are can be edited.
+    query(
+        &mut h,
+        "select name as price, price as name, price * 2 as twice, name \
+           from pythia_edit_t order by id",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for c in 0..3 {
+            r.grid.edit_cell(&rows, 0, c, Some("1".into()));
+        }
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(0));
+        r.grid.edit_cell(&rows, 0, 3, Some("plain".into()));
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(1));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        assert_eq!(w.state.results[0].rows[0][3].as_deref(), Some("plain"));
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
     // Without a key, rows can't be found again.
     query(&mut h, "select * from pythia_edit_n");
     let texts = messages(&mut h);

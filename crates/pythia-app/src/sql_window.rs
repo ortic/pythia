@@ -1498,6 +1498,11 @@ impl SqlWindow {
                 {
                     let key_start = result.columns.len().saturating_sub(edit.key.width());
                     result.grid.set_editable(Some(key_start));
+                    // Only the table's columns as they are (#218).
+                    let plain = crate::data_edit::plain_columns(&edit.source, key_start);
+                    result
+                        .grid
+                        .lock_columns((0..key_start).filter(|&c| !plain[c]));
                     result.edit = Some(edit.clone());
                     result.sql = edit.source.clone();
                     replace = replaces

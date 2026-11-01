@@ -145,6 +145,9 @@ struct Editing {
     /// First of the trailing columns that can't be edited (the ROWID, the
     /// key columns of a MySQL table).
     locked: Option<usize>,
+    /// Other columns that can't be edited: a query's expressions and
+    /// renamed columns (#218).
+    read_only: BTreeSet<usize>,
     changes: Changes,
     /// Cell being edited: (view row, column, text).
     active: Option<(usize, usize, String)>,
@@ -153,7 +156,7 @@ struct Editing {
 
 impl Editing {
     fn is_locked(&self, col: usize) -> bool {
-        self.locked.is_some_and(|l| col >= l)
+        self.locked.is_some_and(|l| col >= l) || self.read_only.contains(&col)
     }
 }
 
@@ -377,6 +380,14 @@ impl GridState {
         });
     }
 
+    /// Keeps `columns` of the editable grid read-only, e.g. those that
+    /// aren't the table's column of their name (#218).
+    pub fn lock_columns(&mut self, columns: impl IntoIterator<Item = usize>) {
+        if let Some(edit) = &mut self.edit {
+            edit.read_only.extend(columns);
+        }
+    }
+
     /// Changes a cell programmatically (as if edited by the user).
     pub fn edit_cell(&mut self, rows: &[Vec<Cell>], view_row: usize, col: usize, value: Cell) {
         self.sync(rows, &[]);
@@ -557,9 +568,9 @@ impl GridState {
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
     /// new rows past the end. Empty cells become NULL.
     pub fn paste(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
-        let Some(locked) = self.edit.as_ref().map(|e| e.locked) else {
+        if self.edit.is_none() {
             return;
-        };
+        }
         self.sync(rows, &[]);
         let visible = self.visible_columns(columns);
         let (r0, c0) = self
@@ -570,7 +581,7 @@ impl GridState {
         let targets: Vec<usize> = visible[from..]
             .iter()
             .copied()
-            .filter(|&c| locked.is_none_or(|l| c < l))
+            .filter(|&c| self.edit.as_ref().is_some_and(|e| !e.is_locked(c)))
             .collect();
         let text = text.strip_suffix('\n').unwrap_or(text);
         let text = text.strip_suffix('\r').unwrap_or(text);
@@ -1317,7 +1328,10 @@ fn header_cell(ui: &mut Ui, c: usize, state: &GridState, d: &mut Draw) {
         Some((s, false)) if s == c => " ▼",
         _ => "",
     };
-    let text = RichText::new(format!("{}{arrow}", col.name)).strong();
+    // While editing, the columns that can't be edited are weak (#218).
+    let locked = state.edit.as_ref().is_some_and(|e| e.is_locked(c));
+    let text = RichText::new(format!("{}{arrow}", col.name));
+    let text = if locked { text.weak() } else { text.strong() };
     let layout = if col.numeric {
         Layout::right_to_left(Align::Center)
     } else {
@@ -1339,8 +1353,13 @@ fn header_cell(ui: &mut Ui, c: usize, state: &GridState, d: &mut Draw) {
                 ui.close();
             }
         });
+        let read_only = if locked {
+            "\nRead-only: the key, an expression or a renamed column"
+        } else {
+            ""
+        };
         r.on_hover_text(format!(
-            "{}\nClick to sort, drag to move, right-click for more",
+            "{}{read_only}\nClick to sort, drag to move, right-click for more",
             col.type_name
         ));
     });

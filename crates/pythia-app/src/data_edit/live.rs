@@ -614,3 +614,100 @@ fn sqlite_blobs_by_their_values() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A query that renames columns, `select id, description as name, name as
+/// title`: a cell under a label that names another column must not write
+/// to it. Only columns of the table as they are are written, each to
+/// itself; a renamed column or an expression changes nothing.
+fn renamed_columns(db: &mut Live, create: &str) {
+    db.script(&[
+        "drop table if exists fd_renamed",
+        create,
+        "insert into fd_renamed values (1, 'same', 'same')",
+    ]);
+    let key = db.key("fd_renamed");
+    let edit = Editable {
+        table: "fd_renamed".into(),
+        source: "select id, description as name, name as title, upper(name) as shout, \
+                 r.name, r.* from fd_renamed r"
+            .into(),
+        key: RowKey::Columns(key),
+    };
+    let sql = edit_query(db.dialect, &edit).expect("an editable query");
+    let (columns, rows) = db.query(&sql);
+    let names: Vec<String> = columns.iter().map(|c| c.name.to_lowercase()).collect();
+    assert_eq!(
+        names[..8],
+        [
+            "id",
+            "name",
+            "title",
+            "shout",
+            "name",
+            "id",
+            "name",
+            "description"
+        ],
+        "{:?}",
+        db.dialect
+    );
+    // Every cell but the key's changed: the renamed ones and the
+    // expression write nothing.
+    let mut changes = Changes::default();
+    for (c, value) in [(1, "x"), (2, "y"), (3, "z")] {
+        changes
+            .updates
+            .entry(0)
+            .or_default()
+            .insert(c, Some(value.into()));
+    }
+    assert!(
+        dml(db.dialect, &edit, &columns, &rows, &changes).is_empty(),
+        "{:?}",
+        dml(db.dialect, &edit, &columns, &rows, &changes)
+    );
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        db.ok(&statement.sql);
+    }
+    // The plain name, and the description from `*`.
+    changes.updates.clear();
+    changes
+        .updates
+        .entry(0)
+        .or_default()
+        .extend([(4, Some("new".to_owned())), (7, Some("told".to_owned()))]);
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        assert!(
+            matches!(db.ok(&statement.sql), Ran::Done(Some(1))),
+            "{}",
+            statement.sql
+        );
+    }
+    let (_, values) = db.query("select name, description from fd_renamed");
+    assert_eq!(
+        values[0],
+        [Some("new".to_owned()), Some("told".to_owned())],
+        "{:?}",
+        db.dialect
+    );
+    db.ok("drop table fd_renamed");
+}
+
+#[test]
+fn renamed_columns_stay_read_only() {
+    let create = "create table fd_renamed (id int primary key, name varchar(20), \
+                  description varchar(20))";
+    let (mut db, path) = Live::sqlite("renamed");
+    renamed_columns(&mut db, create);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    for (env, kind) in [
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql),
+        ("PYTHIA_TEST_POSTGRES", DbKind::Postgres),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer),
+    ] {
+        if let Some(mut db) = Live::connect(env, kind) {
+            renamed_columns(&mut db, create);
+        }
+    }
+}

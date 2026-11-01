@@ -142,6 +142,14 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL boolean was the string `"t"` or `"f"`, SQL Server's `bit`
   `"1"` or `"0"`, Oracle's BOOLEAN `"TRUE"` or `"FALSE"`, and a JSON
   reader takes each of them for true.
+- Editing a result no longer writes into the wrong column when the query
+  renames columns (#218). With `select id, description as name, name as
+  title from t`, a change under `name` was written into the column
+  `name`, without a word when both held the same value; a change under
+  `title` failed (no such column). Only result columns that are the
+  table's columns as they are (`col`, `t.col`, from `*`) can be edited
+  now; renamed columns and expressions are read-only, their headers
+  dimmed, as are the key columns.
 
 ## [0.10.0] - 2026-10-30
 
