@@ -711,17 +711,30 @@ fn dictionary() {
     );
     assert!(ddl.contains("\"Salary\" numeric(8,2) default 0"), "{ddl}");
     assert!(
-        ddl.contains("constraint meta_emp_fk FOREIGN KEY (deptno) REFERENCES meta_dept(deptno)"),
+        ddl.contains(&format!(
+            "constraint meta_emp_fk FOREIGN KEY (deptno) REFERENCES {schema}.meta_dept(deptno)"
+        )),
         "{ddl}"
     );
     assert!(ddl.contains("CREATE INDEX meta_emp_dept ON"), "{ddl}");
-    // The DDL runs: it rebuilds the table elsewhere.
-    h.ok("create schema if not exists meta_copy");
-    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
-        let sql = statement
-            .text(&ddl)
-            .replace(&format!("{schema}."), "meta_copy.");
-        h.ok(&sql);
+    // The DDL runs: it rebuilds the tables elsewhere, the key referencing
+    // the copy's department.
+    h.ok("drop schema if exists meta_copy cascade");
+    h.ok("create schema meta_copy");
+    for table in ["meta_dept", "meta_emp"] {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+            let sql = statement
+                .text(&ddl)
+                .replace(&format!("{schema}."), "meta_copy.");
+            h.ok(&sql);
+        }
     }
     h.ok("drop schema meta_copy cascade");
 
@@ -778,6 +791,281 @@ fn dictionary() {
     h.ok("drop table meta_emp");
     h.ok("drop table meta_dept");
     h.ok("drop function meta_f(int)");
+}
+
+/// Tables of the same name in several schemas: a foreign key names the
+/// table it references with its schema unless it's the table's own, in the
+/// constraints and whatever the session's search path; the DDL names every
+/// schema, so that it builds the table again elsewhere with its own
+/// references.
+#[test]
+fn foreign_keys_name_their_schema() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists fk_same_one, fk_same_two, fk_same_copy cascade");
+    h.ok("drop table if exists fk_same_users");
+    h.ok("create table fk_same_users (id int primary key)");
+    for tenant in ["fk_same_one", "fk_same_two", "fk_same_copy"] {
+        h.ok(&format!("create schema {tenant}"));
+        h.ok(&format!(
+            "create table {tenant}.fk_same_users (id int primary key)"
+        ));
+    }
+    h.ok(
+        "create table fk_same_one.fk_same_note (id int primary key, \
+         own int constraint fk_own references fk_same_one.fk_same_users, \
+         shared int constraint fk_shared references public.fk_same_users)",
+    );
+    h.ok(
+        "create table fk_same_two.fk_same_note (id int primary key, \
+         other int constraint fk_other references fk_same_one.fk_same_users)",
+    );
+    let foreign_keys = |h: &mut Harness, owner: &str| -> Vec<[String; 3]> {
+        let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+            owner: owner.into(),
+            name: "fk_same_note".into(),
+            detail: Detail::Constraints,
+        }) else {
+            panic!("expected a table")
+        };
+        rows.into_iter()
+            .filter(|r| r[1].as_deref() == Some("Foreign key"))
+            .map(|r| [0, 2, 3].map(|i| r[i].clone().unwrap_or_default()))
+            .collect()
+    };
+    assert_eq!(
+        foreign_keys(&mut h, "fk_same_one"),
+        [
+            [
+                "fk_own",
+                "FOREIGN KEY (own) REFERENCES fk_same_users(id)",
+                "fk_same_users"
+            ],
+            [
+                "fk_shared",
+                "FOREIGN KEY (shared) REFERENCES public.fk_same_users(id)",
+                "public.fk_same_users"
+            ],
+        ]
+    );
+    // The session's path finds fk_same_one's table first: the reference
+    // from fk_same_two still says whose it is.
+    h.ok("set search_path = fk_same_one, public");
+    assert_eq!(
+        foreign_keys(&mut h, "fk_same_two"),
+        [[
+            "fk_other",
+            "FOREIGN KEY (other) REFERENCES fk_same_one.fk_same_users(id)",
+            "fk_same_one.fk_same_users"
+        ]]
+    );
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: "fk_same_one".into(),
+        name: "fk_same_note".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    for constraint in [
+        "constraint fk_own FOREIGN KEY (own) REFERENCES fk_same_one.fk_same_users(id)",
+        "constraint fk_shared FOREIGN KEY (shared) REFERENCES public.fk_same_users(id)",
+    ] {
+        assert!(ddl.contains(constraint), "{ddl}");
+    }
+    assert_eq!(
+        h.scalar("select current_setting('search_path')").as_deref(),
+        Some("fk_same_one, public"),
+        "the session keeps its path"
+    );
+    // Run in another schema, the table references that schema's users.
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+        h.ok(&statement
+            .text(&ddl)
+            .replace("fk_same_one.", "fk_same_copy."));
+    }
+    assert_eq!(
+        h.scalar(
+            "select confrelid::regclass::text from pg_constraint \
+              where conname = 'fk_own' and conrelid = 'fk_same_copy.fk_same_note'::regclass"
+        )
+        .as_deref(),
+        Some("fk_same_copy.fk_same_users")
+    );
+    h.ok("reset search_path");
+    h.ok("drop schema fk_same_one, fk_same_two, fk_same_copy cascade");
+    h.ok("drop table fk_same_users");
+}
+
+/// A table's indexes of every kind, each with its columns as its definition
+/// has them (order, collation, operator class), INCLUDE columns and
+/// predicate.
+#[test]
+fn indexes_as_defined() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop table if exists idx_kinds");
+    h.ok(
+        "create table idx_kinds (id int primary key, name text, code text, n int, \
+         tags text[], during tsrange, at timestamptz)",
+    );
+    for sql in [
+        "create index idx_kinds_fts on idx_kinds using gin (to_tsvector('portuguese', name))",
+        "create index idx_kinds_tags on idx_kinds using gin (tags)",
+        "create index idx_kinds_during on idx_kinds using gist (during)",
+        "create index idx_kinds_at on idx_kinds using brin (at)",
+        "create index idx_kinds_lower on idx_kinds (lower(code) desc nulls last, n nulls first)",
+        "create index idx_kinds_like on idx_kinds (code collate \"C\" text_pattern_ops)",
+        "create unique index idx_kinds_cover on idx_kinds (code) include (name, n)",
+        "create index idx_kinds_positive on idx_kinds (n desc) where n > 0",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "idx_kinds".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "INDEX_NAME",
+            "INDEX_TYPE",
+            "UNIQUENESS",
+            "COLUMNS",
+            "INCLUDE",
+            "WHERE"
+        ]
+    );
+    let indexes: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| r.iter().map(|v| v.as_deref().unwrap_or("")).collect())
+        .collect();
+    assert_eq!(
+        indexes,
+        [
+            ["idx_kinds_pkey", "btree", "PRIMARY", "id", "", ""],
+            ["idx_kinds_at", "brin", "NONUNIQUE", "at", "", ""],
+            ["idx_kinds_cover", "btree", "UNIQUE", "code", "name, n", ""],
+            ["idx_kinds_during", "gist", "NONUNIQUE", "during", "", ""],
+            [
+                "idx_kinds_fts",
+                "gin",
+                "NONUNIQUE",
+                "to_tsvector('portuguese'::regconfig, name)",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_like",
+                "btree",
+                "NONUNIQUE",
+                "code COLLATE \"C\" text_pattern_ops",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_lower",
+                "btree",
+                "NONUNIQUE",
+                "lower(code) DESC NULLS LAST, n NULLS FIRST",
+                "",
+                ""
+            ],
+            [
+                "idx_kinds_positive",
+                "btree",
+                "NONUNIQUE",
+                "n DESC",
+                "",
+                "n > 0"
+            ],
+            ["idx_kinds_tags", "gin", "NONUNIQUE", "tags", "", ""],
+        ]
+    );
+    h.ok("drop table idx_kinds");
+}
+
+/// Generated columns read as declared, PostgreSQL 18's virtual ones too: as
+/// their default, and in DDL that builds the table again.
+#[test]
+fn generated_columns_as_declared() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let release: u32 = h
+        .scalar("select current_setting('server_version_num')")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists gen_copy cascade");
+    h.ok("drop table if exists gen_cols");
+    let virtual_column = if release >= 180000 {
+        ", twice int generated always as (a * 2) virtual"
+    } else {
+        ""
+    };
+    h.ok(&format!(
+        "create table gen_cols (id int generated always as identity, a int, \
+         thrice int generated always as (a * 3) stored{virtual_column})"
+    ));
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema.clone(),
+        table: "gen_cols".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    let defaults: Vec<(&str, Option<&str>)> = columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.default.as_deref()))
+        .collect();
+    let mut expected = vec![
+        ("id", Some("generated always as identity")),
+        ("a", None),
+        ("thrice", Some("generated always as ((a * 3)) stored")),
+    ];
+    if release >= 180000 {
+        expected.push(("twice", Some("generated always as ((a * 2)) virtual")));
+    }
+    assert_eq!(defaults, expected);
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "gen_cols".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    h.ok("create schema gen_copy");
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+        h.ok(&statement
+            .text(&ddl)
+            .replace(&format!("{schema}."), "gen_copy."));
+    }
+    assert_eq!(
+        h.scalar(
+            "select string_agg(attname || ':' || attgenerated::text, ' ' order by attnum) \
+               from pg_attribute where attrelid = 'gen_copy.gen_cols'::regclass \
+                and attgenerated <> ''"
+        )
+        .as_deref(),
+        Some(if release >= 180000 {
+            "thrice:s twice:v"
+        } else {
+            "thrice:s"
+        }),
+        "{ddl}"
+    );
+    h.ok("drop schema gen_copy cascade");
+    h.ok("drop table gen_cols");
 }
 
 /// Waits for a session's connect to fail.

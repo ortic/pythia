@@ -279,6 +279,45 @@ All notable changes to Pythia are documented here. The format follows
   with `CREATE OR REPLACE`, which leaves it as it was when the version
   fails. MySQL can only drop its routines and triggers first; their
   script now says so.
+- PostgreSQL: a foreign key to a table of the same name in another
+  schema no longer reads as one to the table's own (#226). With
+  `tenant.users` and `public.users`, a key of `tenant.note` to
+  `public.users` read `REFERENCES users(id)`, by the session's search
+  path, in the object view's *Constraints* and in the DDL. A table's
+  details now name the tables of other schemas with their schema, and
+  its DDL names every schema, as `pg_dump` does: run in another schema
+  or with another search path, it no longer makes keys to other tables.
+- PostgreSQL 18: a virtual generated column reads as one (#227). `twice
+  int generated always as (a * 2)`, virtual by default since 18, showed
+  `(a * 2)` as its default in an object view's columns, and the table's
+  DDL wrote `twice integer (a * 2)`, which fails (syntax error). It now
+  reads `generated always as ((a * 2)) virtual`, as a stored one reads
+  `… stored`.
+- PostgreSQL: a table's *Indexes* show each index's columns as it has
+  them (#228). An index on `(lower(code) desc nulls last, n)` read
+  `lower(code), n`, one on `(code collate "C" text_pattern_ops)` read
+  `code`, and the INCLUDE columns of a covering index were left out, so
+  that `(code) include (name, n)` looked like an index on `code` alone.
+  *Columns* now has the order, collation and operator class, and
+  *Include* the INCLUDE columns.
+- Results of *Query data* can be edited on PostgreSQL (#229). *Edit* on
+  `select * from public.orders`, as *Query data* writes it for a table
+  in `public`, said "Only results of a single-table query can be
+  edited", and so it did for tables named `session`, `comment`, `level`,
+  `type` or `mode`, words of Oracle's SQL that the other databases take
+  as names. The INSERT statements of such a result (*Copy as*, *Export*,
+  *Execute to file*) were written for `my_table`; they now name the
+  table.
+- The object browser writes a table's columns as the database needs
+  them (#230). On PostgreSQL, a column `"Order Date"` dragged into an
+  editor became `order date` and `"Id"` became `id`, another column or
+  none; columns are now listed and dragged quoted where they need it,
+  and on Oracle a quoted name such as `"Mixed"` keeps its case instead
+  of becoming `"mixed"`. *Generate → INSERT* and *UPDATE statement*
+  named their binds after the columns as they are, so `:order date` or
+  `:e-mail` broke the statement, and two columns `Id` and `id` shared
+  `:id`; binds are now `:order_date`, `:e_mail`, `:id_2`. *SELECT
+  statement* no longer takes a digit for its alias.
 
 ## [0.10.0] - 2026-10-30
 
