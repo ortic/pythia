@@ -750,7 +750,7 @@ impl Browser {
             }
             (Pending::Action { object, verb }, Ok(_)) => {
                 let ty = object.object_type.dictionary_name().to_lowercase();
-                log.push(format!("{ty} {} {verb}", object.qualified()));
+                log.push(format!("{ty} {} {verb}", named(self.dialect, &object)));
                 self.refresh(&mut effects);
                 effects.invalid_changed = true;
                 if verb == "dropped" {
@@ -758,7 +758,11 @@ impl Browser {
                 }
             }
             (Pending::Action { object, verb }, Err(e)) => {
-                log.push(format!("{} {} failed: {e}", verb, object.qualified()));
+                log.push(format!(
+                    "{} {} failed: {e}",
+                    verb,
+                    named(self.dialect, &object)
+                ));
                 self.refresh(&mut effects);
             }
             (Pending::TestLink(object), Ok(Some(MetaResult::Text(remote)))) => {
@@ -965,7 +969,7 @@ impl Browser {
                 self.reveal = None;
                 effects
                     .log
-                    .push(format!("{} not found", target.qualified()));
+                    .push(format!("{} not found", named(self.dialect, &target)));
             }
         }
 
@@ -1312,7 +1316,7 @@ impl Browser {
                         )
                     });
                     let response = response.on_hover_ui(|ui| {
-                        ui.label(RichText::new(r.qualified()).strong());
+                        ui.label(RichText::new(named(self.dialect, &r)).strong());
                         ui.label(object.object_type.dictionary_name().to_lowercase());
                         if !object.valid {
                             ui.colored_label(ui.visuals().error_fg_color, "Invalid");
@@ -1561,7 +1565,7 @@ impl Browser {
                     let response = response.on_hover_text(format!(
                         "{} {}",
                         object.object_type.dictionary_name().to_lowercase(),
-                        object.qualified()
+                        named(self.dialect, object)
                     ));
                     if response.clicked() {
                         actions.push(ObjectAction::Select((*object).clone()));
@@ -1845,7 +1849,7 @@ impl Browser {
             ui.label(format!(
                 "Drop {} {}? This cannot be undone.",
                 object.object_type.dictionary_name().to_lowercase(),
-                object.qualified()
+                named(self.dialect, &object)
             ));
             match (self.dialect.kind(), object.object_type) {
                 (pythia_db::DbKind::Oracle, ObjectType::User) => {
@@ -2229,6 +2233,15 @@ fn create_or(ddl: &str, words: &str, next: &str) -> String {
 /// A PostgreSQL string literal.
 fn pg_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// The object as its database's SQL names it, as its `DROP` does: quoted
+/// only where it needs it, a MySQL account as `'user'@'host'` (#268).
+fn named(dialect: Dialect, o: &ObjectRef) -> String {
+    if dialect == Dialect::MYSQL && o.object_type.is_database_object() {
+        return mysql_account(&o.name);
+    }
+    o.qualified_in(dialect)
 }
 
 /// A MySQL account as listed (`user@host`, a role without its host) as
@@ -2797,6 +2810,15 @@ mod tests {
             drop_sql(Dialect::SQLSERVER, &account("reader", ObjectType::Role)),
             "drop role reader"
         );
+        // The question and the log name them so (#268).
+        for (dialect, name, named_so) in [
+            (Dialect::ORACLE, "SCOTT", "SCOTT"),
+            (Dialect::MYSQL, "app@localhost", "'app'@'localhost'"),
+            (Dialect::POSTGRES, "App", "\"App\""),
+            (Dialect::SQLSERVER, "reader", "reader"),
+        ] {
+            assert_eq!(named(dialect, &account(name, ObjectType::User)), named_so);
+        }
     }
 
     fn col(name: &str, pk: Option<u32>) -> TableColumn {

@@ -513,6 +513,12 @@ All notable changes to Pythia are documented here. The format follows
   a URI whose file was mistyped, moved or deleted connected to a new,
   empty database in its place. It now fails with "There is no database
   file"; `mode=ro` and `mode=memory` work as before.
+- *Drop…* names the object as its database writes it (#268), in its
+  question and in the log, as do the hover over a browser entry and the
+  log lines of a failed drop and of *Show in object browser*. They
+  quoted every name as Oracle would, on any database: SQLite's
+  `main.t` read `"main"."t"`, MySQL's ``shop.`my t` `` read
+  `"shop"."my t"`, two strings. A MySQL account reads `'user'@'host'`.
 
 ## [0.10.0] - 2026-10-30
 

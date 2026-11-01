@@ -9615,6 +9615,99 @@ fn object_view_of_a_dropped_table() {
     );
 }
 
+/// *Drop…* names the table as its database writes it, in the question and
+/// in the log (#268). They read `"main"."r55_drop"`, Oracle's quoting, on
+/// every database.
+#[test]
+fn drop_names_the_object_as_its_database_writes_it() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Creates and drops each table through the question, which must name
+    // it so, as must the log.
+    let drops = |h: &mut Ui, connection: &str, tables: &[(&str, &str, &str)]| {
+        for (create, owner, name) in tables {
+            let (owner, name) = (owner.to_string(), name.to_string());
+            run_script(h, connection, create);
+            let object = ObjectRef {
+                owner,
+                name: name.clone(),
+                object_type: ObjectType::Table,
+            };
+            let named = match (object.owner.as_str(), name.as_str()) {
+                ("main", "r55_drop") => "main.r55_drop",
+                ("main", _) => "main.\"R55 Drop\"",
+                ("public", _) => "public.\"R55 Drop\"",
+                ("dbo", _) => "dbo.[r55 drop]",
+                ("PYTHIA", "R55_DROP") => "PYTHIA.R55_DROP",
+                ("PYTHIA", _) => "PYTHIA.\"R55 Drop\"",
+                _ => "pythia.`r55 drop`",
+            };
+            let before = h.state().test_log().len();
+            h.state_mut()
+                .test_object_action(connection, ObjectAction::Drop(object));
+            h.run_steps(3);
+            let question = format!("Drop table {named}? This cannot be undone.");
+            assert!(h.query_by_label(&question).is_some(), "{question}");
+            h.get_by_label("Drop").click();
+            wait_until(h, "the drop", |app| {
+                app.test_log()[before..]
+                    .iter()
+                    .any(|l| l.ends_with(" dropped"))
+            });
+            let log = h.state().test_log()[before..].to_vec();
+            let line = format!("table {named} dropped");
+            assert!(log.contains(&line), "{line}: {log:?}");
+        }
+    };
+
+    let connection = "r55-drop.db";
+    let (mut h, _file) = sqlite_file(connection);
+    drops(
+        &mut h,
+        connection,
+        &[
+            ("create table r55_drop (a)", "main", "r55_drop"),
+            ("create table \"R55 Drop\" (a)", "main", "R55 Drop"),
+        ],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    for (env, kind, table) in [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            ("create table `r55 drop` (a int)", "pythia", "r55 drop"),
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            ("create table \"R55 Drop\" (a int)", "public", "R55 Drop"),
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            ("create table [r55 drop] (a int)", "dbo", "r55 drop"),
+        ),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-drop", kind) {
+            drops(&mut h, "r55-drop", &[table]);
+        }
+    }
+    // Oracle's as before.
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-drop", DbKind::Oracle) {
+        drops(
+            &mut h,
+            "r55-drop",
+            &[
+                ("create table r55_drop (a int)", "PYTHIA", "R55_DROP"),
+                ("create table \"R55 Drop\" (a int)", "PYTHIA", "R55 Drop"),
+            ],
+        );
+    }
+}
+
 /// A name typed after its opening quote is completed and closed (#234):
 /// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
 /// didn't open.
