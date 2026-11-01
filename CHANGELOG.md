@@ -286,6 +286,10 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL, SQL Server and SQLite, the window opened anyway, showed
   Oracle's `CREATE TABLE` and failed only at *Import* ("This tool isn't
   available for SQL Server connections"); the log now says so at once.
+- SQLite: completion offers the columns of an attached database's table
+  named without its schema (#236), as SQLite reads such a name: in
+  `temp`, `main`, then the attached databases in the order they were
+  attached. It looked in `temp` and `main` only and offered nothing.
 
 ## [0.10.0] - 2026-10-30
 
