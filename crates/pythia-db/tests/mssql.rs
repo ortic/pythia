@@ -832,6 +832,151 @@ fn dictionary() {
     h.ok("drop table meta_dept");
 }
 
+/// A table's indexes of the kinds CREATE INDEX makes: covering, filtered,
+/// unique, descending and columnstore. *Indexes* has each one's columns
+/// and INCLUDE columns, and the table's DDL creates each of them again.
+#[test]
+fn indexes_of_every_kind() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r43_copy.r43_ix, r43_copy.r43_cs");
+    h.ok("drop schema if exists r43_copy");
+    h.ok("drop table if exists r43_ix, r43_cs");
+    for sql in [
+        "create table r43_ix (id int constraint r43_ix_pk primary key, a int, b varchar(10), \
+         c int not null)",
+        "create index r43_ix_cover on r43_ix (a desc) include (c, b)",
+        "create index r43_ix_some on r43_ix (b) where b is not null",
+        "create unique index r43_ix_c on r43_ix (c)",
+        "create nonclustered columnstore index r43_ix_store on r43_ix (b, a)",
+        "create table r43_cs (a int, b int)",
+        "create clustered columnstore index r43_cs_store on r43_cs",
+        "create index r43_cs_b on r43_cs (b)",
+    ] {
+        h.ok(sql);
+    }
+    let indexes = |h: &mut Harness, owner: &str, table: &str| -> Vec<Vec<String>> {
+        let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+            owner: owner.into(),
+            name: table.into(),
+            detail: Detail::Indexes,
+        }) else {
+            panic!("expected a table")
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "INDEX_NAME",
+                "INDEX_TYPE",
+                "UNIQUENESS",
+                "COLUMNS",
+                "INCLUDE",
+                "WHERE"
+            ]
+        );
+        rows.into_iter()
+            .map(|r| r.into_iter().map(Option::unwrap_or_default).collect())
+            .collect()
+    };
+    let ix = indexes(&mut h, &schema, "r43_ix");
+    assert_eq!(
+        ix,
+        [
+            ["r43_ix_pk", "CLUSTERED", "PRIMARY", "id", "", ""],
+            ["r43_ix_c", "NONCLUSTERED", "UNIQUE", "c", "", ""],
+            [
+                "r43_ix_cover",
+                "NONCLUSTERED",
+                "NONUNIQUE",
+                "a DESC",
+                "c, b",
+                ""
+            ],
+            [
+                "r43_ix_some",
+                "NONCLUSTERED",
+                "NONUNIQUE",
+                "b",
+                "",
+                "([b] IS NOT NULL)"
+            ],
+            [
+                "r43_ix_store",
+                "NONCLUSTERED COLUMNSTORE",
+                "NONUNIQUE",
+                "b, a",
+                "",
+                ""
+            ],
+        ]
+    );
+    let cs = indexes(&mut h, &schema, "r43_cs");
+    assert_eq!(
+        cs,
+        [
+            ["r43_cs_b", "NONCLUSTERED", "NONUNIQUE", "b", "", ""],
+            [
+                "r43_cs_store",
+                "CLUSTERED COLUMNSTORE",
+                "NONUNIQUE",
+                "a, b",
+                "",
+                ""
+            ],
+        ]
+    );
+
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let ix_ddl = ddl(&mut h, "r43_ix");
+    for line in [
+        format!(
+            "create nonclustered index [r43_ix_cover] on [{schema}].[r43_ix] ([a] desc) include ([c], [b]);"
+        ),
+        format!(
+            "create nonclustered index [r43_ix_some] on [{schema}].[r43_ix] ([b]) where ([b] IS NOT NULL);"
+        ),
+        format!("create unique nonclustered index [r43_ix_c] on [{schema}].[r43_ix] ([c]);"),
+        format!(
+            "create nonclustered columnstore index [r43_ix_store] on [{schema}].[r43_ix] ([b], [a]);"
+        ),
+    ] {
+        assert!(ix_ddl.contains(&line), "{line}\n{ix_ddl}");
+    }
+    let cs_ddl = ddl(&mut h, "r43_cs");
+    let line = format!("create clustered columnstore index [r43_cs_store] on [{schema}].[r43_cs];");
+    assert!(cs_ddl.contains(&line), "{line}\n{cs_ddl}");
+    // The DDL runs: the tables built from it elsewhere have the same
+    // indexes.
+    h.ok("create schema r43_copy");
+    for (table, ddl) in [("r43_ix", &ix_ddl), ("r43_cs", &cs_ddl)] {
+        for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
+            let sql = statement.text(ddl).replace(
+                &format!("[{schema}].[{table}]"),
+                &format!("[r43_copy].[{table}]"),
+            );
+            h.ok(&sql);
+        }
+    }
+    assert_eq!(indexes(&mut h, "r43_copy", "r43_ix"), ix);
+    assert_eq!(indexes(&mut h, "r43_copy", "r43_cs"), cs);
+    h.ok("drop table r43_copy.r43_ix, r43_copy.r43_cs");
+    h.ok("drop schema r43_copy");
+    h.ok("drop table r43_ix, r43_cs");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();

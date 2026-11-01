@@ -439,6 +439,13 @@ All notable changes to Pythia are documented here. The format follows
   session's own schema and left its own as it was: Oracle keeps a unit's
   source without its schema. The window now names the unit's schema, and
   a trigger's table's, when the text doesn't.
+- SQL Server: a table's DDL has its columnstore indexes (#252). It left
+  them out, so that run elsewhere it made a table with a clustered
+  columnstore index a heap stored in rows, and one with a nonclustered
+  columnstore index a table without it. *Indexes* showed such an index
+  without columns, and a covering index `(a) include (b, c)` as one on
+  `a` alone; a columnstore index's columns are now under *Columns*, and
+  *Include* has the INCLUDE columns, as on PostgreSQL.
 
 ## [0.10.0] - 2026-10-30
 
