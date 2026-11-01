@@ -638,8 +638,15 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
 
 /// A failed connect, with what to do about a certificate that isn't
 /// trusted (#211): it read "Lost connection to the MySQL server: IO error:
-/// `invalid peer certificate: UnknownIssuer'".
+/// `invalid peer certificate: UnknownIssuer'"; or about a server without
+/// TLS (#222).
 fn connect_error(e: mysql::Error) -> DbError {
+    if let mysql::Error::DriverError(mysql::DriverError::TlsNotSupported) = e {
+        return DbError::new(
+            "The server doesn't offer TLS, which ?tls asks for. Connect without ?tls, or turn \
+             TLS on at the server.",
+        );
+    }
     let certificate = match &e {
         mysql::Error::IoError(io) | mysql::Error::CodecError(PacketCodecError::Io(io)) => io
             .get_ref()
@@ -946,6 +953,10 @@ impl From<mysql::Error> for DbError {
                 lost: true,
                 ..Self::new(format!("Lost connection to the MySQL server: {e}"))
             },
+            // Their text, not `DriverError { … }` as mysql's Display writes
+            // it (#222).
+            mysql::Error::DriverError(e) => Self::new(e.to_string()),
+            mysql::Error::TlsError(e) => Self::new(e.to_string()),
             e => Self::new(e.to_string()),
         }
     }
@@ -970,6 +981,25 @@ mod tests {
         }));
         assert_eq!(e.code, Some(1046));
         assert_eq!(e.text(), "ERROR 1046 (3D000): No database selected");
+    }
+
+    /// The driver's errors read as what they say, not `DriverError { … }`;
+    /// at connect, ?tls to a server without TLS says what to do (#222).
+    #[test]
+    fn driver_errors() {
+        let e = connect_error(mysql::Error::DriverError(
+            mysql::DriverError::TlsNotSupported,
+        ));
+        assert_eq!(
+            e.message,
+            "The server doesn't offer TLS, which ?tls asks for. Connect without ?tls, or turn \
+             TLS on at the server."
+        );
+        let e = DbError::from(mysql::Error::DriverError(
+            mysql::DriverError::ConnectTimeout,
+        ));
+        assert_eq!(e.message, "Could not connect: connection timeout");
+        assert!(!e.is_connection_lost());
     }
 
     /// The driver refuses a statement larger than max_allowed_packet

@@ -1174,7 +1174,7 @@ fn connect_error(params: ConnectParams) -> pythia_db::DbError {
 /// A certificate that isn't trusted (the test server's is self-signed)
 /// says so and how to connect anyway, instead of "Lost connection to the
 /// MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
-/// (#211).
+/// (#211). A server without TLS says that (#222).
 #[test]
 fn untrusted_certificates_say_so() {
     let Some(params) = params() else {
@@ -1185,6 +1185,18 @@ fn untrusted_certificates_say_so() {
         ..params.clone()
     };
     let error = connect_error(with("tls"));
+    assert!(!error.is_connection_lost());
+    // MariaDB's test container has no TLS: no certificate to check.
+    if error.message.starts_with("The server doesn't offer TLS") {
+        assert!(error.message.contains("Connect without ?tls"), "{error}");
+        let error = connect_error(with("tls=skip-verify"));
+        assert!(
+            error.message.starts_with("The server doesn't offer TLS"),
+            "{error}"
+        );
+        eprintln!("The server has no TLS: its certificate isn't checked");
+        return;
+    }
     assert!(
         error
             .message
