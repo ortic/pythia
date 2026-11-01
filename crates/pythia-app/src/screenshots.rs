@@ -13677,6 +13677,136 @@ fn oracle_files_round_trip() {
     );
 }
 
+/// On Oracle, *Load from file…* takes no JSON and no VECTOR cell (#293):
+/// their text goes into a literal of parts (#342), and a LONG bound into
+/// one fails (ORA-01461 in a VECTOR). A row with files loaded into its
+/// BLOB and CLOB, bound, and a JSON and a VECTOR typed in, longer than a
+/// literal holds, applies; so does a new one.
+#[test]
+fn oracle_files_next_to_json_and_vectors() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let connection = "pythia@FREEPDB1";
+    let drop = "begin execute immediate 'drop table r76_lob_json purge'; \
+                exception when others then null; end;\n/";
+    run_script(&mut h, connection, drop);
+    run_script(
+        &mut h,
+        connection,
+        "create table r76_lob_json (id number primary key, b blob, c clob, j json, \
+           v vector(*, float32));\n\
+         insert into r76_lob_json values (1, hextoraw('CAFE'), 'old', '{\"a\":1}', '[1,2]');\n\
+         commit;",
+    );
+    let dir = std::env::temp_dir().join(format!("pythia-r76-lob-json-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes: Vec<u8> = (0..1usize << 20).map(|i| (i % 251) as u8).collect();
+    let text = "Grüße & 日本語\n".repeat(40_000);
+    let (bin, txt) = (dir.join("b.bin"), dir.join("c.txt"));
+    std::fs::write(&bin, &bytes).unwrap();
+    std::fs::write(&txt, &text).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: "select id, b, c, j, v from r76_lob_json order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    assert!(first_result(&mut h).grid.is_editable());
+
+    // The menu takes a few frames to settle where it fits.
+    for (cell, offered) in [("old", true), (r#"{"a":1}"#, false), ("[1,2]", false)] {
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+        assert!(h.query_by_label("Edit cell").is_some(), "{cell}");
+        assert_eq!(
+            h.query_by_label("Load from file…").is_some(),
+            offered,
+            "{cell}"
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+
+    let load = |h: &mut Harness<'_, PythiaApp>, cell: (usize, usize), path: &PathBuf| {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(path.clone()));
+        let r = first_result(h);
+        r.grid.request_load(&r.columns, cell);
+        let said = file_done(h, before);
+        assert!(said.starts_with("Loaded "), "{said}");
+    };
+    let json = format!(
+        "[{}]",
+        (0..1000)
+            .map(|i| format!(r#"{{"k":{i},"url":"https://example.com/?a={i}&b=2"}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let vector = format!("[{}]", vec!["0.25"; 3000].join(","));
+    {
+        let r = first_result(&mut h);
+        let rows = r.rows.clone();
+        r.grid.add_row(&rows, r.columns.len());
+        r.grid.edit_cell(&rows, 1, 0, Some("2".into()));
+    }
+    for row in [0, 1] {
+        load(&mut h, (row, 1), &bin);
+        load(&mut h, (row, 2), &txt);
+        let r = first_result(&mut h);
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, row, 3, Some(json.clone()));
+        r.grid.edit_cell(&rows, row, 4, Some(vector.clone()));
+    }
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let errors: Vec<String> = {
+        let w = h.state_mut().test_sql_window();
+        w.state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| m.text.clone())
+            .collect()
+    };
+    assert!(errors.is_empty(), "{errors:?}");
+    let rows = first_result(&mut h).rows.clone();
+    assert_eq!(rows.len(), 2);
+    for (r, row) in rows.iter().enumerate() {
+        assert!(row[3].as_deref() == Some(&*json), "row {r}: the JSON");
+        assert!(row[4].as_deref() == Some(&*vector), "row {r}: the VECTOR");
+        for (col, file) in [(1, &bin), (2, &txt)] {
+            let path = dir.join(format!("saved-{r}-{col}"));
+            let before = message_count(&mut h);
+            let files = &mut h.state_mut().test_sql_window().state.value_files;
+            files.chosen.push_back(Some(path.clone()));
+            let result = first_result(&mut h);
+            result
+                .grid
+                .request_save(&result.columns, &result.rows, (r, col));
+            let said = file_done(&mut h, before);
+            assert!(said.starts_with("Saved "), "{said}");
+            assert!(
+                std::fs::read(&path).unwrap() == std::fs::read(file).unwrap(),
+                "row {r}, column {col}"
+            );
+        }
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    run_script(&mut h, connection, drop);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// [`files_round_trip`] on MySQL or MariaDB (`PYTHIA_TEST_MYSQL`): a
 /// LONGBLOB and a LONGTEXT.
 #[test]
