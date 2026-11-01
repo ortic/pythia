@@ -9803,6 +9803,52 @@ fn names_keep_the_case_that_tells_them_apart() {
     }
 }
 
+/// A SQLite table named `""` shows as `""` (#281): in the browser, where it
+/// was a button without a label, 16 pixels wide, its tab and view,
+/// Favorites and Recent. One named `" "` shows as `" "`.
+#[test]
+fn an_empty_name_shows_as_quotes() {
+    use pythia_db::ObjectType;
+    let connection = "r55-empty.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"\" (a, b);\ncreate table \" \" (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    assert!(h.query_by_label("\" \"").is_some());
+    let entry = h.get_by_label("\"\"");
+    assert!(entry.rect().width() > 20.0, "{:?}", entry.rect());
+    entry.click();
+    h.run_steps(2);
+    let selected = h.state().test_browser_selected();
+    assert_eq!(selected.map(|o| o.name), Some(String::new()));
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: String::new(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"\""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"\"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
+}
+
 /// A name typed after its opening quote is completed and closed (#234):
 /// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
 /// didn't open.

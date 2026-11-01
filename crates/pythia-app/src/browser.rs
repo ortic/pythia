@@ -2455,9 +2455,13 @@ impl Template {
 /// `name` as the browser, tabs and titles show it (#272): as it is, so
 /// that names told apart by case read apart. Oracle's names in its default
 /// uppercase read in lowercase, which reads better, and the others as its
-/// SQL writes them (`"Foo"`), so that they don't read like those.
+/// SQL writes them (`"Foo"`), so that they don't read like those. A name
+/// that is empty or only spaces reads quoted too.
 pub fn shown_name(dialect: Dialect, name: &str) -> String {
-    if dialect != Dialect::ORACLE {
+    if name.trim().is_empty() {
+        // There would be nothing to see or click (#281).
+        dialect.quote_ident(name)
+    } else if dialect != Dialect::ORACLE {
         name.to_owned()
     } else if name.chars().any(char::is_lowercase) {
         dialect.quote_ident(name)
@@ -2900,6 +2904,10 @@ mod tests {
             (Dialect::MYSQL, "Emp", "Emp"),
             (Dialect::SQLSERVER, "Emp", "Emp"),
             (Dialect::SQLITE, "Emp", "Emp"),
+            (Dialect::SQLITE, "", "\"\""),
+            (Dialect::SQLITE, "  ", "\"  \""),
+            (Dialect::MYSQL, "", "``"),
+            (Dialect::SQLSERVER, " ", "[ ]"),
         ] {
             assert_eq!(shown_name(dialect, name), shown, "{dialect:?} {name}");
         }

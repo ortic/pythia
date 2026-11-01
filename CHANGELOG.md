@@ -528,6 +528,11 @@ All notable changes to Pythia are documented here. The format follows
   writes it (`"Foo"`). So do the tabs, *Favorites* and *Recent*, a
   table's indexes, constraints and triggers (and their *Copy name*), and
   the object named in an editor's context menu.
+- SQLite: a table named `""` shows as `""` in the object browser (#281),
+  under *Favorites* and *Recent*, on its tab and in its view's heading
+  (`main.""`). It showed as its icon and a button without a name, 16
+  pixels wide, and its tab had no title. A name of spaces only shows
+  quoted as well (`" "`).
 
 ## [0.10.0] - 2026-10-30
 
