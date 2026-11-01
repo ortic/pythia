@@ -343,7 +343,7 @@ impl ProgramWindow {
     fn compile_part(&mut self) -> Effects {
         let mut effects = Effects::default();
         while let Some(i) = self.state.compile_queue.pop() {
-            let sql = runnable(self.parts[i].editor.text());
+            let sql = qualify_unit(&runnable(self.parts[i].editor.text()), &self.object.owner);
             if sql.trim().is_empty() {
                 continue;
             }
@@ -1447,6 +1447,75 @@ impl Outline<'_> {
 }
 
 /// The part's text as a single statement: drops a trailing `/` line.
+/// The unit's `CREATE` as it is compiled in `owner`'s schema (#251).
+/// ALL_SOURCE keeps neither `CREATE` nor the owner, so the source of
+/// another schema's unit went into the session's: the unit's name gets the
+/// owner unless it names one, and so does a trigger's table after `ON`.
+fn qualify_unit(sql: &str, owner: &str) -> String {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize(sql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let word = |i: usize| {
+        tokens
+            .get(i)
+            .filter(|t| t.kind.is_word())
+            .map(|t| sql[t.span.clone()].to_ascii_uppercase())
+    };
+    let is = |i: usize, words: &[&str]| word(i).is_some_and(|w| words.contains(&w.as_str()));
+    // A name that names no schema: not followed by a dot.
+    let bare = |i: usize| {
+        tokens
+            .get(i)
+            .is_some_and(|t| t.kind.is_word() || t.kind == TokenKind::QuotedIdent)
+            && tokens.get(i + 1).is_none_or(|t| t.kind != TokenKind::Dot)
+    };
+    // CREATE [OR REPLACE] [EDITIONABLE | NONEDITIONABLE] kind [BODY] name
+    if !is(0, &["CREATE"]) {
+        return sql.to_owned();
+    }
+    let mut i = if is(1, &["OR"]) { 3 } else { 1 };
+    if is(i, &["EDITIONABLE", "NONEDITIONABLE"]) {
+        i += 1;
+    }
+    let trigger = is(i, &["TRIGGER"]);
+    if !is(
+        i,
+        &[
+            "PACKAGE",
+            "TYPE",
+            "PROCEDURE",
+            "FUNCTION",
+            "TRIGGER",
+            "LIBRARY",
+        ],
+    ) {
+        return sql.to_owned();
+    }
+    i += 1;
+    if is(i, &["BODY"]) {
+        i += 1;
+    }
+    let mut at = Vec::new();
+    if bare(i) {
+        at.push(tokens[i].span.start);
+    }
+    if trigger
+        && let Some(on) = (i + 1..tokens.len()).find(|&j| is(j, &["ON"]))
+        && !is(on + 1, &["DATABASE", "SCHEMA", "PLUGGABLE", "NESTED"])
+        && bare(on + 1)
+    {
+        at.push(tokens[on + 1].span.start);
+    }
+    let prefix = format!("{}.", pythia_db::Dialect::ORACLE.quote_ident(owner));
+    let mut out = sql.to_owned();
+    for start in at.into_iter().rev() {
+        out.insert_str(start, &prefix);
+    }
+    out
+}
+
 fn runnable(text: &str) -> String {
     let trimmed = text.trim_end();
     let trimmed = trimmed
@@ -1473,7 +1542,103 @@ fn markers(errors: &[CompileError]) -> Vec<Marker> {
 
 #[cfg(test)]
 mod tests {
-    use super::{enclosing_subprograms, member_span, subprogram_at, subprogram_items};
+    use super::{
+        enclosing_subprograms, member_span, qualify_unit, subprogram_at, subprogram_items,
+    };
+
+    /// A unit opened from another schema compiles in that schema, not the
+    /// session's (#251): ALL_SOURCE keeps neither CREATE nor the owner.
+    #[test]
+    fn units_compile_in_their_own_schema() {
+        let cases = [
+            (
+                "CREATE OR REPLACE package        o_chk as end;",
+                "CREATE OR REPLACE package        HR.o_chk as end;",
+            ),
+            (
+                "CREATE OR REPLACE PACKAGE BODY \"Mixed\" AS END;",
+                "CREATE OR REPLACE PACKAGE BODY HR.\"Mixed\" AS END;",
+            ),
+            (
+                "CREATE OR REPLACE type body t_x is end;",
+                "CREATE OR REPLACE type body HR.t_x is end;",
+            ),
+            (
+                "create or replace procedure scott.p is begin null; end;",
+                "create or replace procedure scott.p is begin null; end;",
+            ),
+            (
+                "CREATE OR REPLACE trigger trg before insert on emp for each row begin null; end;",
+                "CREATE OR REPLACE trigger HR.trg before insert on HR.emp for each row begin null; end;",
+            ),
+            (
+                "CREATE OR REPLACE trigger trg after insert or update of sal on scott.emp begin null; end;",
+                "CREATE OR REPLACE trigger HR.trg after insert or update of sal on scott.emp begin null; end;",
+            ),
+            (
+                "CREATE OR REPLACE trigger trg after logon on database begin null; end;",
+                "CREATE OR REPLACE trigger HR.trg after logon on database begin null; end;",
+            ),
+            (
+                "CREATE OR REPLACE function f return number is begin return 1; end;",
+                "CREATE OR REPLACE function HR.f return number is begin return 1; end;",
+            ),
+        ];
+        for (sql, compiled) in cases {
+            assert_eq!(qualify_unit(sql, "HR"), compiled, "{sql}");
+        }
+        assert_eq!(
+            qualify_unit("CREATE OR REPLACE package p as end;", "Odd Owner"),
+            "CREATE OR REPLACE package \"Odd Owner\".p as end;"
+        );
+    }
+
+    /// The same, live: as a DBA, a unit of the test user compiles there.
+    #[test]
+    fn units_compile_in_their_own_schema_live() {
+        let Some(dba) = crate::test_db::connect("PYTHIA_TEST_DB_DBA") else {
+            return;
+        };
+        let Some(user) = std::env::var("PYTHIA_TEST_DB")
+            .ok()
+            .and_then(|s| s.split('/').next().map(str::to_uppercase))
+        else {
+            return;
+        };
+        dba.execute(
+            &format!("create or replace package {user}.pw_owner as procedure p; end;"),
+            &[],
+        )
+        .unwrap();
+        let source =
+            pythia_db::object_source(&dba, &user, "PW_OWNER", ObjectType::Package).unwrap();
+        let compiled = qualify_unit(
+            &source.replace("procedure p;", "procedure p; procedure q;"),
+            &user,
+        );
+        dba.execute(&compiled, &[]).unwrap();
+        let owners: Vec<String> = dba
+            .query_as::<String>(
+                "select owner from all_objects where object_name = 'PW_OWNER' order by owner",
+                &[],
+            )
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let text: String = dba
+            .query_as::<String>(
+                "select text from all_source where owner = :1 and name = 'PW_OWNER' order by line",
+                &[&user],
+            )
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for owner in &owners {
+            let _ = dba.execute(&format!("drop package {owner}.pw_owner"), &[]);
+        }
+        assert_eq!(owners, [user.as_str()], "only in its own schema");
+        assert!(text.contains("procedure q;"), "{text}");
+    }
     use crate::browser::Subprogram;
     use crate::documents::ObjectRef;
     use pythia_db::ObjectType;
