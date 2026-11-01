@@ -341,17 +341,14 @@ pub fn create(def: &TableDef, options: &CreateOptions) -> Vec<SyncStatement> {
     statements
 }
 
-/// Quotes an identifier unless it is a plain uppercase name.
+/// Quotes an identifier as `Dialect::quote_ident` does, a reserved word
+/// too (#303): plain uppercase names are written in lowercase.
 pub fn ident(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "_$#".contains(c))
-        && !pythia_plsql::is_keyword(name);
-    if plain {
+    let quoted = pythia_db::Dialect::ORACLE.quote_ident(name);
+    if quoted == name {
         name.to_lowercase()
     } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
+        quoted
     }
 }
 
@@ -1199,5 +1196,27 @@ mod tests {
     fn not_null_checks() {
         assert!(is_not_null_check("\"ID\" IS NOT NULL"));
         assert!(!is_not_null_check("salary > 0"));
+    }
+
+    /// Names Oracle reserves are quoted, also those the highlighter
+    /// doesn't know as keywords: unquoted, `resource number` fails with
+    /// ORA-03050.
+    #[test]
+    fn quotes_reserved_words() {
+        for word in [
+            "RESOURCE",
+            "RENAME",
+            "EXCEPT",
+            "MLSLABEL",
+            "SUCCESSFUL",
+            "LEVEL",
+        ] {
+            assert_eq!(ident(word), format!("\"{word}\""));
+        }
+        assert_eq!(ident("NAME"), "name");
+        let mut source = base();
+        source.columns.push(col("RESOURCE", "NUMBER", true));
+        let d = diff(&source, &base(), false);
+        assert_eq!(sqls(&d), ["alter table emp add (\"RESOURCE\" NUMBER)"]);
     }
 }

@@ -1025,3 +1025,214 @@ fn oracle_binary_values_typed_as_shown() {
             .unwrap();
     }
 }
+
+/// A fetched row's CLOB, NCLOB, BLOB, LONG and LONG RAW can be changed, a
+/// NULL too (#309): the UPDATE checked the value fetched with DECODE,
+/// which fails with ORA-00932 on a LOB and ORA-00997 on a LONG. A LOB
+/// typed so (the Instant Client's types) is checked with
+/// `dbms_lob.compare`, which misses a value changed since; a LONG, and a
+/// LOB the pure-Rust driver types LONG or LONG RAW, is left out.
+#[test]
+fn oracle_lobs_of_fetched_rows() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let tables = ["r65_lobs", "r65_long", "r65_long_raw"];
+    for table in tables {
+        let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+    }
+    for sql in [
+        "create table r65_lobs (id number primary key, c clob, n nclob, b blob)",
+        "insert into r65_lobs values (1, 'abc', 'xyz', hextoraw('CAFE'))",
+        "insert into r65_lobs (id) values (2)",
+        "create table r65_long (id number primary key, l long)",
+        "insert into r65_long values (1, 'abc')",
+        "insert into r65_long (id) values (2)",
+        "create table r65_long_raw (id number primary key, l long raw)",
+        "insert into r65_long_raw values (1, hextoraw('CAFE'))",
+        "insert into r65_long_raw (id) values (2)",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = |table: &str| Editable {
+        table: table.into(),
+        source: format!("select * from {table} order by id"),
+        key: RowKey::Rowid,
+    };
+    // Each value of each row set to another, one UPDATE at a time.
+    let new = |type_name: &str| match type_name {
+        "BLOB" | "LONG RAW" => "0xBABE",
+        _ => "new",
+    };
+    for table in tables {
+        let edit = edit(table);
+        let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+        for r in 0..rows.len() {
+            for (c, col) in columns.iter().enumerate().take(columns.len() - 1).skip(1) {
+                let value = Some(new(&col.type_name).to_owned());
+                let changes = Changes {
+                    updates: BTreeMap::from([(r, BTreeMap::from([(c, value)]))]),
+                    ..Changes::default()
+                };
+                for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+                    let ran = conn
+                        .execute(&statement.sql, &[])
+                        .and_then(|s| s.row_count());
+                    assert!(matches!(ran, Ok(1)), "{ran:?}\n{}", statement.sql);
+                }
+            }
+        }
+    }
+    let (_, rows) = fetch(
+        "select c, n, b, (select count(*) from r65_long where l is not null), \
+           (select count(*) from r65_long_raw where l is not null) from r65_lobs order by id",
+    );
+    let changed = ["new", "new", "BABE", "2", "2"].map(|v| Some(v.to_owned()));
+    assert_eq!(rows, [changed.clone(), changed]);
+
+    // The check of a LOB typed as such finds the value fetched, a NULL
+    // too, and not another.
+    conn.execute(
+        "update r65_lobs set c = null, n = null, b = null where id = 2",
+        &[],
+    )
+    .unwrap();
+    let (_, rows) = fetch("select rowid from r65_lobs order by id");
+    for (name, type_name, value, other) in [
+        ("C", "CLOB", "new", "abc"),
+        ("N", "NCLOB", "new", "xyz"),
+        ("B", "BLOB", "BABE", "CAFE"),
+    ] {
+        let col = Column {
+            name: name.into(),
+            type_name: type_name.into(),
+            numeric: false,
+        };
+        let count = |row: usize, value: Option<&str>| {
+            let rowid = rows[row][0].as_deref().unwrap();
+            let check = same(Dialect::ORACLE, name, &col, value).unwrap();
+            let sql = format!("select count(*) from r65_lobs where rowid = '{rowid}' and {check}");
+            fetch(&sql).1[0][0].clone().unwrap()
+        };
+        assert_eq!(count(0, Some(value)), "1", "{type_name}");
+        assert_eq!(count(0, Some(other)), "0", "{type_name}");
+        assert_eq!(count(0, None), "0", "{type_name}");
+        assert_eq!(count(1, None), "1", "{type_name}");
+        assert_eq!(count(1, Some(value)), "0", "{type_name}");
+    }
+    for table in tables {
+        conn.execute(&format!("drop table {table} purge"), &[])
+            .unwrap();
+    }
+}
+
+/// The check of a fetched BLOB over the 2000 bytes a `hextoraw` takes,
+/// typed BLOB as the Instant Client types it (#314): it finds the value,
+/// and not one with another byte or fewer; with the value in one literal
+/// it failed with ORA-01704.
+#[test]
+fn oracle_long_blobs_are_checked() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r65_long_blob purge", &[]);
+    for sql in [
+        "create table r65_long_blob (id number primary key, b blob)",
+        "declare
+           v blob;
+         begin
+           dbms_lob.createtemporary(v, true);
+           dbms_lob.writeappend(v, 2000, utl_raw.copies(hextoraw('0102'), 1000));
+           dbms_lob.writeappend(v, 1000, utl_raw.copies(hextoraw('0304'), 500));
+           insert into r65_long_blob values (1, v);
+         end;",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let count = |sql: &str| {
+        let mut count = None;
+        pythia_db::stream_query(&conn, sql, 10, |_, rows| {
+            if let Some(row) = rows.first() {
+                count = row[0].clone();
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        count.unwrap()
+    };
+    let hex = count("select b from r65_long_blob");
+    assert_eq!(hex.len(), 6000);
+    let col = Column {
+        name: "B".into(),
+        type_name: "BLOB".into(),
+        numeric: false,
+    };
+    let found = |value: &str| {
+        let check = same(Dialect::ORACLE, "B", &col, Some(value)).unwrap();
+        count(&format!("select count(*) from r65_long_blob where {check}"))
+    };
+    assert_eq!(found(&hex), "1");
+    let other = format!("{}05", &hex[..5998]);
+    assert_eq!(found(&other), "0");
+    assert_eq!(found(&hex[..5000]), "0");
+    conn.execute("drop table r65_long_blob purge", &[]).unwrap();
+}
+
+/// A fetched CLOB over the 4000 bytes a literal holds is changed, and a
+/// new row takes one (#317): the UPDATE and the INSERT failed with
+/// ORA-01704.
+#[test]
+fn oracle_long_clobs_can_be_changed() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r65_long_clob purge", &[]);
+    for sql in [
+        "create table r65_long_clob (id number primary key, c clob)",
+        "insert into r65_long_clob values (1, to_clob(rpad('x', 4000, 'x')) || rpad('y', 1000, 'y'))",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = Editable {
+        table: "r65_long_clob".into(),
+        source: "select * from r65_long_clob order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let changed = format!("{}z{}", "x".repeat(4000), "y".repeat(999));
+    let new = format!("it's & {}", "\u{e9}".repeat(3000));
+    let changes = Changes {
+        updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(changed.clone()))]))]),
+        inserts: vec![vec![Some("2".into()), Some(new.clone()), None]],
+        ..Changes::default()
+    };
+    for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+        let ran = conn
+            .execute(&statement.sql, &[])
+            .and_then(|s| s.row_count());
+        assert!(matches!(ran, Ok(1)), "{ran:?}\n{}", &statement.sql[..200]);
+    }
+    let (_, rows) = fetch("select c from r65_long_clob order by id");
+    assert_eq!(rows, [[Some(changed)], [Some(new)]]);
+    conn.execute("drop table r65_long_clob purge", &[]).unwrap();
+}

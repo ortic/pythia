@@ -822,6 +822,44 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL chooses, `orders_id_seq`, and what reads it by its name
   failed. A name PostgreSQL chose is still left out, so that a copy
   beside the table chooses its own.
+- JSON exports keep every column, in the result's order (#297). Each
+  row was an object keyed by the column names, sorted: of two columns
+  named `ID`, as in most joins, only the last one's value was written. A
+  name that comes again is now `ID_2` (or the next number no column is
+  called). *Copy as*, the grid's *Export*, *Execute to file* and *Export
+  tables* write JSON so.
+- Compare: sync scripts quote a column, table, constraint or index
+  called `RESOURCE`, `RENAME`, `EXCEPT`, `MLSLABEL` or `SUCCESSFUL`
+  (#303), as INSERT statements do since #274: `create table words (id
+  NUMBER, resource NUMBER)` failed with ORA-03050.
+- Oracle: BINARY_DOUBLE and BINARY_FLOAT values keep their exponent
+  (#304), as SQL Server's and MySQL's floats do since #261: `1e300d`
+  showed as a 1 and 300 zeros, `2e-20d` as `0.00000000000000000002`, in
+  the grid and in copies and exports, also with the Instant Client.
+- Oracle: a fetched row's CLOB, NCLOB, BLOB, LONG or LONG RAW can be
+  changed in a result (#309). *Apply* failed with ORA-00932 or
+  ORA-00997: the UPDATE checked the value fetched with DECODE, which
+  takes no LOB and no LONG. A LOB is now checked with
+  `dbms_lob.compare`; a LONG or LONG RAW, which SQL can't compare, is
+  left out of the check, and so is a LOB with the pure-Rust driver,
+  which types it as one.
+- Oracle: INSERT statements of a BLOB over 2000 bytes run (#314). They
+  wrote it as one `hextoraw('…')`, which takes no more than 4000 hex
+  digits: ORA-01704. *Execute to file* and *Export tables* failed so on
+  any larger BLOB, *Copy as* and the grid's *Export* on one of 2001 to
+  4000 bytes. Such a row is now written as a PL/SQL block that makes the
+  BLOB from parts of 1000 bytes and inserts it; Oracle compiles it in
+  some seconds a megabyte. With the Instant Client, a change to a
+  fetched BLOB of that size no longer fails on the check of its value.
+- Oracle: a CLOB, NCLOB or LONG over 4000 bytes can be written (#317).
+  INSERT statements and result editing wrote it as one literal, which
+  holds no more: ORA-01704 from *Execute to file*, *Export tables*,
+  *Copy as* and the grid's *Export*, and on *Apply* of a change to such
+  a value or a new row with one. Result editing now writes it as
+  `to_clob('…') || '…'` of parts of 1000 characters, which Oracle takes
+  for up to about 250,000 characters; INSERT statements write such a row
+  as a PL/SQL block that appends the parts to a CLOB, for any length. A
+  LONG over 4000 bytes still can't be written so.
 
 ## [0.10.0] - 2026-10-30
 

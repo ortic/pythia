@@ -713,9 +713,30 @@ fn column(name: &str, ty: &OracleType) -> Column {
 fn cell(value: &crate::oracle::SqlValue) -> Cell {
     match value.is_null() {
         Ok(true) => None,
-        Ok(false) => Some(value.get::<String>().unwrap_or_else(|_| value.to_string())),
+        Ok(false) => Some(text(value)),
         Err(e) => Some(format!("<{e}>")),
     }
+}
+
+/// A value as text. The Instant Client's BINARY_DOUBLE and BINARY_FLOAT
+/// as the pure-Rust driver writes them, with an exponent where it is long
+/// (#304): the `oracle` crate writes 1e300 as a 1 and 300 zeros.
+fn text(value: &crate::oracle::SqlValue) -> String {
+    #[cfg(feature = "thick")]
+    match value.oracle_type() {
+        Ok(OracleType::BinaryDouble) => {
+            if let Ok(v) = value.get::<f64>() {
+                return crate::float_text(v);
+            }
+        }
+        Ok(OracleType::BinaryFloat) => {
+            if let Ok(v) = value.get::<f32>() {
+                return crate::float_text(v);
+            }
+        }
+        _ => {}
+    }
+    value.get::<String>().unwrap_or_else(|_| value.to_string())
 }
 
 fn statement_kind_label(kind: &StatementType, sql: &str) -> String {
