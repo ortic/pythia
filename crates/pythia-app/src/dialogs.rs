@@ -31,6 +31,9 @@ pub struct ConnectDialog {
     ssh_password: String,
     /// The SSH server's host key isn't known: offered for trust.
     host_key: Option<HostKey>,
+    /// Why passwords aren't saved: there's no keychain, or it refused the
+    /// last one.
+    not_saved: Option<String>,
     /// The key file being chosen in a file dialog.
     picking_key: Option<Receiver<Option<PathBuf>>>,
     /// A SQLite database file being chosen: an existing one, or (`true`) a
@@ -135,9 +138,18 @@ impl ConnectDialog {
         self.host_key = None;
         self.focus_requested = false;
         self.confirm_delete = false;
+        if self.not_saved.is_none() {
+            self.not_saved = secrets::unavailable();
+        }
         if let Some(last) = last {
             self.pick(last.clone());
         }
+    }
+
+    /// Whether the keychain took the passwords last saved: why not is shown
+    /// by *Save password* (#214).
+    pub fn passwords_saved(&mut self, saved: Result<(), String>) {
+        self.not_saved = saved.err();
     }
 
     fn pick(&mut self, profile: ConnectionProfile) {
@@ -515,6 +527,16 @@ impl ConnectDialog {
                     .on_hover_text("Stored in the operating system's keychain");
             }
         });
+        if let Some(why) = self.not_saved.as_deref()
+            && self.form.save_password
+            && !file
+        {
+            ui.label(
+                RichText::new(format!("Passwords aren't saved: {why}"))
+                    .small()
+                    .color(crate::theme::WARN),
+            );
+        }
         if Dialect::from(self.form.kind).supports(Feature::SshTunnel) {
             submit |= self.ssh_ui(ui);
         }

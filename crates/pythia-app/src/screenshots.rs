@@ -6695,6 +6695,44 @@ fn mysql_database_from_the_browser() {
     );
 }
 
+/// Passwords the keychain doesn't take say so (#214), in the log and by
+/// *Save password* in the connect dialog while it's ticked: the next
+/// connect had no password, and nothing said why.
+#[test]
+fn passwords_not_saved() {
+    let mut h = headless_harness();
+    let profile = ConnectionProfile {
+        name: "keychain".into(),
+        kind: pythia_config::DbKind::MySql,
+        username: "app".into(),
+        connect_string: "db.example.com:3306/shop".into(),
+        save_password: true,
+        ..Default::default()
+    };
+    h.state_mut().test_show_connections(vec![profile]);
+    let why = "there's no keychain (no Secret Service)";
+    h.state_mut()
+        .test_passwords_saved("keychain", Err(why.into()));
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains(&format!("Passwords aren't saved: {why}"))
+            .is_some()
+    );
+    let log = h.state().test_log();
+    assert!(
+        log.iter()
+            .any(|l| *l == format!("The password of keychain wasn't saved: {why}")),
+        "{log:?}"
+    );
+    save(&mut h, "connect-password-not-saved");
+    h.state_mut().test_passwords_saved("keychain", Ok(()));
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("Passwords aren't saved")
+            .is_none()
+    );
+}
+
 /// A MySQL connection (`PYTHIA_TEST_MYSQL=user/password@host:port/database`):
 /// queries, transactions, browser and object views work; what MySQL can't
 /// do is left out of the menus, the toolbar and the browser.

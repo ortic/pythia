@@ -145,6 +145,11 @@ All notable changes to Pythia are documented here. The format follows
   (#211). It now says that the certificate isn't trusted and that
   `?tls=skip-verify` connects to a self-signed one; the connect
   dialog's hint mentions it too.
+- *Save password* did nothing on a system without a keychain (such as
+  Linux without a Secret Service, or WSL), and nothing said so (#214):
+  the next connect had no password. The connect dialog now says under
+  *Save password* that passwords aren't saved and why, and the log says
+  so for each connection whose password couldn't be saved.
 
 ## [0.10.0] - 2026-10-30
 
