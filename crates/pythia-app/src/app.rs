@@ -4422,6 +4422,18 @@ impl PythiaApp {
                         Some(id) => id,
                         None => {
                             let connection = self.current_connection();
+                            // Only where the Tools menu offers the import: on
+                            // the others it failed at the end (#235).
+                            let dialect = self.dialect_of(connection.as_deref());
+                            if !Command::ImportData.available(dialect) {
+                                let file = path.file_name().unwrap_or_default().to_string_lossy();
+                                self.log(format!(
+                                    "{file}: {} isn't available for {} connections",
+                                    Command::ImportData.short_label(),
+                                    dialect.name()
+                                ));
+                                continue;
+                            }
                             self.add_doc(connection, DocKind::Import(Default::default()))
                         }
                     };

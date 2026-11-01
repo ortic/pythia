@@ -318,6 +318,41 @@ All notable changes to Pythia are documented here. The format follows
   `:e-mail` broke the statement, and two columns `Id` and `id` shared
   `:id`; binds are now `:order_date`, `:e_mail`, `:id_2`. *SELECT
   statement* no longer takes a digit for its alias.
+- Binary values of SQL Server (`varbinary`, `binary`, `image`), MySQL
+  (`VARBINARY`, `BINARY`) and PostgreSQL (`bytea`) show as binary in the
+  result grid (#224), as Oracle's and BLOBs did: their start and size in
+  the cell, a hex dump in *View value…*. They showed as hex text, without
+  their size, and a value over 4000 bytes didn't show that the grid holds
+  it cut short. So do SQLite columns declared `MEDIUMBLOB` or `LONGBLOB`.
+- *View value…* shows images (#231): a PNG, JPEG, GIF, WebP or BMP
+  value showed ⚠ in place of the image, as Pythia had no decoder for
+  them. An image viewed in a cell no longer shows again for another
+  value viewed there later.
+- *View value…* shows a binary value over 4000 bytes as binary (#232):
+  its size, a hex dump of the first 4000 bytes, which the grid holds of
+  it, and that an image can't be shown from them. It showed the value as
+  8015 characters of text, hex digits and `… (51200 bytes)`.
+- A CSV or Excel file dropped on Pythia opens an import window only on
+  Oracle connections, where *Import Data* is offered (#235). On MySQL,
+  PostgreSQL, SQL Server and SQLite, the window opened anyway, showed
+  Oracle's `CREATE TABLE` and failed only at *Import* ("This tool isn't
+  available for SQL Server connections"); the log now says so at once.
+- SQLite: completion offers the columns of an attached database's table
+  named without its schema (#236), as SQLite reads such a name: in
+  `temp`, `main`, then the attached databases in the order they were
+  attached. It looked in `temp` and `main` only and offered nothing.
+- The result grid sorts and adds up numbers of any size exactly (#238).
+  Numbers past the 15 to 17 digits of a double, such as BIGINT keys or
+  `NUMBER(38)` values, sorted out of order (9223372036854775807 before
+  …806), and the selection's summary rounded them: "Min
+  9223372036854775808." for 9223372036854775806, with a stray dot after
+  every number of 1e15 and more. The summary now shows the smallest and
+  largest value as they are, and the sum and average exactly.
+- *Export* and *Copy all* write a result's rows as the grid shows them
+  (#243): those its filter passes, in the order shown. With "12 of 100
+  rows" in the result bar, they wrote all 100, in the order fetched,
+  while leaving hidden columns out. The message says how many rows were
+  exported ("Exported 12 rows to result.csv").
 
 ## [0.10.0] - 2026-10-30
 

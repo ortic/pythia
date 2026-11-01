@@ -6,6 +6,7 @@
 //! write values as literals of the database they came from (`TO_DATE` on
 //! Oracle, `X'…'` binary on MySQL, …).
 
+use std::cmp::Ordering;
 use std::io::Write;
 
 pub mod import;
@@ -728,6 +729,58 @@ pub fn sqlite_number(text: &str) -> bool {
             .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
 }
 
+/// Compares two numbers written as plain decimals (`-12.50`, `.5`, `007`)
+/// exactly, digit by digit, whatever their size; `None` if one isn't such
+/// a number (`1e300`, `NaN`, text). A double holds 15 to 17 of their
+/// digits (#238).
+pub fn compare_decimals(a: &str, b: &str) -> Option<Ordering> {
+    let (a, b) = (PlainDecimal::parse(a)?, PlainDecimal::parse(b)?);
+    Some(match (a.negative, b.negative) {
+        (false, false) => a.magnitude(&b),
+        (true, true) => b.magnitude(&a),
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+    })
+}
+
+/// A plain decimal's sign and digits, without the zeros before its first
+/// and after its last significant digit; zero isn't negative.
+struct PlainDecimal<'a> {
+    negative: bool,
+    whole: &'a str,
+    fraction: &'a str,
+}
+
+impl<'a> PlainDecimal<'a> {
+    fn parse(text: &'a str) -> Option<Self> {
+        let (negative, digits) = match text.strip_prefix('-') {
+            Some(digits) => (true, digits),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        };
+        let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+        let decimal = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if (whole.is_empty() && fraction.is_empty()) || !decimal(whole) || !decimal(fraction) {
+            return None;
+        }
+        let whole = whole.trim_start_matches('0');
+        let fraction = fraction.trim_end_matches('0');
+        Some(Self {
+            negative: negative && !(whole.is_empty() && fraction.is_empty()),
+            whole,
+            fraction,
+        })
+    }
+
+    /// Compares the absolute values.
+    fn magnitude(&self, other: &Self) -> Ordering {
+        self.whole
+            .len()
+            .cmp(&other.whole.len())
+            .then_with(|| self.whole.cmp(other.whole))
+            .then_with(|| self.fraction.cmp(other.fraction))
+    }
+}
+
 /// SQLite: a blob as the `X'…'` of the hex it is shown as, numbers as
 /// SQLite writes them unquoted (see [`sqlite_number`]), text quoted (no
 /// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
@@ -1225,6 +1278,33 @@ mod tests {
         for value in [whole.as_str(), "it ends… (12 bytes)"] {
             let csv = export_to_vec(Format::Csv, &columns, &rows(value), &Options::default());
             assert!(csv.is_ok(), "{value}");
+        }
+    }
+
+    /// Plain decimals compare digit by digit, past what a double holds
+    /// (#238).
+    #[test]
+    fn decimals_compare_exactly() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        for (a, b, order) in [
+            ("9223372036854775807", "9223372036854775806", Some(Greater)),
+            (
+                "12345678901234567890.25",
+                "12345678901234567890.5",
+                Some(Less),
+            ),
+            ("007", "7", Some(Equal)),
+            (".5", "0.50", Some(Equal)),
+            ("-0", "0", Some(Equal)),
+            ("-1.5", "-1.25", Some(Less)),
+            ("-2", "1", Some(Less)),
+            ("+3", "2.999", Some(Greater)),
+            ("1e3", "1000", None),
+            ("NaN", "1", None),
+            ("-", "1", None),
+            (".", "1", None),
+        ] {
+            assert_eq!(compare_decimals(a, b), order, "{a} {b}");
         }
     }
 

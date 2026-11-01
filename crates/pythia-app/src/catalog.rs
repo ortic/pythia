@@ -283,10 +283,18 @@ mod dictionary {
                 Answer::Objects(schema, objects)
             }
             CatalogRequest::Resolve { schema, name } => {
-                // Unqualified: `temp` hides `main`, as SQLite looks there first.
+                // Unqualified: where SQLite looks, `temp`, `main`, then the
+                // attached databases in the order they were attached (#236).
                 let owners: Vec<String> = match &schema {
                     Some(schema) => vec![schema.clone()],
-                    None => vec!["temp".into(), "main".into()],
+                    None => {
+                        let mut owners = vec!["temp".to_owned(), "main".to_owned()];
+                        if let MetaResult::Schemas(schemas) = client.meta(&MetaQuery::Schemas)? {
+                            owners
+                                .extend(schemas.into_iter().filter(|s| s != "temp" && s != "main"));
+                        }
+                        owners
+                    }
                 };
                 let mut object = None;
                 for owner in owners {
@@ -913,8 +921,20 @@ mod dictionary_live {
         };
         live.run("drop table if exists cat_orders");
         live.run(create);
+        let items = complete_on(&mut live, server.current_schema, names, table);
+        live.run("drop table cat_orders");
+        Some(items)
+    }
 
-        let mut cache = CatalogCache::new(server.current_schema).with_names(names);
+    /// Completes the columns after the alias of `table` in `select o.\n  from
+    /// {table} o` on `live`; returns `(label, inserted text)`.
+    fn complete_on(
+        live: &mut Live,
+        schema: String,
+        names: NameStyle,
+        table: &str,
+    ) -> Vec<(String, String)> {
+        let mut cache = CatalogCache::new(schema).with_names(names);
         // Code assistance looks unquoted names up in uppercase, quoted ones
         // as written, lexed as the database reads them (#208).
         let src = format!("select o.\n  from {table} o");
@@ -930,13 +950,10 @@ mod dictionary_live {
                 live.answer(request).apply(&mut cache);
             }
         }
-        live.run("drop table cat_orders");
-        Some(
-            items
-                .into_iter()
-                .map(|i| (i.label, i.insert_text))
-                .collect(),
-        )
+        items
+            .into_iter()
+            .map(|i| (i.label, i.insert_text))
+            .collect()
     }
 
     fn has(items: &[(String, String)], label: &str, text: &str) -> bool {
@@ -994,5 +1011,75 @@ mod dictionary_live {
             assert!(has(&items, "Customer", "Customer"), "{table}: {items:?}");
             assert!(has(&items, "order", "[order]"), "{table}: {items:?}");
         }
+    }
+
+    /// SQLite looks an unqualified name up in `temp`, `main`, then the
+    /// attached databases in the order they were attached; completion
+    /// looked in `temp` and `main` only, and offered nothing for a table of
+    /// an attached file (#236).
+    #[test]
+    fn sqlite_tables_of_attached_databases() {
+        let dir = std::env::temp_dir();
+        let file =
+            |name: &str| dir.join(format!("pythia-catalog-{}-{name}.db", std::process::id()));
+        let (main, other) = (file("main"), file("other"));
+        for (path, sql) in [
+            (
+                &main,
+                "create table accounts (id integer primary key, fullname text);",
+            ),
+            (
+                &other,
+                "create table accounts (id integer primary key, firstname text);\n\
+                 create table only_other (id integer primary key, note text);",
+            ),
+        ] {
+            let _ = std::fs::remove_file(path);
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+        let (tx, wake) = mpsc::channel();
+        let session = Session::connect(
+            ConnectParams {
+                kind: DbKind::Sqlite,
+                username: String::new(),
+                password: String::new(),
+                connect_string: main.display().to_string(),
+                privilege: Default::default(),
+                init_sql: vec![format!("attach '{}' as other", other.display())],
+                ssh: None,
+            },
+            move || {
+                let _ = tx.send(());
+            },
+        );
+        let mut live = Live {
+            session,
+            wake,
+            dialect: Dialect::SQLITE,
+        };
+        let DbEvent::Connected(server) = live.next() else {
+            panic!("not connected")
+        };
+        let mut complete = |table: &str| {
+            let items = complete_on(
+                &mut live,
+                server.current_schema.clone(),
+                NameStyle::AsWritten,
+                table,
+            );
+            let mut labels: Vec<String> = items.into_iter().map(|(label, _)| label).collect();
+            labels.sort();
+            labels
+        };
+        assert_eq!(complete("only_other"), ["id", "note"]);
+        // `main` comes before the attached ones.
+        assert_eq!(complete("accounts"), ["fullname", "id"]);
+        assert_eq!(complete("other.accounts"), ["firstname", "id"]);
+        drop(live);
+        let _ = std::fs::remove_file(&main);
+        let _ = std::fs::remove_file(&other);
     }
 }

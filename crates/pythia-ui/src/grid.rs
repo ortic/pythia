@@ -14,7 +14,7 @@ use std::ops::RangeInclusive;
 use egui::{Align, Align2, Key, Layout, RichText, Sense, Ui};
 use egui_extras::{Column as TableColumn, TableBuilder};
 use pythia_data::Format;
-use pythia_db::{Cell, Column};
+use pythia_db::{Cell, Column, DbKind, Dialect};
 
 /// The characters of a value's first line a cell lays out at most: more
 /// than any column is wide, and a 10 MB line isn't laid out whole (#212).
@@ -301,8 +301,14 @@ impl GridState {
         if self.ordered_rows == rows.len() {
             return;
         }
+        self.order = self.order_of(rows, columns);
+        self.ordered_rows = rows.len();
+    }
+
+    /// The rows passing the filter, in the order shown.
+    fn order_of(&self, rows: &[Vec<Cell>], columns: &[Column]) -> Vec<usize> {
         let needle = self.filter.trim().to_lowercase();
-        self.order = if needle.is_empty() {
+        let mut order: Vec<usize> = if needle.is_empty() {
             (0..rows.len()).collect()
         } else {
             (0..rows.len())
@@ -314,16 +320,16 @@ impl GridState {
                 })
                 .collect()
         };
-        self.ordered_rows = rows.len();
         if let Some((col, asc)) = self.sort {
             sort_order(
-                &mut self.order,
+                &mut order,
                 rows,
                 col,
                 columns.get(col).is_some_and(|c| c.numeric),
                 asc,
             );
         }
+        order
     }
 
     fn set_sort(&mut self, col: usize, rows: &[Vec<Cell>], columns: &[Column]) {
@@ -679,10 +685,7 @@ fn sort_order(order: &mut [usize], rows: &[Vec<Cell>], col: usize, numeric: bool
             (None, None) => Ordering::Equal,
             (None, Some(_)) => return Ordering::Greater,
             (Some(_), None) => return Ordering::Less,
-            (Some(x), Some(y)) if numeric => match (x.parse::<f64>(), y.parse::<f64>()) {
-                (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-                _ => x.cmp(y),
-            },
+            (Some(x), Some(y)) if numeric => compare_numbers(x, y).unwrap_or_else(|| x.cmp(y)),
             (Some(x), Some(y)) => x.cmp(y),
         };
         if asc { ord } else { ord.reverse() }
@@ -1493,7 +1496,7 @@ fn data_cell(
         .and_then(|e| e.active.as_ref())
         .is_some_and(|(r, ec, _)| *r == view_row && *ec == c);
     // What the cell shows of the value, not a copy of all of it (#212).
-    let binary = is_binary(col);
+    let binary = is_binary(state.dialect, col);
     let shown = state.value(d.rows, view_row, c).map(|text| {
         if binary {
             binary_summary(text)
@@ -1734,22 +1737,22 @@ pub fn selection_data(
     (cols, data)
 }
 
-/// All fetched rows (as fetched) with the columns shown, in the order shown.
+/// The fetched rows as shown, those the filter passes in the order shown
+/// (#243), with the columns shown, in the order shown.
 pub fn shown_data(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
 ) -> (Vec<Column>, Vec<Vec<Cell>>) {
     let keep = state.visible_columns(columns.len());
-    if keep.iter().copied().eq(0..columns.len()) {
-        return (columns.to_vec(), rows.to_vec());
-    }
+    // Also the rows fetched since the grid was drawn.
+    let order = state.order_of(rows, columns);
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
-    let data = rows
+    let data = order
         .iter()
-        .map(|row| {
+        .map(|&r| {
             keep.iter()
-                .map(|&i| row.get(i).cloned().flatten())
+                .map(|&i| rows[r].get(i).cloned().flatten())
                 .collect()
         })
         .collect();
@@ -1796,10 +1799,8 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
         for &ci in &c {
             if let Some(Some(v)) = row.get(ci) {
                 non_null += 1;
-                if columns.get(ci).is_some_and(|col| col.numeric)
-                    && let Ok(n) = v.parse::<f64>()
-                {
-                    numbers.push(n);
+                if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
+                    numbers.push(v.as_str());
                 }
             }
         }
@@ -1807,23 +1808,100 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
     if numbers.is_empty() {
         return Some(format!("{cells} cells · {non_null} not null"));
     }
-    let sum: f64 = numbers.iter().sum();
-    let min = numbers.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // The smallest and largest as they are, not as doubles (#238).
+    let pick = |keep: Ordering| {
+        numbers
+            .iter()
+            .copied()
+            .reduce(|a, b| {
+                if compare_numbers(b, a) == Some(keep) {
+                    b
+                } else {
+                    a
+                }
+            })
+            .unwrap_or_default()
+    };
+    let (min, max) = (pick(Ordering::Less), pick(Ordering::Greater));
+    let (sum, avg) = exact_sum(&numbers).unwrap_or_else(|| {
+        let sum: f64 = numbers.iter().filter_map(|n| n.parse::<f64>().ok()).sum();
+        (fmt_num(sum), fmt_num(sum / numbers.len() as f64))
+    });
     Some(format!(
-        "Count {non_null} · Sum {} · Avg {} · Min {} · Max {}",
-        fmt_num(sum),
-        fmt_num(sum / numbers.len() as f64),
-        fmt_num(min),
-        fmt_num(max)
+        "Count {non_null} · Sum {sum} · Avg {avg} · Min {min} · Max {max}"
     ))
+}
+
+/// Two numbers in order: plain decimals exactly, whatever their size
+/// (#238), others (`1e300`) as doubles; `None` if one isn't a number.
+fn compare_numbers(x: &str, y: &str) -> Option<Ordering> {
+    pythia_data::compare_decimals(x, y)
+        .or_else(|| x.parse::<f64>().ok()?.partial_cmp(&y.parse::<f64>().ok()?))
+}
+
+/// The sum and the average (with four more decimals) of plain decimals,
+/// exact while the sum fits an `i128` of their smallest unit (#238).
+fn exact_sum(numbers: &[&str]) -> Option<(String, String)> {
+    let units: Vec<(i128, u32)> = numbers
+        .iter()
+        .map(|n| decimal_units(n))
+        .collect::<Option<_>>()?;
+    let scale = units.iter().map(|&(_, s)| s).max()?;
+    let mut sum: i128 = 0;
+    for (value, s) in units {
+        sum = sum.checked_add(value.checked_mul(10i128.checked_pow(scale - s)?)?)?;
+    }
+    let n = numbers.len() as i128;
+    // Rounded half away from zero.
+    let scaled = sum.checked_mul(10_000)?;
+    let half = if scaled < 0 { -(n / 2) } else { n / 2 };
+    let avg = scaled.checked_add(half)? / n;
+    Some((decimal_text(sum, scale), decimal_text(avg, scale + 4)))
+}
+
+/// A plain decimal as a count of its smallest unit and the digits after
+/// the point: `12.50` is (125, 1). `None` for other numbers (`1e300`) and
+/// past what an `i128` holds.
+fn decimal_units(text: &str) -> Option<(i128, u32)> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let decimal = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !decimal(whole) || !decimal(fraction) {
+        return None;
+    }
+    let fraction = fraction.trim_end_matches('0');
+    let all = format!("{whole}{fraction}");
+    let value: i128 = if all.is_empty() { 0 } else { all.parse().ok()? };
+    Some((if negative { -value } else { value }, fraction.len() as u32))
+}
+
+/// `units` of 10^-`scale` as a decimal without trailing zeros: (125, 1) is
+/// `12.5`.
+fn decimal_text(units: i128, scale: u32) -> String {
+    let scale = scale as usize;
+    let digits = format!("{:0>width$}", units.unsigned_abs(), width = scale + 1);
+    let (whole, fraction) = digits.split_at(digits.len() - scale);
+    let fraction = fraction.trim_end_matches('0');
+    let sign = if units < 0 { "-" } else { "" };
+    if fraction.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction}")
+    }
 }
 
 fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         format!("{n:.0}")
+    } else if n.abs() >= 1e21 {
+        format!("{n:e}")
     } else {
-        format!("{n:.4}").trim_end_matches('0').to_owned()
+        // Without the dot of 1e15 and more (#238).
+        let text = format!("{n:.4}");
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
     }
 }
 
@@ -2098,17 +2176,33 @@ fn viewer(
         .cloned()
         .flatten();
     let name = columns.get(c).map_or("", |col| col.name.as_str());
-    let bytes = columns
+    let binary = columns
         .get(c)
-        .filter(|col| is_binary(col))
-        .and(value.as_deref())
-        .and_then(decode_hex);
+        .is_some_and(|col| is_binary(state.dialect, col));
+    // A value held cut short shows its size and the bytes held (#232).
+    let cut = value
+        .as_deref()
+        .filter(|_| binary)
+        .and_then(pythia_db::cut_size);
+    let bytes = value
+        .as_deref()
+        .filter(|_| binary)
+        .and_then(|v| decode_hex(held_hex(v)));
     let pretty = value
         .as_deref()
         .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
         .filter(|j| j.is_object() || j.is_array())
         .and_then(|j| serde_json::to_string_pretty(&j).ok());
     let mut text = pretty.clone().or_else(|| value.clone()).unwrap_or_default();
+    // Named by its bytes: egui keeps an image by its URI, and the next value
+    // in this cell (of another result, or edited) would show this one (#231).
+    let image = bytes.as_ref().filter(|_| cut.is_none()).and_then(|b| {
+        let kind = image_kind(b)?;
+        Some(format!(
+            "bytes://pythia-grid/{:016x}.{kind}",
+            egui::util::hash(b)
+        ))
+    });
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2120,11 +2214,21 @@ fn viewer(
             ui.horizontal(|ui| {
                 match (&value, &bytes) {
                     (None, _) => ui.weak("NULL"),
-                    (_, Some(b)) => ui.weak(format!(
-                        "{} · {}",
-                        human_bytes(b.len()),
-                        image_kind(b).unwrap_or("binary")
-                    )),
+                    (_, Some(b)) => {
+                        let size = cut.map_or(b.len(), |n| n as usize);
+                        let mut header = format!(
+                            "{} · {}",
+                            human_bytes(size),
+                            image_kind(b).unwrap_or("binary")
+                        );
+                        if cut.is_some() {
+                            header.push_str(&format!(
+                                " · the grid holds its first {} bytes",
+                                b.len()
+                            ));
+                        }
+                        ui.weak(header)
+                    }
                     (Some(v), None) => ui.weak(format!("{} characters", v.chars().count())),
                 };
                 if pretty.is_some() {
@@ -2139,16 +2243,30 @@ fn viewer(
             ui.separator();
             if let Some(b) = &bytes {
                 egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    if let Some(kind) = image_kind(b) {
-                        let uri = format!("bytes://pythia-grid/{r}-{c}.{kind}");
+                    if let Some(uri) = &image {
                         ui.add(
-                            egui::Image::from_bytes(uri, b.clone())
+                            egui::Image::from_bytes(uri.clone(), b.clone())
                                 .max_width(ui.available_width())
                                 .max_height(480.0),
                         );
                         ui.separator();
+                    } else if cut.is_some() && image_kind(b).is_some() {
+                        ui.weak(format!(
+                            "The image can't be shown: the grid holds the first {} bytes of it. \
+                             Execute to file writes such values whole.",
+                            b.len()
+                        ));
+                        ui.separator();
                     }
-                    ui.label(RichText::new(hex_dump(b, 4096)).monospace());
+                    let mut dump = hex_dump(b, 4096);
+                    if let Some(size) = cut {
+                        let more = (size as usize).saturating_sub(b.len());
+                        dump.push_str(&format!(
+                            "… {} more, not held by the grid",
+                            human_bytes(more)
+                        ));
+                    }
+                    ui.label(RichText::new(dump).monospace());
                 });
                 return;
             }
@@ -2163,6 +2281,9 @@ fn viewer(
         });
     if !open {
         state.viewer = None;
+        if let Some(uri) = &image {
+            ctx.forget_image(uri);
+        }
     }
 }
 
@@ -2187,10 +2308,43 @@ fn record_text(text: &str) -> String {
     }
 }
 
-/// BLOB, RAW and LONG RAW values arrive as hex text.
-fn is_binary(col: &Column) -> bool {
-    let t = col.type_name.to_ascii_uppercase();
-    t.starts_with("BLOB") || t.starts_with("RAW") || t.starts_with("LONG RAW") || t == "BFILE"
+/// Columns whose values arrive as hex text, by the database's type names
+/// (#224): Oracle's BLOB, RAW, LONG RAW and BFILE; MySQL's BLOB, BINARY and
+/// VARBINARY; SQL Server's binary, varbinary and image (as `0x…`);
+/// PostgreSQL's bytea (as `\x…`); SQLite's columns of blobs (#209).
+fn is_binary(dialect: Dialect, col: &Column) -> bool {
+    let t = col.type_name.as_str();
+    match dialect.kind() {
+        DbKind::Oracle => {
+            let t = t.to_ascii_uppercase();
+            t.starts_with("BLOB")
+                || t.starts_with("RAW")
+                || t.starts_with("LONG RAW")
+                || t == "BFILE"
+        }
+        DbKind::MySql => matches!(t, "BLOB" | "BINARY" | "VARBINARY"),
+        DbKind::SqlServer => matches!(t, "binary" | "varbinary" | "image"),
+        DbKind::Postgres => t == "bytea",
+        DbKind::Sqlite => t.to_ascii_uppercase().contains("BLOB"),
+    }
+}
+
+/// The hex digits of a binary value, after SQL Server's `0x` or
+/// PostgreSQL's `\x`.
+fn hex_digits(text: &str) -> &str {
+    text.strip_prefix("0x")
+        .or_else(|| text.strip_prefix("\\x"))
+        .unwrap_or(text)
+}
+
+/// The hex digits the grid holds of a binary value: all of them, or the
+/// first [`pythia_db::SHOWN_BYTES`]' of one held cut short (#204).
+fn held_hex(text: &str) -> &str {
+    let hex = hex_digits(text);
+    match pythia_db::cut_size(text) {
+        Some(_) => &hex[..pythia_db::SHOWN_BYTES * 2],
+        None => hex,
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -2214,7 +2368,8 @@ fn human_bytes(n: usize) -> String {
 
 /// `0x89504E47… · 12.3 KB` for a hex-encoded value; one held cut short has
 /// its size after the hex (#204).
-fn binary_summary(hex: &str) -> String {
+fn binary_summary(text: &str) -> String {
+    let hex = hex_digits(text);
     let head: String = hex.chars().take(16).collect();
     let more = if hex.len() > 16 { "…" } else { "" };
     let size = pythia_db::cut_size(hex).map_or(hex.len() / 2, |n| n as usize);
@@ -2383,6 +2538,82 @@ mod tests {
         );
     }
 
+    /// Numbers sort and add up as the numbers they are, also past the 15
+    /// to 17 digits a double holds (#238): 9223372036854775806 sorted after
+    /// 9223372036854775807, and the summary of both read "Min
+    /// 9223372036854775808." and "Sum 18446744073709551616.".
+    #[test]
+    fn big_numbers_sort_and_add_up_exactly() {
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "NUMBER".into(),
+            numeric: true,
+        }];
+        let values = [
+            "9223372036854775807",
+            "9223372036854775806",
+            "-9223372036854775808",
+            "9007199254740993",
+            "9007199254740992",
+            "12345678901234567890.5",
+            "12345678901234567890.25",
+            "1e300",
+            "0.1",
+            "0.2",
+        ];
+        let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![Some(v.to_string())]).collect();
+        let mut s = GridState::default();
+        s.sync(&rows, &columns);
+        s.set_sort(0, &rows, &columns);
+        let sorted: Vec<&str> = s.order.iter().map(|&i| values[i]).collect();
+        assert_eq!(
+            sorted,
+            [
+                "-9223372036854775808",
+                "0.1",
+                "0.2",
+                "9007199254740992",
+                "9007199254740993",
+                "9223372036854775806",
+                "9223372036854775807",
+                "12345678901234567890.25",
+                "12345678901234567890.5",
+                "1e300",
+            ]
+        );
+        let summary_of = |from: usize, to: usize| {
+            let mut s = GridState::default();
+            s.sync(&rows, &columns);
+            s.select((from, 0), false);
+            s.select((to, 0), true);
+            summary(&columns, &rows, &s).unwrap()
+        };
+        assert_eq!(
+            summary_of(0, 1),
+            "Count 2 · Sum 18446744073709551613 · Avg 9223372036854775806.5 · \
+             Min 9223372036854775806 · Max 9223372036854775807"
+        );
+        assert_eq!(
+            summary_of(3, 4),
+            "Count 2 · Sum 18014398509481985 · Avg 9007199254740992.5 · \
+             Min 9007199254740992 · Max 9007199254740993"
+        );
+        assert_eq!(
+            summary_of(5, 6),
+            "Count 2 · Sum 24691357802469135780.75 · Avg 12345678901234567890.375 · \
+             Min 12345678901234567890.25 · Max 12345678901234567890.5"
+        );
+        assert_eq!(
+            summary_of(8, 9),
+            "Count 2 · Sum 0.3 · Avg 0.15 · Min 0.1 · Max 0.2"
+        );
+        // Past what an exact sum holds, a double's, without a stray dot.
+        assert_eq!(
+            summary_of(6, 7),
+            "Count 2 · Sum 1e300 · Avg 5e299 · Min 12345678901234567890.25 · Max 1e300"
+        );
+    }
+
     #[test]
     fn hidden_columns_are_left_out() {
         let columns = cols();
@@ -2394,6 +2625,40 @@ mod tests {
         assert_eq!(c[0].name, "B");
         assert_eq!(d, vec![vec![Some("x".to_owned())]]);
         assert_eq!(state.visible_columns(2), vec![1]);
+    }
+
+    /// Without a selection, Export and Copy all take the rows as shown
+    /// (#243): those the filter passes, in the order shown, as they leave the
+    /// hidden columns out. They took every fetched row, also those the
+    /// filter hid, in the order fetched.
+    #[test]
+    fn exports_take_the_rows_shown() {
+        let columns = cols();
+        let rows: Vec<Vec<Cell>> = [
+            ("1", "apple"),
+            ("2", "banana"),
+            ("3", "cherry"),
+            ("4", "grape"),
+        ]
+        .iter()
+        .map(|(a, b)| vec![Some(a.to_string()), Some(b.to_string())])
+        .collect();
+        let mut state = GridState::default();
+        state.set_filter("ap");
+        state.set_sort(0, &rows, &columns);
+        state.set_sort(0, &rows, &columns);
+        let shown = vec![
+            vec![Some("4".to_owned()), Some("grape".to_owned())],
+            vec![Some("1".to_owned()), Some("apple".to_owned())],
+        ];
+        assert_eq!(shown_data(&columns, &rows, &state).1, shown);
+        assert_eq!(selection_data(&columns, &rows, &state).1, shown);
+        // Rows fetched since the grid was last drawn are filtered too.
+        let mut more = rows.clone();
+        more.push(vec![Some("5".into()), Some("papaya".into())]);
+        assert_eq!(shown_data(&columns, &more, &state).1.len(), 3);
+        state.set_filter("");
+        assert_eq!(shown_data(&columns, &rows, &state).1.len(), 4);
     }
 
     #[test]
@@ -2721,6 +2986,209 @@ mod tests {
             pressed: true,
             repeat: false,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A small PNG (2×2 pixels).
+    const PNG: &str = "89504E470D0A1A0A0000000D4948445200000002000000020802000000FDD49A73000000\
+                       1049444154789C63F8CFC000440C100A001FEE03FD8B5F14D40000000049454E44AE426082";
+
+    /// Binary values show as binary on every database: their start and
+    /// size in the cell, the image and a hex dump in the viewer. SQL
+    /// Server's, MySQL's VARBINARY and PostgreSQL's bytea showed as text.
+    #[test]
+    fn binary_values_of_every_database() {
+        use pythia_db::Dialect;
+        let cases = [
+            (Dialect::ORACLE, "BLOB", PNG.to_owned()),
+            (Dialect::ORACLE, "RAW(73)", PNG.to_owned()),
+            (Dialect::MYSQL, "BLOB", PNG.to_owned()),
+            (Dialect::MYSQL, "VARBINARY", PNG.to_owned()),
+            (Dialect::MYSQL, "BINARY", PNG.to_owned()),
+            (Dialect::SQLSERVER, "varbinary", format!("0x{PNG}")),
+            (Dialect::SQLSERVER, "binary", format!("0x{PNG}")),
+            (Dialect::SQLSERVER, "image", format!("0x{PNG}")),
+            (
+                Dialect::POSTGRES,
+                "bytea",
+                format!("\\x{}", PNG.to_lowercase()),
+            ),
+            (Dialect::SQLITE, "BLOB", PNG.to_owned()),
+            (Dialect::SQLITE, "MEDIUMBLOB", PNG.to_owned()),
+        ];
+        for (dialect, type_name, value) in cases {
+            let columns = vec![Column {
+                name: "IMG".into(),
+                type_name: type_name.into(),
+                numeric: false,
+            }];
+            let rows = vec![vec![Some(value)]];
+            let ctx = egui::Context::default();
+            let mut state = GridState {
+                dialect,
+                ..Default::default()
+            };
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let summary = if dialect == Dialect::POSTGRES {
+                "0x89504e470d0a1a0a… · 73 bytes"
+            } else {
+                "0x89504E470D0A1A0A… · 73 bytes"
+            };
+            assert!(
+                texts(&drawn).contains(&summary),
+                "{type_name}: {:?}",
+                texts(&drawn)
+            );
+            state.viewer = Some((0, 0));
+            // A window is laid out unseen first.
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            assert!(
+                texts(&drawn).contains(&"73 bytes · png"),
+                "{type_name}: {:?}",
+                texts(&drawn)
+            );
+        }
+        // Text in a column SQLite declares VARBINARY is text.
+        let columns = vec![Column {
+            name: "T".into(),
+            type_name: "VARBINARY".into(),
+            numeric: false,
+        }];
+        let rows = vec![vec![Some("CAFE".to_owned())]];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            ..Default::default()
+        };
+        let drawn = frame(
+            &egui::Context::default(),
+            &columns,
+            &rows,
+            &mut state,
+            vec![],
+        );
+        assert!(texts(&drawn).contains(&"CAFE"), "{:?}", texts(&drawn));
+    }
+
+    /// The textures the viewer of cell (0, 0) paints once its image is
+    /// loaded, and the texts it draws.
+    fn viewer_image(
+        ctx: &egui::Context,
+        rows: &[Vec<Cell>],
+    ) -> (Vec<egui::TextureId>, Vec<String>) {
+        let columns = vec![Column {
+            name: "IMG".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let mut state = GridState {
+            viewer: Some((0, 0)),
+            ..Default::default()
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut painted = (Vec::new(), Vec::new());
+        // Images are decoded while the frames go on.
+        for _ in 0..100 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                ResultGrid::new(&columns, rows, &mut state, "grid").show(ui);
+            });
+            output.textures_delta.clear();
+            let mut textures = Vec::new();
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                match &shape.shape {
+                    egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                    egui::Shape::Rect(r) if r.fill_texture_id() != egui::TextureId::default() => {
+                        textures.push(r.fill_texture_id());
+                    }
+                    egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                        textures.push(m.texture_id);
+                    }
+                    _ => {}
+                }
+            }
+            painted = (textures, texts);
+            if !painted.0.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        painted
+    }
+
+    /// The viewer shows an image as the image (#231): without a decoder for
+    /// PNG, JPEG, GIF, WebP and BMP, it showed ⚠ in its place.
+    #[test]
+    fn the_viewer_shows_images() {
+        const BLUE: &str = "89504E470D0A1A0A0000000D4948445200000002000000020802000000FDD49A73\
+                            0000000F49444154789C636060F80F46600A0017F603FD7EEB37F300000000\
+                            49454E44AE426082";
+        let ctx = egui::Context::default();
+        crate::icons::install(&ctx);
+        let (red, texts) = viewer_image(&ctx, &[vec![Some(PNG.to_owned())]]);
+        assert!(!red.is_empty(), "no image in {texts:?}");
+        assert!(!texts.iter().any(|t| t == "⚠"), "{texts:?}");
+        // Another image in the same cell (of another result, or edited) is
+        // that one, not the one shown before.
+        let (blue, _) = viewer_image(&ctx, &[vec![Some(BLUE.to_owned())]]);
+        assert!(!blue.is_empty());
+        assert_ne!(red, blue);
+    }
+
+    /// The viewer of a binary value the grid holds cut short (#204) shows
+    /// its size, a hex dump of what it holds, and why there is no image
+    /// (#232); it showed the hex and the size as 8015 characters of text.
+    #[test]
+    fn the_viewer_of_a_cut_value_says_so() {
+        use pythia_db::{Dialect, SHOWN_BYTES};
+        let held = format!("{PNG}{}", "00".repeat(SHOWN_BYTES - PNG.len() / 2));
+        for (dialect, type_name, value) in [
+            (Dialect::MYSQL, "BLOB", format!("{held}… (51200 bytes)")),
+            (
+                Dialect::SQLSERVER,
+                "varbinary",
+                format!("0x{held}… (51200 bytes)"),
+            ),
+        ] {
+            let columns = vec![Column {
+                name: "IMG".into(),
+                type_name: type_name.into(),
+                numeric: false,
+            }];
+            let rows = vec![vec![Some(value)]];
+            let ctx = egui::Context::default();
+            let mut state = GridState {
+                dialect,
+                viewer: Some((0, 0)),
+                ..Default::default()
+            };
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let texts = texts(&drawn);
+            assert!(
+                texts.contains(&"50.0 KB · png · the grid holds its first 4000 bytes"),
+                "{type_name}: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t.starts_with(
+                    "The image can't be shown: the grid holds the first 4000 bytes of it."
+                )),
+                "{type_name}: {texts:?}"
+            );
+            let dump = texts
+                .iter()
+                .find(|t| t.starts_with("00000000  89 50 4E 47"))
+                .unwrap_or_else(|| panic!("{type_name}: no hex dump in {texts:?}"));
+            assert!(
+                dump.ends_with("… 46.1 KB more, not held by the grid"),
+                "{type_name}: {dump}"
+            );
         }
     }
 
