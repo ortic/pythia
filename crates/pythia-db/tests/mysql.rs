@@ -9,7 +9,10 @@
 //! (the `ssh` service: `pythia:pythia@localhost:2222` and
 //! `pythia/pythia@mysql:3306/pythia`).
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -500,6 +503,109 @@ fn cancel_interrupts_a_running_statement() {
     };
     assert_eq!(error.code, Some(1317), "{}", error.message);
     assert!(started.elapsed() < Duration::from_secs(5));
+    h.ok("select 1");
+}
+
+/// A TCP relay to the server that can be frozen: then nothing gets
+/// through, in either direction, on its connections or on new ones, as
+/// when the network goes quiet.
+struct Relay {
+    port: u16,
+    frozen: Arc<AtomicBool>,
+}
+
+impl Relay {
+    fn to(server: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let frozen = Arc::new(AtomicBool::new(false));
+        let server = server.to_owned();
+        let relay = frozen.clone();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let (Ok(client), Ok(upstream)) = (client, TcpStream::connect(&server)) else {
+                    continue;
+                };
+                let back = (upstream.try_clone().unwrap(), client.try_clone().unwrap());
+                for (from, to) in [(client, upstream), back] {
+                    let frozen = relay.clone();
+                    std::thread::spawn(move || pump(from, to, &frozen));
+                }
+            }
+        });
+        Self { port, frozen }
+    }
+
+    fn freeze(&self, frozen: bool) {
+        self.frozen.store(frozen, Ordering::SeqCst);
+    }
+}
+
+fn pump(mut from: TcpStream, mut to: TcpStream, frozen: &AtomicBool) {
+    let thaw = || {
+        while frozen.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        thaw();
+        let n = match from.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        thaw();
+        if to.write_all(&buffer[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Write);
+}
+
+/// Break returns at once while the network is gone (#207): it waited for
+/// KILL QUERY's connection of its own, which waited for the server. Once
+/// the network is back, the kill goes through.
+#[test]
+fn cancel_never_waits_for_the_network() {
+    let Some(params) = params() else {
+        return;
+    };
+    let (server, database) = params.connect_string.split_once('/').unwrap();
+    let relay = Relay::to(server);
+    let mut h = Harness::with(ConnectParams {
+        connect_string: format!("127.0.0.1:{}/{database}", relay.port),
+        ..params.clone()
+    });
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select sleep(5)".into(),
+        max_rows: 10,
+        binds: vec![],
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    relay.freeze(true);
+    let thaw = {
+        let frozen = relay.frozen.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            frozen.store(false, Ordering::SeqCst);
+        })
+    };
+    let started = Instant::now();
+    h.session.cancel();
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(100), "Break took {took:?}");
+    thaw.join().unwrap();
+    // A killed SLEEP returns 1.
+    let rows = loop {
+        match h.next_result() {
+            DbEvent::QueryStarted { .. } => {}
+            DbEvent::Rows { rows, .. } => break rows,
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    assert!(started.elapsed() < Duration::from_secs(4));
     h.ok("select 1");
 }
 

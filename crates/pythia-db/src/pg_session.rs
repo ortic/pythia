@@ -55,6 +55,8 @@ type Stream = Pin<Box<SimpleQueryStream>>;
 /// How long the rest of an abandoned result is read before the query is
 /// cancelled: a small result has arrived already.
 const DRAIN: Duration = Duration::from_millis(200);
+/// How long Break waits for the server to take its cancel request.
+const CANCEL_WAIT: Duration = Duration::from_secs(15);
 /// The savepoint each statement in a transaction runs after.
 const SAVEPOINT: &str = "pythia_statement";
 
@@ -87,7 +89,7 @@ pub(crate) fn run(
     let token = client.cancel_token();
     let cancel: Canceller = {
         let (token, tls) = (token.clone(), tls.clone());
-        Arc::new(move || cancel_in_background(token.clone(), tls.clone()))
+        Arc::new(move || cancel_query(&token, tls.clone()))
     };
     *shared.lock().expect("cancel mutex") = Some(cancel);
 
@@ -228,21 +230,18 @@ fn notice_text(notice: &tokio_postgres::error::DbError) -> String {
 }
 
 /// PostgreSQL's way to break into a session: a request on a connection of
-/// its own. Runs on a thread of its own, so Break never waits for it.
-fn cancel_in_background(token: CancelToken, tls: MakeRustlsConnect) {
-    let spawned =
-        std::thread::Builder::new()
-            .name("pg-cancel".into())
-            .spawn(move || match runtime() {
-                Ok(rt) => {
-                    if let Err(e) = rt.block_on(token.cancel_query(tls)) {
-                        warn!("cancel failed: {e}");
-                    }
-                }
-                Err(e) => warn!("cancel failed: {e}"),
-            });
-    if let Err(e) = spawned {
-        warn!("cancel failed: {e}");
+/// its own, on the thread [`crate::Session::cancel`] runs it on. A server
+/// that doesn't answer holds it up for [`CANCEL_WAIT`] at most, so the next
+/// Break gets through (#207).
+fn cancel_query(token: &CancelToken, tls: MakeRustlsConnect) {
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => return warn!("cancel failed: {e}"),
+    };
+    match rt.block_on(async { tokio::time::timeout(CANCEL_WAIT, token.cancel_query(tls)).await }) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("cancel failed: {e}"),
+        Err(_) => warn!("cancel failed: no answer within {CANCEL_WAIT:?}"),
     }
 }
 

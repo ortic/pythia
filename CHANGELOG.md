@@ -129,6 +129,12 @@ All notable changes to Pythia are documented here. The format follows
   backslash on MariaDB's 16 MB): the UPDATE checked the value fetched by
   writing it out again. Values longer than 4 KB are now checked by their
   SHA-256.
+- Break, and closing a window with a statement running, froze Pythia
+  while the network to the server was gone, until it was back (#207):
+  on MySQL, Break connects to the server to send `KILL QUERY`, and the
+  window waited for that. Break now returns at once and the interrupt
+  goes on its own; one that gets no answer gives up after a few seconds
+  (MySQL, PostgreSQL), so Break can be pressed again.
 
 ## [0.10.0] - 2026-10-30
 

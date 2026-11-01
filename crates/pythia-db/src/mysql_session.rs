@@ -32,6 +32,9 @@ use crate::types::{
 
 const DEFAULT_PORT: u16 = 3306;
 
+/// How long `KILL QUERY` waits for each answer of the server.
+const KILL_WAIT: Duration = Duration::from_secs(10);
+
 pub(crate) fn run(
     params: ConnectParams,
     requests: Receiver<DbRequest>,
@@ -559,10 +562,13 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
 }
 
 /// Stops the statement running on connection `id` from a connection of its
-/// own (MySQL's way to break into a session).
+/// own (MySQL's way to break into a session). A server that doesn't answer
+/// holds it up for [`KILL_WAIT`] at most (#207).
 fn kill_query(opts: &Opts, id: u32) {
-    let killed =
-        Conn::new(opts.clone()).and_then(|mut conn| conn.query_drop(format!("kill query {id}")));
+    let opts = OptsBuilder::from_opts(opts.clone())
+        .read_timeout(Some(KILL_WAIT))
+        .write_timeout(Some(KILL_WAIT));
+    let killed = Conn::new(opts).and_then(|mut conn| conn.query_drop(format!("kill query {id}")));
     if let Err(e) = killed {
         warn!("cancel failed: {e}");
     }

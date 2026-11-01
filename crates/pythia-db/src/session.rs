@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,6 +27,8 @@ pub struct Session {
     events: Receiver<DbEvent>,
     /// Shared with the worker so a running call can be interrupted.
     cancel: CancelSlot,
+    /// A [`Session::cancel`] is on its way.
+    cancelling: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -66,6 +69,7 @@ impl Session {
             requests: req_tx,
             events: ev_rx,
             cancel,
+            cancelling: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -82,10 +86,28 @@ impl Session {
     /// Interrupts the statement currently running on this session (OCIBreak
     /// on Oracle, `KILL QUERY` on MySQL, a cancel request on PostgreSQL,
     /// the attention signal on SQL Server, an interrupt on SQLite).
+    ///
+    /// Returns at once: the interrupt goes on a thread of its own, as it
+    /// can wait for the network (MySQL and PostgreSQL connect to send it),
+    /// and the caller is the UI (#207). One at a time: a Break while one is
+    /// on its way wouldn't get through any sooner.
     pub fn cancel(&self) {
-        let cancel = self.cancel.lock().expect("cancel mutex").clone();
-        if let Some(cancel) = cancel {
-            cancel();
+        let Some(cancel) = self.cancel.lock().expect("cancel mutex").clone() else {
+            return;
+        };
+        if self.cancelling.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let cancelling = self.cancelling.clone();
+        let spawned = thread::Builder::new()
+            .name("db-cancel".into())
+            .spawn(move || {
+                cancel();
+                cancelling.store(false, Ordering::Release);
+            });
+        if let Err(e) = spawned {
+            self.cancelling.store(false, Ordering::Release);
+            warn!("cancel failed: {e}");
         }
     }
 }
