@@ -1836,6 +1836,9 @@ impl Browser {
                 (pythia_db::DbKind::Oracle, ObjectType::User) => {
                     ui.weak("A user who owns objects isn't dropped (that needs CASCADE).");
                 }
+                (pythia_db::DbKind::Postgres, ObjectType::Function | ObjectType::Procedure) => {
+                    ui.weak("Every version of it, whatever its arguments, is dropped.");
+                }
                 (pythia_db::DbKind::Postgres, ObjectType::User | ObjectType::Role) => {
                     ui.weak(
                         "A role that owns objects or holds privileges isn't dropped (that \
@@ -2019,6 +2022,26 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
             pg_literal(&o.owner),
             pg_literal(&o.name),
             pg_literal(&o.name)
+        );
+    }
+    if dialect == Dialect::POSTGRES
+        && matches!(o.object_type, ObjectType::Function | ObjectType::Procedure)
+    {
+        // The entry stands for every argument list of the name, which
+        // `drop function name` refuses when there are several (#195).
+        let prokind = if o.object_type == ObjectType::Procedure {
+            "p"
+        } else {
+            "f"
+        };
+        return format!(
+            "do $$\ndeclare\n  r regprocedure;\nbegin\n  \
+             for r in select p.oid::regprocedure from pg_proc p \
+             join pg_namespace n on n.oid = p.pronamespace \
+             where n.nspname = {} and p.proname = {} and p.prokind = '{prokind}' loop\n    \
+             execute format('drop {kind} %s', r);\n  end loop;\nend\n$$",
+            pg_literal(&o.owner),
+            pg_literal(&o.name),
         );
     }
     if dialect == Dialect::MYSQL && o.object_type.is_database_object() {
@@ -2528,6 +2551,71 @@ mod tests {
             "begin dbms_scheduler.drop_job('HR.NIGHTLY', force => true); end;"
         );
         assert_eq!(folders(Dialect::ORACLE, "PUBLIC"), ObjectType::PUBLIC);
+    }
+
+    /// A PostgreSQL function of several argument lists is dropped whole,
+    /// as the browser lists it (#195): `drop function name` refused it.
+    /// A procedure of the same name stays.
+    #[test]
+    fn drops_every_postgres_overload() {
+        let o = |name: &str, object_type| ObjectRef {
+            owner: "public".into(),
+            name: name.into(),
+            object_type,
+        };
+        let sql = drop_sql(Dialect::POSTGRES, &o("summa", ObjectType::Function));
+        assert!(
+            sql.contains("p.proname = 'summa' and p.prokind = 'f'"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("execute format('drop function %s', r)"),
+            "{sql}"
+        );
+        let dropped = crate::test_db::run_on(
+            "PYTHIA_TEST_POSTGRES",
+            pythia_config::DbKind::Postgres,
+            move |c| {
+                for sql in [
+                    "drop function if exists pythia_over(integer, integer)",
+                    "drop function if exists pythia_over(numeric, numeric, numeric)",
+                    "drop procedure if exists pythia_over(text)",
+                    "create function pythia_over(a integer, b integer) returns integer \
+                 language sql as $$ select a + b $$",
+                    "create function pythia_over(a numeric, b numeric, c numeric) returns numeric \
+                 language sql as $$ select a + b + c $$",
+                    "create procedure pythia_over(t text) language sql as $$ select t $$",
+                ] {
+                    c.execute(sql).unwrap();
+                }
+                let left = |c: &mut dyn pythia_db::Client| {
+                    c.query(
+                        "select string_agg(prokind::text, '' order by prokind) from pg_proc \
+                     where proname = 'pythia_over'",
+                        &[],
+                    )
+                    .unwrap()[0][0]
+                        .clone()
+                };
+                assert_eq!(left(c).as_deref(), Some("ffp"));
+                c.execute(&drop_sql(
+                    Dialect::POSTGRES,
+                    &o("pythia_over", ObjectType::Function),
+                ))
+                .unwrap();
+                let after_functions = left(c);
+                c.execute(&drop_sql(
+                    Dialect::POSTGRES,
+                    &o("pythia_over", ObjectType::Procedure),
+                ))
+                .unwrap();
+                (after_functions, left(c))
+            },
+        );
+        if let Some((after_functions, after_all)) = dropped {
+            assert_eq!(after_functions.as_deref(), Some("p"));
+            assert_eq!(after_all, None);
+        }
     }
 
     #[test]
