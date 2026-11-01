@@ -396,6 +396,14 @@ All notable changes to Pythia are documented here. The format follows
   cell and the changes waiting for *Apply* were dropped without a word;
   only an uncommitted transaction was asked about. *Discard and close*
   (or *Exit and discard*) goes ahead, *Cancel* keeps them.
+- *Edit* creates the object where it was, also when another database or
+  schema is current (#248). On MySQL the script dropped a routine or
+  trigger in its database and created it in the current one, or failed
+  after the drop, so a trigger was lost; it now starts with `use` of the
+  object's database. On SQLite the same went for the views, triggers and
+  indexes of an attached database, which went to `main`, and on SQL
+  Server a routine stored without its schema was created in the default
+  one. Both scripts now name the schema.
 
 ## [0.10.0] - 2026-10-30
 

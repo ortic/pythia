@@ -2088,16 +2088,22 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
 /// ALTER`. SQLite has neither: drop, then create, a trigger's body keeping
 /// its `;` without a `/`, and the `;` after a line comment on a line of its
 /// own (#206).
+///
+/// The object is created where it was, whatever the current database or
+/// schema (#248): MySQL's DDL leaves out the database, so the script
+/// starts with `use`; SQL Server's and SQLite's get the schema in front of
+/// the name they create.
 pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool) -> String {
     let ddl = ddl.trim_end();
     let qualified = dialect.qualified(&o.owner, &o.name);
     let kind = o.object_type.dictionary_name().to_lowercase();
+    let database = format!("use {};\n\n", dialect.quote_ident(&o.owner));
     match (dialect.kind(), o.object_type) {
         (pythia_db::DbKind::MySql, ObjectType::View) => {
-            format!("{}\n", create_or(ddl, "or replace", ""))
+            format!("{database}{}\n", create_or(ddl, "or replace", ""))
         }
         (pythia_db::DbKind::MySql, _) if mariadb => {
-            format!("{}\n/\n", create_or(ddl, "or replace", ""))
+            format!("{database}{}\n/\n", create_or(ddl, "or replace", ""))
         }
         (pythia_db::DbKind::MySql, _) => {
             let warning = match o.object_type {
@@ -2110,7 +2116,7 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
                      -- {kind} is gone.\n"
                 ),
             };
-            format!("{warning}drop {kind} if exists {qualified};\n\n{ddl}\n/\n")
+            format!("{database}{warning}drop {kind} if exists {qualified};\n\n{ddl}\n/\n")
         }
         (pythia_db::DbKind::Postgres, ObjectType::Trigger) => {
             format!("{}\n", create_or(ddl, "or replace", "TRIGGER"))
@@ -2119,13 +2125,84 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             format!("drop materialized view if exists {qualified};\n\n{ddl}\n")
         }
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
-        (pythia_db::DbKind::SqlServer, _) => format!("{}\n", create_or(ddl, "or alter", "")),
-        (pythia_db::DbKind::Sqlite, _) => format!(
-            "drop {kind} if exists {qualified};\n\n{}\n",
-            pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Sqlite)
-        ),
+        (pythia_db::DbKind::SqlServer, _) => {
+            let ddl = in_schema(dialect, ddl, &o.owner);
+            format!("{}\n", create_or(&ddl, "or alter", ""))
+        }
+        (pythia_db::DbKind::Sqlite, _) => {
+            let ddl = if o.owner == "main" {
+                ddl.to_owned()
+            } else {
+                in_schema(dialect, ddl, &o.owner)
+            };
+            format!(
+                "drop {kind} if exists {qualified};\n\n{}\n",
+                pythia_plsql::terminated(&ddl, pythia_plsql::Syntax::Sqlite)
+            )
+        }
         _ => format!("drop {kind} if exists {qualified};\n\n{ddl}\n/\n"),
     }
+}
+
+/// `ddl` with `schema` in front of the name it creates, unless it names
+/// one (#248): SQL Server creates an unqualified name in the session's
+/// default schema, SQLite in `main`. A SQL Server trigger's table gets it
+/// too, as it must be in the trigger's schema; SQLite's takes the
+/// trigger's.
+fn in_schema(dialect: Dialect, ddl: &str, schema: &str) -> String {
+    const MODIFIERS: &[&str] = &["OR", "ALTER", "REPLACE", "TEMP", "TEMPORARY", "UNIQUE"];
+    const KINDS: &[&str] = &[
+        "VIEW",
+        "TRIGGER",
+        "INDEX",
+        "TABLE",
+        "PROC",
+        "PROCEDURE",
+        "FUNCTION",
+    ];
+    let tokens = pythia_plsql::tokenize_in(ddl, dialect.syntax());
+    let words: Vec<_> = tokens.iter().filter(|t| !t.kind.is_trivia()).collect();
+    let text = |t: &pythia_plsql::Token| &ddl[t.span.clone()];
+    let is = |i: usize, any: &[&str]| {
+        words.get(i).is_some_and(|t| {
+            t.kind.is_word() && any.iter().any(|w| text(t).eq_ignore_ascii_case(w))
+        })
+    };
+    // Where a name that doesn't name its schema starts.
+    let unqualified = |i: usize| {
+        let dot = |t: &&pythia_plsql::Token| t.kind == pythia_plsql::TokenKind::Dot;
+        let qualified = words.get(i + 1).is_some_and(dot);
+        words.get(i).filter(|_| !qualified).map(|t| t.span.start)
+    };
+    if !is(0, &["CREATE"]) {
+        return ddl.to_owned();
+    }
+    let mut i = 1;
+    while is(i, MODIFIERS) {
+        i += 1;
+    }
+    let trigger = is(i, &["TRIGGER"]);
+    if !is(i, KINDS) {
+        return ddl.to_owned();
+    }
+    i += 1;
+    if is(i, &["IF"]) && is(i + 1, &["NOT"]) && is(i + 2, &["EXISTS"]) {
+        i += 3;
+    }
+    let mut at: Vec<usize> = unqualified(i).into_iter().collect();
+    if trigger && dialect.kind() == pythia_db::DbKind::SqlServer {
+        // Not a database's or the server's trigger (`ON DATABASE`).
+        if let Some(on) = (i + 1..words.len()).find(|&j| is(j, &["ON"]))
+            && !is(on + 1, &["DATABASE", "ALL"])
+        {
+            at.extend(unqualified(on + 1));
+        }
+    }
+    let mut out = ddl.to_owned();
+    for start in at.into_iter().rev() {
+        out.insert_str(start, &format!("{}.", dialect.quote_ident(schema)));
+    }
+    out
 }
 
 /// `ddl` with `words` after its leading `CREATE` (when followed by `next`,
@@ -2844,28 +2921,31 @@ mod tests {
         );
         let ddl = "CREATE DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\nend\n";
         let script = replace_script(Dialect::MYSQL, &routine, ddl, false);
+        // In its database, whatever the current one (#248).
         assert_eq!(
             script,
-            "-- MySQL can't replace a procedure in place: the drop revokes the grants\n\
+            "use shop;\n\n\
+             -- MySQL can't replace a procedure in place: the drop revokes the grants\n\
              -- on it, and if the create fails, the procedure is gone.\n\
              drop procedure if exists shop.add_order;\n\n\
              CREATE DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\nend\n/\n"
         );
-        // Two statements: the drop, and the whole routine up to the slash.
+        // Three statements: the use, the drop, and the whole routine up to
+        // the slash.
         let statements = pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
-        assert_eq!(statements.len(), 2, "{statements:?}");
-        assert!(statements[1].text(&script).ends_with("end"));
+        assert_eq!(statements.len(), 3, "{statements:?}");
+        assert!(statements[2].text(&script).ends_with("end"));
 
         // MariaDB replaces it in place, MySQL a view (#240): one
         // statement, nothing dropped before.
         let script = replace_script(Dialect::MYSQL, &routine, ddl, true);
         assert_eq!(
             script,
-            "CREATE or replace DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  select 1;\n\
-             end\n/\n"
+            "use shop;\n\nCREATE or replace DEFINER=`app`@`%` PROCEDURE `add_order`()\nbegin\n  \
+             select 1;\nend\n/\n"
         );
         let statements = pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
-        assert_eq!(statements.len(), 1, "{statements:?}");
+        assert_eq!(statements.len(), 2, "{statements:?}");
         let view = ObjectRef {
             owner: "shop".into(),
             name: "v".into(),
@@ -2877,12 +2957,12 @@ mod tests {
             let script = replace_script(Dialect::MYSQL, &view, ddl, mariadb);
             assert_eq!(
                 script,
-                "CREATE or replace ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER \
-                 VIEW `v` AS select 1 AS `a`;\n"
+                "use shop;\n\nCREATE or replace ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL \
+                 SECURITY DEFINER VIEW `v` AS select 1 AS `a`;\n"
             );
             let statements =
                 pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::MySql);
-            assert_eq!(statements.len(), 1, "{statements:?}");
+            assert_eq!(statements.len(), 2, "{statements:?}");
         }
         let trigger = ObjectRef {
             owner: "shop".into(),
@@ -2893,13 +2973,14 @@ mod tests {
             "CREATE DEFINER=`app`@`%` TRIGGER t BEFORE INSERT ON x FOR EACH ROW set new.n = 1";
         assert!(
             replace_script(Dialect::MYSQL, &trigger, ddl, false).starts_with(
-                "-- MySQL can't replace a trigger in place: if the create fails, the\n\
+                "use shop;\n\n\
+                 -- MySQL can't replace a trigger in place: if the create fails, the\n\
                  -- trigger is gone.\ndrop trigger if exists shop.t;\n"
             )
         );
         assert!(
             replace_script(Dialect::MYSQL, &trigger, ddl, true)
-                .starts_with("CREATE or replace DEFINER=`app`@`%` TRIGGER t ")
+                .starts_with("use shop;\n\nCREATE or replace DEFINER=`app`@`%` TRIGGER t ")
         );
     }
 
@@ -3004,6 +3085,30 @@ mod tests {
             drop_sql(Dialect::SQLSERVER, &o("my proc", ObjectType::Procedure)),
             "drop procedure app.[my proc]"
         );
+        // Stored without its schema: in its own, not the default one (#248).
+        let unqualified = |name: &str, object_type, ddl: &str| {
+            replace_script(Dialect::SQLSERVER, &o(name, object_type), ddl, false)
+        };
+        assert_eq!(
+            unqualified("p", ObjectType::Procedure, "CREATE PROC [p] AS select 1"),
+            "CREATE or alter PROC app.[p] AS select 1\n"
+        );
+        assert_eq!(
+            unqualified(
+                "t",
+                ObjectType::Trigger,
+                "create trigger t on x after insert as select 1"
+            ),
+            "create or alter trigger app.t on app.x after insert as select 1\n"
+        );
+        assert_eq!(
+            unqualified(
+                "d",
+                ObjectType::Trigger,
+                "create trigger d on database for create_table as select 1"
+            ),
+            "create or alter trigger app.d on database for create_table as select 1\n"
+        );
 
         let lite = |name: &str, object_type| ObjectRef {
             owner: "main".into(),
@@ -3043,6 +3148,31 @@ mod tests {
         assert_eq!(
             drop_sql(Dialect::SQLITE, &lite("order", ObjectType::Table)),
             "drop table main.\"order\""
+        );
+        // Of an attached database: created there, not in main (#248).
+        let aux = |name: &str, object_type| ObjectRef {
+            owner: "aux".into(),
+            name: name.into(),
+            object_type,
+        };
+        assert_eq!(
+            replace_script(
+                Dialect::SQLITE,
+                &aux("t", ObjectType::Trigger),
+                trigger,
+                false
+            ),
+            "drop trigger if exists aux.t;\n\nCREATE TRIGGER aux.t AFTER INSERT ON x BEGIN\n  \
+             update x set n = 1;\nEND;\n"
+        );
+        assert_eq!(
+            replace_script(
+                Dialect::SQLITE,
+                &aux("i", ObjectType::Index),
+                "CREATE UNIQUE INDEX IF NOT EXISTS \"i\" ON x (n)",
+                false
+            ),
+            "drop index if exists aux.i;\n\nCREATE UNIQUE INDEX IF NOT EXISTS aux.\"i\" ON x (n);\n"
         );
     }
 }
