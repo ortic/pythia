@@ -297,6 +297,11 @@ All notable changes to Pythia are documented here. The format follows
   9223372036854775808." for 9223372036854775806, with a stray dot after
   every number of 1e15 and more. The summary now shows the smallest and
   largest value as they are, and the sum and average exactly.
+- *Export* and *Copy all* write a result's rows as the grid shows them
+  (#243): those its filter passes, in the order shown. With "12 of 100
+  rows" in the result bar, they wrote all 100, in the order fetched,
+  while leaving hidden columns out. The message says how many rows were
+  exported ("Exported 12 rows to result.csv").
 
 ## [0.10.0] - 2026-10-30
 

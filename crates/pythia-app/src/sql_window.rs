@@ -113,7 +113,7 @@ pub struct RunState {
     /// worked out for.
     debuggable: Option<(EditorPosition, bool)>,
     /// Result of a running export (file dialog + write on a helper thread).
-    pub export: Option<std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>>>,
+    pub export: Option<std::sync::mpsc::Receiver<ExportDone>>,
     pub selection_summary: Option<String>,
     /// Where the connection's scripts end their statements (from the
     /// document context, each frame).
@@ -1990,9 +1990,14 @@ impl SqlWindow {
         {
             state.export = None;
             let message = match result {
-                Ok(Some(path)) => Message {
+                Ok(Some((path, rows))) => Message {
                     level: Level::Info,
-                    text: format!("Exported to {}", path.display()),
+                    // The rows shown, which a filter may make fewer (#243).
+                    text: format!(
+                        "Exported {rows} row{} to {}",
+                        if rows == 1 { "" } else { "s" },
+                        path.display()
+                    ),
                     jump: None,
                     stack: Vec::new(),
                 },
@@ -2107,7 +2112,7 @@ impl SqlWindow {
                         let formats = |ui: &mut Ui| {
                             for format in pythia_data::Format::ALL {
                                 if ui.button(format.label()).clicked() {
-                                    // The selection if there is one, else all fetched rows.
+                                    // The selection if there is one, else the rows shown.
                                     let (columns, rows) =
                                         selection_data(&result.columns, &result.rows, &result.grid);
                                     // Before asking for a file that would stay empty.
@@ -2145,7 +2150,7 @@ impl SqlWindow {
                         }
                     });
                     if labelled(ui, Icon::Copy, "Copy all")
-                        .on_hover_text("Copy fetched rows as tab separated text")
+                        .on_hover_text("Copy the rows shown as tab separated text")
                         .clicked()
                     {
                         let (columns, rows) =
@@ -2976,12 +2981,16 @@ fn first_line(sql: &str) -> String {
 
 /// Asks for a file name and writes the export on a helper thread, so the
 /// native dialog doesn't block rendering.
+/// An export's end: the file and the rows written into it, `None` when no
+/// file was chosen.
+pub type ExportDone = Result<Option<(std::path::PathBuf, usize)>, String>;
+
 fn export_in_background(
     format: pythia_data::Format,
     columns: Vec<Column>,
     rows: Vec<Vec<Cell>>,
     options: pythia_data::Options,
-) -> std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>, String>> {
+) -> std::sync::mpsc::Receiver<ExportDone> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let path = rfd::FileDialog::new()
@@ -2998,7 +3007,7 @@ fn export_in_background(
                         .map_err(|e| e.to_string())?;
                     std::io::Write::flush(&mut out).map_err(|e| e.to_string())
                 })
-                .map(|()| Some(path)),
+                .map(|()| Some((path, rows.len()))),
         };
         let _ = tx.send(result);
     });

@@ -301,8 +301,14 @@ impl GridState {
         if self.ordered_rows == rows.len() {
             return;
         }
+        self.order = self.order_of(rows, columns);
+        self.ordered_rows = rows.len();
+    }
+
+    /// The rows passing the filter, in the order shown.
+    fn order_of(&self, rows: &[Vec<Cell>], columns: &[Column]) -> Vec<usize> {
         let needle = self.filter.trim().to_lowercase();
-        self.order = if needle.is_empty() {
+        let mut order: Vec<usize> = if needle.is_empty() {
             (0..rows.len()).collect()
         } else {
             (0..rows.len())
@@ -314,16 +320,16 @@ impl GridState {
                 })
                 .collect()
         };
-        self.ordered_rows = rows.len();
         if let Some((col, asc)) = self.sort {
             sort_order(
-                &mut self.order,
+                &mut order,
                 rows,
                 col,
                 columns.get(col).is_some_and(|c| c.numeric),
                 asc,
             );
         }
+        order
     }
 
     fn set_sort(&mut self, col: usize, rows: &[Vec<Cell>], columns: &[Column]) {
@@ -1731,22 +1737,22 @@ pub fn selection_data(
     (cols, data)
 }
 
-/// All fetched rows (as fetched) with the columns shown, in the order shown.
+/// The fetched rows as shown, those the filter passes in the order shown
+/// (#243), with the columns shown, in the order shown.
 pub fn shown_data(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
 ) -> (Vec<Column>, Vec<Vec<Cell>>) {
     let keep = state.visible_columns(columns.len());
-    if keep.iter().copied().eq(0..columns.len()) {
-        return (columns.to_vec(), rows.to_vec());
-    }
+    // Also the rows fetched since the grid was drawn.
+    let order = state.order_of(rows, columns);
     let cols = keep.iter().map(|&i| columns[i].clone()).collect();
-    let data = rows
+    let data = order
         .iter()
-        .map(|row| {
+        .map(|&r| {
             keep.iter()
-                .map(|&i| row.get(i).cloned().flatten())
+                .map(|&i| rows[r].get(i).cloned().flatten())
                 .collect()
         })
         .collect();
@@ -2619,6 +2625,40 @@ mod tests {
         assert_eq!(c[0].name, "B");
         assert_eq!(d, vec![vec![Some("x".to_owned())]]);
         assert_eq!(state.visible_columns(2), vec![1]);
+    }
+
+    /// Without a selection, Export and Copy all take the rows as shown
+    /// (#243): those the filter passes, in the order shown, as they leave the
+    /// hidden columns out. They took every fetched row, also those the
+    /// filter hid, in the order fetched.
+    #[test]
+    fn exports_take_the_rows_shown() {
+        let columns = cols();
+        let rows: Vec<Vec<Cell>> = [
+            ("1", "apple"),
+            ("2", "banana"),
+            ("3", "cherry"),
+            ("4", "grape"),
+        ]
+        .iter()
+        .map(|(a, b)| vec![Some(a.to_string()), Some(b.to_string())])
+        .collect();
+        let mut state = GridState::default();
+        state.set_filter("ap");
+        state.set_sort(0, &rows, &columns);
+        state.set_sort(0, &rows, &columns);
+        let shown = vec![
+            vec![Some("4".to_owned()), Some("grape".to_owned())],
+            vec![Some("1".to_owned()), Some("apple".to_owned())],
+        ];
+        assert_eq!(shown_data(&columns, &rows, &state).1, shown);
+        assert_eq!(selection_data(&columns, &rows, &state).1, shown);
+        // Rows fetched since the grid was last drawn are filtered too.
+        let mut more = rows.clone();
+        more.push(vec![Some("5".into()), Some("papaya".into())]);
+        assert_eq!(shown_data(&columns, &more, &state).1.len(), 3);
+        state.set_filter("");
+        assert_eq!(shown_data(&columns, &rows, &state).1.len(), 4);
     }
 
     #[test]
