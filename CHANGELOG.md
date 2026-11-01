@@ -248,6 +248,11 @@ All notable changes to Pythia are documented here. The format follows
   mysqldump's `/*!40103 SET TIME_ZONE='+00:00' */` left TIMESTAMPs
   shown, and written into INSERTs, in the zone from before; and a view
   created as mysqldump writes it didn't refresh completion's names.
+- MySQL: `?tls` to a server that doesn't offer TLS failed with
+  "DriverError { Client requires secure connection but server does not
+  have this capability }" (#222). It now says that the server doesn't
+  offer TLS and to connect without `?tls`. Other errors of the MySQL
+  driver no longer read `DriverError { … }` either.
 
 ## [0.10.0] - 2026-10-30
 

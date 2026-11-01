@@ -811,15 +811,22 @@ fn cancel_never_waits_for_the_network() {
     let took = started.elapsed();
     assert!(took < Duration::from_millis(100), "Break took {took:?}");
     thaw.join().unwrap();
-    // A killed SLEEP returns 1.
-    let rows = loop {
+    // Killed, SLEEP returns 1 on MySQL; MariaDB ends the query with 1317
+    // (interrupted), as MySQL does other queries.
+    loop {
         match h.next_result() {
             DbEvent::QueryStarted { .. } => {}
-            DbEvent::Rows { rows, .. } => break rows,
-            other => panic!("expected Rows, got {other:?}"),
+            DbEvent::Rows { rows, .. } => {
+                assert_eq!(rows[0][0].as_deref(), Some("1"));
+                break;
+            }
+            DbEvent::Failed { error, .. } => {
+                assert_eq!(error.code, Some(1317), "{error}");
+                break;
+            }
+            other => panic!("expected the end of the query, got {other:?}"),
         }
-    };
-    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    }
     assert!(started.elapsed() < Duration::from_secs(4));
     h.ok("select 1");
 }
@@ -1167,7 +1174,7 @@ fn connect_error(params: ConnectParams) -> pythia_db::DbError {
 /// A certificate that isn't trusted (the test server's is self-signed)
 /// says so and how to connect anyway, instead of "Lost connection to the
 /// MySQL server: IO error: `invalid peer certificate: UnknownIssuer'"
-/// (#211).
+/// (#211). A server without TLS says that (#222).
 #[test]
 fn untrusted_certificates_say_so() {
     let Some(params) = params() else {
@@ -1178,6 +1185,18 @@ fn untrusted_certificates_say_so() {
         ..params.clone()
     };
     let error = connect_error(with("tls"));
+    assert!(!error.is_connection_lost());
+    // MariaDB's test container has no TLS: no certificate to check.
+    if error.message.starts_with("The server doesn't offer TLS") {
+        assert!(error.message.contains("Connect without ?tls"), "{error}");
+        let error = connect_error(with("tls=skip-verify"));
+        assert!(
+            error.message.starts_with("The server doesn't offer TLS"),
+            "{error}"
+        );
+        eprintln!("The server has no TLS: its certificate isn't checked");
+        return;
+    }
     assert!(
         error
             .message
