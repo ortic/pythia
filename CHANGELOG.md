@@ -267,6 +267,12 @@ All notable changes to Pythia are documented here. The format follows
   (the row is found by its key), and a cut value pasted into a cell is
   no longer written: MySQL and SQLite stored it as text, 8000 hex
   digits and the size.
+- Completion after an opening quote writes the name closed (#234). On
+  MySQL, `` `ord `` became ``` ``order` ```, and a name that needs no
+  backticks stayed unclosed; `[` on SQL Server and SQLite did the same,
+  and after `"` the popup didn't open at all. Columns are offered after
+  a quote that isn't closed yet too, and only names are: no keywords or
+  functions.
 
 ## [0.10.0] - 2026-10-30
 

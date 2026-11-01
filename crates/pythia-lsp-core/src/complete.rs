@@ -202,27 +202,65 @@ pub(crate) fn complete(sema: &Sema, offset: usize, opts: &CompletionOptions) -> 
             break;
         }
     }
-    let mut quoted = false;
     let mut word_start = pstart;
-    if src[..pstart].ends_with('"') {
-        // Typing a quoted identifier: `"Mixed|`.
-        let i = sema.tokens.partition_point(|t| t.span.end < pstart);
-        if let Some(t) = sema.tokens.get(i)
-            && t.kind == TokenKind::QuotedIdent
-            && t.span.start == pstart - 1
-        {
-            quoted = true;
-            word_start = pstart - 1;
-        }
-    }
+    // Typing a quoted name: `"Mixed|`, `` `order| ``, `[my t|`. The item
+    // replaces the opening quote too and comes closed (#234).
+    let quote = quoted_name_start(sema.tokens, src, offset).map(|start| {
+        word_start = start;
+        pstart = start + 1;
+        char::from(src.as_bytes()[start])
+    });
     let prefix = &src[pstart..offset];
     completion.replace = word_start..offset;
 
     let ctx = context(sema, word_start, offset);
-    let mut b = Builder::new(prefix, quoted, opts, sema.cat.names());
+    let mut b = Builder::new(prefix, quote, opts, sema.cat.names());
     fill(sema, &ctx, word_start, prefix, &mut b);
     (completion.items, completion.incomplete) = b.finish(opts.max_items);
     completion
+}
+
+/// The closing quote of a quoted name opened with `open`.
+fn closing_quote(open: char) -> Option<char> {
+    match open {
+        '"' | '`' => Some(open),
+        '[' => Some(']'),
+        _ => None,
+    }
+}
+
+/// Where the quoted name `offset` is in starts (its opening quote), unless
+/// `offset` is after its closing quote.
+fn quoted_name_start(tokens: &[Token], src: &str, offset: usize) -> Option<usize> {
+    let i = tokens.partition_point(|t| t.span.end < offset);
+    let t = tokens
+        .get(i)
+        .filter(|t| t.kind == TokenKind::QuotedIdent && t.span.start < offset)?;
+    let text = &src[t.span.clone()];
+    let close = closing_quote(text.chars().next()?)?;
+    let closed = text.len() > 1 && text.ends_with(close);
+    (offset < t.span.end || !closed).then_some(t.span.start)
+}
+
+/// The quote to close a quoted name at `offset` with, when the name being
+/// typed there isn't closed yet: then it runs on to the next such quote or
+/// to the end of the line, and takes the rest of the statement with it, its
+/// FROM clause too (`` select `no| from t ``).
+pub(crate) fn unclosed_quote(tokens: &[Token], src: &str, offset: usize) -> Option<char> {
+    if !src.is_char_boundary(offset) {
+        return None;
+    }
+    let start = quoted_name_start(tokens, src, offset)?;
+    let i = tokens.partition_point(|t| t.span.end < offset);
+    let end = tokens.get(i)?.span.end;
+    let close = closing_quote(char::from(src.as_bytes()[start]))?;
+    // `` `ord|er` `` is closed after its name.
+    let rest = &src[offset..end];
+    let closed = rest.strip_suffix(close).is_some_and(|name| {
+        name.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#'))
+    });
+    (!closed).then_some(close)
 }
 
 /// Inside a comment, string or number: no completion.
@@ -497,7 +535,9 @@ fn plsql_context(sema: &Sema, at: usize, prev: usize, prev_up: &str, prev_text: 
 
 struct Builder {
     prefix: String,
-    quoted: bool,
+    /// The opening quote typed before the prefix: only names are offered,
+    /// written in these quotes.
+    quote: Option<char>,
     case: CaseStyle,
     /// How the database writes dictionary names.
     names: NameStyle,
@@ -516,7 +556,7 @@ const P_SCHEMA: u8 = 6;
 const P_SNIPPET: u8 = 7;
 
 impl Builder {
-    fn new(prefix: &str, quoted: bool, opts: &CompletionOptions, names: NameStyle) -> Self {
+    fn new(prefix: &str, quote: Option<char>, opts: &CompletionOptions, names: NameStyle) -> Self {
         let letters: Vec<char> = prefix.chars().filter(|c| c.is_alphabetic()).collect();
         let case = if opts.match_typing && !letters.is_empty() {
             if letters.iter().all(|c| c.is_lowercase()) {
@@ -531,7 +571,7 @@ impl Builder {
         };
         Self {
             prefix: prefix.to_owned(),
-            quoted,
+            quote,
             case,
             names,
             items: Vec::new(),
@@ -548,10 +588,16 @@ impl Builder {
 
     /// A dictionary name as it is written: Oracle's and PostgreSQL's in the
     /// case the user types unless quoted, MySQL's, SQL Server's and SQLite's
-    /// as stored.
+    /// as stored. After an opening quote, in the quotes typed.
     fn name_text(&self, name: &str) -> String {
+        match self.quote {
+            Some('`') => return format!("`{}`", name.replace('`', "``")),
+            Some('[') => return format!("[{}]", name.replace(']', "]]")),
+            Some(_) => return format!("\"{}\"", name.replace('"', "\"\"")),
+            None => {}
+        }
         match self.names {
-            NameStyle::Upper | NameStyle::Lower if self.quoted || self.needs_quotes(name) => {
+            NameStyle::Upper | NameStyle::Lower if self.needs_quotes(name) => {
                 format!("\"{}\"", name.replace('"', "\"\""))
             }
             NameStyle::Upper | NameStyle::Lower => self.cased(name),
@@ -606,6 +652,9 @@ impl Builder {
     }
 
     fn keyword(&mut self, kw: &str) {
+        if self.quote.is_some() {
+            return;
+        }
         let text = self.cased(kw);
         self.push(
             text.clone(),
@@ -632,14 +681,19 @@ impl Builder {
     ) -> Option<&mut CompletionItem> {
         let text = self.name_text(name);
         let label = match self.names {
-            NameStyle::Upper | NameStyle::Lower if self.needs_quotes(name) => text.clone(),
+            NameStyle::Upper | NameStyle::Lower
+                if self.quote.is_some() || self.needs_quotes(name) =>
+            {
+                text.clone()
+            }
             NameStyle::Upper | NameStyle::Lower => self.cased(name),
             NameStyle::Backticks | NameStyle::Brackets | NameStyle::AsWritten => name.to_owned(),
         };
         self.push(label, kind, detail, text, None, priority)
     }
 
-    /// A name declared in the source: insert as written there.
+    /// A name declared in the source: insert as written there, after an
+    /// opening quote only if it is written in such quotes.
     fn source_name(
         &mut self,
         written: &str,
@@ -647,6 +701,9 @@ impl Builder {
         detail: String,
         priority: u8,
     ) -> Option<&mut CompletionItem> {
+        if self.quote.is_some_and(|q| !written.starts_with(q)) {
+            return None;
+        }
         self.push(
             written.to_owned(),
             kind,
@@ -847,7 +904,12 @@ fn fill(sema: &Sema, ctx: &Ctx, at: usize, prefix: &str, b: &mut Builder) {
         Ctx::Nothing => {}
         Ctx::StatementStart => {
             b.keywords(builtins::STATEMENT_KEYWORDS);
-            for (label, text, detail) in builtins::SNIPPETS {
+            let snippets = if b.quote.is_none() {
+                builtins::SNIPPETS
+            } else {
+                &[]
+            };
+            for (label, text, detail) in snippets {
                 let caret = text.find('|');
                 let insert = text.replacen('|', "", 1);
                 let insert = if b.case == CaseStyle::Lower {
@@ -981,6 +1043,9 @@ fn objects(sema: &Sema, b: &mut Builder, types: &[&str]) {
 }
 
 fn builtin_items(sema: &Sema, b: &mut Builder) {
+    if b.quote.is_some() {
+        return;
+    }
     for f in builtins::FUNCTIONS {
         let text = b.cased(f.name);
         if let Some(item) = b.push(
@@ -1252,7 +1317,7 @@ mod tests {
         assert!(needs_brackets("Order"));
 
         let opts = CompletionOptions::default();
-        let text = |names, name| Builder::new("", false, &opts, names).name_text(name);
+        let text = |names, name| Builder::new("", None, &opts, names).name_text(name);
         assert_eq!(text(NameStyle::Lower, "Emp"), "\"Emp\"");
         assert_eq!(text(NameStyle::Brackets, "a]b"), "[a]]b]");
         assert_eq!(text(NameStyle::Brackets, "Emp"), "Emp");

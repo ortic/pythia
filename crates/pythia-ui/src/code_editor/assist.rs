@@ -101,6 +101,9 @@ pub struct Completion {
     start: usize,
     /// Chars after the caret that were part of the replace range when shown.
     tail: usize,
+    /// The closing quote, when the text being completed starts with an
+    /// opening one: `"`, `` ` `` or `[` (#234).
+    close: Option<char>,
     items: Vec<CompletionEntry>,
     /// Indices into `items`, best match first.
     pub filtered: Vec<usize>,
@@ -140,9 +143,17 @@ impl Completion {
         let caret = state.primary().head;
         let start = replace.start.min(caret);
         let tail = replace.end.saturating_sub(caret);
+        let close = (start < caret)
+            .then(|| state.rope.char(start))
+            .and_then(|open| match open {
+                '"' | '`' => Some(open),
+                '[' => Some(']'),
+                _ => None,
+            });
         let mut c = Self {
             start,
             tail,
+            close,
             items,
             filtered: Vec::new(),
             selected: 0,
@@ -184,13 +195,12 @@ impl Completion {
         self.entry(self.selected)
     }
 
-    /// The typed text the items are filtered by.
+    /// The typed text the items are filtered by: after the opening quote,
+    /// if there is one.
     pub fn prefix(&self, state: &EditorState) -> String {
         let caret = state.primary().head;
-        state
-            .rope
-            .slice(self.start..caret.max(self.start))
-            .to_string()
+        let start = self.start + usize::from(self.close.is_some());
+        state.rope.slice(start..caret.max(start)).to_string()
     }
 
     /// Re-validates after input. Returns `false` if the popup should close:
@@ -200,11 +210,16 @@ impl Completion {
             return false;
         }
         let sel = state.primary();
-        if !sel.is_empty() || sel.head < self.start || sel.head > state.len() {
+        let start = self.start + usize::from(self.close.is_some());
+        if !sel.is_empty() || sel.head < start || sel.head > state.len() {
             return false;
         }
         let prefix = self.prefix(state);
-        if !prefix.chars().all(is_word_char) {
+        // A quoted name may have spaces.
+        if !prefix
+            .chars()
+            .all(|c| is_word_char(c) || (c == ' ' && self.close.is_some()))
+        {
             return false;
         }
         let previous = self.selected_entry().map(|e| e.label.clone());
@@ -246,9 +261,17 @@ impl Completion {
             return false;
         };
         let caret = state.primary().head;
-        let tail = (0..self.tail)
+        let mut tail = (0..self.tail)
             .take_while(|i| caret + i < state.len() && is_word_char(state.rope.char(caret + i)))
             .count();
+        // The name comes closed: a closing quote typed already goes.
+        if let Some(close) = self.close
+            && entry.insert_text.ends_with(close)
+            && caret + tail < state.len()
+            && state.rope.char(caret + tail) == close
+        {
+            tail += 1;
+        }
         if entry.kind == CompletionKind::Snippet
             && super::snippet::has_tab_stops(&entry.insert_text)
         {
@@ -449,6 +472,66 @@ mod tests {
         assert!(!c.update(&s), "typing a non-word char closes it");
         let s = state("select em", 9);
         assert!(Completion::new(&s, 7..9, vec![entry("dual", CompletionKind::Table)]).is_none());
+    }
+
+    /// After an opening quote, the popup filters by the name typed after it;
+    /// accepting replaces the quote too, and a closing one after the caret.
+    #[test]
+    fn names_after_an_opening_quote() {
+        let quoted = |label: &str, insert: &str| CompletionEntry {
+            insert_text: insert.into(),
+            ..entry(label, CompletionKind::Table)
+        };
+        for (text, caret, label, insert, typed, accepted) in [
+            (
+                "select * from `or",
+                17,
+                "order",
+                "`order`",
+                "d",
+                "select * from `order`",
+            ),
+            (
+                "select * from `or` o",
+                17,
+                "order",
+                "`order`",
+                "d",
+                "select * from `order` o",
+            ),
+            (
+                "select * from [my",
+                17,
+                "my table",
+                "[my table]",
+                " t",
+                "select * from [my table]",
+            ),
+            (
+                "select \"Wei",
+                11,
+                "\"Weird Tab\"",
+                "\"Weird Tab\"",
+                "r",
+                "select \"Weird Tab\"",
+            ),
+        ] {
+            let mut s = state(text, caret);
+            let start = text[..caret].rfind(['`', '[', '"']).unwrap();
+            let items = vec![quoted(label, insert), entry("other", CompletionKind::Table)];
+            let mut c = Completion::new(&s, start..caret, items).expect(text);
+            assert_eq!(labels(&c), [label], "{text}");
+            s.insert(typed, 1.0);
+            assert!(c.update(&s), "{text} + {typed}");
+            assert_eq!(labels(&c), [label], "{text} + {typed}");
+            assert!(c.accept(&mut s, 1.1));
+            assert_eq!(s.text(), accepted);
+        }
+        // Moving onto the quote closes it.
+        let mut s = state("select `or", 10);
+        let mut c = Completion::new(&s, 7..10, vec![quoted("order", "`order`")]).unwrap();
+        s.move_cursors(false, |_, _| 7);
+        assert!(!c.update(&s));
     }
 
     #[test]

@@ -482,6 +482,120 @@ fn bracketed_names() {
 }
 
 #[test]
+fn names_after_an_opening_quote() {
+    // Typed after its opening quote, a name replaces the quote too and
+    // comes closed, in the quotes typed; only names are offered.
+    let mysql = as_written("pythia", NameStyle::Backticks, &["fs_plain", "order"]);
+    let tsql = as_written("dbo", NameStyle::Brackets, &["fs_plain", "order"]);
+    let sqlite = as_written("main", NameStyle::AsWritten, &["fs_plain", "my table"]);
+    let mut pg = as_written("public", NameStyle::Lower, &["fs_plain", "Mixed"]);
+    pg.set_columns("public", "Mixed", vec![col("Note", "text", true)]);
+    for (src, syntax, cat, label, insert) in [
+        (
+            "select * from `ord¦",
+            Syntax::MySql,
+            &mysql,
+            "order",
+            "`order`",
+        ),
+        (
+            "select * from `fs¦",
+            Syntax::MySql,
+            &mysql,
+            "fs_plain",
+            "`fs_plain`",
+        ),
+        // The quote not closed yet doesn't take the FROM clause.
+        (
+            "select `no¦ from `fs_plain`",
+            Syntax::MySql,
+            &mysql,
+            "note",
+            "`note`",
+        ),
+        (
+            "select p.`no¦ from `fs_plain` p",
+            Syntax::MySql,
+            &mysql,
+            "note",
+            "`note`",
+        ),
+        (
+            "select [no¦ from [dbo].[fs_plain]",
+            Syntax::TSql,
+            &tsql,
+            "note",
+            "[note]",
+        ),
+        (
+            "select * from [ord¦",
+            Syntax::TSql,
+            &tsql,
+            "order",
+            "[order]",
+        ),
+        (
+            "select * from [my t¦",
+            Syntax::Sqlite,
+            &sqlite,
+            "my table",
+            "[my table]",
+        ),
+        (
+            "select `no¦ from [fs_plain]",
+            Syntax::Sqlite,
+            &sqlite,
+            "note",
+            "`note`",
+        ),
+        (
+            "select \"no¦ from [fs_plain]",
+            Syntax::Sqlite,
+            &sqlite,
+            "note",
+            "\"note\"",
+        ),
+        (
+            "select \"No¦ from \"Mixed\"",
+            Syntax::Postgres,
+            &pg,
+            "\"Note\"",
+            "\"Note\"",
+        ),
+    ] {
+        let (text, offset) = split(src);
+        let c = Analysis::new_in(&text, syntax).complete(offset, cat);
+        assert!(c.missing.is_empty(), "{src}: {:?}", c.missing);
+        let quote = text[..offset].rfind(['`', '[', '"']).unwrap();
+        assert_eq!(c.replace, quote..offset, "{src}");
+        let labels: Vec<&str> = c.items.iter().map(|i| i.label.as_str()).collect();
+        let item = c
+            .items
+            .iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("{src}: no {label} in {labels:?}"));
+        assert_eq!(item.insert_text, insert, "{src}");
+        assert!(
+            c.items
+                .iter()
+                .all(|i| !matches!(i.kind, CompletionKind::Keyword | CompletionKind::Builtin)),
+            "{src}: {labels:?}"
+        );
+    }
+    // Up to the end of the line: the table after FROM is still looked up.
+    let (text, offset) = split("select `no¦ from fs_plain");
+    assert_eq!(
+        Analysis::new_in(&text, Syntax::MySql)
+            .complete(offset, &mysql)
+            .missing,
+        [CatalogRequest::Resolve {
+            schema: None,
+            name: "FS_PLAIN".into()
+        }]
+    );
+}
+
+#[test]
 fn no_completion_in_comments_and_strings() {
     assert!(labels("select '¦' from dual").is_empty());
     assert!(labels("select 1 -- emp¦").is_empty());

@@ -8364,6 +8364,63 @@ fn object_view_of_a_dropped_table() {
     );
 }
 
+/// A name typed after its opening quote is completed and closed (#234):
+/// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
+/// didn't open.
+#[test]
+fn completion_after_an_opening_quote() {
+    let connection = "quoted.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"order\" (id integer, \"unit price\" real)",
+    );
+    // The text, where a letter is typed, and the text once completed.
+    for (text, caret, letter, completed) in [
+        ("select * from `or", 17, "d", "select * from `order`"),
+        ("select * from [o", 16, "r", "select * from [order]"),
+        (
+            "select [u from [order]",
+            9,
+            "n",
+            "select [unit price] from [order]",
+        ),
+        (
+            "select \"u from \"order\"",
+            9,
+            "n",
+            "select \"unit price\" from \"order\"",
+        ),
+    ] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(caret..caret);
+        h.run_steps(2);
+        h.event(egui::Event::Text(letter.into()));
+        let mut open = false;
+        for _ in 0..50 {
+            h.run_steps(1);
+            let editor = &h.state_mut().test_sql_window().editor;
+            if !editor.completion_labels().is_empty() {
+                open = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(open, "{text}: no completion");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state_mut().test_sql_window().editor.text(), completed);
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
+}
+
 /// Maintenance of a SQLite table: its rows, pages and missing statistics,
 /// then ANALYZE (after which it has them), REINDEX and the integrity check.
 #[test]
