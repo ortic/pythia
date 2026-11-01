@@ -792,7 +792,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     )?;
     // Each index as (name, quoted, UNIQUE, its kind, a secondary XML
     // index's USING, its WHERE) and a spatial index's tessellation. Hash
-    // indexes (7) are a memory-optimized table's (#302).
+    // indexes (7) are a memory-optimized table's (#302). The clustered
+    // index, rowstore or columnstore, comes first, so that the others
+    // aren't built again over it; hypothetical indexes, which have
+    // statistics and no rows, are left out (#327).
     let rows = ms.rows(
         "select i.index_id, i.name, quotename(i.name), \
                 case when i.is_unique = 1 then 'unique ' else '' end, \
@@ -819,8 +822,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
            left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
             and t.index_id = i.index_id \
           where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6, 7) \
-            and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
-          order by case when x.using_xml_index_id is null then 0 else 1 end, i.name",
+            and i.is_primary_key = 0 and i.is_unique_constraint = 0 and i.is_hypothetical = 0 \
+          order by case when i.type in (1, 5) then 0 when x.using_xml_index_id is null then 1 \
+                        else 2 end, \
+                   i.name",
         &[object],
     )?;
     for row in rows {
@@ -901,6 +906,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .rows(
             "select quotename(i.name) from sys.indexes i \
               where i.object_id = object_id(@P1) and i.is_disabled = 1 \
+                and i.is_hypothetical = 0 \
               order by case when i.type in (1, 5) then 1 else 0 end, i.name",
             &[object],
         )?

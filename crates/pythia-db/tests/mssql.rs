@@ -1281,10 +1281,10 @@ fn dictionary_at_compatibility_level_100() {
         "    constraint [r63_emp_sal_ck] check ([sal]>=(0))",
         ");",
         "",
+        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
+        "",
         "create nonclustered index [r63_emp_cover] on [dbo].[r63_emp] ([deptno]) \
          include ([sal], [na,me]) where ([deptno] IS NOT NULL);",
-        "",
-        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
         "",
         "create nonclustered columnstore index [r63_emp_store] on [dbo].[r63_emp] \
          ([sal], [site]);",
@@ -2260,6 +2260,108 @@ fn constraint_and_index_states() {
     drop_tables(&mut h, "r74_copy_k", "r74_k");
     h.ok("drop schema r74_copy_k");
     drop_tables(&mut h, &schema, "r74_k");
+}
+
+/// A table's DDL builds its clustered index first, so that the
+/// nonclustered ones aren't built again over it, and leaves out
+/// hypothetical indexes, which have statistics and no rows (#327): run
+/// elsewhere, the copy has the same indexes, all of them real.
+#[test]
+fn clustered_first_without_hypothetical_indexes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_h", "r74_h");
+    h.ok("drop schema if exists r74_copy_h");
+    drop_tables(&mut h, &schema, "r74_h");
+    for sql in [
+        "create table r74_hy (id int not null, a int, b int)",
+        "create index r74_hy_a on r74_hy (a)",
+        "create clustered index r74_hy_z on r74_hy (id)",
+        "create index r74_hy_hypo on r74_hy (b) with statistics_only = -1",
+        "create table r74_hc (id int, a int)",
+        "create index r74_hc_a on r74_hc (a)",
+        "create clustered columnstore index r74_hc_z on r74_hc",
+        "create table r74_hd (id int, a int)",
+        "create clustered index r74_hd_c on r74_hd (id)",
+        "create index r74_hd_hypo on r74_hd (a) with statistics_only = -1",
+        "alter index r74_hd_c on r74_hd disable",
+    ] {
+        h.ok(sql);
+    }
+    assert_eq!(
+        h.scalar(
+            "select count(*) from sys.indexes \
+              where name in ('r74_hy_hypo', 'r74_hd_hypo') and is_hypothetical = 1"
+        )
+        .as_deref(),
+        Some("2")
+    );
+    let hy = table_ddl(&mut h, &schema, "r74_hy");
+    let t = format!("[{schema}].[r74_hy]");
+    assert!(
+        hy.ends_with(&format!(
+            ");\n\n\
+             create clustered index [r74_hy_z] on {t} ([id]);\n\n\
+             create nonclustered index [r74_hy_a] on {t} ([a]);\nGO\n"
+        )),
+        "{hy}"
+    );
+    let hc = table_ddl(&mut h, &schema, "r74_hc");
+    let t = format!("[{schema}].[r74_hc]");
+    assert!(
+        hc.ends_with(&format!(
+            ");\n\n\
+             create clustered columnstore index [r74_hc_z] on {t};\n\n\
+             create nonclustered index [r74_hc_a] on {t} ([a]);\nGO\n"
+        )),
+        "{hc}"
+    );
+    // Disabling a clustered index disables the hypothetical ones too: they
+    // aren't disabled in the DDL either.
+    let hd = table_ddl(&mut h, &schema, "r74_hd");
+    let t = format!("[{schema}].[r74_hd]");
+    assert!(
+        hd.ends_with(&format!(
+            ");\n\n\
+             create clustered index [r74_hd_c] on {t} ([id]);\n\n\
+             alter index [r74_hd_c] on {t} disable;\nGO\n"
+        )),
+        "{hd}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(i.object_id), i.name, i.type_desc, \
+                                         i.is_hypothetical, i.is_disabled) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(i.object_id), i.name) \
+               from sys.indexes i \
+              where i.object_id in (select object_id from sys.tables \
+                                     where schema_id = schema_id('{owner}') \
+                                       and name like 'r74_h%') \
+                and i.type > 0 and i.is_hypothetical = 0"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_h");
+    let tables = ["r74_hy", "r74_hc", "r74_hd"];
+    for ddl in [&hy, &hc, &hd] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_h", &tables);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_h"), before);
+    assert_eq!(
+        h.scalar(
+            "select count(*) from sys.indexes \
+              where object_schema_name(object_id) = 'r74_copy_h' and is_hypothetical = 1"
+        )
+        .as_deref(),
+        Some("0")
+    );
+    drop_tables(&mut h, "r74_copy_h", "r74_h");
+    h.ok("drop schema r74_copy_h");
+    drop_tables(&mut h, &schema, "r74_h");
 }
 
 /// Object filters and Find find names without case, non-ASCII letters too,

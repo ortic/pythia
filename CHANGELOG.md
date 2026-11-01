@@ -851,6 +851,12 @@ All notable changes to Pythia are documented here. The format follows
   it isn't `TABLE`. Run elsewhere, they were all enabled and trusted:
   the copy rejected rows the original takes, and built and kept up to
   date indexes the original doesn't.
+- SQL Server: a table's DDL makes its clustered index before the other
+  indexes (#327). It came in the order of their names, so that run
+  after the rows were loaded, the nonclustered indexes before it were
+  built twice, the second time by the clustered index. Hypothetical
+  indexes, which have statistics and no rows, are left out: they were
+  made as real ones.
 
 ## [0.10.0] - 2026-10-30
 
