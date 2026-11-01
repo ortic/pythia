@@ -177,6 +177,13 @@ pub enum DbEvent {
         more: bool,
         elapsed: Duration,
     },
+    /// Statement `id` returns another result after the rows that come
+    /// next, the last of the one before: MySQL's CALL of a procedure with
+    /// several SELECTs, or statements in one text (#290). Another
+    /// `QueryStarted` follows, or the error that ended the statement.
+    MoreResults {
+        id: u64,
+    },
     Executed {
         id: u64,
         summary: ExecSummary,

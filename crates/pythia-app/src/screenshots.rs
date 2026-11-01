@@ -5853,6 +5853,89 @@ fn explain_case(h: &mut Ui, connection: &str, case: &ExplainCase) {
     wait_until(h, "rollback", |app| !app.test_pending_tx());
 }
 
+/// On MySQL a statement with several results shows each in a tab of its
+/// own (#290): a procedure's SELECTs, and statements kept together after
+/// DELIMITER, also with an error after the first. Only the first showed,
+/// and the error was lost. MariaDB's `BEGIN NOT ATOMIC` too, when the test
+/// database is MariaDB.
+#[test]
+fn mysql_statements_show_every_result() {
+    let connection = "r51@mysql";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_MYSQL",
+        connection,
+        pythia_config::DbKind::MySql,
+    ) else {
+        return;
+    };
+    let mariadb = h.state().test_mariadb(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(&mut h, "drop procedure if exists r51_p");
+    run_in_window(
+        &mut h,
+        "create procedure r51_p() begin select 1 as a; select 'x' as b, 2 as c; end",
+    );
+    // Each result's title and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let row: Vec<&str> = r.rows[0]
+                    .iter()
+                    .map(|c| c.as_deref().unwrap_or(""))
+                    .collect();
+                format!("{}: {}", r.title, row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: 1", "Result 2: x 2"];
+    let mut cases = vec![
+        "call r51_p()",
+        "DELIMITER //\nselect 1 as a; select 'x' as b, 2 as c //\nDELIMITER ;",
+    ];
+    if mariadb {
+        cases.push("begin not atomic select 1 as a; select 'x' as b, 2 as c; end;");
+    }
+    for sql in cases {
+        let (results, messages) = shown(&mut h, sql);
+        assert_eq!(results, two, "{sql}: {messages:?}");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("1 row selected"))
+                .count(),
+            2,
+            "{sql}: {messages:?}"
+        );
+    }
+    let (results, messages) = shown(
+        &mut h,
+        "DELIMITER //\nselect 1 as a; select * from r51_no_such_table //\nselect 2 //",
+    );
+    assert_eq!(results, ["Result 1: 1"], "{messages:?}");
+    assert!(
+        messages.iter().any(|m| m.contains("1146"))
+            && messages
+                .iter()
+                .any(|m| m.contains("1 remaining statement(s) skipped")),
+        "{messages:?}"
+    );
+    run_in_window(&mut h, "drop procedure r51_p");
+}
+
 /// On SQLite `&` is an operator: completion after `1&c.` offers the
 /// alias's columns (#287), which it didn't, reading `&c.` as a
 /// substitution variable. After `SET DEFINE ON` it is one.

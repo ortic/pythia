@@ -532,6 +532,13 @@ All notable changes to Pythia are documented here. The format follows
   SQLite (#287). It offered nothing, reading `&c.` as a substitution
   variable, which there it is only after `SET DEFINE ON` (#190). Code
   assistance now reads `&name` as the window substitutes.
+- MySQL: a statement with several results shows each in a tab of its own
+  (#290): the SELECTs of a procedure a `CALL` runs, statements kept
+  together after `DELIMITER` or in MariaDB's `BEGIN NOT ATOMIC`. Only the
+  first showed, without a word, and an error after it was lost, so the
+  script went on; a SELECT after a `DO` didn't show at all. Such an error
+  now fails the statement. *Execute to file* writes the first result and
+  says how many others there were.
 
 ## [0.10.0] - 2026-10-30
 

@@ -182,9 +182,14 @@ pub struct Apply {
 }
 
 pub struct Running {
+    /// The request's id.
+    pub id: u64,
     pub start: usize,
     pub internal: Option<Internal>,
     pub sql: String,
+    /// Its next rows are those of a result with another after it (MySQL,
+    /// #290): the statement goes on.
+    pub continues: bool,
 }
 
 pub struct QueryResult {
@@ -1040,9 +1045,11 @@ impl SqlWindow {
         }
         let id = request_id();
         self.state.running = Some(Running {
+            id,
             internal: None,
             start,
             sql: sql.clone(),
+            continues: false,
         });
         effects.request(
             Target::Own,
@@ -1098,9 +1105,11 @@ impl SqlWindow {
             }
         };
         self.state.running = Some(Running {
+            id,
             start,
             sql,
             internal: Some(internal),
+            continues: false,
         });
         effects.request(Target::Own, request);
     }
@@ -1600,8 +1609,14 @@ impl SqlWindow {
         }
         match event {
             DbEvent::QueryStarted { id, columns } => {
-                let running = self.state.running.as_ref();
-                let sql = running.map(|r| r.sql.clone()).unwrap_or_default();
+                // Another result of the statement whose result `id` is
+                // (#290), in a tab of its own.
+                let earlier = self.state.results.iter().rev().find(|r| r.id == id);
+                let running = self.state.running.as_ref().filter(|_| earlier.is_none());
+                let sql = match earlier {
+                    Some(result) => result.sql.clone(),
+                    None => running.map(|r| r.sql.clone()).unwrap_or_default(),
+                };
                 let mut result = QueryResult {
                     id,
                     title: String::new(),
@@ -1775,13 +1790,18 @@ impl SqlWindow {
                     result.relations = relations;
                 }
             }
+            DbEvent::MoreResults { id } => {
+                if let Some(running) = self.state.running.as_mut().filter(|r| r.id == id) {
+                    running.continues = true;
+                }
+            }
             DbEvent::Rows {
                 id,
                 rows,
                 more,
                 elapsed,
             } => {
-                let Some(result) = self.state.results.iter_mut().find(|r| r.id == id) else {
+                let Some(result) = self.state.results.iter_mut().rev().find(|r| r.id == id) else {
                     return effects;
                 };
                 result.rows.extend(rows);
@@ -1792,6 +1812,21 @@ impl SqlWindow {
                     self.state.fetching = None;
                     return effects;
                 }
+                // A result with another after it, or one after a result
+                // whose rows were fetched later: the statement isn't ended
+                // by it (#290).
+                let ends = match self.state.running.as_mut().filter(|r| r.id == id) {
+                    Some(running) => !std::mem::take(&mut running.continues),
+                    None => false,
+                };
+                if !ends {
+                    self.info(format!(
+                        "{} selected in {}",
+                        rows_text(fetched),
+                        fmt_duration(elapsed)
+                    ));
+                    return effects;
+                }
                 self.state.done += 1;
                 if let Some(running) = self.state.running.take()
                     && running.internal.is_none()
@@ -1799,13 +1834,9 @@ impl SqlWindow {
                     effects.executed.push(running.sql);
                 }
                 let suffix = if more { " (more available)" } else { "" };
-                let rows = if fetched == 1 {
-                    "1 row".to_owned()
-                } else {
-                    format!("{fetched} rows")
-                };
                 self.info(format!(
-                    "{rows} selected in {}{suffix}",
+                    "{} selected in {}{suffix}",
+                    rows_text(fetched),
                     fmt_duration(elapsed)
                 ));
                 if let Some((_, unapplied)) = self.state.unapplied.take_if(|(r, _)| *r == id) {
@@ -3047,6 +3078,15 @@ fn block_line(debug: &pythia_debugger::ui::DebugSession) -> Option<u32> {
         .then_some(frame.location.line)?
 }
 
+/// `1 row`, `2 rows`.
+fn rows_text(rows: usize) -> String {
+    if rows == 1 {
+        "1 row".to_owned()
+    } else {
+        format!("{rows} rows")
+    }
+}
+
 /// Whether `sql` holds more than comments, blank space and `;`.
 fn has_code(sql: &str, syntax: Syntax) -> bool {
     tokenize_in(sql, syntax)
@@ -3310,9 +3350,11 @@ mod tests {
         };
         let mut w = SqlWindow::new("t".into(), String::new());
         w.state.running = Some(Running {
+            id: 7,
             start: 0,
             sql: "select x from t".into(),
             internal: None,
+            continues: false,
         });
         w.on_event(
             DbEvent::QueryStarted {
@@ -3596,9 +3638,11 @@ mod tests {
         let start = text.find("begin").unwrap();
         let mut w = SqlWindow::new("SQL 1".into(), text.into());
         w.state.running = Some(Running {
+            id: 0,
             start,
             sql: text[start..].into(),
             internal: None,
+            continues: false,
         });
         let error = DbError {
             code: Some(1403),

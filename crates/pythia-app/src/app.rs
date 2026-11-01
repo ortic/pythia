@@ -5108,6 +5108,10 @@ impl PythiaApp {
         }
     }
 
+    pub fn test_mariadb(&self, connection: &str) -> bool {
+        self.mariadb_of(Some(connection))
+    }
+
     pub fn test_connected(&self) -> bool {
         self.connecting.is_none() && self.conns.open.values().any(|c| c.is_connected())
     }

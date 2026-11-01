@@ -403,85 +403,163 @@ struct Fetch<'a> {
 }
 
 impl Fetch<'_> {
+    /// Reports a statement's results. Each set of rows is one, fetched in
+    /// batches: a CALL's SELECTs, the statements of one text (#290); the
+    /// next comes once all rows of the one before were read, announced by
+    /// [`DbEvent::MoreResults`] before its last rows. Sets without rows (a
+    /// DO, an INSERT, a CALL's own status) are counted as done.
     fn stream<T: Protocol>(
         self,
         mut result: QueryResult<'_, '_, '_, T>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, mysql::Error> {
-        let set = result.columns();
-        let types: Vec<mysql::Column> = set.as_ref().to_vec();
-        if types.is_empty() {
+        let mut done = (0, 0);
+        let Some(mut types) = rows_ahead(&mut result, &mut done)? else {
             return Ok(Outcome::Done {
-                affected: result.affected_rows(),
-                warnings: result.warnings(),
+                affected: done.0,
+                warnings: done.1,
             });
-        }
+        };
         let id = self.id;
-        let columns = types.iter().map(column).collect();
-        self.events.send(DbEvent::QueryStarted { id, columns });
-        let mut max_rows = self.max_rows;
         let mut started = self.started;
         loop {
-            let mut rows = Vec::with_capacity(max_rows.min(10_000));
-            let mut more = true;
-            let mut bytes = 0;
-            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
-                match result.next() {
-                    Some(Ok(row)) => {
-                        let cells: Vec<Cell> = row
-                            .unwrap()
-                            .iter()
-                            .zip(&types)
-                            .map(|(value, ty)| cell(value, ty, self.whole))
-                            .collect();
-                        if self.whole {
-                            bytes += row_bytes(&cells);
+            let columns = types.iter().map(column).collect();
+            self.events.send(DbEvent::QueryStarted { id, columns });
+            let mut max_rows = self.max_rows;
+            let rows = loop {
+                let mut rows = Vec::with_capacity(max_rows.min(10_000));
+                let mut more = true;
+                let mut bytes = 0;
+                while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
+                    match result.next() {
+                        Some(Ok(row)) => {
+                            let cells: Vec<Cell> = row
+                                .unwrap()
+                                .iter()
+                                .zip(&types)
+                                .map(|(value, ty)| cell(value, ty, self.whole))
+                                .collect();
+                            if self.whole {
+                                bytes += row_bytes(&cells);
+                            }
+                            rows.push(cells);
                         }
-                        rows.push(cells);
+                        Some(Err(e)) => {
+                            let mut error = DbError::from(e);
+                            if error.code == Some(1317) {
+                                error.message = "Cancelled while fetching".into();
+                            }
+                            self.events.send(DbEvent::Failed {
+                                id,
+                                error,
+                                elapsed: started.elapsed(),
+                            });
+                            return Ok(Outcome::Query { ended: false });
+                        }
+                        None => {
+                            more = false;
+                            break;
+                        }
                     }
-                    Some(Err(e)) => {
-                        let mut error = DbError::from(e);
-                        if error.code == Some(1317) {
-                            error.message = "Cancelled while fetching".into();
-                        }
-                        self.events.send(DbEvent::Failed {
-                            id,
-                            error,
-                            elapsed: started.elapsed(),
-                        });
+                }
+                if !more {
+                    break rows;
+                }
+                self.events.send(DbEvent::Rows {
+                    id,
+                    rows,
+                    more,
+                    elapsed: started.elapsed(),
+                });
+                match self.requests.recv() {
+                    Ok(DbRequest::FetchMore {
+                        id: wanted,
+                        max_rows: n,
+                    }) if wanted == id => {
+                        max_rows = n;
+                        started = Instant::now();
+                    }
+                    other => {
+                        // Rows are left: stop the server instead of reading
+                        // them all when the result is dropped on return.
+                        (self.kill)();
+                        *next = Some(other.unwrap_or(DbRequest::Disconnect));
                         return Ok(Outcome::Query { ended: false });
                     }
-                    None => {
-                        more = false;
-                        break;
-                    }
                 }
-            }
-            self.events.send(DbEvent::Rows {
+            };
+            let last = DbEvent::Rows {
                 id,
                 rows,
-                more,
+                more: false,
                 elapsed: started.elapsed(),
-            });
-            if !more {
+            };
+            // A file has one result: the others are read, and said so.
+            if self.whole {
+                self.events.send(last);
+                self.drop_rest(&mut result)?;
                 return Ok(Outcome::Query { ended: true });
             }
-            match self.requests.recv() {
-                Ok(DbRequest::FetchMore {
-                    id: wanted,
-                    max_rows: n,
-                }) if wanted == id => {
-                    max_rows = n;
+            let after = rows_ahead(&mut result, &mut done);
+            if !matches!(after, Ok(None)) {
+                self.events.send(DbEvent::MoreResults { id });
+            }
+            self.events.send(last);
+            match after? {
+                Some(next_types) => {
+                    types = next_types;
                     started = Instant::now();
                 }
-                other => {
-                    // Rows are left: stop the server instead of reading them
-                    // all when the result is dropped on return.
-                    (self.kill)();
-                    *next = Some(other.unwrap_or(DbRequest::Disconnect));
-                    return Ok(Outcome::Query { ended: false });
-                }
+                None => return Ok(Outcome::Query { ended: true }),
             }
+        }
+    }
+
+    /// Reads the statement's sets after the one written to a file, and
+    /// says how many results it didn't write.
+    fn drop_rest<T: Protocol>(
+        &self,
+        result: &mut QueryResult<'_, '_, '_, T>,
+    ) -> Result<(), mysql::Error> {
+        let mut sets = 0;
+        while rows_ahead(result, &mut (0, 0))?.is_some() {
+            sets += 1;
+            for row in result.by_ref() {
+                row?;
+            }
+        }
+        if sets > 0 {
+            self.events.send(DbEvent::Notice(format!(
+                "The statement returned {sets} more result(s); only the first was written to \
+                 the file"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Moves `result` past the sets without rows to the next one with them,
+/// and returns its columns; `None` at the end. A set without rows stands
+/// for a statement that ran (its rows affected and warnings are added to
+/// `done`) or one that failed, whose error it returns.
+fn rows_ahead<T: Protocol>(
+    result: &mut QueryResult<'_, '_, '_, T>,
+    done: &mut (u64, u16),
+) -> Result<Option<Vec<mysql::Column>>, mysql::Error> {
+    loop {
+        let types: Vec<mysql::Column> = result.columns().as_ref().to_vec();
+        if !types.is_empty() {
+            return Ok(Some(types));
+        }
+        // Not a set of rows: iterating it moves on to the next set, and
+        // reading it takes nothing from that one.
+        let Some(mut set) = result.iter() else {
+            return Ok(None);
+        };
+        done.0 += set.affected_rows();
+        done.1 = set.warnings();
+        if let Some(Err(e)) = set.next() {
+            return Err(e);
         }
     }
 }
