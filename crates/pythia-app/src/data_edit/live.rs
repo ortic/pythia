@@ -1187,3 +1187,52 @@ fn oracle_long_blobs_are_checked() {
     assert_eq!(found(&hex[..5000]), "0");
     conn.execute("drop table r65_long_blob purge", &[]).unwrap();
 }
+
+/// A fetched CLOB over the 4000 bytes a literal holds is changed, and a
+/// new row takes one (#317): the UPDATE and the INSERT failed with
+/// ORA-01704.
+#[test]
+fn oracle_long_clobs_can_be_changed() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r65_long_clob purge", &[]);
+    for sql in [
+        "create table r65_long_clob (id number primary key, c clob)",
+        "insert into r65_long_clob values (1, to_clob(rpad('x', 4000, 'x')) || rpad('y', 1000, 'y'))",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = Editable {
+        table: "r65_long_clob".into(),
+        source: "select * from r65_long_clob order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let changed = format!("{}z{}", "x".repeat(4000), "y".repeat(999));
+    let new = format!("it's & {}", "\u{e9}".repeat(3000));
+    let changes = Changes {
+        updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(changed.clone()))]))]),
+        inserts: vec![vec![Some("2".into()), Some(new.clone()), None]],
+        ..Changes::default()
+    };
+    for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+        let ran = conn
+            .execute(&statement.sql, &[])
+            .and_then(|s| s.row_count());
+        assert!(matches!(ran, Ok(1)), "{ran:?}\n{}", &statement.sql[..200]);
+    }
+    let (_, rows) = fetch("select c from r65_long_clob order by id");
+    assert_eq!(rows, [[Some(changed)], [Some(new)]]);
+    conn.execute("drop table r65_long_clob purge", &[]).unwrap();
+}

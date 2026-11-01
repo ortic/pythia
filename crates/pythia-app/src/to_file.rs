@@ -348,4 +348,76 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The INSERTs of CLOBs and NCLOBs over the 4000 bytes a literal
+    /// holds (#317), with quotes, `&`, two-byte characters and pairs of
+    /// surrogates, run back into a copy of their table, are the same
+    /// values; they failed with ORA-01704.
+    #[test]
+    fn writes_long_text_values() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r65_lt", "r65_lt_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!("create table {table} (id number primary key, c clob, n nclob)"),
+                &[],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "declare
+               v clob;
+             begin
+               dbms_lob.createtemporary(v, true);
+               for i in 1 .. 1000 loop
+                 dbms_lob.writeappend(v, 11, 'it''s & \u{e9} \u{1F600}');
+               end loop;
+               insert into r65_lt values (1, v, v);
+               insert into r65_lt values (2, rpad('x', 3000, 'x'), null);
+               insert into r65_lt values (3, null, null);
+             end;",
+            &[],
+        )
+        .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("pythia-long-text-{}.sql", std::process::id()));
+        let progress = AtomicU64::new(0);
+        let n = run(&conn, "select * from r65_lt order by id", &path, &progress).unwrap();
+        assert_eq!(n, 3);
+        let script = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let statements = pythia_plsql::split_statements(&script);
+        assert_eq!(statements.len(), 3, "{script}");
+        for statement in statements {
+            let sql = statement.text(&script).replacen(
+                "insert into r65_lt ",
+                "insert into r65_lt_copy ",
+                1,
+            );
+            conn.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let same: i64 = conn
+            .query_row_as(
+                "select count(*) from r65_lt a join r65_lt_copy c on c.id = a.id \
+                  where (dbms_lob.compare(a.c, c.c) = 0 or (a.c is null and c.c is null)) \
+                    and (dbms_lob.compare(a.n, c.n) = 0 or (a.n is null and c.n is null))",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(same, 3);
+        let length: i64 = conn
+            .query_row_as(
+                "select dbms_lob.getlength(n) from r65_lt_copy where id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(length, 11000);
+        for table in ["r65_lt", "r65_lt_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

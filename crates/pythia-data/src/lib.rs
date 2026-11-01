@@ -684,13 +684,59 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             Some(hex) => format!("hextoraw('{hex}')"),
             None => format!("hextoraw({quoted})"),
         },
-        Kind::Text => apart_from_ampersands(
-            v,
-            |p| format!("'{}'", p.replace('\'', "''")),
-            "chr(38)",
-            " || ",
-        ),
+        // A literal holds 4000 bytes: a CLOB's longer text is a CLOB of
+        // parts (#317). Oracle takes about 250 of them (ORA-01489 beyond),
+        // and parses many slowly: INSERT statements append them in a
+        // PL/SQL block instead (see `oracle_block`).
+        Kind::Text if long_text(col, v) => {
+            let mut parts = text_parts(v).into_iter().map(text_literal);
+            let first = format!("to_clob({})", parts.next().unwrap_or_default());
+            std::iter::once(first)
+                .chain(parts)
+                .collect::<Vec<_>>()
+                .join(" || ")
+        }
+        Kind::Text => text_literal(v),
     }
+}
+
+/// Text as an Oracle literal, each `&` apart (see [`apart_from_ampersands`]).
+fn text_literal(v: &str) -> String {
+    apart_from_ampersands(
+        v,
+        |p| format!("'{}'", p.replace('\'', "''")),
+        "chr(38)",
+        " || ",
+    )
+}
+
+/// The most bytes a text literal holds (ORA-01704).
+const TEXT_LITERAL_BYTES: usize = 4000;
+
+/// The UTF-16 code units, which a CLOB's length counts, of each part of a
+/// text too long for one literal: no database character set makes 1000
+/// of them more than 4000 bytes.
+const TEXT_PART_UNITS: usize = 1000;
+
+/// Whether `v` is a CLOB's, NCLOB's or LONG's text too long for one
+/// literal (#317); the pure-Rust driver types CLOB columns LONG.
+fn long_text(col: &Column, v: &str) -> bool {
+    matches!(col.type_name.as_str(), "CLOB" | "NCLOB" | "LONG") && v.len() > TEXT_LITERAL_BYTES
+}
+
+/// `text` in parts of at most [`TEXT_PART_UNITS`] UTF-16 code units.
+fn text_parts(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut units) = (0, 0);
+    for (at, c) in text.char_indices() {
+        if units + c.len_utf16() > TEXT_PART_UNITS {
+            parts.push(&text[start..at]);
+            (start, units) = (at, 0);
+        }
+        units += c.len_utf16();
+    }
+    parts.push(&text[start..]);
+    parts
 }
 
 /// A text literal with each `&` outside the quotes, as `amp` joined by
@@ -1016,33 +1062,47 @@ fn long_binary(col: &Column, value: &str) -> Option<String> {
     (digits && hex.len() > 2 * HEX_LITERAL_BYTES).then_some(hex)
 }
 
-/// An Oracle INSERT of a row with a binary value too long for a literal
-/// (#314), as a PL/SQL block that makes each such value in a temporary BLOB
-/// from parts of hex and inserts the row with it. No SQL makes a BLOB
-/// over 2000 bytes from literals: `to_blob(…) || to_blob(…)` is an empty
-/// one, `utl_raw.concat` stops at 2000 bytes. `None` for a row without
-/// such a value.
+/// An Oracle INSERT of a row with a binary value or a CLOB's text too
+/// long for a literal (#314, #317), as a PL/SQL block that makes each such
+/// value in a temporary LOB from parts and inserts the row with it. No
+/// SQL makes a BLOB over 2000 bytes from literals: `to_blob(…) ||
+/// to_blob(…)` is an empty one, `utl_raw.concat` stops at 2000 bytes; a
+/// CLOB's parts compile here in a fraction of the time `||` takes, and
+/// as many as there are. `None` for a row without such a value.
 fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> {
     let mut declare = String::new();
     let mut body = String::new();
     let mut values = Vec::with_capacity(columns.len());
     for (col, cell) in columns.iter().zip(row) {
-        let Some(hex) = cell.as_deref().and_then(|v| long_binary(col, v)) else {
-            values.push(sql_literal(col, cell.as_deref()));
-            continue;
-        };
         let var = format!("pythia${}", values.len() + 1);
-        declare.push_str(&format!("  {var} blob;\n"));
-        body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
-        // The hex goes to writeappend's RAW as hextoraw would take it,
-        // which compiles in half the time; its digits are ASCII, so each
-        // chunk is whole characters.
-        for chunk in hex.as_bytes().chunks(2 * BLOCK_CHUNK_BYTES) {
-            let digits = std::str::from_utf8(chunk).unwrap_or_default();
-            body.push_str(&format!(
-                "  dbms_lob.writeappend({var}, {}, '{digits}');\n",
-                chunk.len() / 2
-            ));
+        let value = cell.as_deref();
+        if let Some(hex) = value.and_then(|v| long_binary(col, v)) {
+            declare.push_str(&format!("  {var} blob;\n"));
+            body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
+            // The hex goes to writeappend's RAW as hextoraw would take it,
+            // which compiles in half the time; its digits are ASCII, so
+            // each chunk is whole characters.
+            for chunk in hex.as_bytes().chunks(2 * BLOCK_CHUNK_BYTES) {
+                let digits = std::str::from_utf8(chunk).unwrap_or_default();
+                body.push_str(&format!(
+                    "  dbms_lob.writeappend({var}, {}, '{digits}');\n",
+                    chunk.len() / 2
+                ));
+            }
+        } else if let Some(text) = value.filter(|v| long_text(col, v)) {
+            // An NCLOB takes the CLOB (#317).
+            declare.push_str(&format!("  {var} clob;\n"));
+            body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
+            for part in text_parts(text) {
+                body.push_str(&format!(
+                    "  dbms_lob.writeappend({var}, {}, {});\n",
+                    part.encode_utf16().count(),
+                    text_literal(part)
+                ));
+            }
+        } else {
+            values.push(sql_literal(col, value));
+            continue;
         }
         values.push(var);
     }
@@ -1802,6 +1862,71 @@ mod tests {
             "CD".repeat(2000),
             parts("pythia$2"),
             parts("pythia$3"),
+        );
+        assert_eq!(text, expected);
+    }
+
+    /// A CLOB's text over the 4000 bytes a literal holds is a CLOB of
+    /// parts of at most 1000 UTF-16 code units, a pair of surrogates kept
+    /// whole and each `&` apart (#317); INSERT statements append the parts
+    /// in a PL/SQL block. VARCHAR2 and shorter CLOBs stay one literal.
+    #[test]
+    fn oracle_long_text_values() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let x = |n: usize| "x".repeat(n);
+        let long = x(4001);
+        let clob = col("C", "CLOB");
+        assert_eq!(
+            sql_literal(&clob, Some(&long)),
+            format!("to_clob('{0}') || '{0}' || '{0}' || '{0}' || 'x'", x(1000))
+        );
+        for ty in ["NCLOB", "LONG"] {
+            assert!(sql_literal(&col("C", ty), Some(&long)).starts_with("to_clob('x"));
+        }
+        assert_eq!(sql_literal(&clob, Some(&x(4000))), format!("'{}'", x(4000)));
+        let varchar = col("V", "VARCHAR2(32767)");
+        assert_eq!(sql_literal(&varchar, Some(&long)), format!("'{long}'"));
+        let wide = format!("{}\u{1F600}{}", x(999), "y".repeat(3100));
+        let parts = text_parts(&wide);
+        assert_eq!(parts[0], x(999));
+        assert_eq!(parts[1], format!("\u{1F600}{}", "y".repeat(998)));
+        assert_eq!(parts.concat(), wide);
+        assert!(parts.iter().all(|p| p.encode_utf16().count() <= 1000));
+        let amp = format!("it's & {}", x(4000));
+        assert!(
+            sql_literal(&clob, Some(&amp)).starts_with("to_clob('it''s ' || chr(38) || ' xxx"),
+            "{}",
+            &sql_literal(&clob, Some(&amp))[..40]
+        );
+
+        let columns = [
+            Column {
+                name: "ID".into(),
+                type_name: "NUMBER".into(),
+                numeric: true,
+            },
+            clob.clone(),
+        ];
+        let rows = vec![vec![Some("1".into()), Some(amp.clone())]];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text =
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap();
+        let expected = format!(
+            "declare\n  pythia$2 clob;\nbegin\n  dbms_lob.createtemporary(pythia$2, true);\n  \
+             dbms_lob.writeappend(pythia$2, 1000, 'it''s ' || chr(38) || ' {}');\n{}  \
+             dbms_lob.writeappend(pythia$2, 7, '{}');\n  insert into t (id, c) values (1, \
+             pythia$2);\nend;\n/\n",
+            x(993),
+            format!("  dbms_lob.writeappend(pythia$2, 1000, '{}');\n", x(1000)).repeat(3),
+            x(7)
         );
         assert_eq!(text, expected);
     }

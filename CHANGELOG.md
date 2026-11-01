@@ -700,6 +700,15 @@ All notable changes to Pythia are documented here. The format follows
   BLOB from parts of 1000 bytes and inserts it; Oracle compiles it in
   some seconds a megabyte. With the Instant Client, a change to a
   fetched BLOB of that size no longer fails on the check of its value.
+- Oracle: a CLOB, NCLOB or LONG over 4000 bytes can be written (#317).
+  INSERT statements and result editing wrote it as one literal, which
+  holds no more: ORA-01704 from *Execute to file*, *Export tables*,
+  *Copy as* and the grid's *Export*, and on *Apply* of a change to such
+  a value or a new row with one. Result editing now writes it as
+  `to_clob('…') || '…'` of parts of 1000 characters, which Oracle takes
+  for up to about 250,000 characters; INSERT statements write such a row
+  as a PL/SQL block that appends the parts to a CLOB, for any length. A
+  LONG over 4000 bytes still can't be written so.
 
 ## [0.10.0] - 2026-10-30
 
