@@ -539,6 +539,11 @@ All notable changes to Pythia are documented here. The format follows
   `foo.sql` are one file, and a character a file name can't hold is
   written as `%` and its hex (`"A/B"` → `a%2Fb.sql`). Comparing such a
   file with the database finds its object again.
+- Pythia builds with tokio 1.54.1 and clipboard-win 5.4.3 (#288): 1.54.0
+  and 5.4.1 were yanked, tokio's for RUSTSEC-2026-0384, a race in its
+  timers that can corrupt memory. rsa, which the SSH tunnels use, still
+  has RUSTSEC-2023-0071 (a timing side channel), for which there is no
+  fixed version yet.
 
 ## [0.10.0] - 2026-10-30
 
