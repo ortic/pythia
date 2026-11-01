@@ -10,7 +10,7 @@ use pythia_plsql::{
     StatementKind, Syntax, TokenKind, split_statements_in, statement_at_in, tokenize, tokenize_in,
 };
 use pythia_ui::icons::{Icon, icon_button, icon_text_button};
-use pythia_ui::{GridState, ResultGrid, selection_data, shown_data, to_tsv};
+use pythia_ui::{GridState, ResultGrid, copy_rows, selection_data, shown_data};
 use serde::{Deserialize, Serialize};
 
 use crate::documents::{DocContext, Effects, ObjectRef, OpenRequest, Target, request_id};
@@ -81,6 +81,9 @@ pub struct RunState {
     pub key_lookup: Option<u64>,
     /// The Apply under way.
     pub apply: Option<Apply>,
+    /// The session had a transaction open after its last statement, as it
+    /// said.
+    pub in_transaction: bool,
     /// The changes an Apply didn't make, for the result (by request id)
     /// that fetches its rows again (#247).
     pub unapplied: Option<(u64, crate::data_edit::Unapplied)>,
@@ -179,6 +182,10 @@ pub struct Apply {
     pub changes: pythia_ui::Changes,
     pub planned: Vec<crate::data_edit::Change>,
     pub applied: Vec<crate::data_edit::Change>,
+    /// One of its statements failed, and the session hasn't said yet
+    /// whether a transaction is open after it: one that ended with it was
+    /// rolled back, with the changes applied before (#289).
+    pub failed: bool,
 }
 
 pub struct Running {
@@ -1188,6 +1195,7 @@ impl SqlWindow {
             changes: changes.clone(),
             planned: statements.iter().map(|d| d.change).collect(),
             applied: Vec::new(),
+            failed: false,
         });
         self.state.messages.clear();
         for dml in statements {
@@ -1847,6 +1855,9 @@ impl SqlWindow {
                 // all stay pending, on the rows as they were.
                 let applying = !error.is_connection_lost()
                     && matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
+                if applying && let Some(apply) = &mut self.state.apply {
+                    apply.failed = true;
+                }
                 let dropped = if applying {
                     self.stop_applying()
                 } else {
@@ -1893,7 +1904,31 @@ impl SqlWindow {
             }
             DbEvent::Notice(text) => self.info(text),
             // A new session says its own zone, if it has one.
-            DbEvent::Connected(_) => self.state.time_zone = None,
+            DbEvent::Connected(_) => {
+                self.state.time_zone = None;
+                self.state.in_transaction = false;
+            }
+            DbEvent::Transaction { pending } => {
+                let ended = std::mem::replace(&mut self.state.in_transaction, pending) && !pending;
+                // The transaction ended with the statement of the Apply that
+                // failed, whose report this is: rolled back, as on SQL
+                // Server after Break, where the session opens the
+                // connection again, and after a deadlock. What the Apply
+                // made before is undone (#289).
+                let mut undone = 0;
+                if let Some(apply) = &mut self.state.apply
+                    && std::mem::take(&mut apply.failed)
+                    && ended
+                {
+                    undone = std::mem::take(&mut apply.applied).len();
+                }
+                if undone > 0 {
+                    self.warn(format!(
+                        "The transaction was rolled back with it: the {undone} change(s) \
+                         applied before it were undone"
+                    ));
+                }
+            }
             DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
                 self.state.running = None;
@@ -2281,7 +2316,7 @@ impl SqlWindow {
                         .clicked()
                     {
                         match shown_data(&result.columns, &result.rows, &result.grid) {
-                            Ok((columns, rows)) => ui.ctx().copy_text(to_tsv(&columns, &rows)),
+                            Ok((columns, rows)) => copy_rows(ui.ctx(), &columns, rows),
                             Err(e) => {
                                 state.messages.push(Message {
                                     level: Level::Error,

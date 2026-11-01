@@ -24,6 +24,13 @@ const SHOWN_CHARS: usize = 500;
 /// a few screens of it, wrapped (#220).
 const RECORD_CHARS: usize = 10_000;
 
+/// The characters of a value the viewer shows in one text field at most;
+/// a longer one shows in rows, laid out as they come into view (#284).
+const VIEWER_CHARS: usize = 100_000;
+
+/// The characters of a row of a long line in the viewer.
+const VIEWER_ROW_CHARS: usize = 1_000;
+
 /// The changes Ctrl+Z can take back at most, and the cells their states
 /// hold together, oldest left out first (#257).
 const UNDO_STEPS: usize = 100;
@@ -41,6 +48,8 @@ pub struct GridState {
     order_revision: u64,
     /// The selection's summary, and what it was worked out for.
     summary: Option<(SummaryKey, Option<String>)>,
+    /// Counts the times the pending changes changed, for the summary.
+    changes_revision: u64,
     /// Selection anchor and cursor as (view row, column).
     anchor: Option<(usize, usize)>,
     cursor: Option<(usize, usize)>,
@@ -49,6 +58,8 @@ pub struct GridState {
     /// Rows must contain this text (case-insensitive) in some cell.
     filter: String,
     viewer: Option<(usize, usize)>,
+    /// What the viewer shows of its cell.
+    viewed: Option<Viewed>,
     scroll_to_cursor: bool,
     edit: Option<Editing>,
     /// Related rows reachable from a row (foreign keys), offered in the
@@ -92,12 +103,14 @@ pub struct GridState {
 }
 
 /// What the summary of a selection was worked out for: the selection,
-/// the rows (where they are, how many) and their order.
+/// the rows (where they are, how many), their order and the pending
+/// changes (#277).
 #[derive(PartialEq)]
 struct SummaryKey {
     selection: Option<(RangeInclusive<usize>, Vec<usize>)>,
     rows: (usize, usize),
     order: u64,
+    changes: u64,
 }
 
 /// A header being dragged to another place.
@@ -329,9 +342,44 @@ impl GridState {
         if self.ordered_rows == rows.len() {
             return;
         }
-        self.order = self.order_of(rows, columns);
+        let order = self.order_of(rows, columns);
+        // Rows fetched since: sorted in among the others, or after them.
+        if self.order_revision > 0 && self.ordered_rows < rows.len() {
+            self.follow_rows(&order, rows.len());
+        }
+        self.order = order;
         self.ordered_rows = rows.len();
         self.order_revision += 1;
+    }
+
+    /// Moves what is held by view row (the selection, the cursor, the cell
+    /// being edited, the viewer and the dialog's cell) to where its row is
+    /// in `order`, the rows' new order, once more of the `count` rows were
+    /// fetched: they stayed in place, on other rows of a sorted result
+    /// (#279). New rows come after the fetched ones.
+    fn follow_rows(&mut self, order: &[usize], count: usize) {
+        let mut place = vec![None; count];
+        for (at, &r) in order.iter().enumerate() {
+            place[r] = Some(at);
+        }
+        let (before, now) = (self.order.len(), order.len());
+        let old = &self.order;
+        let moved = |view_row: &mut usize| {
+            *view_row = match old.get(*view_row) {
+                Some(&r) => place.get(r).copied().flatten().unwrap_or(*view_row),
+                None => *view_row - before + now,
+            }
+        };
+        let cells = [&mut self.anchor, &mut self.cursor, &mut self.viewer];
+        for (view_row, _) in cells.into_iter().flatten() {
+            moved(view_row);
+        }
+        if let Some(editor) = &mut self.value_editor {
+            moved(&mut editor.view_row);
+        }
+        if let Some((view_row, ..)) = self.edit.as_mut().and_then(|e| e.active.as_mut()) {
+            moved(view_row);
+        }
     }
 
     /// The rows passing the filter, in the order shown.
@@ -369,6 +417,7 @@ impl GridState {
             selection: self.selection(columns.len()),
             rows: (rows.as_ptr().addr(), rows.len()),
             order: self.order_revision,
+            changes: self.changes_revision,
         };
         if let Some((kept, summary)) = &self.summary
             && *kept == key
@@ -499,6 +548,7 @@ impl GridState {
             locked,
             ..Editing::default()
         });
+        self.changes_revision += 1;
     }
 
     /// Keeps `columns` of the editable grid read-only, e.g. those that
@@ -535,6 +585,7 @@ impl GridState {
 
     pub fn set_read_only(&mut self) {
         self.edit = None;
+        self.changes_revision += 1;
     }
 
     pub fn is_editable(&self) -> bool {
@@ -564,6 +615,7 @@ impl GridState {
         if let Some(e) = &mut self.edit {
             e.changes = changes;
             e.undo.clear();
+            self.changes_revision += 1;
         }
     }
 
@@ -572,6 +624,7 @@ impl GridState {
             e.changes = Changes::default();
             e.undo.clear();
             e.active = None;
+            self.changes_revision += 1;
         }
     }
 
@@ -586,6 +639,7 @@ impl GridState {
         if edit.changes == before {
             return;
         }
+        self.changes_revision += 1;
         edit.undo.push(before);
         let mut cells = 0;
         let kept = edit
@@ -614,6 +668,7 @@ impl GridState {
             return;
         };
         edit.changes = before;
+        self.changes_revision += 1;
         // Rows inserted may be gone again.
         let last = self.view_len(rows).saturating_sub(1);
         for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
@@ -681,6 +736,14 @@ impl GridState {
                     *cell = value;
                 }
             }
+        }
+    }
+
+    /// Whether a view row is a fetched row marked for deletion.
+    fn to_delete(&self, view_row: usize) -> bool {
+        match (&self.edit, self.row_ref(view_row)) {
+            (Some(edit), RowRef::Existing(r)) => edit.changes.deletes.contains(&r),
+            _ => false,
         }
     }
 
@@ -766,14 +829,19 @@ impl GridState {
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
     /// new rows past the end. Empty cells become NULL.
     pub fn paste(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
+        self.paste_cells(rows, columns, &read_tsv(text));
+    }
+
+    /// Pastes rows of cells at the cursor, adding new rows past the end.
+    fn paste_cells(&mut self, rows: &[Vec<Cell>], columns: usize, cells: &[Vec<Cell>]) {
         if self.edit.is_none() {
             return;
         }
         self.sync(rows, &[]);
-        self.undoable(|s| s.paste_text(rows, columns, text));
+        self.undoable(|s| s.paste_rows(rows, columns, cells));
     }
 
-    fn paste_text(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
+    fn paste_rows(&mut self, rows: &[Vec<Cell>], columns: usize, cells: &[Vec<Cell>]) {
         let visible = self.visible_columns(columns);
         let (r0, c0) = self
             .cursor
@@ -785,17 +853,14 @@ impl GridState {
             .copied()
             .filter(|&c| self.edit.as_ref().is_some_and(|e| !e.is_locked(c)))
             .collect();
-        let text = text.strip_suffix('\n').unwrap_or(text);
-        let text = text.strip_suffix('\r').unwrap_or(text);
         let mut last = None;
-        for (i, line) in text.split('\n').enumerate() {
+        for (i, line) in cells.iter().enumerate() {
             let view_row = r0 + i;
             while view_row >= self.view_len(rows) {
                 self.insert_row(columns);
             }
-            for (cell, &col) in line.trim_end_matches('\r').split('\t').zip(&targets) {
-                let value = (!cell.is_empty()).then(|| cell.to_owned());
-                self.set_value(rows, view_row, col, value);
+            for (cell, &col) in line.iter().zip(&targets) {
+                self.set_value(rows, view_row, col, cell.clone());
                 last = Some((view_row, col));
             }
         }
@@ -1109,7 +1174,8 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
         state.undo(rows);
     }
     if let Some(text) = paste {
-        state.paste(rows, columns.len(), &text);
+        let cells = pasted_cells(ui.ctx(), &text);
+        state.paste_cells(rows, columns.len(), &cells);
     }
     if let Some(with_header) = copy {
         copy_selection(ui, columns, rows, state, with_header);
@@ -2102,54 +2168,198 @@ fn copy_selection(
     state: &mut GridState,
     header: bool,
 ) {
-    match selection_text(columns, rows, state, header) {
-        Ok(text) => ui.ctx().copy_text(text),
+    match selection_cells(columns, rows, state, header) {
+        Ok(cells) => copy_cells(ui.ctx(), cells),
         Err(e) => state.failed = Some(format!("Copy: {e}")),
     }
 }
 
+/// The selection's cells as Copy takes them, the names of its columns
+/// first if `header`.
+fn selection_cells(
+    columns: &[Column],
+    rows: &[Vec<Cell>],
+    state: &GridState,
+    header: bool,
+) -> Result<Vec<Vec<Cell>>, NotCopied> {
+    let (cols, data) = selection_data(columns, rows, state)?;
+    Ok(with_header(header.then_some(&cols[..]), data))
+}
+
+#[cfg(test)]
 fn selection_text(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
     header: bool,
 ) -> Result<String, NotCopied> {
-    let (cols, data) = selection_data(columns, rows, state)?;
-    let mut lines = Vec::with_capacity(data.len() + 1);
-    if header {
-        lines.push(
-            cols.iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join("\t"),
-        );
-    }
-    lines.extend(data.iter().map(|r| {
-        r.iter()
-            .map(|c| c.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\t")
-    }));
-    Ok(lines.join("\n"))
+    selection_cells(columns, rows, state, header).map(|cells| tsv(&cells))
 }
 
+/// `rows`, after a row of the names of `columns` if there are any.
+fn with_header(columns: Option<&[Column]>, rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+    let Some(columns) = columns else {
+        return rows;
+    };
+    let names = columns.iter().map(|c| Some(c.name.clone())).collect();
+    std::iter::once(names).chain(rows).collect()
+}
+
+/// Copies `rows` as tab separated text with a header line, as *Copy all*
+/// does, kept for a paste like [`copy_selection`]'s.
+pub fn copy_rows(ctx: &egui::Context, columns: &[Column], rows: Vec<Vec<Cell>>) {
+    copy_cells(ctx, with_header(Some(columns), rows));
+}
+
+/// What Copy put on the clipboard last: the cells it copied, NULLs as
+/// NULL. The text writes a NULL as an empty cell, as other programs read
+/// it, and an empty text the same; a paste of that text takes the cells
+/// as they were copied (#275).
+#[derive(Clone)]
+struct Copied {
+    /// The text, as [`clipboard_key`] has it.
+    key: (u64, usize),
+    cells: std::sync::Arc<Vec<Vec<Cell>>>,
+}
+
+fn copied_id() -> egui::Id {
+    egui::Id::new("pythia-grid-copied")
+}
+
+/// Tells a text pasted back from others: its hash and length, without the
+/// CRLF line breaks and the line break at the end a clipboard may add.
+fn clipboard_key(text: &str) -> (u64, usize) {
+    let text = text.replace("\r\n", "\n");
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    (egui::util::hash(text), text.len())
+}
+
+/// Copies `cells` as tab separated text, and keeps them for a paste of it.
+fn copy_cells(ctx: &egui::Context, cells: Vec<Vec<Cell>>) {
+    let text = tsv(&cells);
+    let copied = Copied {
+        key: clipboard_key(&text),
+        cells: std::sync::Arc::new(cells),
+    };
+    ctx.data_mut(|d| d.insert_temp(copied_id(), copied));
+    ctx.copy_text(text);
+}
+
+/// The cells of a pasted text: those Copy kept for it, or the text read
+/// as tab separated, an empty cell as NULL.
+fn pasted_cells(ctx: &egui::Context, text: &str) -> std::sync::Arc<Vec<Vec<Cell>>> {
+    match ctx.data(|d| d.get_temp::<Copied>(copied_id())) {
+        Some(copied) if copied.key == clipboard_key(text) => copied.cells,
+        _ => std::sync::Arc::new(read_tsv(text)),
+    }
+}
+
+/// Rows of cells as tab separated text: a NULL is an empty cell.
+fn tsv(cells: &[Vec<Cell>]) -> String {
+    let lines: Vec<String> = cells
+        .iter()
+        .map(|row| tsv_line(row.iter().map(Option::as_deref)))
+        .collect();
+    lines.join("\n")
+}
+
+/// A line of tab separated text: a NULL is an empty cell.
+fn tsv_line<'c>(cells: impl IntoIterator<Item = Option<&'c str>>) -> String {
+    cells
+        .into_iter()
+        .map(|c| tsv_cell(c.unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// A value as a cell of tab separated text: in double quotes, its quotes
+/// doubled, when it has a tab or a line break or starts with a quote, as
+/// spreadsheets write it (#276).
+fn tsv_cell(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains(['\t', '\n', '\r']) || value.starts_with('"') {
+        format!("\"{}\"", value.replace('"', "\"\"")).into()
+    } else {
+        value.into()
+    }
+}
+
+/// Tab separated text, e.g. a spreadsheet's range, as rows of cells: an
+/// empty cell is NULL. A cell in double quotes is the text in them, with
+/// its tabs and line breaks and its doubled quotes single (#276), and
+/// `""` an empty text; a quote that doesn't end the cell is text.
+fn read_tsv(text: &str) -> Vec<Vec<Cell>> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    let mut rows = vec![Vec::new()];
+    let mut rest = text;
+    loop {
+        let (cell, after) = match quoted_cell(rest) {
+            Some((cell, after)) => (Some(cell), after),
+            None => {
+                let end = rest.find(['\t', '\n']).unwrap_or(rest.len());
+                let (mut cell, after) = rest.split_at(end);
+                if !after.starts_with('\t') {
+                    cell = cell.trim_end_matches('\r');
+                }
+                ((!cell.is_empty()).then(|| cell.to_owned()), after)
+            }
+        };
+        rows.last_mut().expect("a row").push(cell);
+        match after.as_bytes().first() {
+            Some(b'\t') => rest = &after[1..],
+            Some(b'\n') => {
+                rows.push(Vec::new());
+                rest = &after[1..];
+            }
+            _ => return rows,
+        }
+    }
+}
+
+/// The cell in double quotes `text` starts with, and what follows it: a
+/// tab, a line break or nothing. `None` where it doesn't start with one.
+fn quoted_cell(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('"')?;
+    let mut cell = String::new();
+    loop {
+        let quote = rest.find('"')?;
+        cell.push_str(&rest[..quote]);
+        rest = &rest[quote + 1..];
+        match rest.strip_prefix('"') {
+            Some(after) => {
+                cell.push('"');
+                rest = after;
+            }
+            None => {
+                let after = rest
+                    .strip_prefix('\r')
+                    .filter(|a| a.starts_with('\n'))
+                    .unwrap_or(rest);
+                let ends = after.is_empty() || after.starts_with(['\t', '\n']);
+                return ends.then_some((cell, after));
+            }
+        }
+    }
+}
+
+/// The count, sum, average, minimum and maximum of the selected cells as
+/// the grid shows them, with the changes waiting for Apply; rows to be
+/// deleted are left out, as Apply leaves them (#277).
 fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<String> {
     let (r, c) = state.selection(columns.len())?;
-    let cells = (r.end() - r.start() + 1) * c.len();
+    let shown: Vec<usize> = r.filter(|&vr| !state.to_delete(vr)).collect();
+    let cells = shown.len() * c.len();
     if cells < 2 {
         return None;
     }
     let mut numbers = Vec::new();
     let mut non_null = 0;
-    for vr in r {
-        let Some(row) = rows.get(state.row_index(vr)) else {
-            continue;
-        };
+    for vr in shown {
         for &ci in &c {
-            if let Some(Some(v)) = row.get(ci) {
+            if let Some(v) = state.value(rows, vr, ci) {
                 non_null += 1;
                 if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
-                    numbers.push(v.as_str());
+                    numbers.push(v);
                 }
             }
         }
@@ -2242,16 +2452,13 @@ fn decimal_text(units: i128, scale: u32) -> String {
     }
 }
 
+/// A sum or an average of doubles as floats are shown (#278): with an
+/// exponent below 1e-4 and from 1e16, plainly in between (#261), to 15
+/// significant digits, past which a double's digits aren't the numbers'.
+/// Rounded to four decimals, 2e-20 read 0.
 fn fmt_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{n:.0}")
-    } else if n.abs() >= 1e21 {
-        format!("{n:e}")
-    } else {
-        // Without the dot of 1e15 and more (#238).
-        let text = format!("{n:.4}");
-        text.trim_end_matches('0').trim_end_matches('.').to_owned()
-    }
+    let rounded = format!("{n:.14e}").parse().unwrap_or(n);
+    pythia_db::float_text(rounded)
 }
 
 /// One row at a time, a field per column. The fields edit like the grid's
@@ -2502,6 +2709,126 @@ fn value_editor(
     }
 }
 
+/// What the viewer shows of a cell, worked out when it opens on the cell
+/// and when the value changes, not on every frame (#284).
+struct Viewed {
+    key: ViewedKey,
+    value: Cell,
+    /// The value is a change not applied, which isn't copied (#250).
+    unapplied: bool,
+    chars: usize,
+    /// The value as formatted JSON, if it is an object or an array.
+    pretty: Option<String>,
+    /// Where the rows of a text over [`VIEWER_CHARS`] start, which are
+    /// laid out as they come into view, and whether a line was cut.
+    rows: Option<(Vec<usize>, bool)>,
+    binary: Option<ViewedBinary>,
+}
+
+/// What the viewer was worked out for: the cell, the rows (where they
+/// are, how many), their order and the pending changes.
+#[derive(PartialEq)]
+struct ViewedKey {
+    cell: (usize, usize),
+    rows: (usize, usize),
+    order: u64,
+    changes: u64,
+}
+
+/// A binary value as the viewer shows it.
+struct ViewedBinary {
+    bytes: Vec<u8>,
+    /// The size of a value held cut short (#232).
+    cut: Option<u64>,
+    /// Named by its bytes: egui keeps an image by its URI, and the next
+    /// value in this cell (of another result, or edited) would show this
+    /// one (#231).
+    image: Option<String>,
+    dump: String,
+}
+
+impl Viewed {
+    fn new(key: ViewedKey, columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Self {
+        let (value, unapplied) = state.viewed(rows, key.cell);
+        let binary = columns
+            .get(key.cell.1)
+            .is_some_and(|col| is_binary(state.dialect, col));
+        let binary = value.as_deref().filter(|_| binary).and_then(|v| {
+            let bytes = decode_hex(held_hex(v))?;
+            let cut = pythia_db::cut_size(v);
+            let image = image_kind(&bytes).filter(|_| cut.is_none()).map(|kind| {
+                format!(
+                    "bytes://pythia-grid/{:016x}.{kind}",
+                    egui::util::hash(&bytes)
+                )
+            });
+            let mut dump = hex_dump(&bytes, 4096);
+            if let Some(size) = cut {
+                let more = (size as usize).saturating_sub(bytes.len());
+                dump.push_str(&format!(
+                    "… {} more, not held by the grid",
+                    human_bytes(more)
+                ));
+            }
+            Some(ViewedBinary {
+                bytes,
+                cut,
+                image,
+                dump,
+            })
+        });
+        let pretty = value
+            .as_deref()
+            .filter(|_| binary.is_none())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
+            .filter(|j| j.is_object() || j.is_array())
+            .and_then(|j| serde_json::to_string_pretty(&j).ok());
+        let text = pretty.as_deref().or(value.as_deref()).unwrap_or_default();
+        let rows =
+            (binary.is_none() && text.chars().nth(VIEWER_CHARS).is_some()).then(|| text_rows(text));
+        Self {
+            key,
+            chars: value.as_deref().map_or(0, |v| v.chars().count()),
+            value,
+            unapplied,
+            pretty,
+            rows,
+            binary,
+        }
+    }
+
+    /// The text shown: the formatted JSON, or the value.
+    fn text(&self) -> &str {
+        self.pretty
+            .as_deref()
+            .or(self.value.as_deref())
+            .unwrap_or_default()
+    }
+}
+
+/// Where the rows of a long text start: at each of its lines, and every
+/// [`VIEWER_ROW_CHARS`] characters of a longer line; and whether a line
+/// was cut so.
+fn text_rows(text: &str) -> (Vec<usize>, bool) {
+    let mut starts = vec![0];
+    let mut chars = 0;
+    let mut cut = false;
+    for (i, c) in text.char_indices() {
+        if c == '\n' {
+            starts.push(i + 1);
+            chars = 0;
+        } else {
+            if chars == VIEWER_ROW_CHARS {
+                starts.push(i);
+                chars = 0;
+                cut = true;
+            }
+            chars += 1;
+        }
+    }
+    (starts, cut)
+}
+
 fn viewer(
     ctx: &egui::Context,
     columns: &[Column],
@@ -2509,36 +2836,21 @@ fn viewer(
     state: &mut GridState,
     id: egui::Id,
 ) {
-    let Some((r, c)) = state.viewer else { return };
-    let (value, unapplied) = state.viewed(rows, (r, c));
+    let Some((r, c)) = state.viewer else {
+        state.viewed = None;
+        return;
+    };
+    let key = ViewedKey {
+        cell: (r, c),
+        rows: (rows.as_ptr().addr(), rows.len()),
+        order: state.order_revision,
+        changes: state.changes_revision,
+    };
+    if state.viewed.as_ref().is_none_or(|v| v.key != key) {
+        state.viewed = Some(Viewed::new(key, columns, rows, state));
+    }
+    let Some(viewed) = &state.viewed else { return };
     let name = columns.get(c).map_or("", |col| col.name.as_str());
-    let binary = columns
-        .get(c)
-        .is_some_and(|col| is_binary(state.dialect, col));
-    // A value held cut short shows its size and the bytes held (#232).
-    let cut = value
-        .as_deref()
-        .filter(|_| binary)
-        .and_then(pythia_db::cut_size);
-    let bytes = value
-        .as_deref()
-        .filter(|_| binary)
-        .and_then(|v| decode_hex(held_hex(v)));
-    let pretty = value
-        .as_deref()
-        .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
-        .filter(|j| j.is_object() || j.is_array())
-        .and_then(|j| serde_json::to_string_pretty(&j).ok());
-    let mut text = pretty.clone().or_else(|| value.clone()).unwrap_or_default();
-    // Named by its bytes: egui keeps an image by its URI, and the next value
-    // in this cell (of another result, or edited) would show this one (#231).
-    let image = bytes.as_ref().filter(|_| cut.is_none()).and_then(|b| {
-        let kind = image_kind(b)?;
-        Some(format!(
-            "bytes://pythia-grid/{:016x}.{kind}",
-            egui::util::hash(b)
-        ))
-    });
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2548,84 +2860,98 @@ fn viewer(
         .collapsible(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                match (&value, &bytes) {
+                match (&viewed.value, &viewed.binary) {
                     (None, _) => ui.weak("NULL"),
                     (_, Some(b)) => {
-                        let size = cut.map_or(b.len(), |n| n as usize);
+                        let size = b.cut.map_or(b.bytes.len(), |n| n as usize);
                         let mut header = format!(
                             "{} · {}",
                             human_bytes(size),
-                            image_kind(b).unwrap_or("binary")
+                            image_kind(&b.bytes).unwrap_or("binary")
                         );
-                        if cut.is_some() {
+                        if b.cut.is_some() {
                             header.push_str(&format!(
                                 " · the grid holds its first {} bytes",
-                                b.len()
+                                b.bytes.len()
                             ));
                         }
                         ui.weak(header)
                     }
-                    (Some(v), None) => ui.weak(format!("{} characters", v.chars().count())),
+                    (Some(_), None) => ui.weak(format!("{} characters", viewed.chars)),
                 };
-                if pretty.is_some() {
+                if viewed.pretty.is_some() {
                     ui.weak("· JSON, formatted");
                 }
-                if unapplied {
+                if viewed.rows.as_ref().is_some_and(|(_, cut)| *cut) {
+                    ui.weak(format!("· lines cut every {VIEWER_ROW_CHARS} characters"));
+                }
+                if viewed.unapplied {
                     ui.weak("· changed, not applied");
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let copy = ui
-                        .add_enabled(!unapplied, egui::Button::new("Copy"))
+                        .add_enabled(!viewed.unapplied, egui::Button::new("Copy"))
                         .on_disabled_hover_text("Apply or discard the change first");
                     if copy.clicked() {
-                        ctx.copy_text(value.clone().unwrap_or_default());
+                        ctx.copy_text(viewed.value.clone().unwrap_or_default());
                     }
                 });
             });
             ui.separator();
-            if let Some(b) = &bytes {
+            if let Some(b) = &viewed.binary {
                 egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    if let Some(uri) = &image {
+                    if let Some(uri) = &b.image {
                         ui.add(
-                            egui::Image::from_bytes(uri.clone(), b.clone())
+                            egui::Image::from_bytes(uri.clone(), b.bytes.clone())
                                 .max_width(ui.available_width())
                                 .max_height(480.0),
                         );
                         ui.separator();
-                    } else if cut.is_some() && image_kind(b).is_some() {
+                    } else if b.cut.is_some() && image_kind(&b.bytes).is_some() {
                         ui.weak(format!(
                             "The image can't be shown: the grid holds the first {} bytes of it. \
                              Execute to file writes such values whole.",
-                            b.len()
+                            b.bytes.len()
                         ));
                         ui.separator();
                     }
-                    let mut dump = hex_dump(b, 4096);
-                    if let Some(size) = cut {
-                        let more = (size as usize).saturating_sub(b.len());
-                        dump.push_str(&format!(
-                            "… {} more, not held by the grid",
-                            human_bytes(more)
-                        ));
-                    }
-                    ui.label(RichText::new(dump).monospace());
+                    ui.label(RichText::new(&b.dump).monospace());
                 });
                 return;
             }
-            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .frame(egui::Frame::NONE),
-                );
-            });
+            let text = viewed.text();
+            let Some((starts, _)) = &viewed.rows else {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut &*text)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .frame(egui::Frame::NONE),
+                    );
+                });
+                return;
+            };
+            // A row at a time, those in view (#284).
+            let height = ui.text_style_height(&egui::TextStyle::Monospace);
+            egui::ScrollArea::both().auto_shrink(false).show_rows(
+                ui,
+                height,
+                starts.len(),
+                |ui, shown| {
+                    for row in shown {
+                        let end = starts.get(row + 1).copied().unwrap_or(text.len());
+                        let line = text[starts[row]..end].trim_end_matches(['\n', '\r']);
+                        ui.add(egui::Label::new(RichText::new(line).monospace()).extend());
+                    }
+                },
+            );
         });
     if !open {
-        state.viewer = None;
-        if let Some(uri) = &image {
+        if let Some(uri) = viewed.binary.as_ref().and_then(|b| b.image.as_ref()) {
             ctx.forget_image(uri);
         }
+        state.viewer = None;
+        state.viewed = None;
     }
 }
 
@@ -2768,15 +3094,10 @@ fn hex_dump(bytes: &[u8], max: usize) -> String {
 
 /// Renders rows as tab separated text with a header line.
 pub fn to_tsv(columns: &[Column], rows: &[Vec<Cell>]) -> String {
-    let mut out = columns
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect::<Vec<_>>()
-        .join("\t");
+    let mut out = tsv_line(columns.iter().map(|c| Some(c.name.as_str())));
     for row in rows {
         out.push('\n');
-        let line: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
-        out.push_str(&line.join("\t"));
+        out.push_str(&tsv_line(row.iter().map(Option::as_deref)));
     }
     out
 }
@@ -4091,6 +4412,409 @@ mod tests {
             }
             let elapsed = started.elapsed().as_secs_f64();
             assert!(elapsed < 2.0, "{elapsed} s");
+        }
+    }
+
+    /// A frame with `events`, and the text it copied, if any.
+    fn copied(
+        ctx: &egui::Context,
+        columns: &[Column],
+        rows: &[Vec<Cell>],
+        state: &mut GridState,
+        events: Vec<egui::Event>,
+    ) -> Option<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ResultGrid::new(columns, rows, state, "grid").show(ui);
+        });
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// Rows copied and pasted back keep their NULLs and their empty texts
+    /// (#275): Copy writes both as an empty cell, and Paste took every
+    /// empty cell for NULL, so '' went back as NULL. Text from elsewhere
+    /// keeps that rule.
+    #[test]
+    fn copied_rows_paste_back_as_they_were() {
+        let (columns, mut rows) = three();
+        rows[0][1] = Some(String::new());
+        rows[1][1] = None;
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        click(&ctx, &columns, &rows, &mut state, "p", 1);
+        state.anchor = Some((0, 1));
+        state.cursor = Some((1, 2));
+        let text = copied(&ctx, &columns, &rows, &mut state, vec![egui::Event::Copy]);
+        assert_eq!(text.as_deref(), Some("\tp\n\tq"));
+        let text = text.unwrap();
+        state.add_row(&rows, 3);
+        state.add_row(&rows, 3);
+        state.anchor = Some((2, 1));
+        state.cursor = Some((2, 1));
+        let paste = |text: &str| vec![egui::Event::Paste(text.into())];
+        frame(&ctx, &columns, &rows, &mut state, paste(&text));
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [
+                vec![None, Some(String::new()), Some("p".into())],
+                vec![None, None, Some("q".into())],
+            ]
+        );
+        // As the clipboard may give it back, with CRLF and a line break
+        // at the end.
+        state.cursor = Some((2, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tP\r\n\tq\r\n"));
+        assert_eq!(state.changes().unwrap().inserts[0][1], None);
+        state.cursor = Some((2, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tp\r\n\tq\r\n"));
+        assert_eq!(state.changes().unwrap().inserts[0][1].as_deref(), Some(""));
+        // Other text: an empty cell is NULL.
+        state.cursor = Some((0, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tz"));
+        assert_eq!(state.changes().unwrap().updates[&0][&1], None);
+        // Copy all, with its header.
+        state.clear_changes();
+        copy_rows(&ctx, &columns, rows.clone());
+        state.add_row(&rows, 3);
+        frame(
+            &ctx,
+            &columns,
+            &rows,
+            &mut state,
+            paste("A\tB\tC\n1\t\tp\n2\t\tq"),
+        );
+        let inserts = &state.changes().unwrap().inserts;
+        assert_eq!(inserts[1][1].as_deref(), Some(""));
+        assert_eq!(inserts[2][1], None);
+    }
+
+    /// A value with a line break or a tab copies in quotes, as spreadsheets
+    /// write it, and pastes back whole (#276): it was copied as it is, and
+    /// Paste split it into new rows and columns. Text from a spreadsheet
+    /// pastes as before.
+    #[test]
+    fn line_breaks_and_tabs_copy_in_quotes() {
+        let (columns, _) = three();
+        let row = |a: &str, b: &str, c: &str| vec![Some(a.into()), Some(b.into()), Some(c.into())];
+        let rows = vec![
+            row("1", "two\nlines", "a\tb"),
+            row("2", "\"quoted\"", "say \"hi\""),
+        ];
+        let copy = "1\t\"two\nlines\"\t\"a\tb\"\n2\t\"\"\"quoted\"\"\"\tsay \"hi\"";
+        let mut state = GridState::default();
+        state.sync(&rows, &columns);
+        state.select((0, 0), false);
+        state.select((1, 2), true);
+        assert_eq!(
+            selection_text(&columns, &rows, &state, false).unwrap(),
+            copy
+        );
+        assert_eq!(to_tsv(&columns, &rows), format!("A\tB\tC\n{copy}"));
+        // Pasted, the values are whole again.
+        state.set_editable(None);
+        state.add_row(&rows, 3);
+        state.paste(&rows, 3, copy);
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [rows[0].clone(), rows[1].clone()]
+        );
+        // From a spreadsheet: CRLF between rows, a quoted cell with a line
+        // break, plain cells with quotes in them.
+        state.clear_changes();
+        state.add_row(&rows, 3);
+        state.paste(
+            &rows,
+            3,
+            "7\t\"multi\nline\"\tplain \"x\"\r\n8\t\t\"a\"\"b\" c\r\n9\t\"\"\t\"\"\"\"\r\n",
+        );
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [
+                row("7", "multi\nline", "plain \"x\""),
+                vec![Some("8".into()), None, Some("\"a\"\"b\" c".into())],
+                row("9", "", "\""),
+            ]
+        );
+    }
+
+    /// The summary of a selection adds up the values the grid shows,
+    /// with the changes waiting for Apply (#277): it read the values
+    /// fetched, and with a filter on, a new row's cells were those of a
+    /// fetched row the filter hid.
+    #[test]
+    fn summary_reads_the_changes() {
+        let columns = cols();
+        let row = |a: &str, b: &str| vec![Some(a.into()), Some(b.into())];
+        let rows = vec![row("1", "x"), row("2", "y"), row("3", "z")];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        let summary = |state: &mut GridState| {
+            let mut summary = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                summary = ResultGrid::new(&columns, &rows, state, "grid")
+                    .show(ui)
+                    .selection_summary;
+            });
+            output.textures_delta.clear();
+            summary.unwrap_or_default()
+        };
+        state.anchor = Some((0, 0));
+        state.cursor = Some((2, 0));
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 6 · Avg 2 · Min 1 · Max 3"
+        );
+        state.edit_cell(&rows, 1, 0, Some("20".into()));
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 24 · Avg 8 · Min 1 · Max 20"
+        );
+        state.edit_cell(&rows, 2, 0, None);
+        assert_eq!(
+            summary(&mut state),
+            "Count 2 · Sum 21 · Avg 10.5 · Min 1 · Max 20"
+        );
+        // A row to be deleted is left out, as Apply leaves it.
+        state.delete_row(&rows, 0);
+        assert_eq!(
+            summary(&mut state),
+            "Count 1 · Sum 20 · Avg 20 · Min 20 · Max 20"
+        );
+        state.clear_changes();
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 6 · Avg 2 · Min 1 · Max 3"
+        );
+        // With a filter, a new row's own cells.
+        state.set_filter("x");
+        summary(&mut state);
+        state.add_row(&rows, 2);
+        state.edit_cell(&rows, 1, 0, Some("5".into()));
+        state.anchor = Some((0, 0));
+        state.cursor = Some((1, 0));
+        assert_eq!(
+            summary(&mut state),
+            "Count 2 · Sum 6 · Avg 3 · Min 1 · Max 5"
+        );
+    }
+
+    /// The sum and the average of very small or very large numbers keep
+    /// them (#278): 2e-20 and 3e-20 added up to "Sum 0 · Avg 0", and 1 and
+    /// 1e-5 to 1, rounded to four decimals.
+    #[test]
+    fn summary_keeps_small_and_large_numbers() {
+        let columns = vec![Column {
+            name: "N".into(),
+            type_name: "FLOAT".into(),
+            numeric: true,
+        }];
+        let summary_of = |values: &[&str]| {
+            let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![Some((*v).into())]).collect();
+            let mut state = GridState::default();
+            state.sync(&rows, &columns);
+            state.select((0, 0), false);
+            state.select((rows.len() - 1, 0), true);
+            summary(&columns, &rows, &state).unwrap()
+        };
+        assert_eq!(
+            summary_of(&["2e-20", "3e-20"]),
+            "Count 2 · Sum 5e-20 · Avg 2.5e-20 · Min 2e-20 · Max 3e-20"
+        );
+        assert_eq!(
+            summary_of(&["1", "1e-5"]),
+            "Count 2 · Sum 1.00001 · Avg 0.500005 · Min 1e-5 · Max 1"
+        );
+        assert_eq!(
+            summary_of(&["1e300", "1e300", "1e299"]),
+            "Count 3 · Sum 2.1e300 · Avg 7e299 · Min 1e299 · Max 1e300"
+        );
+        // A double's last digits aren't the numbers'.
+        assert_eq!(
+            summary_of(&["1e-1", "2e-1"]),
+            "Count 2 · Sum 0.3 · Avg 0.15 · Min 1e-1 · Max 2e-1"
+        );
+        // Plain decimals add up exactly, as before (#238).
+        assert_eq!(
+            summary_of(&["0.1", "0.2", "2.5"]),
+            "Count 3 · Sum 2.8 · Avg 0.93333 · Min 0.1 · Max 2.5"
+        );
+    }
+
+    /// Rows fetched later are sorted in among those shown: the selection,
+    /// the cursor, the cell being edited and the viewer stay on their rows
+    /// (#279). They stayed at their places in the view, on other rows, and a
+    /// value typed went into another row.
+    #[test]
+    fn rows_fetched_later_keep_the_selection() {
+        let columns = cols();
+        let row = |a: &str, b: &str| vec![Some(a.into()), Some(b.into())];
+        let mut rows = vec![row("2", "b"), row("4", "d")];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.set_sort(1, &rows, &columns);
+        state.add_row(&rows, 2);
+        state.edit_cell(&rows, 2, 0, Some("9".into()));
+        // b and d selected, d's B being edited, d's A in the viewer.
+        state.select((0, 0), false);
+        state.select((1, 1), true);
+        state.start_edit(&rows, (1, 1), Some("typed".into()));
+        state.viewer = Some((1, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        rows.extend([row("1", "a"), row("3", "c"), row("5", "e")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.order, [2, 0, 3, 1, 4]);
+        // From b to d, with c that came in between them.
+        assert_eq!(state.anchor, Some((1, 0)));
+        assert_eq!(state.cursor, Some((3, 1)));
+        assert_eq!(state.viewer, Some((3, 0)));
+        assert_eq!(state.value(&rows, 5, 0), Some("9"));
+        assert_eq!(
+            state.edit.as_ref().unwrap().active,
+            Some((3, 1, "typed".into()))
+        );
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::Enter)]);
+        let updates = &state.changes().unwrap().updates;
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[&1][&1].as_deref(), Some("typed"));
+        // The value editor's row too.
+        state.open_value_editor(&rows, (0, 1));
+        rows.push(row("0", "0"));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.value_editor.as_ref().map(|e| e.view_row), Some(1));
+        // Unsorted, the rows fetched come before the new rows.
+        let mut rows = vec![row("1", "a")];
+        let mut state = GridState::default();
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.add_row(&rows, 2);
+        assert_eq!(state.cursor, Some((1, 0)));
+        rows.push(row("2", "b"));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(state.cursor, Some((2, 0)));
+    }
+
+    /// The viewer of a value of megabytes keeps up, shows all of it and
+    /// copies all of it (#284): it worked the value out again on every
+    /// frame and laid it out whole, 1.9 s a frame for 10 MB on one line
+    /// in a test build.
+    #[test]
+    fn the_viewer_of_a_huge_value_keeps_up() {
+        let columns = vec![
+            Column {
+                name: "T".into(),
+                type_name: "text".into(),
+                numeric: false,
+            },
+            Column {
+                name: "B".into(),
+                type_name: "bytea".into(),
+                numeric: false,
+            },
+        ];
+        let json = format!("[{}{{\"end\": 1}}]", "{\"a\": 1}, ".repeat(400_000));
+        let cases = [
+            (format!("{}the end", "word ".repeat(2 << 20)), 0, "the end"),
+            (format!("{}the end", "line\n".repeat(2 << 20)), 0, "the end"),
+            (json, 0, "]"),
+            (
+                format!("\\x{}", "ab".repeat(10 << 20)),
+                1,
+                "10.0 MB · binary",
+            ),
+        ];
+        let ctx = egui::Context::default();
+        for (value, col, last) in cases {
+            let mut row = vec![None, None];
+            row[col] = Some(value.clone());
+            let rows = vec![row];
+            let mut state = GridState {
+                dialect: Dialect::POSTGRES,
+                viewer: Some((0, col)),
+                ..Default::default()
+            };
+            // A window is laid out unseen first.
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(elapsed < 2.0, "{last}: 5 frames took {elapsed} s");
+            let at = |drawn: &[(String, egui::Pos2)], text: &str| {
+                drawn
+                    .iter()
+                    .find(|(t, _)| t == text)
+                    .unwrap_or_else(|| panic!("{text} not in {:?}", texts(drawn)))
+                    .1
+            };
+            let copy = at(&drawn, "Copy");
+            if col == 0 {
+                // Scrolled to the end, the end shows.
+                let below = copy + egui::vec2(-100.0, 120.0);
+                let wheel = egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -1e9),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(
+                    &ctx,
+                    &columns,
+                    &rows,
+                    &mut state,
+                    vec![egui::Event::PointerMoved(below)],
+                );
+                frame(&ctx, &columns, &rows, &mut state, vec![wheel]);
+                let mut drawn = Vec::new();
+                for _ in 0..3 {
+                    drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+                }
+                assert!(
+                    drawn.iter().any(|(t, _)| t.ends_with(last)),
+                    "{last}: {:?}",
+                    texts(&drawn)
+                );
+            } else {
+                assert!(texts(&drawn).contains(&last), "{:?}", texts(&drawn));
+            }
+            // Copy copies all of it.
+            let button = |pressed| egui::Event::PointerButton {
+                pos: copy,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                &ctx,
+                &columns,
+                &rows,
+                &mut state,
+                vec![egui::Event::PointerMoved(copy)],
+            );
+            frame(&ctx, &columns, &rows, &mut state, vec![button(true)]);
+            let copied = copied(&ctx, &columns, &rows, &mut state, vec![button(false)]);
+            assert!(copied == Some(value), "{last}: not copied whole");
         }
     }
 }

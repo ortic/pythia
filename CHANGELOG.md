@@ -508,6 +508,53 @@ All notable changes to Pythia are documented here. The format follows
   of a fetched row failed the same way, and a text column's NULL was
   replaced by `''`. *Set NULL* and the value editor's *Apply* work as
   before.
+- Rows copied from a result and pasted into one being edited keep their
+  empty texts (#275). *Copy* writes a NULL and `''` alike, as an empty
+  cell, and *Paste* took every empty cell for NULL: `''` went back as
+  NULL, which a NOT NULL column refused on *Apply*. The cells Pythia
+  copied now paste as they were, NULLs too, also into another result;
+  text from elsewhere, such as a spreadsheet's range, still pastes an
+  empty cell as NULL.
+- *Paste* into a result no longer splits a value with a line break or a
+  tab into new rows and columns (#276). *Copy* wrote such a value as it
+  was, so pasted back it went over the cells next to it and added rows,
+  and in a spreadsheet it took two rows too. *Copy*, *Copy with header*
+  and *Copy all* now write it in double quotes, as spreadsheets do, and
+  *Paste* reads a cell in quotes as one value, also from a spreadsheet.
+  Other text pastes as before.
+- The summary of a selection in a result being edited adds up what the
+  grid shows (#277). *Count*, *Sum*, *Avg*, *Min* and *Max* were of the
+  values fetched: a changed value counted with its old one, a cell set
+  to NULL still counted, a row to be deleted was added up, and with a
+  filter on, a new row's cells were those of a row the filter hid. They
+  now take the changes waiting for *Apply* and leave out the rows to be
+  deleted, and follow each change.
+- The summary of a selection no longer reads `Sum 0` for very small
+  numbers (#278). The sum and average of floats such as `2e-20` and
+  `3e-20` were rounded to four decimals, "Sum 0 · Avg 0", and those of
+  `1` and `1e-5` read 1 and 0.5. They now read as floats are shown,
+  `5e-20` and `2.5e-20`, `1.00001` and `0.500005`; plain decimals still
+  add up exactly.
+- Rows fetched into a sorted result no longer move the selection and
+  the cell being edited to other rows (#279). The rows that come in when
+  such a result is scrolled to its end are sorted in among the others,
+  and the selection, the cursor, the cell being edited, *View value…*
+  and the dialog editing a cell stayed where they were in the view, on
+  other rows: a value being typed went into another row. They now stay
+  on their rows, and so do new rows.
+- *View value…* no longer freezes Pythia on a value of megabytes (#284),
+  such as a PostgreSQL `text`, `json` or `bytea`: it worked the value out
+  again on every frame and laid all of it out, seconds a frame for 20 MB.
+  A text over 100,000 characters now shows in rows, a long line cut
+  every 1,000 characters, laid out as they come into view; all of it can
+  still be scrolled through, and *Copy* copies all of it.
+- An *Apply* whose transaction is rolled back part-way no longer loses
+  the changes it made before (#289). On SQL Server, Break during an
+  *Apply* opens the connection again, which rolls back what wasn't
+  committed, and on MySQL a deadlock rolls back the whole transaction;
+  the window took the changes before for applied, and they were gone
+  from the grid without a word. The messages now say that they were
+  undone, and all of the *Apply*'s changes wait for *Apply* again.
 
 ## [0.10.0] - 2026-10-30
 
