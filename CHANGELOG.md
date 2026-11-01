@@ -752,6 +752,12 @@ All notable changes to Pythia are documented here. The format follows
   typed, in uppercase, with the name as stored, so `case` found no
   `"My_Case"`, only `MY_C` did. The names are compared in uppercase
   too.
+- *Find Objects* finds a name with a `ß` by it (#306), on Oracle, MySQL,
+  MariaDB and SQL Server, and so do *Search data*'s column names and
+  *Compare schemas*' name filter on Oracle. The filter's `ß` became
+  `SS`, which no database's `upper()` writes, so `straße` found no table
+  `straße`. A letter whose uppercase is more than one letter now stays
+  as it is.
 
 ## [0.10.0] - 2026-10-30
 

@@ -377,8 +377,9 @@ fn compile_errors_and_metadata() {
     exec(&mut h, 20, "drop table pythia_meta_t purge");
 }
 
-/// Object filters and Find find a quoted name with lowercase letters by any
-/// case of the filter (#305).
+/// Object filters and Find find a quoted name with lowercase letters
+/// (#305), and one with a letter that Oracle's upper() keeps, ß (#306), by
+/// any case of the filter.
 #[test]
 fn filters_find_names_in_any_case() {
     let Some(mut h) = Harness::connect() else {
@@ -395,7 +396,12 @@ fn filters_find_names_in_any_case() {
             panic!("{sql}: {error}");
         }
     };
-    let tables = ["\"R62_F_Case\"", "r62_f_upper", "\"R62_F_čaj\""];
+    let tables = [
+        "\"R62_F_Case\"",
+        "r62_f_upper",
+        "\"R62_F_čaj\"",
+        "r62_f_straße",
+    ];
     let drops: Vec<String> = tables
         .iter()
         .map(|t| {
@@ -438,10 +444,11 @@ fn filters_find_names_in_any_case() {
     assert_eq!(filtered("r62_f_?ase"), ["R62_F_Case"]);
     assert_eq!(filtered("r62_f_čaj"), ["R62_F_čaj"]);
     assert_eq!(filtered("R62_F_ČAJ"), ["R62_F_čaj"]);
+    assert_eq!(filtered("r62_f_straße"), ["R62_F_STRAßE"]);
     assert_eq!(filtered("r62_f_upper"), ["R62_F_UPPER"]);
     assert_eq!(
         filtered("r62_f_"),
-        ["R62_F_Case", "R62_F_UPPER", "R62_F_čaj"]
+        ["R62_F_Case", "R62_F_STRAßE", "R62_F_UPPER", "R62_F_čaj"]
     );
     let mut found = |pattern: &str| {
         objects(
@@ -454,6 +461,7 @@ fn filters_find_names_in_any_case() {
     };
     assert_eq!(found("r62_f_case"), ["R62_F_Case"]);
     assert_eq!(found("R62_F_ČAJ"), ["R62_F_čaj"]);
+    assert_eq!(found("r62_f_straße"), ["R62_F_STRAßE"]);
     for drop in &drops {
         exec(&mut h, drop);
     }

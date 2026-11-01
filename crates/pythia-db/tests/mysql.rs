@@ -1628,6 +1628,66 @@ fn view_ddl_names_other_databases_only() {
     }
 }
 
+/// Object filters and Find find names without case, non-ASCII letters too,
+/// where MySQL keeps the case of table names (Linux) and compares them
+/// with it.
+#[test]
+fn filters_match_any_letters_without_case() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let tables = "`r62_čaj`, `r62_bière`, `r62_ÖL`, `R62_Case`, `r62_straße`";
+    h.ok(&format!("drop table if exists {tables}"));
+    h.ok("drop procedure if exists `R62_Proc`");
+    for table in tables.split(", ") {
+        h.ok(&format!("create table {table} (x int)"));
+    }
+    h.ok("create procedure `R62_Proc`() begin end");
+    let filtered = |h: &mut Harness, object_type, filter: &str| -> Vec<String> {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: schema.clone(),
+            object_type,
+            filter: Some(filter.into()),
+        }) else {
+            panic!("expected objects")
+        };
+        let mut names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
+        names.sort();
+        names
+    };
+    let table = ObjectType::Table;
+    assert_eq!(filtered(&mut h, table, "r62_čaj"), ["r62_čaj"]);
+    assert_eq!(filtered(&mut h, table, "R62_ČAJ"), ["r62_čaj"]);
+    assert_eq!(filtered(&mut h, table, "r62_BIÈRE"), ["r62_bière"]);
+    assert_eq!(filtered(&mut h, table, "r62_öl"), ["r62_ÖL"]);
+    // MariaDB compares without accents too (utf8mb3_general_ci): r62_ca
+    // finds r62_čaj there.
+    assert_eq!(filtered(&mut h, table, "r62_cas"), ["R62_Case"]);
+    assert_eq!(filtered(&mut h, table, "R62_CASE"), ["R62_Case"]);
+    assert_eq!(filtered(&mut h, table, "r62_straße"), ["r62_straße"]);
+    assert_eq!(filtered(&mut h, table, "r62_?ase"), ["R62_Case"]);
+    assert_eq!(filtered(&mut h, table, "r62%"), Vec::<String>::new());
+    assert_eq!(
+        filtered(&mut h, ObjectType::Procedure, "r62_proc"),
+        ["R62_Proc"]
+    );
+    let mut found = |pattern: &str| -> Vec<String> {
+        let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+            pattern: pattern.into(),
+            limit: 10,
+        }) else {
+            panic!("expected objects")
+        };
+        found.into_iter().map(|o| o.name).collect()
+    };
+    assert_eq!(found("R62_ČAJ"), ["r62_čaj"]);
+    assert_eq!(found("r62_case"), ["R62_Case"]);
+    assert_eq!(found("r62_PROC"), ["R62_Proc"]);
+    h.ok(&format!("drop table {tables}"));
+    h.ok("drop procedure `R62_Proc`");
+}
+
 /// MariaDB's sequences are sequences, not tables: listed and found as
 /// such, with their DDL, which creates them again.
 #[test]

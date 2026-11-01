@@ -534,10 +534,17 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
 }
 
 /// Turns a user filter into a LIKE pattern: case-insensitive "contains",
-/// `*` and `?` as wildcards, `%`/`_` matched literally.
+/// `*` and `?` as wildcards, `%`/`_` matched literally. Each letter is
+/// uppercased as SQL's `upper()` does, to one letter: `ß` stays `ß`, which
+/// `upper('straße')` keeps (#306).
 pub fn like_pattern(filter: &str) -> String {
     let mut out = String::from("%");
-    for c in filter.trim().to_uppercase().chars() {
+    for c in filter.trim().chars() {
+        let mut upper = c.to_uppercase();
+        let c = match (upper.next(), upper.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        };
         match c {
             '%' | '_' | '\\' => {
                 out.push('\\');
@@ -1205,6 +1212,7 @@ mod tests {
         assert_eq!(like_pattern("emp"), "%EMP%");
         assert_eq!(like_pattern("emp*_hist"), "%EMP%\\_HIST%");
         assert_eq!(like_pattern("a?c"), "%A_C%");
+        assert_eq!(like_pattern("čaj straße"), "%ČAJ STRAßE%");
     }
 
     #[test]
