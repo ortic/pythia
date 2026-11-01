@@ -275,6 +275,12 @@ All notable changes to Pythia are documented here. The format follows
   details now name the tables of other schemas with their schema, and
   its DDL names every schema, as `pg_dump` does: run in another schema
   or with another search path, it no longer makes keys to other tables.
+- PostgreSQL 18: a virtual generated column reads as one (#227). `twice
+  int generated always as (a * 2)`, virtual by default since 18, showed
+  `(a * 2)` as its default in an object view's columns, and the table's
+  DDL wrote `twice integer (a * 2)`, which fails (syntax error). It now
+  reads `generated always as ((a * 2)) virtual`, as a stored one reads
+  `… stored`.
 
 ## [0.10.0] - 2026-10-30
 

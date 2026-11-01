@@ -898,6 +898,81 @@ fn foreign_keys_name_their_schema() {
     h.ok("drop table fk_same_users");
 }
 
+/// Generated columns read as declared, PostgreSQL 18's virtual ones too: as
+/// their default, and in DDL that builds the table again.
+#[test]
+fn generated_columns_as_declared() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let release: u32 = h
+        .scalar("select current_setting('server_version_num')")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists gen_copy cascade");
+    h.ok("drop table if exists gen_cols");
+    let virtual_column = if release >= 180000 {
+        ", twice int generated always as (a * 2) virtual"
+    } else {
+        ""
+    };
+    h.ok(&format!(
+        "create table gen_cols (id int generated always as identity, a int, \
+         thrice int generated always as (a * 3) stored{virtual_column})"
+    ));
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema.clone(),
+        table: "gen_cols".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    let defaults: Vec<(&str, Option<&str>)> = columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.default.as_deref()))
+        .collect();
+    let mut expected = vec![
+        ("id", Some("generated always as identity")),
+        ("a", None),
+        ("thrice", Some("generated always as ((a * 3)) stored")),
+    ];
+    if release >= 180000 {
+        expected.push(("twice", Some("generated always as ((a * 2)) virtual")));
+    }
+    assert_eq!(defaults, expected);
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "gen_cols".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    h.ok("create schema gen_copy");
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::Postgres) {
+        h.ok(&statement
+            .text(&ddl)
+            .replace(&format!("{schema}."), "gen_copy."));
+    }
+    assert_eq!(
+        h.scalar(
+            "select string_agg(attname || ':' || attgenerated::text, ' ' order by attnum) \
+               from pg_attribute where attrelid = 'gen_copy.gen_cols'::regclass \
+                and attgenerated <> ''"
+        )
+        .as_deref(),
+        Some(if release >= 180000 {
+            "thrice:s twice:v"
+        } else {
+            "thrice:s"
+        }),
+        "{ddl}"
+    );
+    h.ok("drop schema gen_copy cascade");
+    h.ok("drop table gen_cols");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();
