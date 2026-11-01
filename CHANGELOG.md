@@ -273,6 +273,11 @@ All notable changes to Pythia are documented here. The format follows
   and after `"` the popup didn't open at all. Columns are offered after
   a quote that isn't closed yet too, and only names are: no keywords or
   functions.
+- A large selection in a result grid no longer slows down every frame
+  (#241). Its count, sum, average, minimum and maximum were worked out
+  again on each frame: with a million rows selected, a frame took a
+  quarter of a second, and scrolling and typing lagged. They are now
+  worked out when the selection or the rows change.
 
 ## [0.10.0] - 2026-10-30
 
