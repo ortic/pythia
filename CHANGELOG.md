@@ -1021,6 +1021,12 @@ All notable changes to Pythia are documented here. The format follows
   follow their rows, and on a row taken away the viewer and the dialog
   close and the edit ends. The selection stays on the rows there are:
   a Paste past them added empty new rows up to it.
+- *View value…* no longer keeps every image it showed in memory (#333).
+  egui kept an image's bytes, its pixels and its texture until the
+  viewer's ✕ closed it: going through a column of images with the viewer
+  open kept each one, as did a viewer closed by a filter, by Ctrl+Z or
+  with its result, a photo's pixels taking tens of megabytes twice. The
+  viewer now lets go of an image once it shows another value or closes.
 
 ## [0.10.0] - 2026-10-30
 

@@ -61,6 +61,8 @@ pub struct GridState {
     viewer: Option<(usize, usize)>,
     /// What the viewer shows of its cell.
     viewed: Option<Viewed>,
+    /// The image the viewer shows, which egui keeps until it's forgotten.
+    shown_image: Option<ShownImage>,
     scroll_to_cursor: bool,
     edit: Option<Editing>,
     /// Related rows reachable from a row (foreign keys), offered in the
@@ -3153,6 +3155,22 @@ struct ViewedKey {
     changes: u64,
 }
 
+/// An image the viewer shows, by its URI: egui keeps its bytes, its
+/// pixels and its texture until it is told to forget them, which dropping
+/// this does, once the viewer shows another value, closes, or goes with
+/// its grid. They stayed, of every image viewed, unless the viewer's ✕
+/// closed it (#333).
+struct ShownImage {
+    ctx: egui::Context,
+    uri: String,
+}
+
+impl Drop for ShownImage {
+    fn drop(&mut self) {
+        self.ctx.forget_image(&self.uri);
+    }
+}
+
 /// A binary value as the viewer shows it.
 struct ViewedBinary {
     bytes: Arc<[u8]>,
@@ -3264,6 +3282,7 @@ fn viewer(
 ) {
     let Some((r, c)) = state.viewer else {
         state.viewed = None;
+        state.shown_image = None;
         return;
     };
     let key = ViewedKey {
@@ -3276,6 +3295,14 @@ fn viewer(
         state.viewed = Some(Viewed::new(key, columns, rows, state));
     }
     let Some(viewed) = &state.viewed else { return };
+    // The same image again (rows fetched, another change) stays loaded.
+    let image = viewed.binary.as_ref().and_then(|b| b.image.as_ref());
+    if state.shown_image.as_ref().map(|i| &i.uri) != image {
+        state.shown_image = image.map(|uri| ShownImage {
+            ctx: ctx.clone(),
+            uri: uri.clone(),
+        });
+    }
     let name = columns.get(c).map_or("", |col| col.name.as_str());
     let files = state.value_files
         && columns
@@ -3383,11 +3410,9 @@ fn viewer(
             );
         });
     if !open {
-        if let Some(uri) = viewed.binary.as_ref().and_then(|b| b.image.as_ref()) {
-            ctx.forget_image(uri);
-        }
         state.viewer = None;
         state.viewed = None;
+        state.shown_image = None;
     } else if save {
         state.request_save(columns, rows, (r, c));
     }
@@ -4415,6 +4440,82 @@ mod tests {
         let (blue, _) = viewer_image(&ctx, &[vec![Some(BLUE.to_owned())]]);
         assert!(!blue.is_empty());
         assert_ne!(red, blue);
+    }
+
+    /// egui forgets an image once the viewer no longer shows it: on to
+    /// another cell, or closed by the grid, as a filter that hides its row
+    /// does. It forgot it only when the viewer's ✕ closed it, and kept each
+    /// other one's bytes, pixels and texture for good. The image shown
+    /// again after a change isn't loaded again.
+    #[test]
+    fn the_viewer_lets_go_of_the_images_it_showed() {
+        let png = |shade: u8| -> String {
+            let image = image::RgbImage::from_pixel(64, 64, image::Rgb([shade, 0, 0]));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            bytes
+                .into_inner()
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect()
+        };
+        let columns = vec![Column {
+            name: "IMG".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let rows: Vec<Vec<Cell>> = (0..20).map(|shade| vec![Some(png(shade))]).collect();
+        let ctx = egui::Context::default();
+        crate::icons::install(&ctx);
+        let held = || {
+            use egui::load::BytesLoader as _;
+            let loaders = ctx.loaders();
+            let images: usize = loaders.image.lock().iter().map(|l| l.byte_size()).sum();
+            let textures: usize = loaders.texture.lock().iter().map(|l| l.byte_size()).sum();
+            loaders.include.byte_size() + images + textures
+        };
+        // The frames until the viewer paints its image, decoded meanwhile.
+        let painted = |state: &mut GridState| {
+            for frames in 1..100 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ResultGrid::new(&columns, &rows, state, "grid").show(ui);
+                });
+                output.textures_delta.clear();
+                let textured = output.shapes.iter().any(|s| match &s.shape {
+                    egui::Shape::Rect(r) => r.fill_texture_id() != egui::TextureId::default(),
+                    egui::Shape::Mesh(m) => m.texture_id != egui::TextureId::default(),
+                    _ => false,
+                });
+                if textured {
+                    return frames;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("no image");
+        };
+        let mut state = GridState::default();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let before = held();
+        let mut one = 0;
+        for row in 0..rows.len() {
+            state.viewer = Some((row, 0));
+            painted(&mut state);
+            if row == 0 {
+                one = held() - before;
+            }
+            if row % 2 == 0 {
+                state.set_filter("none");
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+                assert_eq!(state.viewer, None);
+                state.set_filter("");
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+        }
+        let now = held() - before;
+        assert!(now <= 2 * one, "{now} bytes held, one image {one}");
+        // Shown again after a change, the image isn't loaded again.
+        state.changes_revision += 1;
+        assert_eq!(painted(&mut state), 1);
     }
 
     /// The viewer of a binary value the grid holds cut short (#204) shows
