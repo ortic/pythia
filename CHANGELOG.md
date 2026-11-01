@@ -508,6 +508,13 @@ All notable changes to Pythia are documented here. The format follows
   of a fetched row failed the same way, and a text column's NULL was
   replaced by `''`. *Set NULL* and the value editor's *Apply* work as
   before.
+- Rows copied from a result and pasted into one being edited keep their
+  empty texts (#275). *Copy* writes a NULL and `''` alike, as an empty
+  cell, and *Paste* took every empty cell for NULL: `''` went back as
+  NULL, which a NOT NULL column refused on *Apply*. The cells Pythia
+  copied now paste as they were, NULLs too, also into another result;
+  text from elsewhere, such as a spreadsheet's range, still pastes an
+  empty cell as NULL.
 
 ## [0.10.0] - 2026-10-30
 

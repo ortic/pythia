@@ -10,7 +10,7 @@ use pythia_plsql::{
     StatementKind, Syntax, TokenKind, split_statements_in, statement_at_in, tokenize, tokenize_in,
 };
 use pythia_ui::icons::{Icon, icon_button, icon_text_button};
-use pythia_ui::{GridState, ResultGrid, selection_data, shown_data, to_tsv};
+use pythia_ui::{GridState, ResultGrid, copy_rows, selection_data, shown_data};
 use serde::{Deserialize, Serialize};
 
 use crate::documents::{DocContext, Effects, ObjectRef, OpenRequest, Target, request_id};
@@ -2281,7 +2281,7 @@ impl SqlWindow {
                         .clicked()
                     {
                         match shown_data(&result.columns, &result.rows, &result.grid) {
-                            Ok((columns, rows)) => ui.ctx().copy_text(to_tsv(&columns, &rows)),
+                            Ok((columns, rows)) => copy_rows(ui.ctx(), &columns, rows),
                             Err(e) => {
                                 state.messages.push(Message {
                                     level: Level::Error,

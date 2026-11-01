@@ -766,14 +766,19 @@ impl GridState {
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
     /// new rows past the end. Empty cells become NULL.
     pub fn paste(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
+        self.paste_cells(rows, columns, &read_tsv(text));
+    }
+
+    /// Pastes rows of cells at the cursor, adding new rows past the end.
+    fn paste_cells(&mut self, rows: &[Vec<Cell>], columns: usize, cells: &[Vec<Cell>]) {
         if self.edit.is_none() {
             return;
         }
         self.sync(rows, &[]);
-        self.undoable(|s| s.paste_text(rows, columns, text));
+        self.undoable(|s| s.paste_rows(rows, columns, cells));
     }
 
-    fn paste_text(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
+    fn paste_rows(&mut self, rows: &[Vec<Cell>], columns: usize, cells: &[Vec<Cell>]) {
         let visible = self.visible_columns(columns);
         let (r0, c0) = self
             .cursor
@@ -785,17 +790,14 @@ impl GridState {
             .copied()
             .filter(|&c| self.edit.as_ref().is_some_and(|e| !e.is_locked(c)))
             .collect();
-        let text = text.strip_suffix('\n').unwrap_or(text);
-        let text = text.strip_suffix('\r').unwrap_or(text);
         let mut last = None;
-        for (i, line) in text.split('\n').enumerate() {
+        for (i, line) in cells.iter().enumerate() {
             let view_row = r0 + i;
             while view_row >= self.view_len(rows) {
                 self.insert_row(columns);
             }
-            for (cell, &col) in line.trim_end_matches('\r').split('\t').zip(&targets) {
-                let value = (!cell.is_empty()).then(|| cell.to_owned());
-                self.set_value(rows, view_row, col, value);
+            for (cell, &col) in line.iter().zip(&targets) {
+                self.set_value(rows, view_row, col, cell.clone());
                 last = Some((view_row, col));
             }
         }
@@ -1109,7 +1111,8 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
         state.undo(rows);
     }
     if let Some(text) = paste {
-        state.paste(rows, columns.len(), &text);
+        let cells = pasted_cells(ui.ctx(), &text);
+        state.paste_cells(rows, columns.len(), &cells);
     }
     if let Some(with_header) = copy {
         copy_selection(ui, columns, rows, state, with_header);
@@ -2102,35 +2105,123 @@ fn copy_selection(
     state: &mut GridState,
     header: bool,
 ) {
-    match selection_text(columns, rows, state, header) {
-        Ok(text) => ui.ctx().copy_text(text),
+    match selection_cells(columns, rows, state, header) {
+        Ok(cells) => copy_cells(ui.ctx(), cells),
         Err(e) => state.failed = Some(format!("Copy: {e}")),
     }
 }
 
+/// The selection's cells as Copy takes them, the names of its columns
+/// first if `header`.
+fn selection_cells(
+    columns: &[Column],
+    rows: &[Vec<Cell>],
+    state: &GridState,
+    header: bool,
+) -> Result<Vec<Vec<Cell>>, NotCopied> {
+    let (cols, data) = selection_data(columns, rows, state)?;
+    Ok(with_header(header.then_some(&cols[..]), data))
+}
+
+#[cfg(test)]
 fn selection_text(
     columns: &[Column],
     rows: &[Vec<Cell>],
     state: &GridState,
     header: bool,
 ) -> Result<String, NotCopied> {
-    let (cols, data) = selection_data(columns, rows, state)?;
-    let mut lines = Vec::with_capacity(data.len() + 1);
-    if header {
-        lines.push(
-            cols.iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join("\t"),
-        );
+    selection_cells(columns, rows, state, header).map(|cells| tsv(&cells))
+}
+
+/// `rows`, after a row of the names of `columns` if there are any.
+fn with_header(columns: Option<&[Column]>, rows: Vec<Vec<Cell>>) -> Vec<Vec<Cell>> {
+    let Some(columns) = columns else {
+        return rows;
+    };
+    let names = columns.iter().map(|c| Some(c.name.clone())).collect();
+    std::iter::once(names).chain(rows).collect()
+}
+
+/// Copies `rows` as tab separated text with a header line, as *Copy all*
+/// does, kept for a paste like [`copy_selection`]'s.
+pub fn copy_rows(ctx: &egui::Context, columns: &[Column], rows: Vec<Vec<Cell>>) {
+    copy_cells(ctx, with_header(Some(columns), rows));
+}
+
+/// What Copy put on the clipboard last: the cells it copied, NULLs as
+/// NULL. The text writes a NULL as an empty cell, as other programs read
+/// it, and an empty text the same; a paste of that text takes the cells
+/// as they were copied (#275).
+#[derive(Clone)]
+struct Copied {
+    /// The text, as [`clipboard_key`] has it.
+    key: (u64, usize),
+    cells: std::sync::Arc<Vec<Vec<Cell>>>,
+}
+
+fn copied_id() -> egui::Id {
+    egui::Id::new("pythia-grid-copied")
+}
+
+/// Tells a text pasted back from others: its hash and length, without the
+/// CRLF line breaks and the line break at the end a clipboard may add.
+fn clipboard_key(text: &str) -> (u64, usize) {
+    let text = text.replace("\r\n", "\n");
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    (egui::util::hash(text), text.len())
+}
+
+/// Copies `cells` as tab separated text, and keeps them for a paste of it.
+fn copy_cells(ctx: &egui::Context, cells: Vec<Vec<Cell>>) {
+    let text = tsv(&cells);
+    let copied = Copied {
+        key: clipboard_key(&text),
+        cells: std::sync::Arc::new(cells),
+    };
+    ctx.data_mut(|d| d.insert_temp(copied_id(), copied));
+    ctx.copy_text(text);
+}
+
+/// The cells of a pasted text: those Copy kept for it, or the text read
+/// as tab separated, an empty cell as NULL.
+fn pasted_cells(ctx: &egui::Context, text: &str) -> std::sync::Arc<Vec<Vec<Cell>>> {
+    match ctx.data(|d| d.get_temp::<Copied>(copied_id())) {
+        Some(copied) if copied.key == clipboard_key(text) => copied.cells,
+        _ => std::sync::Arc::new(read_tsv(text)),
     }
-    lines.extend(data.iter().map(|r| {
-        r.iter()
-            .map(|c| c.as_deref().unwrap_or(""))
-            .collect::<Vec<_>>()
-            .join("\t")
-    }));
-    Ok(lines.join("\n"))
+}
+
+/// Rows of cells as tab separated text: a NULL is an empty cell.
+fn tsv(cells: &[Vec<Cell>]) -> String {
+    let lines: Vec<String> = cells
+        .iter()
+        .map(|row| tsv_line(row.iter().map(Option::as_deref)))
+        .collect();
+    lines.join("\n")
+}
+
+/// A line of tab separated text: a NULL is an empty cell.
+fn tsv_line<'c>(cells: impl IntoIterator<Item = Option<&'c str>>) -> String {
+    cells
+        .into_iter()
+        .map(|c| c.unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Tab separated text, e.g. a spreadsheet's range, as rows of cells: an
+/// empty cell is NULL.
+fn read_tsv(text: &str) -> Vec<Vec<Cell>> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    text.split('\n')
+        .map(|line| {
+            line.trim_end_matches('\r')
+                .split('\t')
+                .map(|cell| (!cell.is_empty()).then(|| cell.to_owned()))
+                .collect()
+        })
+        .collect()
 }
 
 fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<String> {
@@ -2768,15 +2859,10 @@ fn hex_dump(bytes: &[u8], max: usize) -> String {
 
 /// Renders rows as tab separated text with a header line.
 pub fn to_tsv(columns: &[Column], rows: &[Vec<Cell>]) -> String {
-    let mut out = columns
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect::<Vec<_>>()
-        .join("\t");
+    let mut out = tsv_line(columns.iter().map(|c| Some(c.name.as_str())));
     for row in rows {
         out.push('\n');
-        let line: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
-        out.push_str(&line.join("\t"));
+        out.push_str(&tsv_line(row.iter().map(Option::as_deref)));
     }
     out
 }
@@ -4092,5 +4178,95 @@ mod tests {
             let elapsed = started.elapsed().as_secs_f64();
             assert!(elapsed < 2.0, "{elapsed} s");
         }
+    }
+
+    /// A frame with `events`, and the text it copied, if any.
+    fn copied(
+        ctx: &egui::Context,
+        columns: &[Column],
+        rows: &[Vec<Cell>],
+        state: &mut GridState,
+        events: Vec<egui::Event>,
+    ) -> Option<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            ResultGrid::new(columns, rows, state, "grid").show(ui);
+        });
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// Rows copied and pasted back keep their NULLs and their empty texts
+    /// (#275): Copy writes both as an empty cell, and Paste took every
+    /// empty cell for NULL, so '' went back as NULL. Text from elsewhere
+    /// keeps that rule.
+    #[test]
+    fn copied_rows_paste_back_as_they_were() {
+        let (columns, mut rows) = three();
+        rows[0][1] = Some(String::new());
+        rows[1][1] = None;
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        click(&ctx, &columns, &rows, &mut state, "p", 1);
+        state.anchor = Some((0, 1));
+        state.cursor = Some((1, 2));
+        let text = copied(&ctx, &columns, &rows, &mut state, vec![egui::Event::Copy]);
+        assert_eq!(text.as_deref(), Some("\tp\n\tq"));
+        let text = text.unwrap();
+        state.add_row(&rows, 3);
+        state.add_row(&rows, 3);
+        state.anchor = Some((2, 1));
+        state.cursor = Some((2, 1));
+        let paste = |text: &str| vec![egui::Event::Paste(text.into())];
+        frame(&ctx, &columns, &rows, &mut state, paste(&text));
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [
+                vec![None, Some(String::new()), Some("p".into())],
+                vec![None, None, Some("q".into())],
+            ]
+        );
+        // As the clipboard may give it back, with CRLF and a line break
+        // at the end.
+        state.cursor = Some((2, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tP\r\n\tq\r\n"));
+        assert_eq!(state.changes().unwrap().inserts[0][1], None);
+        state.cursor = Some((2, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tp\r\n\tq\r\n"));
+        assert_eq!(state.changes().unwrap().inserts[0][1].as_deref(), Some(""));
+        // Other text: an empty cell is NULL.
+        state.cursor = Some((0, 1));
+        frame(&ctx, &columns, &rows, &mut state, paste("\tz"));
+        assert_eq!(state.changes().unwrap().updates[&0][&1], None);
+        // Copy all, with its header.
+        state.clear_changes();
+        copy_rows(&ctx, &columns, rows.clone());
+        state.add_row(&rows, 3);
+        frame(
+            &ctx,
+            &columns,
+            &rows,
+            &mut state,
+            paste("A\tB\tC\n1\t\tp\n2\t\tq"),
+        );
+        let inserts = &state.changes().unwrap().inserts;
+        assert_eq!(inserts[1][1].as_deref(), Some(""));
+        assert_eq!(inserts[2][1], None);
     }
 }

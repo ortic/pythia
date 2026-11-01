@@ -8,8 +8,8 @@ pub mod plan;
 
 pub use editor::{EditorOutput, SqlEditor, SyntaxTheme, highlight};
 pub use grid::{
-    Changes, GridLink, GridOutput, GridState, GridStyle, NotCopied, ResultGrid, selection_data,
-    set_grid_style, shown_data, to_tsv,
+    Changes, GridLink, GridOutput, GridState, GridStyle, NotCopied, ResultGrid, copy_rows,
+    selection_data, set_grid_style, shown_data, to_tsv,
 };
 
 /// A modifier pressed on its own, which egui (0.36) sends as a key press
