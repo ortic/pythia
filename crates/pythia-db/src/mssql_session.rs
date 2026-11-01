@@ -428,11 +428,13 @@ impl Worker {
                 (Outcome::Done, Err(error)) if is_dml(&statement_kind(sql)) => {
                     let why = (!error.is_connection_lost())
                         .then(|| format!("The connection got out of step ({})", error.message));
+                    // Without a transaction, auto-commit committed it (#345).
                     let error = DbError {
                         message: format!(
                             "{}\nThe statement ran; its row count couldn't be read.",
                             error.message
                         ),
+                        committed: !self.pending,
                         ..error
                     };
                     self.events.send(DbEvent::Failed {

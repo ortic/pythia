@@ -330,6 +330,10 @@ pub struct DbError {
     pub offset: Option<u32>,
     /// Set by backends that know from the error that the session is gone.
     pub lost: bool,
+    /// The statement ran, outside a transaction, so it was committed, and
+    /// what failed came after it: SQL Server's row count, read with a query
+    /// of its own (#310, #345).
+    pub committed: bool,
     /// The SSH server's host key isn't known: connecting works once the
     /// user trusts it.
     pub host_key: Option<Box<HostKey>>,
@@ -343,6 +347,7 @@ impl DbError {
             message: message.into(),
             offset: None,
             lost: false,
+            committed: false,
             host_key: None,
         }
     }

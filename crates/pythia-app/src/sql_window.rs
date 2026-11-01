@@ -2174,7 +2174,11 @@ impl SqlWindow {
                     effects.extend(self.run_next(cx));
                     return effects;
                 }
-                let dml = matches!(running.and_then(|r| r.internal), Some(Internal::Dml { .. }));
+                let change = match running.and_then(|r| r.internal) {
+                    Some(Internal::Dml { change, .. }) => Some(change),
+                    _ => None,
+                };
+                let dml = change.is_some();
                 let lost = error.is_connection_lost();
                 let applying = dml && !lost;
                 if applying && let Some(apply) = &mut self.state.apply {
@@ -2189,10 +2193,17 @@ impl SqlWindow {
                     Some(apply) if dml && lost && !self.state.in_transaction => apply.applied.len(),
                     _ => 0,
                 };
+                // So is this one where it ran outside a transaction and only
+                // its row count wasn't read (#310, #345).
+                let ran = change.filter(|_| error.committed);
+                if let (Some(change), Some(apply)) = (ran, &mut self.state.apply) {
+                    apply.applied.push(change);
+                }
+                let fetch_again = applying || committed > 0 || ran.is_some();
                 // The session skips those sent ahead.
                 let ahead = self.drop_ahead();
                 let dropped = ahead
-                    + if applying || committed > 0 {
+                    + if fetch_again {
                         self.stop_applying()
                     } else {
                         std::mem::take(&mut self.state.queue).len()
@@ -2206,11 +2217,16 @@ impl SqlWindow {
                         "Auto-commit committed the {committed} change(s) applied before it"
                     ));
                 }
-                if self.state.rollback_on_error && !applying && committed == 0 {
+                if ran.is_some() {
+                    self.info(
+                        "Auto-commit committed its change too: only its row count wasn't read",
+                    );
+                }
+                if self.state.rollback_on_error && !fetch_again {
                     self.info("Rolling back (WHENEVER SQLERROR EXIT ROLLBACK)");
                     effects.request(Target::Own, DbRequest::Rollback);
                 }
-                if applying || committed > 0 {
+                if fetch_again {
                     effects.extend(self.run_next(cx));
                 }
             }
