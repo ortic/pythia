@@ -4,6 +4,7 @@
 use pythia_plsql::{Syntax, TokenKind, tokenize};
 
 use crate::compat::Release;
+use crate::types::Bind;
 
 /// The first one or two words of a statement, uppercase, comments skipped.
 pub(crate) fn leading_words(sql: &str) -> Vec<String> {
@@ -71,8 +72,8 @@ pub(crate) fn has_inner_semicolon(sql: &str) -> bool {
 /// position (from 1) and value.
 pub(crate) fn replace_binds(
     sql: &str,
-    binds: &[(String, Option<String>)],
-    mut replace: impl FnMut(usize, &Option<String>) -> String,
+    binds: &[(String, Bind)],
+    mut replace: impl FnMut(usize, &Bind) -> String,
 ) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
@@ -228,13 +229,13 @@ mod tests {
         assert!(has_inner_semicolon("select 1; select 2"));
         assert!(!has_inner_semicolon("select ';' from t;"));
         let binds = vec![
-            ("id".to_owned(), Some("7".to_owned())),
-            ("n".to_owned(), None),
+            ("id".to_owned(), Some("7".to_owned()).into()),
+            ("n".to_owned(), Bind::Text(None)),
         ];
         let sql = replace_binds(
             "select * from t where id = :ID or :n is null and x = ':id' and y = :other",
             &binds,
-            |i, v| format!("${i}{}", if v.is_some() { "v" } else { "" }),
+            |i, v| format!("${i}{}", if *v == Bind::Text(None) { "" } else { "v" }),
         );
         assert_eq!(
             sql,

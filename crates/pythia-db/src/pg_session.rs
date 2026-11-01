@@ -45,7 +45,7 @@ use crate::sql_text::{
 };
 use crate::ssh::Tunnel;
 use crate::types::{
-    Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
+    Bind, Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
 
 type Connection =
@@ -330,19 +330,25 @@ impl Worker {
         id: u64,
         sql: &str,
         max_rows: usize,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         requests: &Requests,
         whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
-        // Values are written into the statement: the simple protocol has no
+        // Text is written into the statement: the simple protocol has no
         // parameters, and PostgreSQL types an unadorned literal by its use.
+        // A value bound whole (#293) is a parameter, `$1`, `$2`, ….
+        let mut params = Vec::new();
         let sql = if binds.is_empty() {
             sql.to_owned()
         } else {
-            replace_binds(sql, binds, |_, value| {
-                value.as_deref().map_or_else(|| "null".into(), literal)
+            replace_binds(sql, binds, |_, value| match value {
+                Bind::Text(text) => text.as_deref().map_or_else(|| "null".into(), literal),
+                whole => {
+                    params.push(whole.clone());
+                    format!("${}", params.len())
+                }
             })
         };
         let effect = TxEffect::of(&sql);
@@ -375,7 +381,11 @@ impl Worker {
             started,
             requests,
         };
-        let ran = self.run_statement(&sql, fetch, &mut next);
+        let ran = if params.is_empty() {
+            self.run_statement(&sql, fetch, &mut next)
+        } else {
+            self.run_with_params(&sql, &params)
+        };
         let failed = match ran {
             Ok(Outcome::Done { affected }) => {
                 let kind = statement_kind(&sql);
@@ -429,6 +439,31 @@ impl Worker {
         self.report_notices();
         self.report_transaction();
         next
+    }
+
+    /// Runs a statement with parameters, which only the extended protocol
+    /// has, as a statement without rows: bytes as bytea, text as text.
+    fn run_with_params(
+        &mut self,
+        sql: &str,
+        params: &[Bind],
+    ) -> Result<Outcome, tokio_postgres::Error> {
+        let values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = params
+            .iter()
+            .map(|p| -> Box<dyn tokio_postgres::types::ToSql + Sync> {
+                match p {
+                    Bind::Text(text) => Box::new(text.clone()),
+                    Bind::Bytes(bytes) => Box::new(bytes.to_vec()),
+                    Bind::LongText(text) => Box::new(text.to_string()),
+                }
+            })
+            .collect();
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            values.iter().map(|v| &**v).collect();
+        let affected = self.rt.block_on(self.client.execute(sql, &refs))?;
+        Ok(Outcome::Done {
+            affected: Some(affected),
+        })
     }
 
     fn run_statement(

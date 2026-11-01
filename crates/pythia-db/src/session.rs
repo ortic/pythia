@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::dialect::Dialect;
 use crate::meta::{self, MetaQuery, MetaResult};
 use crate::types::{
-    Cell, Client, Column, Compiled, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
+    Bind, Cell, Client, Column, Compiled, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary,
     ServerInfo,
 };
 
@@ -405,7 +405,7 @@ impl Worker {
         Ok((server, failed))
     }
 
-    fn execute(&mut self, id: u64, sql: &str, max_rows: usize, binds: &[(String, Option<String>)]) {
+    fn execute(&mut self, id: u64, sql: &str, max_rows: usize, binds: &[(String, Bind)]) {
         // The last query's rows left can't be fetched after it.
         if let Some(open) = self.open_query.take() {
             self.events.send(DbEvent::QueryClosed { id: open.id });
@@ -434,12 +434,14 @@ impl Worker {
         id: u64,
         sql: &str,
         max_rows: usize,
-        binds: &[(String, Option<String>)],
+        binds: &[(String, Bind)],
         started: Instant,
     ) -> Result<Option<DbEvent>, DbError> {
+        let values: Vec<Bound<'_>> = binds.iter().map(|(_, value)| Bound(value)).collect();
         let named: Vec<(&str, &dyn crate::oracle::sql_type::ToSql)> = binds
             .iter()
-            .map(|(name, value)| (name.as_str(), value as &dyn crate::oracle::sql_type::ToSql))
+            .zip(&values)
+            .map(|((name, _), value)| (name.as_str(), value as &dyn crate::oracle::sql_type::ToSql))
             .collect();
         let mut stmt = self.conn.statement(sql).build()?;
         if stmt.is_query() {
@@ -590,6 +592,48 @@ impl Worker {
                 return Ok(lines);
             }
             lines.push(stmt.bind_value::<_, Option<String>>(1)?.unwrap_or_default());
+        }
+    }
+}
+
+/// A bind's value as the driver binds it: text as a string; bytes as RAW
+/// and text as VARCHAR2, whole (#293). The thin driver binds a value over
+/// 32767 bytes as LONG RAW or LONG itself, which also go into a LOB.
+struct Bound<'a>(&'a Bind);
+
+#[cfg(not(feature = "thick"))]
+impl crate::oracle::sql_type::ToSql for Bound<'_> {
+    fn to_bind(&self) -> crate::oracle::Bind {
+        match self.0 {
+            Bind::Text(value) => value.to_bind(),
+            Bind::Bytes(bytes) => (**bytes).to_bind(),
+            Bind::LongText(text) => (**text).to_bind(),
+        }
+    }
+}
+
+/// The Instant Client binds RAW and VARCHAR2 of up to 32767 bytes: past
+/// that, as LONG RAW and LONG.
+#[cfg(feature = "thick")]
+const LONGEST_INLINE: usize = 32767;
+
+#[cfg(feature = "thick")]
+impl ::oracle::sql_type::ToSql for Bound<'_> {
+    fn oratype(&self, conn: &Connection) -> ::oracle::Result<OracleType> {
+        match self.0 {
+            Bind::Text(value) => value.oratype(conn),
+            Bind::Bytes(bytes) if bytes.len() > LONGEST_INLINE => Ok(OracleType::LongRaw),
+            Bind::Bytes(bytes) => (&**bytes).oratype(conn),
+            Bind::LongText(text) if text.len() > LONGEST_INLINE => Ok(OracleType::Long),
+            Bind::LongText(text) => (&**text).oratype(conn),
+        }
+    }
+
+    fn to_sql(&self, val: &mut ::oracle::SqlValue) -> ::oracle::Result<()> {
+        match self.0 {
+            Bind::Text(value) => value.to_sql(val),
+            Bind::Bytes(bytes) => (&**bytes).to_sql(val),
+            Bind::LongText(text) => (&**text).to_sql(val),
         }
     }
 }

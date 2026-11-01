@@ -1254,7 +1254,7 @@ impl SqlWindow {
                 id,
                 sql,
                 max_rows: cx.fetch_size,
-                binds,
+                binds: binds.into_iter().map(|(n, v)| (n, v.into())).collect(),
             },
         );
     }
@@ -4565,8 +4565,8 @@ mod tests {
         assert_eq!(
             binds,
             &[
-                ("a".to_owned(), None),
-                ("b".to_owned(), Some(String::new()))
+                ("a".to_owned(), pythia_db::Bind::Text(None)),
+                ("b".to_owned(), pythia_db::Bind::Text(Some(String::new())))
             ]
         );
         assert_eq!(w.bind_values["b"], Some(String::new()));
