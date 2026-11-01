@@ -102,6 +102,16 @@ All notable changes to Pythia are documented here. The format follows
   lists failed with "function name is not unique" (#195). The browser
   lists such a name once, its source shows every version, and *Drop*
   now drops every version, as the confirmation says.
+- Several Pythias open at once no longer undo each other's changes
+  (#196). Each wrote its files from what it read at its start: a
+  connection saved in one was gone once the other connected from the
+  dialog, saved reports likewise, the history was the last one's, and a
+  Pythia that exited later reset the settings the other had changed. A
+  change now goes to the file as it is (the connect dialog shows the
+  other's connections), the history is merged, and settings write only
+  what changed. The open windows are the first Pythia's; one started
+  while it runs keeps its own as long as it runs. Two saves at the same
+  moment no longer share a temporary file, where one of them failed.
 
 ## [0.10.0] - 2026-10-30
 

@@ -37,6 +37,7 @@ pythia-ui.workspace = true
 serde.workspace = true
 # Windows Firewall settings (firewall.rs).
 serde_json.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -49,7 +50,6 @@ winit = { version = "0.30", default-features = false, features = ["x11"] }
 embed-resource = "3"
 
 [dev-dependencies]
-toml.workspace = true
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
 # Reads the fonts' character maps (theme.rs tests); egui's has_glyph misses
 # the characters of the font that holds its replacement glyph.

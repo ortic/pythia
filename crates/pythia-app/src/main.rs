@@ -43,6 +43,7 @@ mod reports;
 mod screenshots;
 mod secrets;
 mod settings_dialog;
+mod shared;
 mod source_search;
 mod sql_window;
 mod statistics;
@@ -90,13 +91,25 @@ fn main() -> anyhow::Result<()> {
     // Set once the app exists: a later error isn't the renderer's, e.g. the
     // window system went away (#60).
     let started = Arc::new(AtomicBool::new(false));
-    let result = run(eframe::Renderer::Wgpu, paths.clone(), &started).or_else(|e| {
+    // The open windows are the first Pythia's (#196); held until the end.
+    let workspace = paths
+        .as_ref()
+        .map(|p| shared::Workspace::claim(&p.data_dir));
+    let kept = workspace.as_ref().map(|w| w.path.clone());
+    let result = run(
+        eframe::Renderer::Wgpu,
+        paths.clone(),
+        kept.clone(),
+        &started,
+    )
+    .or_else(|e| {
         if started.load(Ordering::SeqCst) {
             return Err(e);
         }
         warn!("wgpu renderer failed ({e}), falling back to OpenGL");
-        run(eframe::Renderer::Glow, paths.clone(), &started)
+        run(eframe::Renderer::Glow, paths.clone(), kept, &started)
     });
+    drop(workspace);
     if let Err(e) = &result {
         let log = paths
             .as_ref()
@@ -153,6 +166,7 @@ fn attach_parent_console() {
 fn run(
     renderer: eframe::Renderer,
     paths: Option<Paths>,
+    workspace: Option<std::path::PathBuf>,
     started: &Arc<AtomicBool>,
 ) -> eframe::Result {
     let started = started.clone();
@@ -164,7 +178,7 @@ fn run(
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0])
             .with_icon(window_icon()),
-        persistence_path: paths.as_ref().map(|p| p.data_dir.join("workspace.ron")),
+        persistence_path: workspace,
         event_loop_builder: x11_on_wslg(),
         ..Default::default()
     };
