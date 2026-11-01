@@ -281,6 +281,11 @@ All notable changes to Pythia are documented here. The format follows
   its size, a hex dump of the first 4000 bytes, which the grid holds of
   it, and that an image can't be shown from them. It showed the value as
   8015 characters of text, hex digits and `… (51200 bytes)`.
+- A CSV or Excel file dropped on Pythia opens an import window only on
+  Oracle connections, where *Import Data* is offered (#235). On MySQL,
+  PostgreSQL, SQL Server and SQLite, the window opened anyway, showed
+  Oracle's `CREATE TABLE` and failed only at *Import* ("This tool isn't
+  available for SQL Server connections"); the log now says so at once.
 
 ## [0.10.0] - 2026-10-30
 

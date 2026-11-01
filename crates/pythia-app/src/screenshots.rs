@@ -8224,6 +8224,48 @@ impl Drop for SqliteFile {
     }
 }
 
+/// A file dropped on the window.
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+/// A data file dropped on a connection whose database Pythia doesn't import
+/// into says so (#235), as the Tools menu doesn't offer the import there. It
+/// opened an import window, which showed Oracle's CREATE TABLE and failed
+/// only at Import: "This tool isn't available for SQLite connections".
+#[test]
+fn dropped_data_files_import_only_where_they_can() {
+    let connection = "drop.db";
+    let (mut h, _file) = sqlite_file(connection);
+    let dir = std::env::temp_dir().join(format!("pythia-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("names.csv");
+    std::fs::write(&path, "id;name\n1;äöü\n2;日本\n").unwrap();
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(path)));
+    h.run_steps(3);
+    let windows = h.state().test_window_connections();
+    assert!(
+        !windows.iter().any(|(title, _)| title.starts_with("Import")),
+        "{windows:?}"
+    );
+    assert_eq!(
+        h.state().test_log().last().map(String::as_str),
+        Some("names.csv: Import Data (CSV, Excel)… isn't available for SQLite connections")
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Completion forgets what the object browser changed or read again
 /// (#198): after the browser dropped a table, completion still offered its
 /// columns; after a column was added from outside, Refresh didn't make
