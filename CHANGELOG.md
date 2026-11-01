@@ -272,6 +272,13 @@ All notable changes to Pythia are documented here. The format follows
   and MariaDB from Debian's and Ubuntu's packages do: `localhost` is
   `::1` first on most systems, and only a host's first address was
   tried. The others are tried now, in turn, for any host name.
+- *Edit* of a MariaDB routine, trigger or view, and of a MySQL view, no
+  longer drops it before the new version is created (#240): when the
+  new version failed, a typo in its body say, the object was gone, and
+  the drop had revoked the grants on a routine. The script replaces it
+  with `CREATE OR REPLACE`, which leaves it as it was when the version
+  fails. MySQL can only drop its routines and triggers first; their
+  script now says so.
 
 ## [0.10.0] - 2026-10-30
 

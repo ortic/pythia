@@ -272,6 +272,7 @@ impl ObjectView {
                                 self.dialect,
                                 &self.object,
                                 ddl.text(),
+                                cx.mariadb,
                             ),
                             run: false,
                         });
