@@ -1048,6 +1048,12 @@ All notable changes to Pythia are documented here. The format follows
   checked with `json_equal`, which finds an object with its keys in
   another order than Pythia shows them; a VECTOR, which SQL can't
   compare, is left out of the check.
+- Oracle: a VECTOR's float elements keep their exponent (#341), as
+  BINARY_DOUBLE values do since #304, and so do a JSON's binary numbers:
+  `[1e30,0.1]` showed as `[1000000000000000000000000000000,0.1]`,
+  `1e300` as a 1 and 300 zeros. A sparse VECTOR shows as Oracle writes
+  it, `[6,[0,5],[2.5,1e-30]]`; it showed as `SparseVector {…}`, which
+  its INSERT statements wrote and Oracle rejected with ORA-51804.
 
 ## [0.10.0] - 2026-10-30
 

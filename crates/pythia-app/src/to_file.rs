@@ -498,4 +498,97 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// `n` random finite, normal doubles and reals of any size (xorshift:
+    /// the same each run), as Rust writes them shortest, with an exponent.
+    fn random_floats(n: usize) -> Vec<(String, String)> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values = Vec::new();
+        while values.len() < n {
+            let (d, r) = (f64::from_bits(next()), f32::from_bits(next() as u32));
+            if d.is_normal() && r.is_normal() {
+                values.push((format!("{d:e}"), format!("{r:e}")));
+            }
+        }
+        values
+    }
+
+    /// The INSERTs of VECTORs (#341), run back into a copy of their table,
+    /// are the same vectors: FLOAT32 and FLOAT64 elements of any size and
+    /// sparse vectors, which were written as `SparseVector {…}`
+    /// (ORA-51804).
+    #[test]
+    fn writes_vectors() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_vec", "r76_vec_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, f vector(6, float32), \
+                       d vector(6, float64), s vector(6, float64, sparse), \
+                       i vector(2, int8), b vector(16, binary))"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        let floats = random_floats(6 * 20);
+        for (id, row) in floats.chunks(6).enumerate() {
+            let (d, f): (Vec<String>, Vec<String>) = row.iter().cloned().unzip();
+            conn.execute(
+                &format!(
+                    "insert into r76_vec values ({id}, '[{}]', '[{}]', '[6,[0,5],[{},{}]]', \
+                       '[-128,127]', '[255,1]')",
+                    f.join(","),
+                    d.join(","),
+                    d[0],
+                    d[1]
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "insert into r76_vec values (100, '[1e30,1e-30,0.1,100,-1.5,3.4028235e38]', \
+               '[1e300,-1e-300,0.1,100,-1.5,1.7976931348623157e308]', '[6,[2],[1e-300]]', \
+               null, null)",
+            &[],
+        )
+        .unwrap();
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_vec order by id",
+            "r76_vec",
+            "r76_vec_copy",
+        );
+        assert_eq!(n, 21);
+        let mut rows = texts(&conn, "select * from r76_vec order by id");
+        let mut copy = texts(&conn, "select * from r76_vec_copy order by id");
+        // Oracle reads the text of a dense FLOAT64 vector a unit in the
+        // last place off for about half of all doubles, its own text
+        // too: those elements are only as close as that.
+        let elements = |row: &mut Vec<Cell>| -> Vec<f64> {
+            let text = row[2].take().unwrap();
+            let list = text.trim_start_matches('[').trim_end_matches(']');
+            list.split(',').map(|x| x.parse().unwrap()).collect()
+        };
+        for (row, copied) in rows.iter_mut().zip(&mut copy) {
+            for (a, b) in elements(row).into_iter().zip(elements(copied)) {
+                assert!((a - b).abs() <= a.abs() * 1e-15, "{a} {b}");
+            }
+        }
+        assert_eq!(copy, rows);
+        for table in ["r76_vec", "r76_vec_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

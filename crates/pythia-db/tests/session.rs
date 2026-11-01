@@ -237,6 +237,49 @@ fn binary_floats_keep_their_exponent() {
     );
 }
 
+/// VECTOR elements keep their exponent (#341), as BINARY_DOUBLE values do
+/// since #304, and so do JSON's binary numbers; a sparse VECTOR reads as
+/// Oracle writes it. 1e30 came as 31 digits, 1e300 as 301, a sparse
+/// vector as `SparseVector {…}`.
+#[test]
+fn vectors_read_as_oracle_writes_them() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select to_vector('[1e30, 2e-20, 0.1, 100, -1.5]', 5, float32) a, \
+                to_vector('[1e300, -1e-300, 3e15]', 3, float64) b, \
+                to_vector('[6, [0, 5], [2.5, 1e-30]]', 6, float32, sparse) c, \
+                to_vector('[1, -2]', 2, int8) d, to_vector('[255, 1]', 16, binary) e, \
+                json('{\"a\": 1e300, \"b\": 2.5}') f, json_scalar(1e30f) g \
+              from dual"
+            .into(),
+        max_rows: 10,
+        binds: vec![],
+    });
+    let DbEvent::QueryStarted { columns, .. } = h.next_result() else {
+        panic!("expected QueryStarted")
+    };
+    assert_eq!(columns[0].type_name, "VECTOR");
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    let texts: Vec<&str> = rows[0].iter().map(|v| v.as_deref().unwrap()).collect();
+    assert_eq!(
+        texts,
+        [
+            "[1e30,2e-20,0.1,100,-1.5]",
+            "[1e300,-1e-300,3000000000000000]",
+            "[6,[0,5],[2.5,1e-30]]",
+            "[1,-2]",
+            "[255,1]",
+            r#"{"a":1e300,"b":2.5}"#,
+            "1e30"
+        ]
+    );
+}
+
 #[test]
 fn transaction_state() {
     let Some(mut h) = Harness::connect() else {
