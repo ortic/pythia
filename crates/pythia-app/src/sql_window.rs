@@ -4344,6 +4344,37 @@ mod tests {
         assert!(checked >= 4);
     }
 
+    /// A lone `;` is no statement to execute (#313), on every database:
+    /// `select 1;;` sent `;` after the query, and `;` on a line of its own
+    /// went with the next statement.
+    #[test]
+    fn lone_semicolons_are_no_statements() {
+        let settings = pythia_config::Settings::default();
+        for dialect in [
+            pythia_db::Dialect::ORACLE,
+            pythia_db::Dialect::MYSQL,
+            pythia_db::Dialect::POSTGRES,
+            pythia_db::Dialect::SQLSERVER,
+            pythia_db::Dialect::SQLITE,
+        ] {
+            let cx = DocContext {
+                dialect,
+                ..test_cx(&settings, false)
+            };
+            let mut w = SqlWindow::new("t".into(), "select 1;;".into());
+            let sql: Vec<String> = sent(&w.execute(false, &cx))
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect();
+            assert_eq!(sql, ["select 1"], "{dialect:?}");
+
+            let mut w = SqlWindow::new("t".into(), ";".into());
+            assert!(sent(&w.execute(false, &cx)).is_empty(), "{dialect:?}");
+            let said: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+            assert_eq!(said, ["Nothing to execute"], "{dialect:?}");
+        }
+    }
+
     /// Explain plan of a selection without a statement says so, as Execute
     /// does, and a lone `;` is none (#273). `&name` is replaced only where
     /// the window substitutes, as for Execute and Profile.

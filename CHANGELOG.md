@@ -734,6 +734,11 @@ All notable changes to Pythia are documented here. The format follows
   (#318). Each statement went through the whole history, 2,000 entries,
   and since #291 a frame hands over up to 1,000: 17 ms of every such
   frame went to it. The order and the counts stay as they were.
+- A `;` with no statement before it, as in `select 1;;` or on a line of
+  its own, is no statement (#313). It was sent to the database, alone or
+  with the next statement: MySQL answered ERROR 1065 or 1064, Oracle
+  ORA-00900 and SQLite "bad parameter or other API misuse", which
+  stopped the script; PostgreSQL and SQL Server said "; executed".
 
 ## [0.10.0] - 2026-10-30
 

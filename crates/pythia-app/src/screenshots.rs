@@ -7279,6 +7279,68 @@ fn closed_case(h: &mut Ui, connection: &str, rows: &str, oracle: bool) {
     h.run_steps(2);
 }
 
+/// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
+/// database, which failed on MySQL (ERROR 1065), Oracle (ORA-00900) and
+/// SQLite and stopped the script, and said "; executed" on PostgreSQL and
+/// SQL Server; a `;` on a line of its own went with the next statement,
+/// which failed on MySQL and Oracle. SQLite, and the servers whose test
+/// databases are set.
+#[test]
+fn lone_semicolons_are_skipped() {
+    use pythia_config::DbKind;
+    let script = |from_dual: &str| {
+        format!("select 1{from_dual};;\nselect 2{from_dual};\n;\nselect 3{from_dual};")
+    };
+    let check = |h: &mut Ui, connection: &str, from_dual: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        assert_eq!(
+            run_in_window(h, &script(from_dual)).as_deref(),
+            Some("3"),
+            "{connection}"
+        );
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(w.state.results.len(), 3, "{connection}: {messages:?}");
+        assert!(
+            messages.iter().all(|m| m.contains("1 row selected")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(h, ";\n");
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(messages, ["Nothing to execute"], "{connection}");
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    };
+    let (mut h, _file) = sqlite_file("r66_semicolons.db");
+    check(&mut h, "r66_semicolons.db", "");
+    drop(h);
+    for (env, kind) in [
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql),
+        ("PYTHIA_TEST_POSTGRES", DbKind::Postgres),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer),
+    ] {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        check(&mut h, &connection, "");
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    check(&mut h, &connection, " from dual");
+}
+
 /// Clicks Fetch all on result `index` and waits for its rows; false if the
 /// result doesn't offer it.
 fn fetch_all(h: &mut Ui, index: usize) -> bool {
