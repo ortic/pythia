@@ -1546,6 +1546,208 @@ fn selective_xml_indexes() {
     h.ok("drop table r63_sx");
 }
 
+/// The indexes of the tables in `owner` whose names start with `prefix`,
+/// with their options and storage, and how each partition is compressed,
+/// as the catalog has them.
+fn catalog_storage(h: &mut Harness, owner: &str, prefix: &str, xml: bool) -> Vec<String> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%'"
+    );
+    let xml_compression = if xml { "p.xml_compression_desc" } else { "''" };
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, l.name), '; ') within group (order by t.name) \
+               from sys.tables t left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(x.line collate database_default, '; ') within group (order by x.line) \
+               from (select concat_ws(' ', object_name(i.object_id), i.name, \
+                                      i.type_desc collate database_default, i.fill_factor, \
+                                      i.is_padded, i.ignore_dup_key, i.allow_row_locks, \
+                                      i.allow_page_locks, i.optimize_for_sequential_key, \
+                                      i.compression_delay, s.no_recompute, s.is_incremental, \
+                                      d.name, c.columns) as line \
+                       from sys.indexes i \
+                       left join sys.stats s on s.object_id = i.object_id and s.stats_id = i.index_id \
+                       left join sys.data_spaces d on d.data_space_id = i.data_space_id \
+                      outer apply (select string_agg(col_name(ic.object_id, ic.column_id) \
+                                                     + ' ' + cast(ic.key_ordinal as varchar(3)) \
+                                                     + ' ' + cast(ic.partition_ordinal as varchar(3)) \
+                                                     + ' ' + cast(ic.is_included_column as varchar(3)), \
+                                                     ',') \
+                                            within group (order by ic.index_column_id) as columns \
+                                     from sys.index_columns ic \
+                                    where ic.object_id = i.object_id \
+                                      and ic.index_id = i.index_id) c \
+                      where i.object_id in ({tables})) x"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(p.object_id), i.name, p.partition_number, \
+                                         p.data_compression_desc, {xml_compression}) \
+                                 collate database_default, '; ') \
+                      within group (order by object_name(p.object_id), i.name, p.partition_number) \
+               from sys.partitions p join sys.indexes i on i.object_id = p.object_id \
+                and i.index_id = p.index_id \
+              where p.object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .filter_map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A table's DDL has its indexes' options where they aren't the defaults,
+/// their compression, also by partition, and the filegroup or partition
+/// scheme of the table, its indexes and its LOB data (#315): run in another
+/// schema, it makes the same indexes, stored alike. An index on a partition
+/// scheme has the partitioning column, which isn't one of its columns.
+#[test]
+fn index_options_and_storage() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(
+        &mut dba,
+        "r63_opts",
+        &[
+            "alter database [{db}] add filegroup [r63_fg]",
+            "declare @path nvarchar(400) = \
+               cast(serverproperty('InstanceDefaultDataPath') as nvarchar(400)) + '{db}_fg.ndf'; \
+             exec('alter database [{db}] add file (name = [{db}_fg], filename = ''' \
+                  + @path + ''') to filegroup [r63_fg]')",
+        ],
+    );
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // OPTIMIZE_FOR_SEQUENTIAL_KEY came with SQL Server 2019, XML_COMPRESSION
+    // with 2022.
+    let (sequential, xml) = (major >= 15, major >= 16);
+    let sequential_key = if sequential {
+        ", optimize_for_sequential_key = on"
+    } else {
+        ""
+    };
+    h.ok(
+        "create table r63_o (id int not null, a int, b varchar(10), d varchar(max), \
+           constraint r63_o_pk primary key clustered (id) \
+             with (fillfactor = 80, pad_index = on, data_compression = page) on [r63_fg], \
+           constraint r63_o_a unique (a) \
+             with (ignore_dup_key = on, allow_row_locks = off, statistics_norecompute = on) \
+             on [primary]) \
+         on [r63_fg] textimage_on [primary]",
+    );
+    h.ok(&format!(
+        "create index r63_o_b on r63_o (b) \
+         with (allow_page_locks = off{sequential_key}, data_compression = row) on [r63_fg]"
+    ));
+    for sql in [
+        "create partition function r63_pf (int) as range right for values (10, 20)",
+        "create partition scheme r63_ps as partition r63_pf to ([primary], [r63_fg], [primary])",
+        "create index r63_o_plain on r63_o (b, a)",
+        "create table r63_h (id int, v int) on [r63_fg] with (data_compression = row)",
+        "create table r63_p (id int not null, v int, w int) on r63_ps (id)",
+        "create index r63_p_v on r63_p (v) include (w) \
+         with (data_compression = page on partitions (1, 3), \
+               data_compression = row on partitions (2), statistics_incremental = on)",
+        "create unique index r63_p_id on r63_p (id desc) on [primary]",
+        "create table r63_c (id int not null, v int) on r63_ps (id)",
+        "create clustered columnstore index r63_c_cs on r63_c \
+         with (data_compression = columnstore_archive on partitions (2, 3), \
+               compression_delay = 5) \
+         on r63_ps (id)",
+        "create table r63_g (id int constraint r63_g_pk primary key, shape geometry)",
+        "create spatial index r63_g_s on r63_g (shape) using geometry_auto_grid \
+         with (bounding_box = (0, 0, 10, 10), fillfactor = 60, pad_index = on) on [r63_fg]",
+    ] {
+        h.ok(sql);
+    }
+    if xml {
+        h.ok("create table r63_x (id int, doc xml) with (xml_compression = on)");
+    }
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "dbo".into(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let mut tables = vec!["r63_o", "r63_h", "r63_p", "r63_c", "r63_g"];
+    if xml {
+        tables.push("r63_x");
+    }
+    let ddls: Vec<String> = tables.iter().map(|t| ddl(&mut h, t)).collect();
+    let mut lines = vec![
+        "    constraint [r63_o_pk] primary key clustered ([id]) \
+         with (pad_index = on, fillfactor = 80, data_compression = page),"
+            .to_owned(),
+        "    constraint [r63_o_a] unique nonclustered ([a]) \
+         with (ignore_dup_key = on, statistics_norecompute = on, allow_row_locks = off) \
+         on [PRIMARY]\n) on [r63_fg] textimage_on [PRIMARY];"
+            .to_owned(),
+        format!(
+            "create nonclustered index [r63_o_b] on [dbo].[r63_o] ([b]) \
+             with (allow_page_locks = off{sequential_key}, data_compression = row);"
+        ),
+        "create nonclustered index [r63_o_plain] on [dbo].[r63_o] ([b], [a]);".to_owned(),
+        ") on [r63_fg] with (data_compression = row);".to_owned(),
+        ") on [r63_ps] ([id]);".to_owned(),
+        "create unique nonclustered index [r63_p_id] on [dbo].[r63_p] ([id] desc) on [PRIMARY];"
+            .to_owned(),
+        "create nonclustered index [r63_p_v] on [dbo].[r63_p] ([v]) include ([w]) \
+         with (statistics_incremental = on, data_compression = page on partitions (1, 3), \
+         data_compression = row on partitions (2));"
+            .to_owned(),
+        "create clustered columnstore index [r63_c_cs] on [dbo].[r63_c] \
+         with (compression_delay = 5, data_compression = columnstore_archive on partitions (2 to 3));"
+            .to_owned(),
+        "create spatial index [r63_g_s] on [dbo].[r63_g] ([shape]) using geometry_auto_grid \
+         with (bounding_box = (0, 0, 10, 10), cells_per_object = 8, pad_index = on, \
+         fillfactor = 60) on [r63_fg];"
+            .to_owned(),
+    ];
+    if xml {
+        lines.push(") with (xml_compression = on);".to_owned());
+    }
+    let all = ddls.join("\n");
+    for line in lines {
+        assert!(all.contains(&line), "{line}\n{all}");
+    }
+    // Indexes leaves out the partitioning column an index on a partition
+    // scheme has too.
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: "dbo".into(),
+        name: "r63_p".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let p_v = rows
+        .iter()
+        .find(|r| r[0].as_deref() == Some("r63_p_v"))
+        .expect("r63_p_v");
+    assert_eq!(
+        (p_v[3].as_deref(), p_v[4].as_deref()),
+        (Some("v"), Some("w"))
+    );
+    let before = catalog_storage(&mut h, "dbo", "r63_", xml);
+    h.ok("create schema r63_copy");
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, "dbo", "r63_copy", &tables);
+    }
+    assert_eq!(catalog_storage(&mut h, "r63_copy", "r63_", xml), before);
+    drop(h);
+    drop_database(&mut dba, "r63_opts");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();

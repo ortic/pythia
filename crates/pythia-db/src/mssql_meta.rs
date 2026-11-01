@@ -39,6 +39,12 @@ const COLUMN_TYPE: &str = "case when t.name in ('varchar', 'char', 'varbinary', 
                                   then t.name + '(' + cast(c.scale as varchar(10)) + ')' \
                                 else t.name end";
 
+/// Whether `sys.index_columns ic` is a column the index was made with: on a
+/// partition scheme, an index has the partitioning column too, neither a
+/// key nor an included column, unless it was given (#315).
+const INDEX_COLUMN: &str = "not (ic.key_ordinal = 0 and ic.is_included_column = 0 \
+                                 and ic.partition_ordinal > 0)";
+
 pub(crate) fn run(ms: &mut Ms<'_>, query: &MetaQuery) -> Result<MetaResult, DbError> {
     Ok(match query {
         MetaQuery::Schemas => MetaResult::Schemas(
@@ -306,16 +312,18 @@ fn details(
     // columns and INCLUDE columns, a key's columns, a trigger's events.
     // Every column of a columnstore index (types 5 and 6) counts as
     // included: they are its columns, not INCLUDE columns (#252).
-    let (lists, filled): (&str, &[(usize, &str)]) = match detail {
+    let (lists, filled): (String, &[(usize, &str)]) = match detail {
         Detail::Indexes => (
-            "select i.name, case when ic.is_included_column = 0 or i.type in (5, 6) \
+            format!(
+                "select i.name, case when ic.is_included_column = 0 or i.type in (5, 6) \
                                  then 'columns' else 'include' end, \
                     col_name(ic.object_id, ic.column_id) \
                       + case when ic.is_descending_key = 1 then ' DESC' else '' end \
                from sys.indexes i \
                join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
-              where i.object_id = object_id(@P1) and i.type > 0 \
-              order by ic.key_ordinal, ic.index_column_id",
+              where i.object_id = object_id(@P1) and i.type > 0 and {INDEX_COLUMN} \
+              order by ic.key_ordinal, ic.index_column_id"
+            ),
             &[(3, "columns"), (4, "include")],
         ),
         Detail::Constraints => (
@@ -330,20 +338,22 @@ fn details(
                from sys.foreign_keys f \
                join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
               where f.parent_object_id = object_id(@P1) \
-              order by 4",
+              order by 4"
+                .to_owned(),
             &[(2, "columns")],
         ),
         Detail::Triggers => (
             "select t.name, 'events', e.type_desc \
                from sys.triggers t join sys.trigger_events e on e.object_id = t.object_id \
               where t.parent_id = object_id(@P1) \
-              order by e.type",
+              order by e.type"
+                .to_owned(),
             &[(1, "events")],
         ),
-        _ => ("", &[]),
+        _ => (String::new(), &[]),
     };
     if !filled.is_empty() {
-        let lists = Lists::read(ms, lists, &object)?;
+        let lists = Lists::read(ms, &lists, &object)?;
         for row in &mut rows {
             let Some(name) = row.first().cloned().flatten() else {
                 continue;
@@ -516,17 +526,49 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
-    // A memory-optimized table's durability (#302). CREATE INDEX can't make
-    // its indexes: they are declared in CREATE TABLE.
-    let durability = ms
+    // A memory-optimized table's durability (#302): CREATE INDEX can't make
+    // its indexes, they are declared in CREATE TABLE. Its LOB data's
+    // filegroup where it isn't the table's, and whether the table is a heap
+    // (0) or its clustered index (1) holds its rows (#315).
+    let table = ms
         .rows(
-            "select lower(durability_desc collate database_default) from sys.tables \
-              where object_id = object_id(@P1) and is_memory_optimized = 1",
+            "select case when t.is_memory_optimized = 1 \
+                         then lower(t.durability_desc collate database_default) end, \
+                    case when t.lob_data_space_id not in (0, i.data_space_id) \
+                         then quotename(l.name) end, \
+                    i.index_id \
+               from sys.tables t \
+               join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
+               left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
+              where t.object_id = object_id(@P1)",
             &[object],
         )?
         .into_iter()
-        .find_map(first);
-    let options = index_options(ms, object)?;
+        .next()
+        .unwrap_or_default();
+    let mut table = table.into_iter();
+    let (durability, textimage, rows_in) = (
+        table.next().flatten(),
+        table.next().flatten(),
+        table.next().flatten().unwrap_or_default(),
+    );
+    // Catalog columns of later versions: a columnstore index's ORDER
+    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019) and XML_COMPRESSION (2022).
+    let later = ms
+        .rows(
+            "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
+                    col_length('sys.indexes', 'optimize_for_sequential_key'), \
+                    col_length('sys.partitions', 'xml_compression')",
+            &[],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    let storage = index_storage(ms, object, has(1), has(2))?;
+    let no_storage = Storage::default();
+    let storage_of = |index: &str| storage.get(index).unwrap_or(&no_storage);
+    let table_storage = storage_of(&rows_in);
     // A key's columns, a foreign key's and the ones it references, and the
     // columns of the indexes, quoted, as lists (see Lists).
     let lists = Lists::read(
@@ -560,7 +602,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
            select k.name, 'constraint ' + quotename(k.name) \
                   + case k.type when 'PK' then ' primary key ' else ' unique ' end \
                   + lower(i.type_desc collate database_default) as line, \
-                  null as refs, '' as actions, i.name as ix, \
+                  null as refs, '' as actions, i.index_id as ix, \
                   case k.type when 'PK' then 1 else 2 end as ord \
              from sys.key_constraints k \
              join sys.indexes i on i.object_id = k.parent_object_id and i.index_id = k.unique_index_id \
@@ -592,10 +634,11 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         let references = refs
             .map(|refs| format!("{refs}{}", lists.clause(" ", &name, "references")))
             .unwrap_or_default();
-        let with = index
-            .and_then(|index| options.get(&index))
-            .map_or("", String::as_str);
-        Some(format!("{line}{columns}{references}{actions}{with}"))
+        let storage = index.map(|index| storage_of(&index).clauses(&[], table_storage));
+        Some(format!(
+            "{line}{columns}{references}{actions}{}",
+            storage.unwrap_or_default()
+        ))
     });
     let mut lines: Vec<String> = columns
         .into_iter()
@@ -610,15 +653,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // primary one it uses, and a columnstore index's ORDER, which SQL
     // Server has from 2022 (#265). A selective XML index has its
     // namespaces and paths, a secondary one the path it is on (#311).
-    let ordered = ms
-        .rows(
-            "select col_length('sys.index_columns', 'column_store_order_ordinal')",
-            &[],
-        )?
-        .into_iter()
-        .find_map(first)
-        .is_some();
-    let order = if ordered {
+    let order = if has(0) {
         "union all \
          select i.name, 'order', quotename(col_name(ic.object_id, ic.column_id)), \
                 ic.column_store_order_ordinal, 0 \
@@ -641,7 +676,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                     ic.key_ordinal, ic.index_column_id \
                from sys.indexes i \
                join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
-              where i.object_id = object_id(@P1) \
+              where i.object_id = object_id(@P1) and {INDEX_COLUMN} \
              {order} \
              union all \
              select i.name, 'namespaces', \
@@ -688,7 +723,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // index's USING, its WHERE) and a spatial index's tessellation. Hash
     // indexes (7) are a memory-optimized table's (#302).
     let rows = ms.rows(
-        "select i.name, quotename(i.name), case when i.is_unique = 1 then 'unique ' else '' end, \
+        "select i.index_id, i.name, quotename(i.name), \
+                case when i.is_unique = 1 then 'unique ' else '' end, \
                 case x.xml_index_type when 0 then 'primary xml' when 2 then 'selective xml' \
                      else lower(i.type_desc collate database_default) end, \
                 coalesce(' using xml index ' + quotename(u.name) + ' for ' \
@@ -719,7 +755,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     for row in rows {
         let mut values = row.into_iter();
         let mut next = || values.next().flatten();
-        let (Some(name), Some(quoted)) = (next(), next()) else {
+        let (Some(id), Some(name), Some(quoted)) = (next(), next(), next()) else {
             continue;
         };
         let kind = format!(
@@ -729,26 +765,41 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         );
         let (using, filter) = (next().unwrap_or_default(), next().unwrap_or_default());
         let spatial: Vec<Cell> = values.collect();
+        let (scheme, spatial) = spatial_options(&spatial);
         let columns = lists.clause(" ", &name, "columns");
-        let with = options.get(&name).map_or("", String::as_str);
+        let storage = storage_of(&id).clauses(&spatial, table_storage);
         if durability.is_some() {
-            lines.push(format!("index {quoted} {kind}{columns}{with}"));
+            lines.push(format!("index {quoted} {kind}{columns}{storage}"));
             continue;
         }
         indexes.push(format!(
-            "create {kind} index {quoted} on {object}{columns}{}{}{}{using}{}{filter}{}{with};",
+            "create {kind} index {quoted} on {object}{columns}{}{}{}{using}{}{filter}{scheme}\
+             {storage};",
             lists.clause(" with xmlnamespaces ", &name, "namespaces"),
             lists.clause(" for ", &name, "paths"),
             lists.clause(" include ", &name, "include"),
             lists.clause(" order ", &name, "order"),
-            spatial_options(&spatial)
         ));
     }
+    // The table's filegroup or partition scheme, and its LOB data's, then
+    // its options: a memory-optimized table's, a heap's compression.
     let mut ddl = format!("create table {object} (\n    {}\n)", lines.join(",\n    "));
+    if let Some(on) = table_storage.on.as_ref().filter(|_| !table_storage.default) {
+        ddl.push_str(&format!(" on {on}"));
+    }
+    if let Some(textimage) = textimage {
+        ddl.push_str(&format!(" textimage_on {textimage}"));
+    }
+    let mut options = Vec::new();
     if let Some(durability) = durability {
-        ddl.push_str(&format!(
-            " with (memory_optimized = on, durability = {durability})"
-        ));
+        options.push("memory_optimized = on".to_owned());
+        options.push(format!("durability = {durability}"));
+    }
+    if rows_in == "0" {
+        options.extend(table_storage.options.iter().cloned());
+    }
+    if !options.is_empty() {
+        ddl.push_str(&format!(" with ({})", options.join(", ")));
     }
     ddl.push(';');
     for index in indexes {
@@ -757,39 +808,230 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     Ok(ddl)
 }
 
-/// Each index's options as ` with (…)`, by the index's name: a hash
-/// index's bucket count (#302).
-fn index_options(ms: &mut Ms<'_>, object: &str) -> Result<HashMap<String, String>, DbError> {
-    let rows = ms.rows(
-        "select i.name, cast(h.bucket_count as varchar(20)) \
-           from sys.indexes i \
-           left join sys.hash_indexes h on h.object_id = i.object_id and h.index_id = i.index_id \
-          where i.object_id = object_id(@P1) and i.name is not null",
-        &[object],
-    )?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let mut values = row.into_iter();
-            let name = values.next().flatten()?;
-            let mut options = Vec::new();
-            if let Some(buckets) = values.next().flatten() {
-                options.push(format!("bucket_count = {buckets}"));
-            }
-            (!options.is_empty()).then(|| (name, format!(" with ({})", options.join(", "))))
-        })
-        .collect())
+/// What an index has that isn't the default: its options, for `with (…)`,
+/// and the filegroup or partition scheme it is on (`[ps] ([column])`), and
+/// whether that is the database's default filegroup.
+#[derive(Default)]
+struct Storage {
+    options: Vec<String>,
+    on: Option<String>,
+    default: bool,
 }
 
-/// `USING … WITH (…)` of a spatial index from its tessellation: the scheme,
+impl Storage {
+    /// ` with (…)`, `first` before the index's options, and ` on …` where
+    /// the index isn't on `table`'s filegroup or partition scheme, where
+    /// CREATE INDEX puts it.
+    fn clauses(&self, first: &[String], table: &Storage) -> String {
+        let options: Vec<&str> = first
+            .iter()
+            .chain(&self.options)
+            .map(String::as_str)
+            .collect();
+        let mut clauses = String::new();
+        if !options.is_empty() {
+            clauses.push_str(&format!(" with ({})", options.join(", ")));
+        }
+        if let Some(on) = self.on.as_ref().filter(|&on| table.on.as_ref() != Some(on)) {
+            clauses.push_str(&format!(" on {on}"));
+        }
+        clauses
+    }
+}
+
+/// Each index's storage, by its index_id: a hash index's bucket count
+/// (#302), the options of CREATE INDEX that aren't the defaults, its
+/// compression, by partition where they differ, and its filegroup or
+/// partition scheme (#315). Columnstore indexes and a memory-optimized
+/// table's take no rowstore options (their locks read as off), an XML
+/// index no filegroup, a heap only its compression and filegroup.
+/// `sequential` and `xml` tell whether the catalog has
+/// OPTIMIZE_FOR_SEQUENTIAL_KEY (2019) and XML_COMPRESSION (2022).
+fn index_storage(
+    ms: &mut Ms<'_>,
+    object: &str,
+    sequential: bool,
+    xml: bool,
+) -> Result<HashMap<String, Storage>, DbError> {
+    let sequential = if sequential {
+        "i.optimize_for_sequential_key"
+    } else {
+        "0"
+    };
+    let rows = ms.rows(
+        &format!(
+            "select i.index_id, i.type, tb.is_memory_optimized, h.bucket_count, i.is_padded, \
+                    i.fill_factor, i.ignore_dup_key, st.no_recompute, st.is_incremental, \
+                    i.allow_row_locks, i.allow_page_locks, {sequential}, i.compression_delay, \
+                    case when i.type <> 3 and i.data_space_id <> 0 \
+                         then quotename(d.name) + coalesce(' (' + quotename(pc.name) + ')', '') end, \
+                    case when i.data_space_id = (select f.data_space_id from sys.filegroups f \
+                                                  where f.is_default = 1 and f.type = 'FG') \
+                         then 1 else 0 end \
+               from sys.indexes i \
+               join sys.tables tb on tb.object_id = i.object_id \
+               left join sys.hash_indexes h on h.object_id = i.object_id and h.index_id = i.index_id \
+               left join sys.stats st on st.object_id = i.object_id and st.stats_id = i.index_id \
+               left join sys.data_spaces d on d.data_space_id = i.data_space_id \
+              outer apply (select col_name(ic.object_id, ic.column_id) as name \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                              and ic.partition_ordinal = 1) pc \
+              where i.object_id = object_id(@P1)"
+        ),
+        &[object],
+    )?;
+    let xml = if xml {
+        "lower(p.xml_compression_desc)"
+    } else {
+        "'off'"
+    };
+    let mut partitions: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
+    for row in ms.rows(
+        &format!(
+            "select p.index_id, p.partition_number, lower(p.data_compression_desc), {xml} \
+               from sys.partitions p where p.object_id = object_id(@P1) \
+              order by p.index_id, p.partition_number"
+        ),
+        &[object],
+    )? {
+        let mut values = row.into_iter().map(Option::unwrap_or_default);
+        let (Some(index), Some(number)) = (values.next(), values.next()) else {
+            continue;
+        };
+        let (data, xml) = (
+            values.next().unwrap_or_default(),
+            values.next().unwrap_or_default(),
+        );
+        partitions
+            .entry(index)
+            .or_default()
+            .push((number.parse().unwrap_or_default(), data, xml));
+    }
+    let mut storage = HashMap::new();
+    for row in rows {
+        let get = |i: usize| row.get(i).cloned().flatten();
+        let on = |i: usize| get(i).as_deref() == Some("1");
+        let off = |i: usize| get(i).as_deref() == Some("0");
+        let Some(id) = get(0) else {
+            continue;
+        };
+        let kind = get(1).unwrap_or_default();
+        let memory_optimized = on(2);
+        let columnstore = matches!(kind.as_str(), "5" | "6");
+        let mut options = Vec::new();
+        if let Some(buckets) = get(3) {
+            options.push(format!("bucket_count = {buckets}"));
+        }
+        if !memory_optimized && !columnstore && kind != "0" {
+            if on(4) {
+                options.push("pad_index = on".to_owned());
+            }
+            if let Some(fill) = get(5).filter(|f| f != "0") {
+                options.push(format!("fillfactor = {fill}"));
+            }
+            if on(6) {
+                options.push("ignore_dup_key = on".to_owned());
+            }
+            // An XML index takes no statistics options.
+            if on(7) && kind != "3" {
+                options.push("statistics_norecompute = on".to_owned());
+            }
+            if on(8) && kind != "3" {
+                options.push("statistics_incremental = on".to_owned());
+            }
+            if off(9) {
+                options.push("allow_row_locks = off".to_owned());
+            }
+            if off(10) {
+                options.push("allow_page_locks = off".to_owned());
+            }
+            if on(11) {
+                options.push("optimize_for_sequential_key = on".to_owned());
+            }
+        }
+        if let Some(delay) = get(12).filter(|d| d != "0") {
+            options.push(format!("compression_delay = {delay}"));
+        }
+        if !memory_optimized && let Some(parts) = partitions.get(&id) {
+            let data: Vec<(u32, &str)> = parts.iter().map(|(n, d, _)| (*n, d.as_str())).collect();
+            let default = if columnstore { "columnstore" } else { "none" };
+            options.extend(by_partition("data_compression", &data, default));
+            let xml: Vec<(u32, &str)> = parts.iter().map(|(n, _, x)| (*n, x.as_str())).collect();
+            options.extend(by_partition("xml_compression", &xml, "off"));
+        }
+        storage.insert(
+            id,
+            Storage {
+                options,
+                on: get(13),
+                default: on(14),
+            },
+        );
+    }
+    Ok(storage)
+}
+
+/// `name = value` where partitions have a value that isn't `default`: one
+/// for all of them alike, else each value `on partitions (…)`.
+fn by_partition(name: &str, partitions: &[(u32, &str)], default: &str) -> Vec<String> {
+    let Some(&(_, first)) = partitions.first() else {
+        return Vec::new();
+    };
+    if partitions.iter().all(|&(_, value)| value == first) {
+        return if first == default {
+            Vec::new()
+        } else {
+            vec![format!("{name} = {first}")]
+        };
+    }
+    let mut values: Vec<&str> = Vec::new();
+    for &(_, value) in partitions {
+        if value != default && !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let numbers: Vec<u32> = partitions
+                .iter()
+                .filter(|&&(_, v)| v == value)
+                .map(|&(n, _)| n)
+                .collect();
+            format!("{name} = {value} on partitions ({})", ranges(&numbers))
+        })
+        .collect()
+}
+
+/// Partition numbers in order as `1, 3 to 5`.
+fn ranges(numbers: &[u32]) -> String {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < numbers.len() {
+        let mut j = i;
+        while j + 1 < numbers.len() && numbers[j + 1] == numbers[j] + 1 {
+            j += 1;
+        }
+        ranges.push(if j > i {
+            format!("{} to {}", numbers[i], numbers[j])
+        } else {
+            numbers[i].to_string()
+        });
+        i = j + 1;
+    }
+    ranges.join(", ")
+}
+
+/// ` using …` of a spatial index and its options from its tessellation:
 /// the bounding box, the grids' four levels and the cells per object, each
 /// where it has one; nothing for other indexes.
-fn spatial_options(values: &[Cell]) -> String {
+fn spatial_options(values: &[Cell]) -> (String, Vec<String>) {
     let [scheme, xmin, ymin, xmax, ymax, l1, l2, l3, l4, cells] = values else {
-        return String::new();
+        return Default::default();
     };
     let Some(scheme) = scheme else {
-        return String::new();
+        return Default::default();
     };
     let mut options = Vec::new();
     if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (xmin, ymin, xmax, ymax) {
@@ -803,11 +1045,7 @@ fn spatial_options(values: &[Cell]) -> String {
     if let Some(cells) = cells {
         options.push(format!("cells_per_object = {cells}"));
     }
-    if options.is_empty() {
-        format!(" using {scheme}")
-    } else {
-        format!(" using {scheme} with ({})", options.join(", "))
-    }
+    (format!(" using {scheme}"), options)
 }
 
 /// The plan of `sql` from `SET SHOWPLAN_ALL`: the server compiles the
@@ -962,6 +1200,50 @@ fn object_name(object: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_by_partition() {
+        assert_eq!(ranges(&[1, 3, 4, 5, 7, 8]), "1, 3 to 5, 7 to 8");
+        assert_eq!(ranges(&[2]), "2");
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            by_partition("data_compression", &[(1, "none"), (2, "none")], "none"),
+            none
+        );
+        assert_eq!(
+            by_partition("data_compression", &[(1, "page"), (2, "page")], "none"),
+            ["data_compression = page"]
+        );
+        assert_eq!(
+            by_partition(
+                "data_compression",
+                &[
+                    (1, "page"),
+                    (2, "row"),
+                    (3, "page"),
+                    (4, "none"),
+                    (5, "row")
+                ],
+                "none"
+            ),
+            [
+                "data_compression = page on partitions (1, 3)",
+                "data_compression = row on partitions (2, 5)"
+            ]
+        );
+        assert_eq!(
+            by_partition(
+                "data_compression",
+                &[
+                    (1, "columnstore"),
+                    (2, "columnstore_archive"),
+                    (3, "columnstore_archive")
+                ],
+                "columnstore"
+            ),
+            ["data_compression = columnstore_archive on partitions (2 to 3)"]
+        );
+    }
 
     #[test]
     fn plan_arguments() {

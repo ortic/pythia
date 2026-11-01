@@ -652,6 +652,19 @@ All notable changes to Pythia are documented here. The format follows
   maxlength(20)`, `singleton`), and the secondary ones on their paths.
   They were left out, so that run elsewhere the DDL made a table whose
   XML queries had no index to use.
+- SQL Server: a table's DDL has its indexes' and keys' options where
+  they aren't the defaults (#315): `ignore_dup_key = on`, `fillfactor`,
+  `pad_index`, `allow_row_locks = off`, `allow_page_locks = off`,
+  `statistics_norecompute`, `statistics_incremental`,
+  `optimize_for_sequential_key`, `compression_delay`, and their
+  `data_compression` and `xml_compression`, by partition where they
+  differ. The table, its indexes and its LOB data keep their filegroup
+  or partition scheme (`on [fg2]`, `on [ps] ([id])`, `textimage_on`), and
+  a heap its compression. They were left out, so that run elsewhere a
+  key that ignored duplicates rejected them, and tables and indexes were
+  made uncompressed and unpartitioned on the default filegroup. An index
+  on a partition scheme no longer gets the partitioning column as its
+  first column, in the DDL and in *Indexes*.
 
 ## [0.10.0] - 2026-10-30
 
