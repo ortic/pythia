@@ -1438,3 +1438,128 @@ fn oracle_binary_floats_find_their_rows() {
     assert_eq!(again, [values, copies].concat());
     conn.execute("drop table r76_floats purge", &[]).unwrap();
 }
+
+/// A fetched row's JSON and VECTOR can be changed, to NULL too, and new
+/// rows take them (#340): the UPDATE checked the value fetched with DECODE,
+/// which fails with ORA-40796 on JSON and ORA-00932 on a VECTOR. JSON is
+/// checked with `json_equal`, which finds the value fetched (its keys in
+/// another order) and not another; a VECTOR, which Oracle can't compare
+/// (ORA-22848), is left out of the check.
+#[test]
+fn oracle_json_and_vectors_of_fetched_rows() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r76_json purge", &[]);
+    for sql in [
+        "create table r76_json (id number primary key, j json, v vector(3, float32))",
+        r#"insert into r76_json values (1, '{"b":1,"a":[1,2.5,"x"],"c":"H&L"}', '[1,2,3]')"#,
+        r#"insert into r76_json values (2, '"text"', '[0.5,-2,4]')"#,
+        "insert into r76_json values (3, 'null', null)",
+        "insert into r76_json (id) values (4)",
+        // The window's session applies the changes.
+        "commit",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        fetched
+    };
+    let edit = Editable {
+        table: "r76_json".into(),
+        source: "select * from r76_json order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    assert_eq!(columns[1].type_name, "JSON");
+    assert_eq!(columns[2].type_name, "VECTOR");
+    assert_eq!(
+        rows[0][1].as_deref(),
+        Some(r#"{"a":[1,2.5,"x"],"b":1,"c":"H&L"}"#)
+    );
+
+    // The check of each JSON finds its row's value, and not another's.
+    for (r, row) in rows.iter().enumerate() {
+        let rowid = row[3].as_deref().unwrap();
+        for (other, value) in rows.iter().map(|row| row[1].as_deref()).enumerate() {
+            let check = same(Dialect::ORACLE, "J", &columns[1], value).unwrap();
+            let sql = format!("select count(*) from r76_json where rowid = '{rowid}' and {check}");
+            let count = fetch(&sql).1[0][0].clone().unwrap();
+            assert_eq!(count, if other == r { "1" } else { "0" }, "{sql}");
+        }
+        assert_eq!(
+            same(Dialect::ORACLE, "V", &columns[2], row[2].as_deref()),
+            None
+        );
+    }
+
+    // As the window runs them.
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let mut apply = |changes: &Changes| {
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, changes) {
+            let ran = db.apply(&statement);
+            assert!(
+                matches!(ran, Ok(Ran::Done(Some(1)))),
+                "{ran:?}\n{}",
+                statement.sql
+            );
+        }
+    };
+    // Each value set to itself, one UPDATE at a time.
+    for (r, row) in rows.iter().enumerate() {
+        for c in [1, 2] {
+            apply(&Changes {
+                updates: BTreeMap::from([(r, BTreeMap::from([(c, row[c].clone())]))]),
+                ..Changes::default()
+            });
+        }
+    }
+    let (_, again) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    assert_eq!(again, rows);
+
+    // Then to others, the second row's to NULL, the third's from a file,
+    // which is bound (#293), and two new rows.
+    let new = |r: usize| (r != 1).then(|| (format!(r#"{{"row":{r}}}"#), format!("[{r},{r},{r}]")));
+    let mut changes = Changes::default();
+    for r in 0..rows.len() {
+        let (j, v) = new(r).unzip();
+        changes.updates.insert(r, BTreeMap::from([(1, j), (2, v)]));
+    }
+    changes.inserts = vec![
+        vec![
+            Some("11".into()),
+            Some(r#"{"new":[true,null]}"#.into()),
+            Some("[1.5,2.5,3.5]".into()),
+            None,
+        ],
+        vec![Some("12".into()), Some(r#""x""#.into()), None, None],
+    ];
+    let file = Loaded::Text(r#"{"file":[1,2]}"#.into());
+    changes.loaded.insert((RowRef::Existing(2), 1), file);
+    apply(&changes);
+    let (_, again) = fetch("select id, j, v from r76_json order by id");
+    let cells = |values: [Option<&str>; 3]| values.map(|v| v.map(str::to_owned)).to_vec();
+    assert_eq!(
+        again,
+        [
+            cells([Some("1"), Some(r#"{"row":0}"#), Some("[0,0,0]")]),
+            cells([Some("2"), None, None]),
+            cells([Some("3"), Some(r#"{"file":[1,2]}"#), Some("[2,2,2]")]),
+            cells([Some("4"), Some(r#"{"row":3}"#), Some("[3,3,3]")]),
+            cells([
+                Some("11"),
+                Some(r#"{"new":[true,null]}"#),
+                Some("[1.5,2.5,3.5]")
+            ]),
+            cells([Some("12"), Some(r#""x""#), None]),
+        ]
+    );
+    conn.execute("drop table r76_json purge", &[]).unwrap();
+}

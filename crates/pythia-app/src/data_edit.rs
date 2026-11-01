@@ -1021,11 +1021,15 @@ fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
 /// or BLOB is compared with `dbms_lob.compare` (an empty one by its
 /// length, as `''` is NULL), a LONG or LONG RAW is left out of the check.
 /// The pure-Rust driver types LOB columns LONG and LONG RAW, so they are
-/// left out there too.
+/// left out there too. Nor does DECODE take a JSON (ORA-40796) or a VECTOR
+/// (ORA-00932) (#340): a JSON is compared as JSON with `json_equal`, which
+/// takes the keys of an object in any order (Pythia shows them sorted); a
+/// VECTOR, which SQL doesn't compare, is left out.
 fn oracle_same(name: &str, col: &Column, value: Option<&str>, lit: &str) -> Option<String> {
     Some(match (col.type_name.as_str(), value) {
-        ("LONG" | "LONG RAW", _) => return None,
-        ("CLOB" | "NCLOB" | "BLOB", None) => format!("{name} is null"),
+        ("LONG" | "LONG RAW" | "VECTOR", _) => return None,
+        ("JSON", Some(_)) => format!("json_equal({name}, {lit})"),
+        ("CLOB" | "NCLOB" | "BLOB" | "JSON", None) => format!("{name} is null"),
         ("CLOB" | "NCLOB" | "BLOB", Some("")) => format!("dbms_lob.getlength({name}) = 0"),
         ("BLOB", Some(v)) if v.len() > 2 * HEX_LITERAL_BYTES => long_blob_same(name, v)?,
         ("CLOB" | "NCLOB" | "BLOB", Some(_)) => format!("dbms_lob.compare({name}, {lit}) = 0"),

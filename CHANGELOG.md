@@ -1042,6 +1042,12 @@ All notable changes to Pythia are documented here. The format follows
   or were written as 0 (`2e-300`), and the check of an infinity or NaN
   fetched compared it as text and reported the row as changed by
   another session.
+- Oracle: a fetched row's JSON or VECTOR can be changed in a result
+  (#340). *Apply* failed with ORA-40796 or ORA-00932: the UPDATE checked
+  the value fetched with DECODE, which takes neither. A JSON is now
+  checked with `json_equal`, which finds an object with its keys in
+  another order than Pythia shows them; a VECTOR, which SQL can't
+  compare, is left out of the check.
 
 ## [0.10.0] - 2026-10-30
 
