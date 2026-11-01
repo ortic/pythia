@@ -522,6 +522,13 @@ All notable changes to Pythia are documented here. The format follows
   and *Copy all* now write it in double quotes, as spreadsheets do, and
   *Paste* reads a cell in quotes as one value, also from a spreadsheet.
   Other text pastes as before.
+- The summary of a selection in a result being edited adds up what the
+  grid shows (#277). *Count*, *Sum*, *Avg*, *Min* and *Max* were of the
+  values fetched: a changed value counted with its old one, a cell set
+  to NULL still counted, a row to be deleted was added up, and with a
+  filter on, a new row's cells were those of a row the filter hid. They
+  now take the changes waiting for *Apply* and leave out the rows to be
+  deleted, and follow each change.
 
 ## [0.10.0] - 2026-10-30
 

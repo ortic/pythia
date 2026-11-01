@@ -41,6 +41,8 @@ pub struct GridState {
     order_revision: u64,
     /// The selection's summary, and what it was worked out for.
     summary: Option<(SummaryKey, Option<String>)>,
+    /// Counts the times the pending changes changed, for the summary.
+    changes_revision: u64,
     /// Selection anchor and cursor as (view row, column).
     anchor: Option<(usize, usize)>,
     cursor: Option<(usize, usize)>,
@@ -92,12 +94,14 @@ pub struct GridState {
 }
 
 /// What the summary of a selection was worked out for: the selection,
-/// the rows (where they are, how many) and their order.
+/// the rows (where they are, how many), their order and the pending
+/// changes (#277).
 #[derive(PartialEq)]
 struct SummaryKey {
     selection: Option<(RangeInclusive<usize>, Vec<usize>)>,
     rows: (usize, usize),
     order: u64,
+    changes: u64,
 }
 
 /// A header being dragged to another place.
@@ -369,6 +373,7 @@ impl GridState {
             selection: self.selection(columns.len()),
             rows: (rows.as_ptr().addr(), rows.len()),
             order: self.order_revision,
+            changes: self.changes_revision,
         };
         if let Some((kept, summary)) = &self.summary
             && *kept == key
@@ -499,6 +504,7 @@ impl GridState {
             locked,
             ..Editing::default()
         });
+        self.changes_revision += 1;
     }
 
     /// Keeps `columns` of the editable grid read-only, e.g. those that
@@ -535,6 +541,7 @@ impl GridState {
 
     pub fn set_read_only(&mut self) {
         self.edit = None;
+        self.changes_revision += 1;
     }
 
     pub fn is_editable(&self) -> bool {
@@ -564,6 +571,7 @@ impl GridState {
         if let Some(e) = &mut self.edit {
             e.changes = changes;
             e.undo.clear();
+            self.changes_revision += 1;
         }
     }
 
@@ -572,6 +580,7 @@ impl GridState {
             e.changes = Changes::default();
             e.undo.clear();
             e.active = None;
+            self.changes_revision += 1;
         }
     }
 
@@ -586,6 +595,7 @@ impl GridState {
         if edit.changes == before {
             return;
         }
+        self.changes_revision += 1;
         edit.undo.push(before);
         let mut cells = 0;
         let kept = edit
@@ -614,6 +624,7 @@ impl GridState {
             return;
         };
         edit.changes = before;
+        self.changes_revision += 1;
         // Rows inserted may be gone again.
         let last = self.view_len(rows).saturating_sub(1);
         for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
@@ -681,6 +692,14 @@ impl GridState {
                     *cell = value;
                 }
             }
+        }
+    }
+
+    /// Whether a view row is a fetched row marked for deletion.
+    fn to_delete(&self, view_row: usize) -> bool {
+        match (&self.edit, self.row_ref(view_row)) {
+            (Some(edit), RowRef::Existing(r)) => edit.changes.deletes.contains(&r),
+            _ => false,
         }
     }
 
@@ -2279,23 +2298,24 @@ fn quoted_cell(text: &str) -> Option<(String, &str)> {
     }
 }
 
+/// The count, sum, average, minimum and maximum of the selected cells as
+/// the grid shows them, with the changes waiting for Apply; rows to be
+/// deleted are left out, as Apply leaves them (#277).
 fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<String> {
     let (r, c) = state.selection(columns.len())?;
-    let cells = (r.end() - r.start() + 1) * c.len();
+    let shown: Vec<usize> = r.filter(|&vr| !state.to_delete(vr)).collect();
+    let cells = shown.len() * c.len();
     if cells < 2 {
         return None;
     }
     let mut numbers = Vec::new();
     let mut non_null = 0;
-    for vr in r {
-        let Some(row) = rows.get(state.row_index(vr)) else {
-            continue;
-        };
+    for vr in shown {
         for &ci in &c {
-            if let Some(Some(v)) = row.get(ci) {
+            if let Some(v) = state.value(rows, vr, ci) {
                 non_null += 1;
                 if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
-                    numbers.push(v.as_str());
+                    numbers.push(v);
                 }
             }
         }
@@ -4371,6 +4391,68 @@ mod tests {
                 vec![Some("8".into()), None, Some("\"a\"\"b\" c".into())],
                 row("9", "", "\""),
             ]
+        );
+    }
+
+    /// The summary of a selection adds up the values the grid shows,
+    /// with the changes waiting for Apply (#277): it read the values
+    /// fetched, and with a filter on, a new row's cells were those of a
+    /// fetched row the filter hid.
+    #[test]
+    fn summary_reads_the_changes() {
+        let columns = cols();
+        let row = |a: &str, b: &str| vec![Some(a.into()), Some(b.into())];
+        let rows = vec![row("1", "x"), row("2", "y"), row("3", "z")];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        let summary = |state: &mut GridState| {
+            let mut summary = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                summary = ResultGrid::new(&columns, &rows, state, "grid")
+                    .show(ui)
+                    .selection_summary;
+            });
+            output.textures_delta.clear();
+            summary.unwrap_or_default()
+        };
+        state.anchor = Some((0, 0));
+        state.cursor = Some((2, 0));
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 6 · Avg 2 · Min 1 · Max 3"
+        );
+        state.edit_cell(&rows, 1, 0, Some("20".into()));
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 24 · Avg 8 · Min 1 · Max 20"
+        );
+        state.edit_cell(&rows, 2, 0, None);
+        assert_eq!(
+            summary(&mut state),
+            "Count 2 · Sum 21 · Avg 10.5 · Min 1 · Max 20"
+        );
+        // A row to be deleted is left out, as Apply leaves it.
+        state.delete_row(&rows, 0);
+        assert_eq!(
+            summary(&mut state),
+            "Count 1 · Sum 20 · Avg 20 · Min 20 · Max 20"
+        );
+        state.clear_changes();
+        assert_eq!(
+            summary(&mut state),
+            "Count 3 · Sum 6 · Avg 2 · Min 1 · Max 3"
+        );
+        // With a filter, a new row's own cells.
+        state.set_filter("x");
+        summary(&mut state);
+        state.add_row(&rows, 2);
+        state.edit_cell(&rows, 1, 0, Some("5".into()));
+        state.anchor = Some((0, 0));
+        state.cursor = Some((1, 0));
+        assert_eq!(
+            summary(&mut state),
+            "Count 2 · Sum 6 · Avg 3 · Min 1 · Max 5"
         );
     }
 }
