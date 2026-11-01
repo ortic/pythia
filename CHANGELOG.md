@@ -515,6 +515,13 @@ All notable changes to Pythia are documented here. The format follows
   copied now paste as they were, NULLs too, also into another result;
   text from elsewhere, such as a spreadsheet's range, still pastes an
   empty cell as NULL.
+- *Paste* into a result no longer splits a value with a line break or a
+  tab into new rows and columns (#276). *Copy* wrote such a value as it
+  was, so pasted back it went over the cells next to it and added rows,
+  and in a spreadsheet it took two rows too. *Copy*, *Copy with header*
+  and *Copy all* now write it in double quotes, as spreadsheets do, and
+  *Paste* reads a cell in quotes as one value, also from a spreadsheet.
+  Other text pastes as before.
 
 ## [0.10.0] - 2026-10-30
 

@@ -2204,24 +2204,79 @@ fn tsv(cells: &[Vec<Cell>]) -> String {
 fn tsv_line<'c>(cells: impl IntoIterator<Item = Option<&'c str>>) -> String {
     cells
         .into_iter()
-        .map(|c| c.unwrap_or(""))
+        .map(|c| tsv_cell(c.unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\t")
 }
 
+/// A value as a cell of tab separated text: in double quotes, its quotes
+/// doubled, when it has a tab or a line break or starts with a quote, as
+/// spreadsheets write it (#276).
+fn tsv_cell(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.contains(['\t', '\n', '\r']) || value.starts_with('"') {
+        format!("\"{}\"", value.replace('"', "\"\"")).into()
+    } else {
+        value.into()
+    }
+}
+
 /// Tab separated text, e.g. a spreadsheet's range, as rows of cells: an
-/// empty cell is NULL.
+/// empty cell is NULL. A cell in double quotes is the text in them, with
+/// its tabs and line breaks and its doubled quotes single (#276), and
+/// `""` an empty text; a quote that doesn't end the cell is text.
 fn read_tsv(text: &str) -> Vec<Vec<Cell>> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let text = text.strip_suffix('\r').unwrap_or(text);
-    text.split('\n')
-        .map(|line| {
-            line.trim_end_matches('\r')
-                .split('\t')
-                .map(|cell| (!cell.is_empty()).then(|| cell.to_owned()))
-                .collect()
-        })
-        .collect()
+    let mut rows = vec![Vec::new()];
+    let mut rest = text;
+    loop {
+        let (cell, after) = match quoted_cell(rest) {
+            Some((cell, after)) => (Some(cell), after),
+            None => {
+                let end = rest.find(['\t', '\n']).unwrap_or(rest.len());
+                let (mut cell, after) = rest.split_at(end);
+                if !after.starts_with('\t') {
+                    cell = cell.trim_end_matches('\r');
+                }
+                ((!cell.is_empty()).then(|| cell.to_owned()), after)
+            }
+        };
+        rows.last_mut().expect("a row").push(cell);
+        match after.as_bytes().first() {
+            Some(b'\t') => rest = &after[1..],
+            Some(b'\n') => {
+                rows.push(Vec::new());
+                rest = &after[1..];
+            }
+            _ => return rows,
+        }
+    }
+}
+
+/// The cell in double quotes `text` starts with, and what follows it: a
+/// tab, a line break or nothing. `None` where it doesn't start with one.
+fn quoted_cell(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('"')?;
+    let mut cell = String::new();
+    loop {
+        let quote = rest.find('"')?;
+        cell.push_str(&rest[..quote]);
+        rest = &rest[quote + 1..];
+        match rest.strip_prefix('"') {
+            Some(after) => {
+                cell.push('"');
+                rest = after;
+            }
+            None => {
+                let after = rest
+                    .strip_prefix('\r')
+                    .filter(|a| a.starts_with('\n'))
+                    .unwrap_or(rest);
+                let ends = after.is_empty() || after.starts_with(['\t', '\n']);
+                return ends.then_some((cell, after));
+            }
+        }
+    }
 }
 
 fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<String> {
@@ -4268,5 +4323,54 @@ mod tests {
         let inserts = &state.changes().unwrap().inserts;
         assert_eq!(inserts[1][1].as_deref(), Some(""));
         assert_eq!(inserts[2][1], None);
+    }
+
+    /// A value with a line break or a tab copies in quotes, as spreadsheets
+    /// write it, and pastes back whole (#276): it was copied as it is, and
+    /// Paste split it into new rows and columns. Text from a spreadsheet
+    /// pastes as before.
+    #[test]
+    fn line_breaks_and_tabs_copy_in_quotes() {
+        let (columns, _) = three();
+        let row = |a: &str, b: &str, c: &str| vec![Some(a.into()), Some(b.into()), Some(c.into())];
+        let rows = vec![
+            row("1", "two\nlines", "a\tb"),
+            row("2", "\"quoted\"", "say \"hi\""),
+        ];
+        let copy = "1\t\"two\nlines\"\t\"a\tb\"\n2\t\"\"\"quoted\"\"\"\tsay \"hi\"";
+        let mut state = GridState::default();
+        state.sync(&rows, &columns);
+        state.select((0, 0), false);
+        state.select((1, 2), true);
+        assert_eq!(
+            selection_text(&columns, &rows, &state, false).unwrap(),
+            copy
+        );
+        assert_eq!(to_tsv(&columns, &rows), format!("A\tB\tC\n{copy}"));
+        // Pasted, the values are whole again.
+        state.set_editable(None);
+        state.add_row(&rows, 3);
+        state.paste(&rows, 3, copy);
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [rows[0].clone(), rows[1].clone()]
+        );
+        // From a spreadsheet: CRLF between rows, a quoted cell with a line
+        // break, plain cells with quotes in them.
+        state.clear_changes();
+        state.add_row(&rows, 3);
+        state.paste(
+            &rows,
+            3,
+            "7\t\"multi\nline\"\tplain \"x\"\r\n8\t\t\"a\"\"b\" c\r\n9\t\"\"\t\"\"\"\"\r\n",
+        );
+        assert_eq!(
+            state.changes().unwrap().inserts,
+            [
+                row("7", "multi\nline", "plain \"x\""),
+                vec![Some("8".into()), None, Some("\"a\"\"b\" c".into())],
+                row("9", "", "\""),
+            ]
+        );
     }
 }
