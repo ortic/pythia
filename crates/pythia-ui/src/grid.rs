@@ -732,11 +732,7 @@ impl GridState {
 
     fn start_edit(&mut self, rows: &[Vec<Cell>], cell: (usize, usize), initial: Option<String>) {
         let value = self.value(rows, cell.0, cell.1).map(str::to_owned);
-        // The inline editor is one line; it would lose line breaks.
-        let long = value
-            .as_deref()
-            .is_some_and(|v| v.contains('\n') || v.chars().count() > 200);
-        if long && initial.is_none() {
+        if !fits_inline(value.as_deref()) && initial.is_none() {
             self.open_value_editor(rows, cell);
             return;
         }
@@ -783,6 +779,96 @@ impl GridState {
             self.set_value(rows, r, c, Some(text));
         }
     }
+
+    /// Ends an edit as `end` says.
+    fn end_edit(&mut self, rows: &[Vec<Cell>], columns: usize, end: EditEnd) {
+        match end {
+            EditEnd::Drop => self.finish_edit(rows, false),
+            EditEnd::Keep => self.finish_edit(rows, true),
+            EditEnd::Next(back) => self.edit_next(rows, columns, back),
+        }
+    }
+
+    /// Keeps the value being typed and edits the next cell that can be
+    /// edited, or the one before it (`back`): along the row, then on to
+    /// the next one (#254). Past the last cell, the cursor stays.
+    fn edit_next(&mut self, rows: &[Vec<Cell>], columns: usize, back: bool) {
+        let Some((r, c)) = self
+            .edit
+            .as_ref()
+            .and_then(|e| e.active.as_ref())
+            .map(|(r, c, _)| (*r, *c))
+        else {
+            return;
+        };
+        self.finish_edit(rows, true);
+        let visible = self.visible_columns(columns);
+        let Some(edit) = &self.edit else { return };
+        let editable: Vec<usize> = visible
+            .into_iter()
+            .filter(|&col| !edit.is_locked(col))
+            .collect();
+        let Some(at) = editable.iter().position(|&col| col == c) else {
+            return;
+        };
+        // Cells counted along the rows.
+        let at = r * editable.len() + at;
+        let next = if back {
+            at.checked_sub(1)
+        } else {
+            Some(at + 1).filter(|&n| n < self.view_len(rows) * editable.len())
+        };
+        let Some(next) = next else { return };
+        let cell = (next / editable.len(), editable[next % editable.len()]);
+        self.select(cell, false);
+        self.scroll_to_cursor = true;
+        // A value the one-line editor can't hold waits for Enter or F2,
+        // which open the dialog.
+        if fits_inline(self.value(rows, cell.0, cell.1)) {
+            self.start_edit(rows, cell, None);
+        }
+    }
+}
+
+/// How the edit of a cell ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditEnd {
+    /// Escape: what was typed is dropped.
+    Drop,
+    /// Enter, or the focus went elsewhere: the value is kept.
+    Keep,
+    /// Tab (`true`: Shift+Tab): the value is kept and the next cell (the
+    /// one before) is edited.
+    Next(bool),
+}
+
+/// How a key ends the edit of a cell this frame, if one does.
+fn edit_end(i: &egui::InputState, lost_focus: bool) -> Option<EditEnd> {
+    // The key's own modifiers: Shift may be let go of in the same frame.
+    let tab = i.events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key: Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } => Some(modifiers.shift),
+        _ => None,
+    });
+    if i.key_pressed(Key::Escape) {
+        Some(EditEnd::Drop)
+    } else if let Some(back) = tab {
+        Some(EditEnd::Next(back))
+    } else if i.key_pressed(Key::Enter) || lost_focus {
+        Some(EditEnd::Keep)
+    } else {
+        None
+    }
+}
+
+/// Whether the one-line editor can hold a value: it would lose line
+/// breaks, and long text goes to the dialog.
+fn fits_inline(value: Option<&str>) -> bool {
+    value.is_none_or(|v| !v.contains('\n') && v.chars().count() <= 200)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1067,7 +1153,7 @@ struct Interactions {
     row_clicked: Option<usize>,
     open_viewer: Option<(usize, usize)>,
     menu_cell: Option<(usize, usize)>,
-    edit_done: Option<bool>,
+    edit_done: Option<EditEnd>,
     edit_click: Option<(usize, usize)>,
     column: Option<ColumnAction>,
     /// Widths of the columns drawn: (column, width).
@@ -1297,8 +1383,8 @@ fn table(
         let sum: f32 = frozen_cols.iter().filter_map(|c| state.widths.get(c)).sum();
         state.frozen_width = Some(d.numbers_width() + sum + spacing * (d.frozen + 1) as f32);
     }
-    if let Some(commit) = act.edit_done {
-        state.finish_edit(rows, commit);
+    if let Some(end) = act.edit_done {
+        state.end_edit(rows, columns.len(), end);
         ui.memory_mut(|m| m.request_focus(focus_id));
     }
     if let Some(cell) = act.edit_click {
@@ -1645,17 +1731,8 @@ fn data_cell(
             if std::mem::take(&mut edit.focus_editor) {
                 r.request_focus();
             }
-            let (enter, escape) = ui.input(|i| {
-                (
-                    i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab),
-                    i.key_pressed(Key::Escape),
-                )
-            });
-            if escape {
-                edit_done = Some(false);
-            } else if enter || r.lost_focus() {
-                edit_done = Some(true);
-            }
+            let lost_focus = r.lost_focus();
+            edit_done = ui.input(|i| edit_end(i, lost_focus));
             return;
         }
         if selected {
@@ -2167,17 +2244,8 @@ fn record_view(
                             if std::mem::take(&mut edit.focus_editor) {
                                 response.request_focus();
                             }
-                            let (enter, escape) = ui.input(|i| {
-                                (
-                                    i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab),
-                                    i.key_pressed(Key::Escape),
-                                )
-                            });
-                            if escape {
-                                edit_done = Some(false);
-                            } else if enter || response.lost_focus() {
-                                edit_done = Some(true);
-                            }
+                            let lost_focus = response.lost_focus();
+                            edit_done = ui.input(|i| edit_end(i, lost_focus));
                             ui.end_row();
                             continue;
                         }
@@ -2244,8 +2312,8 @@ fn record_view(
                 });
         });
     state.scroll_to_cursor = false;
-    if let Some(commit) = edit_done {
-        state.finish_edit(rows, commit);
+    if let Some(end) = edit_done {
+        state.end_edit(rows, columns.len(), end);
         ui.memory_mut(|m| m.request_focus(focus_id));
     }
 }
@@ -3655,6 +3723,106 @@ mod tests {
         assert_eq!(
             state.changes().unwrap().updates[&1][&1].as_deref(),
             Some("b")
+        );
+    }
+
+    /// Tab keeps the value typed and edits the next cell, Shift+Tab the
+    /// one before (#254): the value typed next went into the cell just
+    /// edited, in place of what Tab had kept.
+    #[test]
+    fn tab_edits_the_next_cell() {
+        let (columns, rows) = three();
+        let tab = |shift: bool| egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            },
+        };
+        let text = |s: &str| egui::Event::Text(s.into());
+        let active = |state: &GridState| state.edit.as_ref().unwrap().active.clone();
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        // The middle column is read-only: Tab goes past it.
+        state.lock_columns([1]);
+        // The row's number reads 1 too.
+        click(&ctx, &columns, &rows, &mut state, "x", 1);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::ArrowLeft)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::F2)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![text("0")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 2, "p".into())));
+        assert_eq!(state.cursor, Some((0, 2)));
+        frame(&ctx, &columns, &rows, &mut state, vec![text("2")]);
+        // At the end of the row, Tab goes on to the next one.
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((1, 0, "2".into())));
+        let updates = &state.changes().unwrap().updates;
+        assert_eq!(updates[&0][&0].as_deref(), Some("10"));
+        assert_eq!(updates[&0][&2].as_deref(), Some("p2"));
+        // Shift+Tab goes back, past the read-only column again.
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(true)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 2, "p2".into())));
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(true)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 0, "10".into())));
+        // Escape drops only what was typed in the cell being edited.
+        frame(&ctx, &columns, &rows, &mut state, vec![text("9")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::Escape)]);
+        assert_eq!(active(&state), None);
+        assert_eq!(
+            state.changes().unwrap().updates[&0][&0].as_deref(),
+            Some("10")
+        );
+        // Past the last cell, Tab keeps the value and stays.
+        state.cursor = Some((1, 2));
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::F2)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![text("!")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), None);
+        assert_eq!(state.cursor, Some((1, 2)));
+        assert_eq!(
+            state.changes().unwrap().updates[&1][&2].as_deref(),
+            Some("q!")
+        );
+    }
+
+    /// In the record view, Tab edits the next field (#254).
+    #[test]
+    fn tab_edits_the_next_field_of_the_record() {
+        let (c, r) = (cols(), rows());
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        state.cursor = Some((0, 0));
+        state.set_record_view(&r, true);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        click(&ctx, &c, &r, &mut state, "10", 1);
+        frame(
+            &ctx,
+            &c,
+            &r,
+            &mut state,
+            vec![egui::Event::Text("1".into())],
+        );
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Tab)]);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        assert_eq!(
+            state.edit.as_ref().unwrap().active,
+            Some((0, 1, "x".into()))
+        );
+        assert_eq!(
+            state.changes().unwrap().updates[&0][&0].as_deref(),
+            Some("1")
         );
     }
 

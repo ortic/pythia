@@ -439,6 +439,12 @@ All notable changes to Pythia are documented here. The format follows
   session's own schema and left its own as it was: Oracle keeps a unit's
   source without its schema. The window now names the unit's schema, and
   a trigger's table's, when the text doesn't.
+- Tab in a cell being edited goes on to the next cell and edits it
+  (#254). It kept the value but left the cursor where it was, so the
+  value typed next went into the same cell and replaced it. Shift+Tab
+  edits the cell before; read-only columns are passed over, and at the
+  end of a row Tab goes on to the next one. In the record view, Tab goes
+  to the next field.
 
 ## [0.10.0] - 2026-10-30
 
