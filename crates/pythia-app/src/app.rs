@@ -505,6 +505,7 @@ impl PythiaApp {
         if !self.history.dirty {
             return;
         }
+        self.history.tidy();
         if let Some(paths) = &self.paths {
             // Another Pythia's statements stay (#196).
             match load_toml::<History>(&history_file(paths)) {
@@ -4721,6 +4722,8 @@ impl PythiaApp {
             None => {}
         }
         let connection = self.current_connection();
+        // Once a frame, for all the statements that ran in it (#318).
+        self.history.tidy();
         if let Some(sql) = self
             .history_dialog
             .ui(ctx, &self.history, connection.as_deref())

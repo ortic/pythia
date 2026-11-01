@@ -730,6 +730,10 @@ All notable changes to Pythia are documented here. The format follows
   first result now fails the statement, which stops a script; it came as
   a message only. *Execute to file* writes the first result and says how
   many others there were.
+- The statement history takes in the statements a script ran in one go
+  (#318). Each statement went through the whole history, 2,000 entries,
+  and since #291 a frame hands over up to 1,000: 17 ms of every such
+  frame went to it. The order and the counts stay as they were.
 
 ## [0.10.0] - 2026-10-30
 
