@@ -1051,6 +1051,42 @@ fn cut(value: &Cell) -> bool {
     value.as_deref().and_then(pythia_db::cut_size).is_some()
 }
 
+/// Where a fetched `row` of `edit`'s result is the row of its table, by
+/// the key in its last columns; `None` without its key (the key
+/// [`row_key`] picks can always be compared).
+fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -> Option<String> {
+    let key_start = columns.len().saturating_sub(edit.key.width());
+    match &edit.key {
+        RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
+        RowKey::Columns(key) => {
+            let checks: Option<Vec<String>> = key
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let v = value(row, key_start + i)?;
+                    same(dialect, name, &columns[key_start + i], Some(&v))
+                })
+                .collect();
+            checks.map(|c| c.join(" and "))
+        }
+    }
+}
+
+/// The query that fetches the value of column `col` of a fetched `row` of
+/// `edit`'s result again, by the row's key: *Save to file…* writes it
+/// whole (#293).
+pub fn value_query(
+    dialect: Dialect,
+    edit: &Editable,
+    columns: &[Column],
+    row: &[Cell],
+    col: usize,
+) -> Option<String> {
+    let found = row_is(dialect, edit, columns, row)?;
+    let name = dialect.quote_ident(&columns.get(col)?.name);
+    Some(format!("select {name} from {} where {found}", edit.table))
+}
+
 /// Generates the DML for `changes` to the rows of `edit`, in `dialect`'s
 /// SQL. The last columns of `columns` / `rows` hold the key.
 pub fn dml(
@@ -1066,22 +1102,7 @@ pub fn dml(
     // Written under their names: the table's columns as they are (#218).
     let plain = plain_columns(&edit.source, key_start);
     let editable = |c: usize| plain.get(c).copied().unwrap_or(false);
-    // Where the row is the one fetched; `None` without its key (the key
-    // [`row_key`] picks can always be compared).
-    let row_is = |row: &[Cell]| match &edit.key {
-        RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
-        RowKey::Columns(key) => {
-            let checks: Option<Vec<String>> = key
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let v = value(row, key_start + i)?;
-                    same(dialect, name, &columns[key_start + i], Some(&v))
-                })
-                .collect();
-            checks.map(|c| c.join(" and "))
-        }
-    };
+    let row_is = |row: &[Cell]| row_is(dialect, edit, columns, row);
 
     for &r in &changes.deletes {
         let Some(row) = rows.get(r) else { continue };
@@ -1415,6 +1436,46 @@ mod tests {
             )
             .as_deref(),
             Some("select top 5 name, [order id] as [pythia$order id] from [dbo].[Order Lines]")
+        );
+    }
+
+    /// Save to file fetches a value again by its row's key (#293).
+    #[test]
+    fn values_are_fetched_by_their_rows_key() {
+        let oracle = Editable {
+            table: "docs".into(),
+            source: "select * from docs".into(),
+            key: RowKey::Rowid,
+        };
+        let columns = vec![
+            col("ID", "NUMBER", true),
+            col("DOC", "BLOB", false),
+            col(ROWID_COLUMN, "ROWID", false),
+        ];
+        let row = vec![Some("1".into()), None, Some("AAAx".into())];
+        assert_eq!(
+            value_query(Dialect::ORACLE, &oracle, &columns, &row, 1).as_deref(),
+            Some("select DOC from docs where rowid = 'AAAx'")
+        );
+        let keyed = Editable {
+            table: "[dbo].[Docs]".into(),
+            source: "select * from [dbo].[Docs]".into(),
+            key: RowKey::Columns(vec!["doc id".into()]),
+        };
+        let columns = vec![
+            col("Body Text", "nvarchar", false),
+            col("pythia$doc id", "int", true),
+        ];
+        let row = vec![Some("x".into()), Some("7".into())];
+        assert_eq!(
+            value_query(Dialect::SQLSERVER, &keyed, &columns, &row, 0).as_deref(),
+            Some("select [Body Text] from [dbo].[Docs] where [doc id] = 7")
+        );
+        // Without its key, a row isn't found.
+        let row = vec![Some("x".into()), None];
+        assert_eq!(
+            value_query(Dialect::SQLSERVER, &keyed, &columns, &row, 0),
+            None
         );
     }
 

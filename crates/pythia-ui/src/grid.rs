@@ -100,6 +100,11 @@ pub struct GridState {
     pub time_zone: Option<String>,
     /// Why a copy failed, for the owner to show (a value held cut short).
     failed: Option<String>,
+    /// The owner saves values to files: the context menu and the viewer
+    /// offer it (#293).
+    pub value_files: bool,
+    /// *Save to file…* chosen, for the owner.
+    file_request: Option<FileRequest>,
 }
 
 /// What the summary of a selection was worked out for: the selection,
@@ -165,6 +170,38 @@ pub struct Changes {
     pub deletes: BTreeSet<usize>,
 }
 
+/// *Save to file…* chosen in a grid, for its owner to ask for the file
+/// and write it (#293).
+#[derive(Debug, Clone)]
+pub enum FileRequest {
+    Save(SaveValue),
+}
+
+/// A cell's value to save to a file.
+#[derive(Debug, Clone)]
+pub struct SaveValue {
+    pub row: RowRef,
+    pub col: usize,
+    /// A binary column's value is written as its bytes, a text column's as
+    /// UTF-8.
+    pub binary: bool,
+    /// The file name the dialog suggests: the column's, with `.bin` or
+    /// `.txt`, or the extension the first bytes of a binary value say.
+    pub file_name: String,
+    pub source: SaveSource,
+}
+
+/// Where a value saved to a file comes from.
+#[derive(Debug, Clone)]
+pub enum SaveSource {
+    /// The value as the grid holds it whole: a pending change typed in, or
+    /// the value of a result that isn't being edited (see [`value_bytes`]).
+    Held(String),
+    /// A fetched row of the result being edited, by its index: the owner
+    /// fetches the value again whole by the row's key.
+    Fetch(usize),
+}
+
 impl Changes {
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty() && self.inserts.is_empty() && self.deletes.is_empty()
@@ -207,8 +244,10 @@ impl Editing {
 
 /// A view row resolved to either a fetched row or a new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowRef {
+pub enum RowRef {
+    /// A fetched row, by its index into the rows.
     Existing(usize),
+    /// A new row, by its index into [`Changes::inserts`].
     New(usize),
 }
 
@@ -258,6 +297,70 @@ impl GridState {
     /// Why *Copy as* copied nothing, once.
     pub fn take_failed(&mut self) -> Option<String> {
         self.failed.take()
+    }
+
+    /// *Save to file…* chosen, once.
+    pub fn take_file_request(&mut self) -> Option<FileRequest> {
+        self.file_request.take()
+    }
+
+    /// Asks the owner to save the value of a cell to a file, as *Save to
+    /// file…* does (#293). A value held cut short, which only the result
+    /// being edited fetches again, fails.
+    pub fn request_save(
+        &mut self,
+        columns: &[Column],
+        rows: &[Vec<Cell>],
+        (view_row, col): (usize, usize),
+    ) {
+        let Some(binary) = columns.get(col).and_then(|c| file_kind(self.dialect, c)) else {
+            return;
+        };
+        self.sync(rows, columns);
+        let row = self.row_ref(view_row);
+        let Some(held) = self.value(rows, view_row, col) else {
+            self.failed = Some("Save to file: the value is NULL".into());
+            return;
+        };
+        let first = if binary {
+            decode_hex(&hex_digits(held).chars().take(32).collect::<String>()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // A fetched value the result being edited finds again by its key,
+        // unless it was changed: the change is saved.
+        let fetch = match (&self.edit, row) {
+            (Some(edit), RowRef::Existing(r))
+                if !edit.is_locked(col)
+                    && !edit
+                        .changes
+                        .updates
+                        .get(&r)
+                        .is_some_and(|u| u.contains_key(&col)) =>
+            {
+                Some(r)
+            }
+            _ => None,
+        };
+        let source = match fetch {
+            Some(r) => SaveSource::Fetch(r),
+            None if pythia_db::cut_size(held).is_some() => {
+                self.failed = Some(format!(
+                    "Save to file: the grid holds the first {} bytes of this value. Edit the \
+                     result: Save to file then fetches the value whole.",
+                    pythia_db::SHOWN_BYTES
+                ));
+                return;
+            }
+            None => SaveSource::Held(held.to_owned()),
+        };
+        self.file_request = Some(FileRequest::Save(SaveValue {
+            row,
+            col,
+            binary,
+            file_name: file_name(&columns[col].name, binary, &first),
+            source,
+        }));
     }
 
     /// All column indices in the order shown, hidden ones included.
@@ -2004,6 +2107,13 @@ fn data_cell(
 }
 
 fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut GridState) {
+    // Values of binary and text columns go to files (#293).
+    let file_cell = state.cursor.filter(|&(_, c)| {
+        state.value_files
+            && columns
+                .get(c)
+                .is_some_and(|col| file_kind(state.dialect, col).is_some())
+    });
     if state.is_editable() {
         if ui.button("Edit cell").clicked() {
             if let Some(cell) = state.cursor {
@@ -2113,6 +2223,17 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
     if ui.button("View value…").clicked() {
         state.viewer = state.cursor;
         ui.close();
+    }
+    if let Some(cell) = file_cell {
+        let null = state.value(rows, cell.0, cell.1).is_none();
+        if ui
+            .add_enabled(!null, egui::Button::new("Save to file…"))
+            .on_disabled_hover_text("The value is NULL")
+            .clicked()
+        {
+            state.request_save(columns, rows, cell);
+            ui.close();
+        }
     }
     if ui
         .button(if state.record_view {
@@ -2907,6 +3028,11 @@ fn viewer(
     }
     let Some(viewed) = &state.viewed else { return };
     let name = columns.get(c).map_or("", |col| col.name.as_str());
+    let files = state.value_files
+        && columns
+            .get(c)
+            .is_some_and(|col| file_kind(state.dialect, col).is_some());
+    let mut save = false;
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2950,6 +3076,9 @@ fn viewer(
                         .on_disabled_hover_text("Apply or discard the change first");
                     if copy.clicked() {
                         ctx.copy_text(viewed.value.clone().unwrap_or_default());
+                    }
+                    if files && viewed.value.is_some() && ui.button("Save to file…").clicked() {
+                        save = true;
                     }
                 });
             });
@@ -3008,6 +3137,8 @@ fn viewer(
         }
         state.viewer = None;
         state.viewed = None;
+    } else if save {
+        state.request_save(columns, rows, (r, c));
     }
 }
 
@@ -3051,6 +3182,86 @@ fn is_binary(dialect: Dialect, col: &Column) -> bool {
         DbKind::Postgres => t == "bytea",
         DbKind::Sqlite => t.to_ascii_uppercase().contains("BLOB"),
     }
+}
+
+/// Whether *Save to file…* takes a column's values, and as what:
+/// `Some(true)` as bytes, `Some(false)` as text (#293).
+/// Oracle's BLOB, RAW, LONG RAW, CLOB, NCLOB and LONG (the thin driver
+/// types LOBs as LONG and LONG RAW); MySQL's BLOB, BINARY, VARBINARY and
+/// TEXT types; PostgreSQL's bytea and text; SQL Server's binary,
+/// varbinary, image, varchar, nvarchar (`max` or not, which a result
+/// doesn't say), text and ntext; SQLite's columns of blobs and of text
+/// affinity.
+fn file_kind(dialect: Dialect, col: &Column) -> Option<bool> {
+    let t = col.type_name.as_str();
+    let text = match dialect.kind() {
+        DbKind::Oracle => {
+            let t = t.to_ascii_uppercase();
+            if t == "BFILE" {
+                return None;
+            }
+            matches!(t.as_str(), "CLOB" | "NCLOB" | "LONG")
+        }
+        DbKind::MySql => t == "TEXT",
+        DbKind::SqlServer => matches!(t, "varchar" | "nvarchar" | "text" | "ntext"),
+        DbKind::Postgres => t == "text",
+        DbKind::Sqlite => {
+            let t = t.to_ascii_uppercase();
+            !t.contains("BLOB") && ["TEXT", "CHAR", "CLOB"].iter().any(|a| t.contains(a))
+        }
+    };
+    if text {
+        Some(false)
+    } else {
+        is_binary(dialect, col).then_some(true)
+    }
+}
+
+/// The file name *Save to file…* suggests for a value of column `name`:
+/// the name, with `.txt` for text and `.bin` for bytes, unless their
+/// `first` bytes say what they are.
+fn file_name(name: &str, binary: bool, first: &[u8]) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let stem = match stem.trim_matches('_') {
+        "" => "value",
+        stem => stem,
+    };
+    let extension = match first {
+        _ if !binary => "txt",
+        [0x89, b'P', b'N', b'G', ..] => "png",
+        [0xFF, 0xD8, 0xFF, ..] => "jpg",
+        [b'G', b'I', b'F', b'8', ..] => "gif",
+        [b'%', b'P', b'D', b'F', ..] => "pdf",
+        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] | [b'P', b'K', 7, 8, ..] => "zip",
+        [0x1F, 0x8B, ..] => "gz",
+        _ => "bin",
+    };
+    format!("{stem}.{extension}")
+}
+
+/// The bytes of a value the grid holds whole, as *Save to file…* writes
+/// them: a binary value's hex decoded (SQLite's blob column may hold text,
+/// which is written as it is), text as UTF-8.
+pub fn value_bytes(text: &str, binary: bool) -> Result<Vec<u8>, String> {
+    if pythia_db::cut_size(text).is_some() {
+        return Err(format!(
+            "the grid holds the first {} bytes of the value",
+            pythia_db::SHOWN_BYTES
+        ));
+    }
+    if binary && let Some(bytes) = decode_hex(hex_digits(text)) {
+        return Ok(bytes);
+    }
+    Ok(text.as_bytes().to_vec())
 }
 
 /// The hex digits of a binary value, after SQL Server's `0x` or
@@ -5018,5 +5229,153 @@ mod tests {
         click(&ctx, &c, &r, &mut state, "x", 1);
         frame(&ctx, &c, &r, &mut state, vec![key(Key::ArrowDown)]);
         assert_eq!(state.cursor, Some((1, 1)));
+    }
+
+    fn col_of(name: &str, type_name: &str) -> Column {
+        Column {
+            name: name.into(),
+            type_name: type_name.into(),
+            numeric: false,
+        }
+    }
+
+    /// Save to file takes binary and long text columns, by each database's
+    /// type names (#293).
+    #[test]
+    fn files_take_binary_and_text_columns() {
+        use pythia_db::Dialect;
+        let cases = [
+            (Dialect::ORACLE, "BLOB", Some(true)),
+            (Dialect::ORACLE, "RAW(16)", Some(true)),
+            (Dialect::ORACLE, "LONG RAW", Some(true)),
+            (Dialect::ORACLE, "CLOB", Some(false)),
+            (Dialect::ORACLE, "NCLOB", Some(false)),
+            (Dialect::ORACLE, "LONG", Some(false)),
+            (Dialect::ORACLE, "BFILE", None),
+            (Dialect::ORACLE, "VARCHAR2(10)", None),
+            (Dialect::MYSQL, "BLOB", Some(true)),
+            (Dialect::MYSQL, "VARBINARY", Some(true)),
+            (Dialect::MYSQL, "TEXT", Some(false)),
+            (Dialect::MYSQL, "VARCHAR", None),
+            (Dialect::POSTGRES, "bytea", Some(true)),
+            (Dialect::POSTGRES, "text", Some(false)),
+            (Dialect::POSTGRES, "json", None),
+            (Dialect::SQLSERVER, "varbinary", Some(true)),
+            (Dialect::SQLSERVER, "image", Some(true)),
+            (Dialect::SQLSERVER, "nvarchar", Some(false)),
+            (Dialect::SQLSERVER, "ntext", Some(false)),
+            (Dialect::SQLSERVER, "int", None),
+            (Dialect::SQLITE, "BLOB", Some(true)),
+            (Dialect::SQLITE, "TEXT", Some(false)),
+            (Dialect::SQLITE, "VARCHAR(20)", Some(false)),
+            (Dialect::SQLITE, "INTEGER", None),
+        ];
+        for (dialect, type_name, kind) in cases {
+            assert_eq!(
+                file_kind(dialect, &col_of("C", type_name)),
+                kind,
+                "{dialect:?} {type_name}"
+            );
+        }
+    }
+
+    /// The dialog suggests the column's name, with the extension the first
+    /// bytes say (#293).
+    #[test]
+    fn file_names_say_what_the_value_is() {
+        let cases: [(&str, bool, &[u8], &str); 10] = [
+            (
+                "PHOTO",
+                true,
+                &[0x89, b'P', b'N', b'G', 13, 10],
+                "PHOTO.png",
+            ),
+            ("photo", true, &[0xFF, 0xD8, 0xFF, 0xE0], "photo.jpg"),
+            ("anim", true, b"GIF89a", "anim.gif"),
+            ("doc", true, b"%PDF-1.7", "doc.pdf"),
+            ("archive", true, &[b'P', b'K', 3, 4], "archive.zip"),
+            ("dump", true, &[0x1F, 0x8B, 8], "dump.gz"),
+            ("data", true, &[0, 1, 2], "data.bin"),
+            ("notes", false, b"%PDF", "notes.txt"),
+            ("my col/x", true, &[], "my_col_x.bin"),
+            ("\"\"", false, &[], "value.txt"),
+        ];
+        for (name, binary, first, file) in cases {
+            assert_eq!(file_name(name, binary, first), file);
+        }
+    }
+
+    /// A value the grid holds whole is written as its bytes; one held cut
+    /// short isn't (#293).
+    #[test]
+    fn values_saved_as_their_bytes() {
+        assert_eq!(value_bytes("CAFE01", true), Ok(vec![0xCA, 0xFE, 1]));
+        assert_eq!(value_bytes("0xCAFE", true), Ok(vec![0xCA, 0xFE]));
+        assert_eq!(value_bytes("\\xcafe", true), Ok(vec![0xCA, 0xFE]));
+        // Text in a SQLite blob column.
+        assert_eq!(value_bytes("grüße", true), Ok("grüße".as_bytes().to_vec()));
+        assert_eq!(value_bytes("CAFE", false), Ok(b"CAFE".to_vec()));
+        let cut = format!("{}… (5000 bytes)", "AB".repeat(pythia_db::SHOWN_BYTES));
+        assert!(value_bytes(&cut, true).is_err());
+    }
+
+    /// Save to file asks for a whole value: the result being edited
+    /// fetches a fetched row's again, a change is saved as it is, and a
+    /// value held cut short of a result not edited is refused (#293).
+    #[test]
+    fn saves_take_the_value_whole() {
+        use pythia_db::Dialect;
+        let columns = vec![col_of("ID", "INTEGER"), col_of("IMG", "BLOB")];
+        let cut = format!(
+            "{PNG}{}… (9000 bytes)",
+            "00".repeat(pythia_db::SHOWN_BYTES - PNG.len() / 2)
+        );
+        let rows = vec![
+            vec![Some("1".into()), Some(PNG.into())],
+            vec![Some("2".into()), Some(cut)],
+            vec![Some("3".into()), None],
+        ];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            value_files: true,
+            ..Default::default()
+        };
+        state.sync(&rows, &columns);
+        let source = |state: &mut GridState, cell| {
+            state.request_save(&columns, &rows, cell);
+            match state.take_file_request() {
+                Some(FileRequest::Save(save)) => {
+                    assert_eq!(save.file_name, "IMG.png");
+                    Ok(save.source)
+                }
+                other => Err((other, state.take_failed())),
+            }
+        };
+        assert!(matches!(source(&mut state, (0, 1)), Ok(SaveSource::Held(v)) if v == PNG));
+        let refused = source(&mut state, (1, 1))
+            .unwrap_err()
+            .1
+            .unwrap_or_default();
+        assert!(refused.contains("Edit the result"), "{refused}");
+        assert!(
+            source(&mut state, (2, 1))
+                .unwrap_err()
+                .1
+                .unwrap()
+                .contains("NULL")
+        );
+        // Nothing for a number.
+        state.request_save(&columns, &rows, (0, 0));
+        assert!(state.take_file_request().is_none());
+
+        state.set_editable(None);
+        assert!(matches!(
+            source(&mut state, (1, 1)),
+            Ok(SaveSource::Fetch(1))
+        ));
+        state.edit_cell(&rows, 0, 1, Some(PNG.to_lowercase()));
+        assert!(
+            matches!(source(&mut state, (0, 1)), Ok(SaveSource::Held(v)) if v == PNG.to_lowercase())
+        );
     }
 }

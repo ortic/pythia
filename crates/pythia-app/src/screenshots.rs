@@ -12938,3 +12938,112 @@ fn debugger_panels_are_tabs() {
         app.test_tab(Tab::DebugWatches).unwrap().0
     );
 }
+
+/// The focused window's first result.
+fn first_result<'h>(h: &'h mut Harness<'_, PythiaApp>) -> &'h mut crate::sql_window::QueryResult {
+    &mut h.state_mut().test_sql_window().state.results[0]
+}
+
+/// The number of messages of the focused window.
+fn message_count(h: &mut Harness<'_, PythiaApp>) -> usize {
+    h.state_mut().test_sql_window().state.messages.len()
+}
+
+/// Waits for the window to say how saving or loading a file went, after
+/// the `before` messages it had; that message.
+fn file_done(h: &mut Harness<'_, PythiaApp>, before: usize) -> String {
+    wait_until(h, "the file", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| !w.state.value_files.is_busy() && w.state.messages.len() > before)
+    });
+    let w = h.state_mut().test_sql_window();
+    w.state
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
+}
+
+/// *Save to file…* writes a binary or text value whole (#293): from the
+/// cell's context menu and from the viewer, the dialog suggesting the
+/// column's name with what the bytes say they are. The grid holds a blob
+/// past 4000 bytes cut short: that is refused until the result is edited,
+/// which fetches it again by its row's key.
+#[test]
+fn values_save_to_files() {
+    let (mut h, _db) = sqlite_file("lob-save.db");
+    let dir = std::env::temp_dir().join(format!("pythia-lob-save-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png: Vec<u8> = [0x89, b'P', b'N', b'G', 13, 10, 0x1A, 10]
+        .into_iter()
+        .chain((0..9000u32).map(|i| (i * 7 % 256) as u8))
+        .collect();
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02X}")).collect() };
+    run_script(
+        &mut h,
+        "lob-save.db",
+        &format!(
+            "create table lob_doc (id integer primary key, img blob, body text);\n\
+             insert into lob_doc values (1, X'{}', 'Grüße, 日本');\n\
+             insert into lob_doc values (2, X'{}', null);\n\
+             commit;\n",
+            hex(&png[..64]),
+            hex(&png)
+        ),
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-save.db".into(),
+        text: "select id, img, body from lob_doc order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let save = |h: &mut Harness<'_, PythiaApp>, cell: &str, name: &str| -> String {
+        let before = message_count(h);
+        let files = &mut h.state_mut().test_sql_window().state.value_files;
+        files.chosen.push_back(Some(dir.join(name)));
+        // The menu takes a few frames to settle where it fits.
+        h.get_by_label(cell).click_secondary();
+        h.run_steps(4);
+        h.get_by_label("Save to file…").click();
+        file_done(h, before)
+    };
+
+    // A small blob, held whole.
+    let shown = "0x89504E470D0A1A0A… · 64 bytes";
+    let said = save(&mut h, shown, "small.png");
+    assert!(said.starts_with("Saved 64 bytes to"), "{said}");
+    assert_eq!(std::fs::read(dir.join("small.png")).unwrap(), png[..64]);
+    // A big one is cut short in the grid.
+    let big = "0x89504E470D0A1A0A… · 8.8 KB";
+    let said = save(&mut h, big, "big.png");
+    assert!(said.contains("Edit the result"), "{said}");
+    assert!(!dir.join("big.png").exists());
+    let files = &mut h.state_mut().test_sql_window().state.value_files;
+    assert_eq!(files.chosen.drain(..).count(), 1, "no dialog");
+    // Edited, the result fetches the value again whole by its key.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    assert!(first_result(&mut h).grid.is_editable());
+    let said = save(&mut h, big, "big.png");
+    assert!(said.starts_with("Saved 9008 bytes"), "{said}");
+    assert_eq!(std::fs::read(dir.join("big.png")).unwrap(), png);
+
+    // Text from the viewer, as UTF-8.
+    let path = dir.join("body.txt");
+    let before = message_count(&mut h);
+    let files = &mut h.state_mut().test_sql_window().state.value_files;
+    files.chosen.push_back(Some(path.clone()));
+    h.get_by_label("Grüße, 日本").click_secondary();
+    h.run_steps(4);
+    h.get_by_label("View value…").click();
+    h.run_steps(2);
+    h.get_by_label("Save to file…").click();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Saved 15 bytes"), "{said}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Grüße, 日本");
+    let suggested = &h.state_mut().test_sql_window().state.value_files.suggested;
+    assert_eq!(suggested, &["img.png", "img.png", "body.txt"]);
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

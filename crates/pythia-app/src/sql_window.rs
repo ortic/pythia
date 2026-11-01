@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::documents::{DocContext, Effects, ObjectRef, OpenRequest, Target, request_id};
 use crate::editor::{Editor, Marker, MarkerKind};
 
+mod value_file;
+
 #[derive(Serialize, Deserialize)]
 pub struct SqlWindow {
     pub title: String,
@@ -134,6 +136,8 @@ pub struct RunState {
     debuggable: Option<(EditorPosition, bool)>,
     /// Result of a running export (file dialog + write on a helper thread).
     pub export: Option<std::sync::mpsc::Receiver<ExportDone>>,
+    /// Values saved to files (#293).
+    pub value_files: value_file::ValueFiles,
     pub selection_summary: Option<String>,
     /// Where the connection's scripts end their statements (from the
     /// document context, each frame).
@@ -1005,6 +1009,7 @@ impl SqlWindow {
     fn session_busy(&self) -> bool {
         self.state.running.is_some()
             || self.state.to_file.is_some()
+            || self.state.value_files.fetching()
             || self.state.fetching.is_some()
             || self
                 .state
@@ -1801,6 +1806,9 @@ impl SqlWindow {
 
     fn handle_event(&mut self, event: DbEvent, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
+        let Some(event) = self.value_event(event) else {
+            return effects;
+        };
         let streamed = match &event {
             DbEvent::QueryStarted { id, .. }
             | DbEvent::Rows { id, .. }
@@ -1844,6 +1852,7 @@ impl SqlWindow {
                     link_relations: Vec::new(),
                 };
                 result.grid.dialect = cx.dialect;
+                result.grid.value_files = true;
                 result.grid.table = crate::data_edit::single_table(&result.sql);
                 result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
@@ -2361,6 +2370,7 @@ impl SqlWindow {
 
     fn bottom_ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = self.poll_to_file(ui, cx.dialect);
+        self.poll_value_files(ui.ctx(), cx, &mut effects);
         let mut edit_action = None;
         let variables = self.variables().len();
         let show_variables = &mut self.show_variables;
@@ -2700,6 +2710,9 @@ impl SqlWindow {
                 )
                 .show(ui);
                 state.selection_summary = out.selection_summary;
+                if let Some(request) = result.grid.take_file_request() {
+                    state.value_files.ask(result.id, request);
+                }
                 if let Some(text) = result.grid.take_failed() {
                     state.messages.push(Message {
                         level: Level::Error,
