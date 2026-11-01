@@ -685,6 +685,13 @@ All notable changes to Pythia are documented here. The format follows
   (#304), as SQL Server's and MySQL's floats do since #261: `1e300d`
   showed as a 1 and 300 zeros, `2e-20d` as `0.00000000000000000002`, in
   the grid and in copies and exports, also with the Instant Client.
+- Oracle: a fetched row's CLOB, NCLOB, BLOB, LONG or LONG RAW can be
+  changed in a result (#309). *Apply* failed with ORA-00932 or
+  ORA-00997: the UPDATE checked the value fetched with DECODE, which
+  takes no LOB and no LONG. A LOB is now checked with
+  `dbms_lob.compare`; a LONG or LONG RAW, which SQL can't compare, is
+  left out of the check, and so is a LOB with the pure-Rust driver,
+  which types it as one.
 
 ## [0.10.0] - 2026-10-30
 
