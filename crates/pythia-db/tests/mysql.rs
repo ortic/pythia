@@ -1264,6 +1264,71 @@ fn functional_index_parts() {
     h.ok("drop table r41_fi");
 }
 
+/// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE
+/// TABLE writes it (#260): MySQL gives a literal's value as it is, so
+/// `DEFAULT ''` read as no default, `'NULL'` as NULL and
+/// `'CURRENT_TIMESTAMP'` as the function.
+#[test]
+fn column_defaults_read_as_sql() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let mariadb = h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"));
+    h.ok("drop table if exists r41_df");
+    h.ok(
+        "create table r41_df (e enum('a','b') default 'a', s set('x','y') default 'x,y', \
+           v varchar(20) default '', vn varchar(20) default 'NULL', \
+           vc varchar(20) default 'CURRENT_TIMESTAMP', q varchar(10) default 'it''s', \
+           bs varchar(10) default 'a\\\\b', i int default 0, d decimal(5,2) default 1.5, \
+           b bit(3) default b'101', dd date default '2020-01-01', t time default '12:30:00', \
+           ts timestamp null default current_timestamp on update current_timestamp, \
+           dt datetime(3) default current_timestamp(3), u varchar(36) default (uuid()), \
+           n varchar(5) default null, nn varchar(5) not null)",
+    );
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema,
+        table: "r41_df".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    let defaults: Vec<(&str, Option<&str>)> = columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.default.as_deref()))
+        .collect();
+    let (now, now3, null) = if mariadb {
+        ("current_timestamp()", "current_timestamp(3)", Some("NULL"))
+    } else {
+        ("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(3)", None)
+    };
+    assert_eq!(
+        defaults,
+        [
+            ("e", Some("'a'")),
+            ("s", Some("'x,y'")),
+            ("v", Some("''")),
+            ("vn", Some("'NULL'")),
+            ("vc", Some("'CURRENT_TIMESTAMP'")),
+            ("q", Some("'it''s'")),
+            ("bs", Some(r"'a\\b'")),
+            ("i", Some("0")),
+            ("d", Some("1.50")),
+            ("b", Some("b'101'")),
+            ("dd", Some("'2020-01-01'")),
+            ("t", Some("'12:30:00'")),
+            ("ts", Some(now)),
+            ("dt", Some(now3)),
+            ("u", Some("uuid()")),
+            ("n", null),
+            ("nn", None),
+        ]
+    );
+    h.ok("drop table r41_df");
+}
+
 #[test]
 fn accounts() {
     let Some(mut h) = Harness::connect() else {

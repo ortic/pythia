@@ -455,6 +455,11 @@ All notable changes to Pythia are documented here. The format follows
   expression (#258). An index on `((lower(name)))` showed no columns,
   and one on `(id, (lower(name)))` read `id`, like an index on `id`
   alone. Such a key part now reads ``(lower(`name`))``, as in the DDL.
+- MySQL: a column's default reads with its quotes in an object view's
+  *Columns* (#260), as on MariaDB and in the DDL. `DEFAULT ''` read as
+  no default, `DEFAULT 'NULL'` as NULL, `'CURRENT_TIMESTAMP'` as the
+  function, and an ENUM's `'a'` as `a`. Numbers, bits and expressions
+  such as `CURRENT_TIMESTAMP` or `uuid()` read as before.
 
 ## [0.10.0] - 2026-10-30
 
