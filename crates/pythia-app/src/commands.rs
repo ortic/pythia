@@ -228,8 +228,16 @@ impl Keymap {
             let Some(command) = Command::from_id(id) else {
                 continue;
             };
+            let shortcut = parse_shortcut(text);
+            if let Some(s) = shortcut.filter(takes_editing_key) {
+                tracing::warn!(
+                    "ignoring the shortcut {} of {id}: the editor needs the key",
+                    shortcut_string(&s)
+                );
+                continue;
+            }
             keymap.bindings.retain(|(c, _)| *c != command);
-            if let Some(shortcut) = parse_shortcut(text) {
+            if let Some(shortcut) = shortcut {
                 keymap.bindings.push((command, shortcut));
             }
         }
@@ -363,6 +371,48 @@ impl Keymap {
     }
 }
 
+/// Whether a shortcut would take a key that typing and editing text need
+/// (#191): commands get their keys before the editor and the grid do.
+/// Those are, alone or with Shift, what types text, Enter, Tab, Delete,
+/// Backspace, Insert and the moves (Escape alone); with Ctrl, the moves,
+/// Delete and Backspace, and A, C, V, X, Y, Z (select all, the clipboard,
+/// undo). Function keys, Alt and other Ctrl shortcuts are free.
+pub fn takes_editing_key(s: &KeyboardShortcut) -> bool {
+    let m = s.modifiers;
+    if m.alt {
+        return false;
+    }
+    let key = s.logical_key;
+    if m.command || m.ctrl || m.mac_cmd {
+        return matches!(
+            key,
+            Key::ArrowUp
+                | Key::ArrowDown
+                | Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+                | Key::Delete
+                | Key::Backspace
+                | Key::A
+                | Key::C
+                | Key::V
+                | Key::X
+                | Key::Y
+                | Key::Z
+        );
+    }
+    if key == Key::Escape {
+        return !m.shift;
+    }
+    let name = key.name();
+    let function_key =
+        name.len() > 1 && name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit());
+    !function_key
+}
+
 /// Parses `Ctrl+Shift+F5`, `Alt+X`, `Shift+Esc` (case-insensitive; `Cmd`
 /// and `Ctrl` both mean the platform's command key).
 pub fn parse_shortcut(text: &str) -> Option<KeyboardShortcut> {
@@ -490,6 +540,54 @@ mod tests {
         assert_eq!(keymap.shortcut(Command::ExecuteAll), None);
         assert_eq!(keymap.command_for(&alt_f), Some(Command::Format));
         assert_eq!(Command::from_id("Format"), Some(Command::Format));
+    }
+
+    /// A shortcut can't take a key of typing and editing (#191); the
+    /// presets' don't, and one set by hand in the settings is ignored.
+    #[test]
+    fn editing_keys_stay_the_editors() {
+        let ctrl = Modifiers::COMMAND;
+        let shift = Modifiers::SHIFT;
+        for (modifiers, key) in [
+            (Modifiers::NONE, Key::Delete),
+            (Modifiers::NONE, Key::Enter),
+            (Modifiers::NONE, Key::Tab),
+            (Modifiers::NONE, Key::A),
+            (Modifiers::NONE, Key::Escape),
+            (shift, Key::Delete),
+            (shift, Key::ArrowDown),
+            (shift, Key::Num1),
+            (ctrl, Key::Backspace),
+            (ctrl | shift, Key::ArrowLeft),
+            (ctrl, Key::C),
+            (ctrl | shift, Key::Z),
+        ] {
+            let s = KeyboardShortcut::new(modifiers, key);
+            assert!(takes_editing_key(&s), "{}", shortcut_string(&s));
+        }
+        for (modifiers, key) in [
+            (Modifiers::NONE, Key::F8),
+            (shift, Key::F10),
+            (shift, Key::Escape),
+            (ctrl, Key::Enter),
+            (ctrl, Key::N),
+            (ctrl | shift, Key::F),
+            (Modifiers::ALT, Key::ArrowLeft),
+            (Modifiers::ALT, Key::Delete),
+        ] {
+            let s = KeyboardShortcut::new(modifiers, key);
+            assert!(!takes_editing_key(&s), "{}", shortcut_string(&s));
+        }
+        for (command, s) in &Keymap::new(KeymapPreset::PlsqlDeveloper).bindings {
+            assert!(!takes_editing_key(s), "{command:?}: {}", shortcut_string(s));
+        }
+        let overrides =
+            std::collections::BTreeMap::from([("NewSqlWindow".to_owned(), "Delete".to_owned())]);
+        let keymap = Keymap::with_overrides(KeymapPreset::PlsqlDeveloper, &overrides);
+        assert_eq!(
+            keymap.shortcut(Command::NewSqlWindow),
+            Keymap::new(KeymapPreset::PlsqlDeveloper).shortcut(Command::NewSqlWindow)
+        );
     }
 
     #[test]

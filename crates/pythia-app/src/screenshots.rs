@@ -3067,6 +3067,64 @@ fn settings_record_shortcut_with_modifiers() {
     assert!(h.query_by_label("Press keys… (Esc cancels)").is_none());
 }
 
+/// A shortcut can't take a key the editor needs (#191): recording Delete
+/// says so and waits for another key. With Delete, a new SQL window
+/// opened instead of a character being deleted.
+#[test]
+fn settings_refuse_editing_keys() {
+    let mut h = headless_harness();
+    h.state_mut().test_settings_keyboard();
+    h.state_mut().test_filter_keyboard("new sql window");
+    h.run_steps(3);
+    h.get_by_label("Ctrl+N").click();
+    h.run_steps(2);
+    let press = |h: &mut Ui, key, modifiers| {
+        h.event(egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        h.run_steps(2);
+    };
+    press(&mut h, egui::Key::Delete, egui::Modifiers::NONE);
+    let bindings = &h.state_mut().test_settings_mut().keybindings;
+    assert_eq!(bindings.get("NewSqlWindow"), None);
+    assert!(
+        h.query_by_label_contains("Delete is for typing and editing")
+            .is_some()
+    );
+    assert!(h.query_by_label("Press keys… (Esc cancels)").is_some());
+    press(&mut h, egui::Key::F3, egui::Modifiers::SHIFT);
+    assert_eq!(
+        h.state_mut()
+            .test_settings_mut()
+            .keybindings
+            .get("NewSqlWindow")
+            .map(String::as_str),
+        Some("Shift+F3")
+    );
+    h.state_mut().test_close_settings();
+    h.run_steps(2);
+
+    // Delete in a SQL window deletes.
+    h.get_by_label("New SQL").click();
+    h.run_steps(2);
+    h.event(egui::Event::Text("select 1".into()));
+    h.run_steps(2);
+    let title = h.state_mut().test_sql_window().title.clone();
+    h.key_press(egui::Key::Home);
+    h.run_steps(1);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    assert_eq!(
+        (w.title.as_str(), w.editor.text()),
+        (title.as_str(), "elect 1")
+    );
+}
+
 /// A font file for code replaces Hack; a bad file is reported, not loaded.
 #[test]
 fn code_font() {

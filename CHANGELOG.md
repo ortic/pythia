@@ -80,6 +80,14 @@ All notable changes to Pythia are documented here. The format follows
   `1 - -comment` and found no column `comment`. The editor highlights,
   folds and matches brackets the same way, and shows MySQL's `"…"` as
   the string it is there.
+- Settings → Keyboard no longer takes a key that typing and editing
+  need for a command (#191). A shortcut on Delete made Delete run the
+  command everywhere: in a SQL window it opened a new window and deleted
+  nothing. The same went for Enter, Tab, the arrows, letters with or
+  without Shift, and Ctrl with Backspace, Delete, an arrow, A, C, V, X, Y
+  or Z. Recording one now says so and waits for another key; such a
+  shortcut in `settings.toml` is ignored. Function keys, Alt and the
+  other Ctrl shortcuts are free.
 
 ## [0.10.0] - 2026-10-30
 

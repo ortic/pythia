@@ -1420,21 +1420,30 @@ fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut KeysState) {
                 }
                 let shortcut = egui::KeyboardShortcut::new(modifiers, key);
                 st.notice = None;
-                if let Some(other) = current.command_for(&shortcut).filter(|c| *c != command) {
-                    s.keybindings.insert(other.id().to_owned(), String::new());
+                if crate::commands::takes_editing_key(&shortcut) {
+                    // It would take the key from the editor (#191): say so,
+                    // and wait for another.
                     st.notice = Some(format!(
-                        "{} was taken from \"{}\"",
-                        shortcut_string(&shortcut),
-                        other.label()
+                        "{} is for typing and editing: add Ctrl or Alt, or take a function key",
+                        shortcut_string(&shortcut)
                     ));
-                }
-                if preset.shortcut(command) == Some(&shortcut) {
-                    s.keybindings.remove(command.id());
                 } else {
-                    s.keybindings
-                        .insert(command.id().to_owned(), shortcut_string(&shortcut));
+                    if let Some(other) = current.command_for(&shortcut).filter(|c| *c != command) {
+                        s.keybindings.insert(other.id().to_owned(), String::new());
+                        st.notice = Some(format!(
+                            "{} was taken from \"{}\"",
+                            shortcut_string(&shortcut),
+                            other.label()
+                        ));
+                    }
+                    if preset.shortcut(command) == Some(&shortcut) {
+                        s.keybindings.remove(command.id());
+                    } else {
+                        s.keybindings
+                            .insert(command.id().to_owned(), shortcut_string(&shortcut));
+                    }
+                    st.recording = None;
                 }
-                st.recording = None;
             }
             None => {}
         }
