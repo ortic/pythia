@@ -7785,10 +7785,76 @@ fn completion_follows_the_browser() {
     h.run_steps(2);
     h.get_by_label("Drop").click();
     wait_until(&mut h, "drop", |app| {
-        app.test_log().iter().any(|l| l.contains("dropped"))
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("cb_t") && l.ends_with("dropped"))
     });
     h.run_steps(2);
     assert_eq!(columns(&mut h), Vec::<String>::new(), "after Drop");
+}
+
+/// A table's object view doesn't stay as if it were there after the table
+/// is dropped (#200): a Drop in the object browser closes it, and Refresh
+/// after a DROP elsewhere says the table is gone instead of showing no
+/// columns.
+#[test]
+fn object_view_of_a_dropped_table() {
+    use pythia_db::ObjectType;
+    let connection = "views.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table dv_a (id integer, name text);\ncreate table dv_b (id integer)",
+    );
+    let open = |h: &mut Ui, name: &str, columns: usize| {
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: crate::documents::ObjectRef {
+                owner: "main".into(),
+                name: name.into(),
+                object_type: ObjectType::Table,
+            },
+        });
+        wait_until(h, "columns", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_object_view().loaded_for_test().1, columns);
+    };
+    open(&mut h, "dv_a", 2);
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(2);
+    h.get_by_label("dv_a").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Drop…").click();
+    h.run_steps(2);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "drop", |app| {
+        app.test_log()
+            .iter()
+            .any(|l| l.contains("dv_a") && l.ends_with("dropped"))
+    });
+    h.run_steps(3);
+    assert!(h.query_by_label("main.dv_a").is_none(), "its view closed");
+
+    open(&mut h, "dv_b", 1);
+    run_script(&mut h, connection, "drop table dv_b");
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: crate::documents::ObjectRef {
+            owner: "main".into(),
+            name: "dv_b".into(),
+            object_type: ObjectType::Table,
+        },
+    });
+    h.run_steps(3);
+    h.get_by_label("Refresh").click();
+    wait_until(&mut h, "refresh", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("There is no table main.dv_b")
+            .is_some(),
+        "Refresh says it's gone"
+    );
 }
 
 /// Maintenance of a SQLite table: its rows, pages and missing statistics,

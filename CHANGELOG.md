@@ -121,6 +121,10 @@ All notable changes to Pythia are documented here. The format follows
   column added from outside didn't show up after Refresh. The browser's
   actions and Refresh, the object view's Refresh and the object editors'
   changes now make completion read the dictionary again.
+- A table's object view no longer goes on showing it after it's dropped
+  (#200). *Drop* in the object browser closes the object's views, and
+  *Refresh* in a view whose table was dropped elsewhere says there is no
+  such table instead of showing an empty column list.
 
 ## [0.10.0] - 2026-10-30
 

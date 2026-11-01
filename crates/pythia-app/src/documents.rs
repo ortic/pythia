@@ -87,6 +87,8 @@ pub struct Effects {
     /// Objects may have changed, or were read again: completion forgets the
     /// connection's names (#198).
     pub catalog_changed: bool,
+    /// An object was dropped: its views close (#200).
+    pub dropped: Option<ObjectRef>,
     /// The editor jumped (go to definition, …) from this place: (part,
     /// byte offset), for going back.
     pub jumped_from: Option<(usize, usize)>,
@@ -163,6 +165,7 @@ impl Effects {
         self.recompile = other.recompile.or(self.recompile.take());
         self.invalid_changed |= other.invalid_changed;
         self.catalog_changed |= other.catalog_changed;
+        self.dropped = other.dropped.or(self.dropped.take());
         self.references = other.references.or(self.references.take());
         self.ai.extend(other.ai);
         self.changed = other.changed.or(self.changed.take());

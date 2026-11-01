@@ -744,6 +744,9 @@ impl Browser {
                 log.push(format!("{ty} {} {verb}", object.qualified()));
                 self.refresh(&mut effects);
                 effects.invalid_changed = true;
+                if verb == "dropped" {
+                    effects.dropped = Some(object);
+                }
             }
             (Pending::Action { object, verb }, Err(e)) => {
                 log.push(format!("{} {} failed: {e}", verb, object.qualified()));

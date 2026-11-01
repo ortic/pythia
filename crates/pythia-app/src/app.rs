@@ -2433,6 +2433,7 @@ impl PythiaApp {
             log,
             invalid_changed,
             catalog_changed,
+            dropped,
             database,
             ..
         } = effects;
@@ -2462,6 +2463,21 @@ impl PythiaApp {
         }
         if catalog_changed && let Some(name) = self.browser.connection.clone() {
             self.invalidate_catalog(&name);
+        }
+        // A dropped object's views would show it as if it were there.
+        if let (Some(object), Some(name)) = (dropped, self.browser.connection.clone()) {
+            let views: Vec<DocId> = self
+                .docs
+                .iter()
+                .filter(|(_, d)| {
+                    d.connection.as_deref() == Some(name.as_str())
+                        && matches!(&d.kind, DocKind::Object(v) if v.object == object)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in views {
+                self.remove_window(id);
+            }
         }
     }
 
