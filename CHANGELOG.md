@@ -548,6 +548,13 @@ All notable changes to Pythia are documented here. The format follows
   A text over 100,000 characters now shows in rows, a long line cut
   every 1,000 characters, laid out as they come into view; all of it can
   still be scrolled through, and *Copy* copies all of it.
+- An *Apply* whose transaction is rolled back part-way no longer loses
+  the changes it made before (#289). On SQL Server, Break during an
+  *Apply* opens the connection again, which rolls back what wasn't
+  committed, and on MySQL a deadlock rolls back the whole transaction;
+  the window took the changes before for applied, and they were gone
+  from the grid without a word. The messages now say that they were
+  undone, and all of the *Apply*'s changes wait for *Apply* again.
 
 ## [0.10.0] - 2026-10-30
 

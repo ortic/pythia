@@ -1975,6 +1975,333 @@ fn applied_part_way() {
     }
 }
 
+/// A session of a UI test's own, beside the app's: `user/password@connect
+/// string` of a database of `kind`, autocommitting.
+struct Side {
+    session: pythia_db::Session,
+    wake: std::sync::mpsc::Receiver<()>,
+}
+
+impl Side {
+    fn connect(kind: pythia_db::DbKind, spec: &str) -> Self {
+        let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+        let (username, password) = credentials.split_once('/').unwrap();
+        let (tx, wake) = std::sync::mpsc::channel();
+        let session = pythia_db::Session::connect(
+            pythia_db::ConnectParams {
+                kind,
+                username: username.into(),
+                password: password.into(),
+                connect_string: connect_string.into(),
+                privilege: Default::default(),
+                init_sql: Vec::new(),
+                ssh: None,
+            },
+            move || {
+                let _ = tx.send(());
+            },
+        );
+        let mut side = Self { session, wake };
+        match side.next() {
+            pythia_db::DbEvent::Connected(_) => {}
+            other => panic!("{spec}: {other:?}"),
+        }
+        side.session.send(pythia_db::DbRequest::SetAutocommit(true));
+        side
+    }
+
+    fn next(&mut self) -> pythia_db::DbEvent {
+        loop {
+            if let Some(event) = self.session.try_recv() {
+                return event;
+            }
+            self.wake
+                .recv_timeout(Duration::from_secs(60))
+                .expect("timed out");
+        }
+    }
+
+    /// Runs a statement that must succeed: the rows of a query.
+    fn run(&mut self, sql: &str) -> Vec<Vec<pythia_db::Cell>> {
+        self.session.send(pythia_db::DbRequest::Execute {
+            id: 1,
+            sql: sql.into(),
+            max_rows: 1000,
+            binds: Vec::new(),
+        });
+        let mut rows = Vec::new();
+        loop {
+            match self.next() {
+                pythia_db::DbEvent::Rows { rows: r, .. } => rows = r,
+                pythia_db::DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                pythia_db::DbEvent::Transaction { .. } => return rows,
+                _ => {}
+            }
+        }
+    }
+
+    fn end(&mut self, request: pythia_db::DbRequest) {
+        self.session.send(request);
+        while !matches!(self.next(), pythia_db::DbEvent::Transaction { .. }) {}
+    }
+}
+
+/// An Apply on SQL Server cut off while a statement after the first waits
+/// for a lock: the session killed, a lost connection, or Break, after
+/// which the session opens the connection again (#289). Both roll back
+/// the transaction, and all the changes wait for Apply again. Before, the
+/// changes before Break were taken for applied, and lost.
+#[test]
+fn an_apply_cut_off_by_a_new_connection() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("PYTHIA_TEST_MSSQL"),
+        std::env::var("PYTHIA_TEST_MSSQL_DBA"),
+    ) else {
+        eprintln!("PYTHIA_TEST_MSSQL / PYTHIA_TEST_MSSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = pythia_db::DbKind::SqlServer;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r52_apply");
+    locker.run("create table r52_apply (id int primary key, v varchar(10))");
+    locker.run("insert into r52_apply values (1, 'a'), (2, 'b'), (3, 'c')");
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::SqlServer,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r52_apply order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    let locker_spid = locker.run("select @@spid")[0][0].clone().unwrap();
+    let schema = locker.run("select schema_name()")[0][0].clone().unwrap();
+    for how in ["kill", "break"] {
+        // Row 2 locked: the Apply updates row 1, then waits.
+        locker
+            .session
+            .send(pythia_db::DbRequest::SetAutocommit(false));
+        locker.run("update r52_apply set v = v where id = 2");
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+        let started = Instant::now();
+        let spid = loop {
+            h.step();
+            let blocked = admin.run(&format!(
+                "select session_id from sys.dm_exec_requests \
+                 where blocking_session_id = {locker_spid}"
+            ));
+            if let Some(spid) = blocked.first().and_then(|r| r[0].clone()) {
+                break spid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{how}: not blocked"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if how == "kill" {
+            admin.run(&format!("kill {spid}"));
+        } else {
+            h.state_mut().test_command(crate::commands::Command::Cancel);
+        }
+        // The statement stopped, row 2 is let go: fetching the result again
+        // waits for it.
+        let started = Instant::now();
+        while !admin
+            .run(&format!(
+                "select 1 from sys.dm_exec_requests where session_id = {spid} \
+                 and blocking_session_id = {locker_spid}"
+            ))
+            .is_empty()
+        {
+            h.step();
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{how}: still blocked"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        locker.end(pythia_db::DbRequest::Rollback);
+        locker
+            .session
+            .send(pythia_db::DbRequest::SetAutocommit(true));
+        wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+        let stored = admin.run(&format!("select v from {schema}.r52_apply order by id"));
+        let (rows, updates, _, _, messages) = part(&mut h);
+        let text = |v: &str| vec![Some(v.to_owned())];
+        assert_eq!(stored, [text("a"), text("b"), text("c")], "{how}");
+        assert_eq!(
+            rows,
+            pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
+            "{how}: {messages:?}"
+        );
+        assert_eq!(
+            updates,
+            pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+            "{how}: {messages:?}"
+        );
+        let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
+        if how == "kill" {
+            assert!(said("Connection lost."), "{messages:?}");
+        } else {
+            assert!(
+                said("The transaction was rolled back with it: the 1 change(s) applied"),
+                "{messages:?}"
+            );
+            assert!(
+                said("3 change(s) weren't applied: they wait for Apply"),
+                "{messages:?}"
+            );
+        }
+    }
+    // Applied again, all of them go in once.
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("Changes applied")),
+        "{messages:?}"
+    );
+    assert_eq!(rows, pairs(&[("1", "x"), ("2", "y"), ("3", "z")]));
+    assert!(updates.is_empty());
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    locker.run("drop table r52_apply");
+}
+
+/// An Apply whose statement after the first is chosen as a deadlock's
+/// victim, on MySQL (`PYTHIA_TEST_MYSQL`, `PYTHIA_TEST_MYSQL_DBA`): InnoDB
+/// rolls the whole transaction back, and all the changes wait for Apply
+/// again (#289).
+#[test]
+fn an_apply_rolled_back_by_a_deadlock() {
+    let (Ok(spec), Ok(dba)) = (
+        std::env::var("PYTHIA_TEST_MYSQL"),
+        std::env::var("PYTHIA_TEST_MYSQL_DBA"),
+    ) else {
+        eprintln!("PYTHIA_TEST_MYSQL / PYTHIA_TEST_MYSQL_DBA not set, skipping");
+        return;
+    };
+    let kind = pythia_db::DbKind::MySql;
+    let mut locker = Side::connect(kind, &spec);
+    let mut admin = Side::connect(kind, &dba);
+    locker.run("drop table if exists r52_apply, r52_heavy");
+    locker.run("create table r52_apply (id int primary key, v varchar(10))");
+    locker.run("create table r52_heavy (n int)");
+    locker.run("insert into r52_apply values (1, 'a'), (2, 'b'), (3, 'c')");
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (username, password) = credentials.split_once('/').unwrap();
+    let profile = ConnectionProfile {
+        name: "shop".into(),
+        kind: pythia_config::DbKind::MySql,
+        username: username.into(),
+        connect_string: connect_string.into(),
+        ..Default::default()
+    };
+    let mut h = headless_harness();
+    h.state_mut().test_connect(profile, password.into());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "shop".into(),
+        text: "select id, v from r52_apply order by id".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for (row, v) in ["x", "y", "z"].into_iter().enumerate() {
+            r.grid.edit_cell(&rows, row, 1, Some(v.into()));
+        }
+    }
+    // The other transaction is the larger one: InnoDB rolls back the
+    // Apply's.
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(false));
+    locker.run(
+        "insert into r52_heavy with recursive r (n) as \
+         (select 1 union all select n + 1 from r where n < 200) select n from r",
+    );
+    locker.run("update r52_apply set v = v where id = 2");
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
+    let started = Instant::now();
+    // Row 2's update waits for the lock.
+    while admin
+        .run(
+            "select 1 from information_schema.processlist \
+             where info like 'update r52_apply set v = ''y''%'",
+        )
+        .is_empty()
+    {
+        h.step();
+        assert!(started.elapsed() < Duration::from_secs(30), "not waiting");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    locker.run("update r52_apply set v = v where id = 1");
+    locker.end(pythia_db::DbRequest::Rollback);
+    locker
+        .session
+        .send(pythia_db::DbRequest::SetAutocommit(true));
+    wait_until(&mut h, "apply", |app| !app.test_focused_busy());
+    let (rows, updates, _, _, messages) = part(&mut h);
+    assert!(
+        messages.iter().any(|m| m.contains("ERROR 1213")),
+        "{messages:?}"
+    );
+    assert_eq!(
+        rows,
+        pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
+        "{messages:?}"
+    );
+    assert_eq!(
+        updates,
+        pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m
+                .starts_with("The transaction was rolled back with it: the 1 change(s) applied")),
+        "{messages:?}"
+    );
+    h.state_mut().test_rollback();
+    h.state_mut().test_close_focused();
+    locker.run("drop table r52_apply, r52_heavy");
+}
+
 /// Types `.` after a table alias in a real editor and waits for the
 /// completion popup, which needs a round trip to the dictionary.
 #[test]
