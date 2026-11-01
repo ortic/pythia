@@ -2109,6 +2109,15 @@ fn viewer(
         .filter(|j| j.is_object() || j.is_array())
         .and_then(|j| serde_json::to_string_pretty(&j).ok());
     let mut text = pretty.clone().or_else(|| value.clone()).unwrap_or_default();
+    // Named by its bytes: egui keeps an image by its URI, and the next value
+    // in this cell (of another result, or edited) would show this one (#231).
+    let image = bytes.as_ref().and_then(|b| {
+        let kind = image_kind(b)?;
+        Some(format!(
+            "bytes://pythia-grid/{:016x}.{kind}",
+            egui::util::hash(b)
+        ))
+    });
     let mut open = true;
     egui::Window::new(format!("{name} — row {}", r + 1))
         .id(id.with("viewer"))
@@ -2139,10 +2148,9 @@ fn viewer(
             ui.separator();
             if let Some(b) = &bytes {
                 egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    if let Some(kind) = image_kind(b) {
-                        let uri = format!("bytes://pythia-grid/{r}-{c}.{kind}");
+                    if let Some(uri) = &image {
                         ui.add(
-                            egui::Image::from_bytes(uri, b.clone())
+                            egui::Image::from_bytes(uri.clone(), b.clone())
                                 .max_width(ui.available_width())
                                 .max_height(480.0),
                         );
@@ -2163,6 +2171,9 @@ fn viewer(
         });
     if !open {
         state.viewer = None;
+        if let Some(uri) = &image {
+            ctx.forget_image(uri);
+        }
     }
 }
 
@@ -2827,6 +2838,77 @@ mod tests {
             vec![],
         );
         assert!(texts(&drawn).contains(&"CAFE"), "{:?}", texts(&drawn));
+    }
+
+    /// The textures the viewer of cell (0, 0) paints once its image is
+    /// loaded, and the texts it draws.
+    fn viewer_image(
+        ctx: &egui::Context,
+        rows: &[Vec<Cell>],
+    ) -> (Vec<egui::TextureId>, Vec<String>) {
+        let columns = vec![Column {
+            name: "IMG".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let mut state = GridState {
+            viewer: Some((0, 0)),
+            ..Default::default()
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut painted = (Vec::new(), Vec::new());
+        // Images are decoded while the frames go on.
+        for _ in 0..100 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                ResultGrid::new(&columns, rows, &mut state, "grid").show(ui);
+            });
+            output.textures_delta.clear();
+            let mut textures = Vec::new();
+            let mut texts = Vec::new();
+            for shape in &output.shapes {
+                match &shape.shape {
+                    egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                    egui::Shape::Rect(r) if r.fill_texture_id() != egui::TextureId::default() => {
+                        textures.push(r.fill_texture_id());
+                    }
+                    egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                        textures.push(m.texture_id);
+                    }
+                    _ => {}
+                }
+            }
+            painted = (textures, texts);
+            if !painted.0.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        painted
+    }
+
+    /// The viewer shows an image as the image (#231): without a decoder for
+    /// PNG, JPEG, GIF, WebP and BMP, it showed ⚠ in its place.
+    #[test]
+    fn the_viewer_shows_images() {
+        const BLUE: &str = "89504E470D0A1A0A0000000D4948445200000002000000020802000000FDD49A73\
+                            0000000F49444154789C636060F80F46600A0017F603FD7EEB37F300000000\
+                            49454E44AE426082";
+        let ctx = egui::Context::default();
+        crate::icons::install(&ctx);
+        let (red, texts) = viewer_image(&ctx, &[vec![Some(PNG.to_owned())]]);
+        assert!(!red.is_empty(), "no image in {texts:?}");
+        assert!(!texts.iter().any(|t| t == "⚠"), "{texts:?}");
+        // Another image in the same cell (of another result, or edited) is
+        // that one, not the one shown before.
+        let (blue, _) = viewer_image(&ctx, &[vec![Some(BLUE.to_owned())]]);
+        assert!(!blue.is_empty());
+        assert_ne!(red, blue);
     }
 
     /// A cell lays out no more of a value than it can show (#212): 10 MB on

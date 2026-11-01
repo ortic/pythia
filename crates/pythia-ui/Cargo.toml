@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
-egui_extras = { workspace = true, features = ["svg", "datepicker", "serde"] }
+egui_extras = { workspace = true, features = ["svg", "image", "datepicker", "serde"] }
+# The formats the value viewer shows images of (egui_extras decodes them).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 pythia-data.workspace = true
 pythia-db.workspace = true

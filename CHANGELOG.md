@@ -273,6 +273,10 @@ All notable changes to Pythia are documented here. The format follows
   the cell, a hex dump in *View value…*. They showed as hex text, without
   their size, and a value over 4000 bytes didn't show that the grid holds
   it cut short. So do SQLite columns declared `MEDIUMBLOB` or `LONGBLOB`.
+- *View value…* shows images (#231): a PNG, JPEG, GIF, WebP or BMP
+  value showed ⚠ in place of the image, as Pythia had no decoder for
+  them. An image viewed in a cell no longer shows again for another
+  value viewed there later.
 
 ## [0.10.0] - 2026-10-30
 
