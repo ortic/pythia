@@ -28,7 +28,8 @@ use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
 use crate::sql_text::{
-    WHOLE_BATCH_BYTES, hex, leading_words_in, release, replace_binds, row_bytes, statement_kind_in,
+    WHOLE_BATCH_BYTES, float_text, hex, leading_words_in, release, replace_binds, row_bytes,
+    statement_kind_in,
 };
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
@@ -862,8 +863,10 @@ pub(crate) fn cell(value: &Value, column: &mysql::Column, whole: bool) -> Cell {
         Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         Value::Int(v) => v.to_string(),
         Value::UInt(v) => v.to_string(),
-        Value::Float(v) => v.to_string(),
-        Value::Double(v) => v.to_string(),
+        // Values of a statement with binds, which MySQL sends in its binary
+        // protocol; without binds they come as its text (#261).
+        Value::Float(v) => float_text(*v),
+        Value::Double(v) => float_text(*v),
         Value::Date(y, m, d, h, mi, s, us) => {
             let date = format!("{y:04}-{m:02}-{d:02}");
             if matches!(

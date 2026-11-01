@@ -289,6 +289,43 @@ fn values_types_and_binds() {
     );
 }
 
+/// A float keeps its exponent (#261): 2e-20 came as
+/// 0.00000000000000000002, and 1e-300 as 302 characters, which the grid
+/// shows cut short as `0.0000…`.
+#[test]
+fn floats_keep_their_exponent() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let DbEvent::QueryStarted { .. } = h.run(
+        1,
+        "select cast(2e-20 as float) a, cast(3e15 as float) b, cast(2e20 as float) c, \
+                cast(-1e-300 as float) d, cast(2.5e-7 as real) e, cast(2.5 as float) f, \
+                cast(100 as float) g, cast(0.0001 as float) h, cast(1e16 as real) i",
+    ) else {
+        panic!("expected QueryStarted")
+    };
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    h.settle();
+    let texts: Vec<&str> = rows[0].iter().map(|v| v.as_deref().unwrap()).collect();
+    assert_eq!(
+        texts,
+        [
+            "2e-20",
+            "3000000000000000",
+            "2e20",
+            "-1e-300",
+            "2.5e-7",
+            "2.5",
+            "100",
+            "0.0001",
+            "1e16"
+        ]
+    );
+}
+
 #[test]
 fn errors_carry_number_and_line() {
     let Some(mut h) = Harness::connect() else {

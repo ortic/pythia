@@ -315,6 +315,42 @@ fn values_types_and_binds() {
     assert_eq!(rows[0][2].as_deref(), Some("41"));
 }
 
+/// A float keeps its exponent also in a query with binds (#261), which
+/// MySQL answers in its binary protocol: 2e-20 came as
+/// 0.00000000000000000002 there, and as `2e-20` without binds.
+#[test]
+fn floats_keep_their_exponent() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select 2e-20 a, 3e15 b, 2e20 c, -1e-300 d, cast(2.5e-7 as float) e, 2.5e0 f, \
+                     100e0 g, :x as x"
+            .into(),
+        max_rows: 10,
+        binds: vec![("x".into(), Some("1".into()))],
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    let texts: Vec<&str> = rows[0].iter().map(|v| v.as_deref().unwrap()).collect();
+    assert_eq!(
+        texts,
+        [
+            "2e-20",
+            "3000000000000000",
+            "2e20",
+            "-1e-300",
+            "2.5e-7",
+            "2.5",
+            "100",
+            "1"
+        ]
+    );
+}
+
 /// A table's columns have the types its DDL gives them (#221); MariaDB flags a
 /// TIMESTAMP and an INET6 unsigned, which they aren't.
 #[test]
