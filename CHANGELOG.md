@@ -135,6 +135,10 @@ All notable changes to Pythia are documented here. The format follows
   window waited for that. Break now returns at once and the interrupt
   goes on its own; one that gets no answer gives up after a few seconds
   (MySQL, PostgreSQL), so Break can be pressed again.
+- MySQL: a query's warnings never showed (#210). `select 1/0` said only
+  "1 row selected"; now "Warning 1365: Division by 0" follows among the
+  messages once the rows are read, as it did for statements without a
+  result.
 
 ## [0.10.0] - 2026-10-30
 

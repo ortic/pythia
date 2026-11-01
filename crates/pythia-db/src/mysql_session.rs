@@ -155,9 +155,10 @@ struct Worker {
 }
 
 /// How a statement ended: a query's rows were reported as they were
-/// fetched, anything else is summarized.
+/// fetched (`ended` when all of them were read), anything else is
+/// summarized.
 enum Outcome {
-    Query,
+    Query { ended: bool },
     Done { affected: u64, warnings: u16 },
 }
 
@@ -240,6 +241,11 @@ impl Worker {
                     if warnings > 0 {
                         self.report_warnings();
                     }
+                } else if let Outcome::Query { ended: true } = outcome
+                    // A query's are known once all its rows are read (#210).
+                    && self.conn.warnings() > 0
+                {
+                    self.report_warnings();
                 }
             }
             Err(e) => {
@@ -380,7 +386,7 @@ impl Fetch<'_> {
                             error,
                             elapsed: started.elapsed(),
                         });
-                        return Ok(Outcome::Query);
+                        return Ok(Outcome::Query { ended: false });
                     }
                     None => {
                         more = false;
@@ -395,7 +401,7 @@ impl Fetch<'_> {
                 elapsed: started.elapsed(),
             });
             if !more {
-                return Ok(Outcome::Query);
+                return Ok(Outcome::Query { ended: true });
             }
             match self.requests.recv() {
                 Ok(DbRequest::FetchMore {
@@ -410,7 +416,7 @@ impl Fetch<'_> {
                     // all when the result is dropped on return.
                     (self.kill)();
                     *next = Some(other.unwrap_or(DbRequest::Disconnect));
-                    return Ok(Outcome::Query);
+                    return Ok(Outcome::Query { ended: false });
                 }
             }
         }

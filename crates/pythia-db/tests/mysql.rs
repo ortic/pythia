@@ -691,6 +691,46 @@ fn warnings_become_notices() {
     h.ok("drop table warn_t");
 }
 
+/// A query's warnings show after its rows (#210), with binds too.
+#[test]
+fn query_warnings_become_notices() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let events = |h: &mut Harness, sql: &str, binds: Vec<(String, Option<String>)>| {
+        h.session.send(DbRequest::Execute {
+            id: 1,
+            sql: sql.into(),
+            max_rows: 10,
+            binds,
+        });
+        let mut seen = Vec::new();
+        loop {
+            match h.next() {
+                DbEvent::Rows { .. } => seen.push("(rows)".to_owned()),
+                DbEvent::Notice(n) => seen.push(n),
+                DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                DbEvent::Transaction { .. } => return seen,
+                _ => {}
+            }
+        }
+    };
+    assert_eq!(
+        events(&mut h, "select 1/0", Vec::new()),
+        ["(rows)", "Warning 1365: Division by 0"]
+    );
+    assert_eq!(
+        events(
+            &mut h,
+            "select :a / 0",
+            vec![("a".into(), Some("1".into()))]
+        ),
+        ["(rows)", "Warning 1365: Division by 0"]
+    );
+    // None after a query without them.
+    assert_eq!(events(&mut h, "select 1", Vec::new()), ["(rows)"]);
+}
+
 #[test]
 fn dictionary() {
     let Some(mut h) = Harness::connect() else {
