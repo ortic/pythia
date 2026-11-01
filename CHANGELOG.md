@@ -769,6 +769,29 @@ All notable changes to Pythia are documented here. The format follows
   made uncompressed and unpartitioned on the default filegroup. An index
   on a partition scheme no longer gets the partitioning column as its
   first column, in the DDL and in *Indexes*.
+- A sort or a filter of the result grid no longer moves the selection
+  and the cell being edited to other rows (#296). After a click on a
+  column's header, the selection, the cursor, the cell being edited,
+  *View value…* and the dialog editing a cell stayed where they were in
+  the view, on other rows: *Set NULL*, *Delete / undelete rows*, a value
+  typed and the dialog's *Apply* went into rows that weren't selected.
+  A filter did the same to the viewer, the dialog and the edit. They now
+  stay on their rows; a selection of several rows keeps the cursor's
+  row. Where the filter hides their row, the viewer and the dialog close
+  and the value being typed is kept.
+- Ctrl+Z that takes back a new row no longer leaves *View value…*, the
+  dialog editing a cell and a cell being typed into on another row
+  (#299). They stayed where they were in the view: past the rows, where
+  the dialog's *Apply* did nothing or went into the next new row, or on
+  a new row Ctrl+Z brought back in between. They now stay on their rows;
+  on the row taken back, the viewer and the dialog close and the edit
+  ends, which also no longer keeps the keys from the grid.
+- SQL Server: a connection lost once a statement of an Apply ran, while
+  Pythia read how many rows it changed, no longer reads as "Conflict on
+  row N: it was changed or deleted by another session" (#310). The
+  statement now fails with the lost connection, which says the statement
+  ran and its row count couldn't be read, and the change waits for
+  Apply. A connection out of step then is opened again.
 
 ## [0.10.0] - 2026-10-30
 

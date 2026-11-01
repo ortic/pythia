@@ -424,13 +424,36 @@ impl Worker {
         };
         let ran = self.run_statement(sql, binds, fetch, &mut next);
         let failed = match ran {
-            Ok(outcome) => {
-                let counts = self.counts();
-                if let Outcome::Done = outcome {
+            Ok(outcome) => match (outcome, self.counts()) {
+                // A change is reported with its row count, which an Apply
+                // checks: without one, it took the change for another
+                // session's (#310). The connection went, or got out of step,
+                // once the statement ran.
+                (Outcome::Done, Err(error)) if is_dml(&statement_kind(sql)) => {
+                    let why = (!error.is_connection_lost())
+                        .then(|| format!("The connection got out of step ({})", error.message));
+                    let error = DbError {
+                        message: format!(
+                            "{}\nThe statement ran; its row count couldn't be read.",
+                            error.message
+                        ),
+                        ..error
+                    };
+                    self.events.send(DbEvent::Failed {
+                        id,
+                        error,
+                        elapsed: started.elapsed(),
+                    });
+                    if let Some(why) = why {
+                        self.reset(&why);
+                    }
+                    true
+                }
+                (Outcome::Done, counts) => {
                     let kind = statement_kind(sql);
                     let summary = ExecSummary {
                         rows_affected: if is_dml(&kind) {
-                            counts.as_ref().ok().map(|c| c.0)
+                            counts.ok().map(|c| c.0)
                         } else {
                             None
                         },
@@ -442,9 +465,10 @@ impl Worker {
                         summary,
                         elapsed: started.elapsed(),
                     });
+                    false
                 }
-                false
-            }
+                (Outcome::Query, _) => false,
+            },
             Err(Failure::Statement(error)) => {
                 self.events.send(DbEvent::Failed {
                     id,
