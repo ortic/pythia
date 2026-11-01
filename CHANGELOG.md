@@ -527,6 +527,11 @@ All notable changes to Pythia are documented here. The format follows
   MySQL and SQLite, once `select * from r51_s.` had offered `r51_t`,
   `select t. from r51_s.r51_t t` offered nothing: the table, typed in
   another case than stored, was taken for one that doesn't exist.
+- Completion after an alias that follows `&` without a space, as in
+  `where 1&c.`, offers its columns on MySQL, PostgreSQL, SQL Server and
+  SQLite (#287). It offered nothing, reading `&c.` as a substitution
+  variable, which there it is only after `SET DEFINE ON` (#190). Code
+  assistance now reads `&name` as the window substitutes.
 
 ## [0.10.0] - 2026-10-30
 

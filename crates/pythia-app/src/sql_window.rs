@@ -2004,6 +2004,8 @@ impl SqlWindow {
         let mut effects = Effects::default();
         self.state.syntax = cx.dialect.syntax();
         self.editor.set_syntax(self.state.syntax);
+        let substitution = self.substitutes();
+        self.editor.set_substitution(substitution);
         egui::Panel::bottom(egui::Id::new(("sql-bottom", cx.id)))
             .resizable(true)
             .default_size(ui.available_height() * 0.45)

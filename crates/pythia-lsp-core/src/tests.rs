@@ -521,6 +521,40 @@ fn names_of_a_completed_schema() {
 }
 
 #[test]
+fn bitwise_and_before_an_alias() {
+    // `&` is an operator outside Oracle: `1&c.` is `1 & c.`, not a
+    // substitution variable `&c.` (#287).
+    let cat = as_written("main", NameStyle::AsWritten, &["T"]);
+    for syntax in [
+        Syntax::MySql,
+        Syntax::Postgres,
+        Syntax::TSql,
+        Syntax::Sqlite,
+    ] {
+        for src in [
+            "select * from t c where 1&c.¦",
+            "select * from t c where c.id&c.¦ = 0",
+            "select c.id&&c.¦ from t c",
+        ] {
+            let labels = columns_in(src, syntax, &cat);
+            assert!(
+                labels.contains(&"note".to_owned()),
+                "{syntax:?}: {src}: {labels:?}"
+            );
+        }
+    }
+    // With `SET DEFINE ON` it is one, as on Oracle.
+    let (text, offset) = split("select * from t c where 1&c.¦");
+    for analysis in [
+        Analysis::new_with(&text, Syntax::MySql, true),
+        Analysis::new_in(&text, Syntax::Oracle),
+    ] {
+        let c = analysis.complete(offset, &cat);
+        assert!(c.items.iter().all(|i| i.label != "note"), "{:?}", c.items);
+    }
+}
+
+#[test]
 fn names_after_an_opening_quote() {
     // Typed after its opening quote, a name replaces the quote too and
     // comes closed, in the quotes typed; only names are offered.

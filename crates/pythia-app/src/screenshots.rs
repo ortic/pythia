@@ -5853,6 +5853,53 @@ fn explain_case(h: &mut Ui, connection: &str, case: &ExplainCase) {
     wait_until(h, "rollback", |app| !app.test_pending_tx());
 }
 
+/// On SQLite `&` is an operator: completion after `1&c.` offers the
+/// alias's columns (#287), which it didn't, reading `&c.` as a
+/// substitution variable. After `SET DEFINE ON` it is one.
+#[test]
+fn completion_after_a_bitwise_and() {
+    let connection = "r51_and.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r51_t (id integer primary key, note text)",
+    );
+    let text = "select * from r51_t c where 1&c";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .select(text.len()..text.len());
+    h.run_steps(3);
+    h.event(egui::Event::Text(".".into()));
+    wait_until(&mut h, "completion popup", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.completion_visible_with("note"))
+    });
+    assert!(
+        !h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+    run_in_window(&mut h, "set define on");
+    h.run_steps(2);
+    assert!(
+        h.state()
+            .test_sql_window_ref()
+            .unwrap()
+            .editor
+            .substitution()
+    );
+}
+
 /// Explain plan runs in the window's session, so it sees what Execute in
 /// that window sees (#269): a temporary table, PostgreSQL's search path,
 /// Oracle's current schema. On the connection's main session it said there
