@@ -277,6 +277,10 @@ All notable changes to Pythia are documented here. The format follows
   value showed ⚠ in place of the image, as Pythia had no decoder for
   them. An image viewed in a cell no longer shows again for another
   value viewed there later.
+- *View value…* shows a binary value over 4000 bytes as binary (#232):
+  its size, a hex dump of the first 4000 bytes, which the grid holds of
+  it, and that an image can't be shown from them. It showed the value as
+  8015 characters of text, hex digits and `… (51200 bytes)`.
 
 ## [0.10.0] - 2026-10-30
 

@@ -2098,11 +2098,18 @@ fn viewer(
         .cloned()
         .flatten();
     let name = columns.get(c).map_or("", |col| col.name.as_str());
-    let bytes = columns
+    let binary = columns
         .get(c)
-        .filter(|col| is_binary(state.dialect, col))
-        .and(value.as_deref())
-        .and_then(|v| decode_hex(hex_digits(v)));
+        .is_some_and(|col| is_binary(state.dialect, col));
+    // A value held cut short shows its size and the bytes held (#232).
+    let cut = value
+        .as_deref()
+        .filter(|_| binary)
+        .and_then(pythia_db::cut_size);
+    let bytes = value
+        .as_deref()
+        .filter(|_| binary)
+        .and_then(|v| decode_hex(held_hex(v)));
     let pretty = value
         .as_deref()
         .and_then(|v| serde_json::from_str::<serde_json::Value>(v.trim()).ok())
@@ -2111,7 +2118,7 @@ fn viewer(
     let mut text = pretty.clone().or_else(|| value.clone()).unwrap_or_default();
     // Named by its bytes: egui keeps an image by its URI, and the next value
     // in this cell (of another result, or edited) would show this one (#231).
-    let image = bytes.as_ref().and_then(|b| {
+    let image = bytes.as_ref().filter(|_| cut.is_none()).and_then(|b| {
         let kind = image_kind(b)?;
         Some(format!(
             "bytes://pythia-grid/{:016x}.{kind}",
@@ -2129,11 +2136,21 @@ fn viewer(
             ui.horizontal(|ui| {
                 match (&value, &bytes) {
                     (None, _) => ui.weak("NULL"),
-                    (_, Some(b)) => ui.weak(format!(
-                        "{} · {}",
-                        human_bytes(b.len()),
-                        image_kind(b).unwrap_or("binary")
-                    )),
+                    (_, Some(b)) => {
+                        let size = cut.map_or(b.len(), |n| n as usize);
+                        let mut header = format!(
+                            "{} · {}",
+                            human_bytes(size),
+                            image_kind(b).unwrap_or("binary")
+                        );
+                        if cut.is_some() {
+                            header.push_str(&format!(
+                                " · the grid holds its first {} bytes",
+                                b.len()
+                            ));
+                        }
+                        ui.weak(header)
+                    }
                     (Some(v), None) => ui.weak(format!("{} characters", v.chars().count())),
                 };
                 if pretty.is_some() {
@@ -2155,8 +2172,23 @@ fn viewer(
                                 .max_height(480.0),
                         );
                         ui.separator();
+                    } else if cut.is_some() && image_kind(b).is_some() {
+                        ui.weak(format!(
+                            "The image can't be shown: the grid holds the first {} bytes of it. \
+                             Execute to file writes such values whole.",
+                            b.len()
+                        ));
+                        ui.separator();
                     }
-                    ui.label(RichText::new(hex_dump(b, 4096)).monospace());
+                    let mut dump = hex_dump(b, 4096);
+                    if let Some(size) = cut {
+                        let more = (size as usize).saturating_sub(b.len());
+                        dump.push_str(&format!(
+                            "… {} more, not held by the grid",
+                            human_bytes(more)
+                        ));
+                    }
+                    ui.label(RichText::new(dump).monospace());
                 });
                 return;
             }
@@ -2225,6 +2257,16 @@ fn hex_digits(text: &str) -> &str {
     text.strip_prefix("0x")
         .or_else(|| text.strip_prefix("\\x"))
         .unwrap_or(text)
+}
+
+/// The hex digits the grid holds of a binary value: all of them, or the
+/// first [`pythia_db::SHOWN_BYTES`]' of one held cut short (#204).
+fn held_hex(text: &str) -> &str {
+    let hex = hex_digits(text);
+    match pythia_db::cut_size(text) {
+        Some(_) => &hex[..pythia_db::SHOWN_BYTES * 2],
+        None => hex,
+    }
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -2909,6 +2951,57 @@ mod tests {
         let (blue, _) = viewer_image(&ctx, &[vec![Some(BLUE.to_owned())]]);
         assert!(!blue.is_empty());
         assert_ne!(red, blue);
+    }
+
+    /// The viewer of a binary value the grid holds cut short (#204) shows
+    /// its size, a hex dump of what it holds, and why there is no image
+    /// (#232); it showed the hex and the size as 8015 characters of text.
+    #[test]
+    fn the_viewer_of_a_cut_value_says_so() {
+        use pythia_db::{Dialect, SHOWN_BYTES};
+        let held = format!("{PNG}{}", "00".repeat(SHOWN_BYTES - PNG.len() / 2));
+        for (dialect, type_name, value) in [
+            (Dialect::MYSQL, "BLOB", format!("{held}… (51200 bytes)")),
+            (
+                Dialect::SQLSERVER,
+                "varbinary",
+                format!("0x{held}… (51200 bytes)"),
+            ),
+        ] {
+            let columns = vec![Column {
+                name: "IMG".into(),
+                type_name: type_name.into(),
+                numeric: false,
+            }];
+            let rows = vec![vec![Some(value)]];
+            let ctx = egui::Context::default();
+            let mut state = GridState {
+                dialect,
+                viewer: Some((0, 0)),
+                ..Default::default()
+            };
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let texts = texts(&drawn);
+            assert!(
+                texts.contains(&"50.0 KB · png · the grid holds its first 4000 bytes"),
+                "{type_name}: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|t| t.starts_with(
+                    "The image can't be shown: the grid holds the first 4000 bytes of it."
+                )),
+                "{type_name}: {texts:?}"
+            );
+            let dump = texts
+                .iter()
+                .find(|t| t.starts_with("00000000  89 50 4E 47"))
+                .unwrap_or_else(|| panic!("{type_name}: no hex dump in {texts:?}"));
+            assert!(
+                dump.ends_with("… 46.1 KB more, not held by the grid"),
+                "{type_name}: {dump}"
+            );
+        }
     }
 
     /// A cell lays out no more of a value than it can show (#212): 10 MB on
