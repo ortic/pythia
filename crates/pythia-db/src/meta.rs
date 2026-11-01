@@ -470,9 +470,11 @@ fn objects(
     if object_type == ObjectType::DatabaseLink {
         return links(conn, owner, &pattern);
     }
+    // A quoted name keeps its lowercase letters: compared in uppercase
+    // with the filter (#305).
     let sql = format!(
         "select {OBJECT_COLUMNS} from all_objects \
-         where owner = :1 and object_type = :2 and object_name like :3 escape '\\' \
+         where owner = :1 and object_type = :2 and upper(object_name) like :3 escape '\\' \
            and object_name not like 'BIN$%' and generated = 'N' \
          order by object_name"
     );
@@ -522,7 +524,7 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
         .collect();
     let sql = format!(
         "select {OBJECT_COLUMNS} from all_objects \
-         where object_name like :1 escape '\\' and object_type in ({}) \
+         where upper(object_name) like :1 escape '\\' and object_type in ({}) \
          order by case when owner = sys_context('USERENV', 'CURRENT_SCHEMA') then 0 else 1 end, \
                   length(object_name), object_name, owner",
         types.join(", ")
@@ -532,10 +534,17 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
 }
 
 /// Turns a user filter into a LIKE pattern: case-insensitive "contains",
-/// `*` and `?` as wildcards, `%`/`_` matched literally.
+/// `*` and `?` as wildcards, `%`/`_` matched literally. Each letter is
+/// uppercased as SQL's `upper()` does, to one letter: `ß` stays `ß`, which
+/// `upper('straße')` keeps (#306).
 pub fn like_pattern(filter: &str) -> String {
     let mut out = String::from("%");
-    for c in filter.trim().to_uppercase().chars() {
+    for c in filter.trim().chars() {
+        let mut upper = c.to_uppercase();
+        let c = match (upper.next(), upper.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        };
         match c {
             '%' | '_' | '\\' => {
                 out.push('\\');
@@ -1203,6 +1212,7 @@ mod tests {
         assert_eq!(like_pattern("emp"), "%EMP%");
         assert_eq!(like_pattern("emp*_hist"), "%EMP%\\_HIST%");
         assert_eq!(like_pattern("a?c"), "%A_C%");
+        assert_eq!(like_pattern("čaj straße"), "%ČAJ STRAßE%");
     }
 
     #[test]

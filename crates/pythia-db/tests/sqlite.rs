@@ -960,3 +960,60 @@ fn tools_run_through_the_client() {
         }
     }
 }
+
+/// Object filters and Find find names without case whatever their letters:
+/// SQLite's upper() and LIKE change ASCII letters only.
+#[test]
+fn filters_match_any_letters_without_case() {
+    let db = TempDb::new("letters");
+    let mut h = Harness::connect(&db.create());
+    for sql in [
+        "create table \"r62_čaj\" (x)",
+        "create table \"r62_bière\" (x)",
+        "create table \"r62_ÖL\" (x)",
+        "create table r62_tea (x)",
+        "create view \"r62_Straße\" as select 1",
+    ] {
+        h.ok(sql);
+    }
+    let filtered = |h: &mut Harness, object_type, filter: &str| -> Vec<String> {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: "main".into(),
+            object_type,
+            filter: Some(filter.into()),
+        }) else {
+            panic!("expected objects")
+        };
+        objects.into_iter().map(|o| o.name).collect()
+    };
+    let mut tables = |filter: &str| filtered(&mut h, ObjectType::Table, filter);
+    assert_eq!(tables("čaj"), ["r62_čaj"]);
+    assert_eq!(tables("ČAJ"), ["r62_čaj"]);
+    assert_eq!(tables("r62_Č"), ["r62_čaj"]);
+    assert_eq!(tables("BIÈRE"), ["r62_bière"]);
+    assert_eq!(tables("öl"), ["r62_ÖL"]);
+    assert_eq!(tables("R62_?A"), ["r62_čaj"]);
+    assert_eq!(tables("r62_?EA"), ["r62_tea"]);
+    assert_eq!(tables("r62*è"), ["r62_bière"]);
+    assert_eq!(tables("r62_t*a"), ["r62_tea"]);
+    assert_eq!(tables("r62%"), Vec::<String>::new());
+    assert_eq!(tables("r62.t"), Vec::<String>::new());
+    assert_eq!(
+        tables("R62_"),
+        ["r62_bière", "r62_tea", "r62_ÖL", "r62_čaj"]
+    );
+    assert_eq!(filtered(&mut h, ObjectType::View, "straße"), ["r62_Straße"]);
+    assert_eq!(filtered(&mut h, ObjectType::View, "STRAßE"), ["r62_Straße"]);
+    let mut found = |pattern: &str| -> Vec<String> {
+        let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+            pattern: pattern.into(),
+            limit: 10,
+        }) else {
+            panic!("expected objects")
+        };
+        found.into_iter().map(|o| o.name).collect()
+    };
+    assert_eq!(found("R62_ČA"), ["r62_čaj"]);
+    assert_eq!(found("ère"), ["r62_bière"]);
+    assert_eq!(found("r62_*e"), ["r62_tea", "r62_bière", "r62_Straße"]);
+}

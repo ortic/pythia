@@ -215,7 +215,7 @@ fn object_names(
     };
     let sql = format!(
         "select object_name from all_objects o \
-          where owner = :1 and object_type = :2 and object_name like :3 escape '\\' \
+          where owner = :1 and object_type = :2 and upper(object_name) like :3 escape '\\' \
             and object_name not like 'BIN$%' and generated = 'N'{extra} \
           order by object_name"
     );
@@ -728,5 +728,30 @@ mod tests {
             ),
             "\"ID\" NUMBER NOT NULL ENABLE, CONSTRAINT \"PK\" PRIMARY KEY"
         );
+    }
+
+    /// The name filter finds a quoted name with lowercase letters by any
+    /// case (#305).
+    #[test]
+    fn the_name_filter_finds_names_in_any_case() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        conn.execute(
+            "create or replace view \"R62_Cmp\" as select 1 as x from dual",
+            &[],
+        )
+        .unwrap();
+        let options = Options {
+            name_filter: "r62_cm".into(),
+            ..Options::default()
+        };
+        let part = collect_type(&conn, &user.to_uppercase(), ObjectType::View, &options).unwrap();
+        let names: Vec<&str> = part.objects.iter().map(|(k, _)| k.name.as_str()).collect();
+        assert_eq!(names, ["R62_Cmp"], "{:?}", part.errors);
+        conn.execute("drop view \"R62_Cmp\"", &[]).unwrap();
     }
 }

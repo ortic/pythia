@@ -1748,6 +1748,83 @@ fn index_options_and_storage() {
     drop_database(&mut dba, "r63_opts");
 }
 
+/// Object filters and Find find names without case, non-ASCII letters too,
+/// in the test database and, as a DBA, in one with a case-sensitive
+/// collation.
+#[test]
+fn filters_match_any_letters_without_case() {
+    let Some(params) = params() else {
+        return;
+    };
+    let check = |h: &mut Harness| {
+        let schema = h.schema.clone();
+        let tables = "[r62_čaj], [r62_bière], [r62_ÖL], [R62_Case], [r62_straße]";
+        h.ok(&format!("drop table if exists {tables}"));
+        for table in tables.split(", ") {
+            h.ok(&format!("create table {table} (x int)"));
+        }
+        let mut filtered = |filter: &str| -> Vec<String> {
+            let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+                owner: schema.clone(),
+                object_type: ObjectType::Table,
+                filter: Some(filter.into()),
+            }) else {
+                panic!("expected objects")
+            };
+            objects.into_iter().map(|o| o.name).collect()
+        };
+        assert_eq!(filtered("r62_čaj"), ["r62_čaj"]);
+        assert_eq!(filtered("R62_ČAJ"), ["r62_čaj"]);
+        assert_eq!(filtered("r62_BIÈRE"), ["r62_bière"]);
+        assert_eq!(filtered("r62_öl"), ["r62_ÖL"]);
+        assert_eq!(filtered("r62_ca"), ["R62_Case"]);
+        assert_eq!(filtered("R62_CASE"), ["R62_Case"]);
+        assert_eq!(filtered("r62_straße"), ["r62_straße"]);
+        assert_eq!(filtered("r62_?ase"), ["R62_Case"]);
+        assert_eq!(filtered("r62%"), Vec::<String>::new());
+        let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+            pattern: "R62_ČAJ".into(),
+            limit: 10,
+        }) else {
+            panic!("expected objects")
+        };
+        let found: Vec<&str> = found.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(found, ["r62_čaj"]);
+        h.ok(&format!("drop table {tables}"));
+    };
+    let mut h = Harness::with(params.clone());
+    h.session.send(DbRequest::SetAutocommit(true));
+    check(&mut h);
+    let Some(dba) = std::env::var("PYTHIA_TEST_MSSQL_DBA")
+        .ok()
+        .and_then(|spec| from_spec(&spec))
+    else {
+        return;
+    };
+    let mut d = Harness::with(dba.clone());
+    d.session.send(DbRequest::SetAutocommit(true));
+    d.ok("drop database if exists r62_cs");
+    d.ok("create database r62_cs collate Latin1_General_100_CS_AS_SC");
+    let connect_string = {
+        let (server, _) = dba.connect_string.split_once('/').expect("a database");
+        let options = dba.connect_string.split_once('?').map_or("", |(_, o)| o);
+        format!("{server}/r62_cs?{options}")
+    };
+    let mut c = Harness::with(ConnectParams {
+        connect_string,
+        ..dba
+    });
+    c.session.send(DbRequest::SetAutocommit(true));
+    assert_eq!(
+        c.scalar("select convert(varchar(60), databasepropertyex(db_name(), 'Collation'))")
+            .as_deref(),
+        Some("Latin1_General_100_CS_AS_SC")
+    );
+    check(&mut c);
+    drop(c);
+    d.ok("drop database r62_cs");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();

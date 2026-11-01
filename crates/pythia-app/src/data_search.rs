@@ -165,7 +165,8 @@ impl DataSearch {
                     .map(|c| pythia_lsp_core::Catalog::current_schema(c).to_owned())
             })
             .unwrap_or_default();
-        let tables = self.tables.trim().to_uppercase().replace('*', "%");
+        // Uppercased by Oracle, as the names it is compared with (#305).
+        let tables = self.tables.trim().replace('*', "%");
         let (mode, match_case) = (self.mode, self.match_case);
         let progress = Arc::new(Progress::default());
         let id = request_id();
@@ -367,9 +368,12 @@ fn find_columns(
 ) -> Result<(), DbError> {
     let (condition, value) = match mode {
         Match::Exact if match_case => ("c.column_name = :3", pattern.trim().to_owned()),
-        Match::Exact => ("c.column_name = upper(:3)", pattern.trim().to_owned()),
+        Match::Exact => (
+            "upper(c.column_name) = upper(:3)",
+            pattern.trim().to_owned(),
+        ),
         Match::Contains => (
-            "c.column_name like :3 escape '\\'",
+            "upper(c.column_name) like :3 escape '\\'",
             pythia_db::like_pattern(pattern.trim()),
         ),
         Match::Regex if match_case => ("regexp_like(c.column_name, :3)", pattern.to_owned()),
@@ -378,7 +382,7 @@ fn find_columns(
     let sql = format!(
         "select c.table_name, c.column_name, c.data_type
            from all_tab_columns c
-          where c.owner = :1 and c.table_name like :2 and {condition}
+          where c.owner = :1 and upper(c.table_name) like upper(:2) and {condition}
           order by c.table_name, c.column_id"
     );
     let tables = if tables.is_empty() { "%" } else { tables };
@@ -412,7 +416,7 @@ fn search(
     let rows = conn.query_as::<(String, String, String)>(
         "select c.table_name, c.column_name, c.data_type from all_tab_columns c \
            join all_tables t on t.owner = c.owner and t.table_name = c.table_name \
-          where c.owner = :1 and (:2 is null or c.table_name like :2) \
+          where c.owner = :1 and (:2 is null or upper(c.table_name) like upper(:2)) \
             and t.temporary = 'N' and nvl(t.iot_type, '-') <> 'IOT_OVERFLOW' \
           order by c.table_name, c.column_id",
         &[&owner, &Some(tables).filter(|t| !t.is_empty())],
@@ -506,5 +510,63 @@ mod tests {
             [ValueKind::Text, ValueKind::Number]
         );
         assert_eq!(value_kinds("42", Match::Contains), [ValueKind::Text]);
+    }
+
+    /// The tables filter and a column name without Match case find quoted
+    /// names with lowercase letters by any case (#305).
+    #[test]
+    fn finds_names_in_any_case() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        let _ = conn.execute("drop table \"R62_Data\" purge", &[]);
+        conn.execute(
+            "create table \"R62_Data\" (\"Mixed\" varchar2(10), plain varchar2(10))",
+            &[],
+        )
+        .unwrap();
+        conn.execute("insert into \"R62_Data\" values ('needle', 'needle')", &[])
+            .unwrap();
+        conn.commit().unwrap();
+        let owner = user.to_uppercase();
+        let hits = |progress: Progress| {
+            let hits = progress.hits.lock().unwrap();
+            hits.iter()
+                .map(|h| format!("{}.{}={}", h.table, h.column, h.count))
+                .collect::<Vec<_>>()
+        };
+        let columns = |tables: &str, pattern: &str, mode| {
+            let progress = Progress::default();
+            find_columns(&conn, &owner, tables, pattern, mode, false, &progress).unwrap();
+            hits(progress)
+        };
+        assert_eq!(
+            columns("r62_d%", "mix", Match::Contains),
+            ["R62_Data.Mixed=0"]
+        );
+        assert_eq!(
+            columns("R62_DATA", "mixed", Match::Exact),
+            ["R62_Data.Mixed=0"]
+        );
+        assert_eq!(
+            columns("r62_data", "plain", Match::Exact),
+            ["R62_Data.PLAIN=0"]
+        );
+        let progress = Progress::default();
+        search(
+            &conn,
+            &owner,
+            "r62_d%",
+            "needle",
+            Match::Exact,
+            true,
+            &progress,
+        )
+        .unwrap();
+        assert_eq!(hits(progress), ["R62_Data.Mixed=1", "R62_Data.PLAIN=1"]);
+        conn.execute("drop table \"R62_Data\" purge", &[]).unwrap();
     }
 }

@@ -213,15 +213,10 @@ fn browser_types(dialect: Dialect, mariadb: bool) -> &'static [ObjectType] {
     }
 }
 
-/// Whether a name contains the (uppercase) filter. Oracle's names are
-/// uppercase already; MySQL's are compared without case.
-fn name_matches(dialect: Dialect, name: &str, filter: &str) -> bool {
-    filter.is_empty()
-        || if dialect == Dialect::ORACLE {
-            name.contains(filter)
-        } else {
-            name.to_uppercase().contains(filter)
-        }
+/// Whether a name contains the (uppercase) filter, without case: on Oracle
+/// too, where a quoted name keeps its lowercase letters (#305).
+pub(crate) fn name_matches(name: &str, filter: &str) -> bool {
+    filter.is_empty() || name.to_uppercase().contains(filter)
 }
 
 /// One visible line of the tree.
@@ -432,11 +427,7 @@ impl Browser {
             ..object
         };
         self.set_schema(object.owner.clone(), effects);
-        if !name_matches(
-            self.dialect,
-            &object.name,
-            &self.filter.trim().to_uppercase(),
-        ) {
+        if !name_matches(&object.name, &self.filter.trim().to_uppercase()) {
             self.filter.clear();
         }
         let node = Node::Folder(object.owner.clone(), object_type);
@@ -1032,7 +1023,7 @@ impl Browser {
             };
             let matching: Vec<&ObjectRef> = list
                 .iter()
-                .filter(|o| name_matches(self.dialect, &o.name, &filter))
+                .filter(|o| name_matches(&o.name, &filter))
                 .collect();
             if matching.is_empty() {
                 continue;
@@ -1054,7 +1045,7 @@ impl Browser {
                 .to_string()
         });
         let shown = |o: &DbObject| {
-            name_matches(self.dialect, &o.name, &filter)
+            name_matches(&o.name, &filter)
                 && (!self.invalid_only || !o.valid)
                 && cutoff.as_deref().is_none_or(|c| o.last_ddl.as_str() >= c)
         };
@@ -1175,7 +1166,7 @@ impl Browser {
             let matching: Vec<&(String, String)> = match list {
                 Some(Loaded::Ready(names)) => names
                     .iter()
-                    .filter(|(n, _)| name_matches(self.dialect, n, &filter))
+                    .filter(|(n, _)| name_matches(n, &filter))
                     .collect(),
                 _ => Vec::new(),
             };
@@ -3011,6 +3002,22 @@ mod tests {
             "Sales.Emp"
         );
         assert_eq!(shown_qualified(Dialect::POSTGRES, &emp("")), "Emp");
+    }
+
+    /// The filter, uppercased, finds a name in any case: an Oracle name with
+    /// lowercase letters too (#305).
+    #[test]
+    fn names_match_without_case() {
+        for (name, filter) in [
+            ("R62_Case", "CASE"),
+            ("R62_CASE", "CASE"),
+            ("r62_čaj", "ČAJ"),
+            ("Straße", "STRASSE"),
+            ("emp", ""),
+        ] {
+            assert!(name_matches(name, filter), "{name} {filter}");
+        }
+        assert!(!name_matches("R62_Case", "CASES"));
     }
 
     /// Names that need quotes give binds that are binds: a bind ends at a

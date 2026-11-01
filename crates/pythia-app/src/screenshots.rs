@@ -11523,6 +11523,73 @@ fn names_keep_the_case_that_tells_them_apart() {
     }
 }
 
+/// On Oracle the filters of the object browser, Export tables and Invalid
+/// objects find a quoted name with lowercase letters by any case (#305):
+/// `r62_ca` found no "R62_Case", `r62_bad` no "R62_Bad".
+#[test]
+fn oracle_filters_find_names_in_any_case() {
+    use pythia_db::ObjectType;
+
+    let connection = "r62-filters";
+    let Some(mut h) = connect_to("PYTHIA_TEST_DB", connection, pythia_config::DbKind::Oracle)
+    else {
+        return;
+    };
+    let drops = [
+        "table \"R62_Case\" purge",
+        "table r62_upper purge",
+        "view \"R62_Bad\"",
+    ]
+    .map(|o| {
+        format!(
+            "begin execute immediate 'drop {o}'; \
+             exception when others then null; end;\n/"
+        )
+    })
+    .join("\n");
+    run_script(&mut h, connection, &drops);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"R62_Case\" (a number);\ncreate table r62_upper (a number);\n\
+         create force view \"R62_Bad\" as select * from r62_missing;",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    h.state_mut().test_browser().set_filter("r62_ca");
+    h.state_mut().test_refresh_browser();
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Case\"").count(), 1);
+    assert_eq!(h.query_all_by_label("r62_upper").count(), 0);
+
+    // The browser shows none of them now.
+    h.state_mut().test_browser().set_filter("r62_none");
+    h.state_mut()
+        .test_command(crate::commands::Command::ExportTables);
+    h.run_steps(3);
+    wait_until(&mut h, "tables", |app| !app.test_focused_busy());
+    h.state_mut().test_export_tables().set_filter("r62_ca");
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Case\"").count(), 1);
+    assert_eq!(h.query_all_by_label("r62_upper").count(), 0);
+    h.state_mut().test_close_focused();
+
+    h.state_mut().test_open(OpenRequest::InvalidObjects {
+        connection: connection.into(),
+        schema: None,
+        recompile: false,
+    });
+    wait_until(&mut h, "invalid objects", |app| {
+        app.test_invalid_window()
+            .is_some_and(|w| !w.is_busy() && w.objects().iter().any(|o| o.id.name == "R62_Bad"))
+    });
+    h.state_mut().test_invalid_window_mut().unwrap().filter = "r62_bad".into();
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"R62_Bad\"").count(), 1);
+    h.state_mut().test_close_focused();
+    run_script(&mut h, connection, &drops);
+}
+
 /// A SQLite table named `""` shows as `""` (#281): in the browser, where it
 /// was a button without a label, 16 pixels wide, its tab and view,
 /// Favorites and Recent. One named `" "` shows as `" "`.

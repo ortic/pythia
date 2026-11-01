@@ -144,7 +144,7 @@ impl SourceSearch {
         let owner = Some(self.owner.trim().to_uppercase()).filter(|o| !o.is_empty());
         let name = Some(self.name.trim())
             .filter(|n| !n.is_empty())
-            .map(|n| n.to_uppercase().replace('*', "%").replace('?', "_"));
+            .map(|n| n.replace('*', "%").replace('?', "_"));
         let id = request_id();
         self.state.pending = Some((id, Instant::now()));
         let task = Box::new(move |conn: &Connection| {
@@ -413,7 +413,7 @@ struct Filter<'a> {
     regex: bool,
     match_case: bool,
     owner: Option<&'a str>,
-    /// LIKE pattern on the object name.
+    /// LIKE pattern on the object name, in any case (#305).
     name: Option<&'a str>,
     include_oracle: bool,
     kind: SourceKind,
@@ -454,7 +454,7 @@ fn query(conn: &Connection, pattern: &str, f: &Filter) -> Result<Found, DbError>
         let sql = format!(
             "select s.owner, s.name, s.type, s.line, s.text from all_source s \
               where {} and (:owner is null or s.owner = :owner) \
-                and (:name is null or s.name like :name){types}{} \
+                and (:name is null or upper(s.name) like upper(:name)){types}{} \
               order by s.owner, s.name, s.type, s.line",
             condition("s.text"),
             oracle_filter("s.owner"),
@@ -500,7 +500,7 @@ fn query(conn: &Connection, pattern: &str, f: &Filter) -> Result<Found, DbError>
         let sql = format!(
             "select v.owner, v.view_name, v.text_vc from all_views v \
               where {} and (:owner is null or v.owner = :owner) \
-                and (:name is null or v.view_name like :name){} \
+                and (:name is null or upper(v.view_name) like upper(:name)){} \
               order by v.owner, v.view_name",
             condition("v.text_vc"),
             oracle_filter("v.owner")
@@ -516,7 +516,7 @@ fn query(conn: &Connection, pattern: &str, f: &Filter) -> Result<Found, DbError>
         let sql = format!(
             "select v.owner, v.view_name, v.text from all_views v \
               where (:owner is null or v.owner = :owner) \
-                and (:name is null or v.view_name like :name){} \
+                and (:name is null or upper(v.view_name) like upper(:name)){} \
               order by v.owner, v.view_name",
             oracle_filter("v.owner")
         );
@@ -537,7 +537,7 @@ fn query(conn: &Connection, pattern: &str, f: &Filter) -> Result<Found, DbError>
         let sql = format!(
             "select j.owner, j.job_name, j.job_action from all_scheduler_jobs j \
               where {} and (:owner is null or j.owner = :owner) \
-                and (:name is null or j.job_name like :name){} \
+                and (:name is null or upper(j.job_name) like upper(:name)){} \
               order by j.owner, j.job_name",
             condition("j.job_action"),
             oracle_filter("j.owner")
@@ -648,5 +648,47 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    /// The name filter finds a quoted name with lowercase letters by any
+    /// case (#305).
+    #[test]
+    fn the_name_filter_finds_names_in_any_case() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        conn.execute(
+            "create or replace procedure \"R62_Proc\" is begin null; -- needle_r62\nend;",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "create or replace view \"R62_View\" as select 'needle_r62' as marker from dual",
+            &[],
+        )
+        .unwrap();
+        let names = |name: &str| {
+            let filter = Filter {
+                regex: false,
+                match_case: false,
+                owner: None,
+                name: Some(name),
+                include_oracle: false,
+                kind: SourceKind::All,
+            };
+            let found = query(&conn, "needle_r62", &filter).unwrap();
+            found
+                .rows
+                .into_iter()
+                .map(|r| format!("{} {}", r.2, r.1))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("r62_p%"), ["PROCEDURE R62_Proc"]);
+        assert_eq!(names("R62_VIEW"), ["VIEW R62_View"]);
+        conn.execute("drop procedure \"R62_Proc\"", &[]).unwrap();
+        conn.execute("drop view \"R62_View\"", &[]).unwrap();
     }
 }

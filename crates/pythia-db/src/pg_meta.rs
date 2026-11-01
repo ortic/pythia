@@ -247,12 +247,20 @@ fn on_path<T>(
 /// The column's default as written in DDL, identity and generated columns
 /// included (`a` is `pg_attribute`, `d` is `pg_attrdef`); PostgreSQL 18's
 /// generated columns are virtual unless stored (#227). An identity has the
-/// options of its sequence that aren't the defaults (#263).
+/// options of its sequence that aren't the defaults (#263), and its
+/// sequence's name where it isn't the one PostgreSQL chooses (#308):
+/// `table_column_seq` in the table's schema, the two names cut to fit 63
+/// bytes, the longer first, as `makeObjectName` cuts them. A chosen name is
+/// left out, so that a copy chooses its own.
 const DEFAULT: &str = "case when a.attidentity in ('a', 'd') \
                               then 'generated ' \
                                    || case a.attidentity when 'a' then 'always' else 'by default' end \
                                    || ' as identity' || coalesce(( \
                                 select ' (' || nullif(concat_ws(' ', \
+                                         case when sc.relnamespace <> r.relnamespace \
+                                                or sc.relname <> chosen.name \
+                                              then 'sequence name ' || quote_ident(sn.nspname) \
+                                                   || '.' || quote_ident(sc.relname) end, \
                                          case when s.seqstart <> case when s.seqincrement > 0 \
                                                                       then s.seqmin else s.seqmax end \
                                               then 'start with ' || s.seqstart end, \
@@ -267,10 +275,25 @@ const DEFAULT: &str = "case when a.attidentity in ('a', 'd') \
                                          case when s.seqcache <> 1 then 'cache ' || s.seqcache end, \
                                          case when s.seqcycle then 'cycle' end), '') || ')' \
                                   from pg_depend q join pg_sequence s on s.seqrelid = q.objid \
+                                  join pg_class sc on sc.oid = q.objid \
+                                  join pg_namespace sn on sn.oid = sc.relnamespace \
+                                  join pg_class r on r.oid = q.refobjid \
                                  cross join lateral ( \
                                        select case s.seqtypid when 'int2'::regtype then 32767 \
                                                    when 'int4'::regtype then 2147483647 \
                                                    else 9223372036854775807 end as top) t \
+                                 cross join lateral ( \
+                                       select least(octet_length(r.relname), \
+                                                    greatest(29, 58 - octet_length(a.attname))) as table_bytes, \
+                                              least(octet_length(a.attname), \
+                                                    greatest(29, 58 - octet_length(r.relname))) as column_bytes) cut \
+                                 cross join lateral ( \
+                                       select (select left(r.relname, max(i)) from generate_series(0, cut.table_bytes) i \
+                                                where octet_length(left(r.relname, i)) <= cut.table_bytes) \
+                                              || '_' \
+                                              || (select left(a.attname, max(i)) from generate_series(0, cut.column_bytes) i \
+                                                   where octet_length(left(a.attname, i)) <= cut.column_bytes) \
+                                              || '_seq' as name) chosen \
                                  where q.classid = 'pg_class'::regclass \
                                    and q.refclassid = 'pg_class'::regclass \
                                    and q.refobjid = a.attrelid and q.refobjsubid = a.attnum \
@@ -574,7 +597,7 @@ fn ddl(
         }
         ObjectType::Sequence => {
             let (owner, name) = stored(pg, owner, name)?;
-            sequence_ddl(pg, &owner, &name, end)?.ok_or_else(missing)
+            sequence_ddl(pg, &owner, &name, true, end)?.ok_or_else(missing)
         }
         other => Err(DbError::new(format!(
             "PostgreSQL has no {}",
@@ -583,26 +606,44 @@ fn ddl(
     }
 }
 
-/// `CREATE SEQUENCE` of a sequence as stored, if there is one.
+/// `CREATE SEQUENCE` of a sequence as stored, if there is one. `owned`
+/// names the column that owns it (`serial`, `OWNED BY`), so that a copy
+/// goes with the copy's column (#307); a table's DDL makes the column the
+/// owner after the table.
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
     name: &str,
+    owned: bool,
     end: &str,
 ) -> Result<Option<String>, DbError> {
     let row = pg.first(
         "select format_type(s.seqtypid, null), s.seqincrement, s.seqmin, s.seqmax, \
-                s.seqstart, s.seqcache, s.seqcycle \
+                s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
            from pg_sequence s join pg_class c on c.oid = s.seqrelid \
            join pg_namespace n on n.oid = c.relnamespace \
+           left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
+                and d.refclassid = 'pg_class'::regclass and d.deptype = 'a' \
+           left join pg_class t on t.oid = d.refobjid \
+           left join pg_namespace tn on tn.oid = t.relnamespace \
+           left join pg_attribute a on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
           where n.nspname = $1 and c.relname = $2",
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let v: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+        let (v, column) = row.split_at(7);
+        let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
+        let owned_by = match column {
+            [Some(schema), Some(table), Some(column)] if owned => format!(
+                "\n  owned by {}.{}",
+                Dialect::POSTGRES.qualified(schema, table),
+                Dialect::POSTGRES.quote_ident(column)
+            ),
+            _ => String::new(),
+        };
         format!(
             "create sequence {} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
-             start with {} cache {}{}{end}",
+             start with {} cache {}{}{owned_by}{end}",
             Dialect::POSTGRES.qualified(owner, name),
             v[0],
             v[1],
@@ -690,7 +731,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
     for (sequence, _) in &sequences {
-        if let Some(create) = sequence_ddl(pg, &owner, sequence, ";")? {
+        if let Some(create) = sequence_ddl(pg, &owner, sequence, false, ";")? {
             ddl.push_str(&format!("{create}\n\n"));
         }
     }
