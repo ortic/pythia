@@ -843,6 +843,14 @@ All notable changes to Pythia are documented here. The format follows
   rows written through the column set left the sparse columns NULL,
   `select *` read every sparse column, and a table of more than 1,024
   columns failed.
+- SQL Server: a table's DDL keeps what CREATE TABLE can't give (#326).
+  A foreign key or check that isn't trusted is added after the table
+  `with nocheck`, and a disabled one then disabled (`nocheck
+  constraint`); a disabled index or key is disabled after it is made,
+  a clustered one last; and the table's `lock_escalation` is set where
+  it isn't `TABLE`. Run elsewhere, they were all enabled and trusted:
+  the copy rejected rows the original takes, and built and kept up to
+  date indexes the original doesn't.
 
 ## [0.10.0] - 2026-10-30
 

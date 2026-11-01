@@ -2110,6 +2110,158 @@ fn sparse_columns_and_column_sets() {
     drop_tables(&mut h, &schema, "r74_s");
 }
 
+/// A table's DDL keeps the states CREATE TABLE can't give (#326): foreign
+/// keys and checks added WITH NOCHECK, or disabled, are added so after the
+/// table, disabled indexes are disabled, and its lock escalation is set.
+/// Run elsewhere, the copy's constraints and indexes are as trusted and
+/// enabled as the original's.
+#[test]
+fn constraint_and_index_states() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_k", "r74_k");
+    h.ok("drop schema if exists r74_copy_k");
+    drop_tables(&mut h, &schema, "r74_k");
+    for sql in [
+        "create table r74_kp (id int constraint r74_kp_pk primary key, a int, \
+         constraint r74_kp_u unique (a))",
+        "create table r74_kc (id int, k int, n int, \
+         constraint r74_kc_fk foreign key (k) references r74_kp (id), \
+         constraint r74_kc_ck check (n > 0))",
+        "alter table r74_kc add constraint r74_kc_fk_off foreign key (id) references r74_kp (id)",
+        "alter table r74_kc add constraint r74_kc_ck_off check (k <> 0)",
+        "alter table r74_kc nocheck constraint r74_kc_fk_off",
+        "alter table r74_kc nocheck constraint r74_kc_ck_off",
+        "insert into r74_kc values (7, null, 500)",
+        "alter table r74_kc with nocheck add constraint r74_kc_fk_nc foreign key (n) \
+         references r74_kp (id) on delete cascade",
+        "alter table r74_kc with nocheck add constraint r74_kc_ck_nc check (n < 100)",
+        "create index r74_kc_k on r74_kc (k)",
+        "create index r74_kc_n on r74_kc (n)",
+        "alter index r74_kc_n on r74_kc disable",
+        "alter index r74_kp_u on r74_kp disable",
+        "alter table r74_kc set (lock_escalation = auto)",
+        "alter table r74_kp set (lock_escalation = disable)",
+        "create table r74_km (id int, v int)",
+        "create clustered index r74_km_c on r74_km (id)",
+        "create index r74_km_v on r74_km (v)",
+        "alter index r74_km_c on r74_km disable",
+    ] {
+        h.ok(sql);
+    }
+    let kp = table_ddl(&mut h, &schema, "r74_kp");
+    let t = format!("[{schema}].[r74_kp]");
+    assert_eq!(
+        kp,
+        format!(
+            "create table {t} (\n    \
+               [id] int not null,\n    \
+               [a] int null,\n    \
+               constraint [r74_kp_pk] primary key clustered ([id]),\n    \
+               constraint [r74_kp_u] unique nonclustered ([a])\n\
+             );\n\n\
+             alter table {t} set (lock_escalation = disable);\n\n\
+             alter index [r74_kp_u] on {t} disable;\nGO\n"
+        )
+    );
+    let kc = table_ddl(&mut h, &schema, "r74_kc");
+    let t = format!("[{schema}].[r74_kc]");
+    let p = format!("[{schema}].[r74_kp]");
+    assert_eq!(
+        kc,
+        format!(
+            "create table {t} (\n    \
+               [id] int null,\n    \
+               [k] int null,\n    \
+               [n] int null,\n    \
+               constraint [r74_kc_fk] foreign key ([k]) references {p} ([id]),\n    \
+               constraint [r74_kc_ck] check ([n]>(0))\n\
+             );\n\n\
+             alter table {t} set (lock_escalation = auto);\n\n\
+             create nonclustered index [r74_kc_k] on {t} ([k]);\n\n\
+             create nonclustered index [r74_kc_n] on {t} ([n]);\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_fk_nc] foreign key ([n]) \
+               references {p} ([id]) on delete cascade;\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_fk_off] foreign key ([id]) \
+               references {p} ([id]);\n\n\
+             alter table {t} nocheck constraint [r74_kc_fk_off];\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_ck_nc] check ([n]<(100));\n\n\
+             alter table {t} with nocheck add constraint [r74_kc_ck_off] check ([k]<>(0));\n\n\
+             alter table {t} nocheck constraint [r74_kc_ck_off];\n\n\
+             alter index [r74_kc_n] on {t} disable;\nGO\n"
+        )
+    );
+    // A disabled clustered index disables the others too: they are
+    // disabled first, while the table can be read.
+    let km = table_ddl(&mut h, &schema, "r74_km");
+    let t = format!("[{schema}].[r74_km]");
+    assert!(
+        km.ends_with(&format!(
+            "create clustered index [r74_km_c] on {t} ([id]);\n\n\
+             create nonclustered index [r74_km_v] on {t} ([v]);\n\n\
+             alter index [r74_km_v] on {t} disable;\n\n\
+             alter index [r74_km_c] on {t} disable;\nGO\n"
+        )),
+        "{km}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let tables = format!(
+            "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+                and name like 'r74_k%'"
+        );
+        [
+            format!(
+                "select string_agg(concat_ws(' ', t.name, t.lock_escalation_desc) \
+                                   collate database_default, '; ') within group (order by t.name) \
+                   from sys.tables t where t.object_id in ({tables})"
+            ),
+            format!(
+                "select string_agg(x.line collate database_default, '; ') \
+                          within group (order by x.line) \
+                   from (select concat_ws(' ', object_name(parent_object_id), name, is_disabled, \
+                                          is_not_trusted, delete_referential_action) as line \
+                           from sys.foreign_keys where parent_object_id in ({tables}) \
+                         union all \
+                         select concat_ws(' ', object_name(parent_object_id), name, is_disabled, \
+                                          is_not_trusted, definition) \
+                           from sys.check_constraints where parent_object_id in ({tables})) x"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', object_name(i.object_id), i.name, \
+                                             i.type_desc, i.is_disabled) \
+                                   collate database_default, '; ') \
+                          within group (order by object_name(i.object_id), i.name) \
+                   from sys.indexes i where i.object_id in ({tables}) and i.type > 0"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_k");
+    let tables = ["r74_kp", "r74_kc", "r74_km"];
+    for ddl in [&kp, &kc, &km] {
+        run_ddl_in(&mut h, ddl, &schema, "r74_copy_k", &tables);
+    }
+    assert_eq!(catalog(&mut h, "r74_copy_k"), before);
+    // Rows the disabled constraints let into the original go into the copy.
+    for owner in [schema.as_str(), "r74_copy_k"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r74_kp] (id) values (0), (50)"
+        ));
+        h.ok(&format!(
+            "insert into [{owner}].[r74_kc] values (99, 0, 50)"
+        ));
+    }
+    drop_tables(&mut h, "r74_copy_k", "r74_k");
+    h.ok("drop schema r74_copy_k");
+    drop_tables(&mut h, &schema, "r74_k");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.
