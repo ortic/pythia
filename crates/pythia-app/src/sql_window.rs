@@ -118,6 +118,9 @@ pub struct RunState {
     /// Where the connection's scripts end their statements (from the
     /// document context, each frame).
     pub syntax: Syntax,
+    /// The zone the session shows MySQL's TIMESTAMP values in, as it last
+    /// said: INSERT statements of its results set it (#213).
+    pub time_zone: Option<String>,
     /// Error stacks to look up, not sent yet.
     stack_lookups: Vec<StackLookup>,
 }
@@ -571,7 +574,8 @@ impl SqlWindow {
                 Ok(Some(path)) if dialect != pythia_db::Dialect::ORACLE => {
                     let sql = sql.clone();
                     self.state.to_file_pick = None;
-                    match crate::to_file::Sink::create(&path, &sql, dialect) {
+                    let zone = self.state.time_zone.clone();
+                    match crate::to_file::Sink::create(&path, &sql, dialect, zone) {
                         Ok(sink) => {
                             let id = request_id();
                             self.state.to_file = Some(crate::to_file::ToFile {
@@ -1487,6 +1491,7 @@ impl SqlWindow {
                 };
                 result.grid.dialect = cx.dialect;
                 result.grid.table = crate::data_edit::single_table(&result.sql);
+                result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
                 if let Some(Internal::EditQuery { edit, replaces }) =
                     running.and_then(|r| r.internal.as_ref())
@@ -1761,6 +1766,9 @@ impl SqlWindow {
                 }
             }
             DbEvent::Notice(text) => self.info(text),
+            // A new session says its own zone, if it has one.
+            DbEvent::Connected(_) => self.state.time_zone = None,
+            DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
                 self.state.running = None;
                 self.state.fetching = None;

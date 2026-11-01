@@ -62,6 +62,7 @@ pub(crate) fn run(
         kill,
         autocommit: false,
         tx: Transaction::default(),
+        time_zone: None,
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
@@ -69,6 +70,7 @@ pub(crate) fn run(
             for notice in failed {
                 worker.events.send(DbEvent::Notice(notice));
             }
+            worker.report_time_zone();
         }
         Err(e) => {
             *shared.lock().expect("cancel mutex") = None;
@@ -153,6 +155,8 @@ struct Worker {
     kill: Canceller,
     autocommit: bool,
     tx: Transaction,
+    /// The time zone last reported (see [`Worker::report_time_zone`]).
+    time_zone: Option<String>,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -270,6 +274,15 @@ impl Worker {
                 });
             }
         }
+        // SET time_zone, or a procedure that sets it: the first words tell,
+        // also of an INSERT of megabytes.
+        let head = sql.char_indices().nth(1000).map_or(sql, |(i, _)| &sql[..i]);
+        if matches!(
+            leading_words(head).first().map(String::as_str),
+            Some("SET" | "CALL")
+        ) {
+            self.report_time_zone();
+        }
         self.report_transaction();
         next
     }
@@ -311,6 +324,40 @@ impl Worker {
         self.events.send(DbEvent::Transaction {
             pending: self.tx.pending,
         });
+    }
+
+    /// Reports the zone the session shows TIMESTAMP values in, when it
+    /// changed (#213). `SYSTEM`, which another server reads as its own
+    /// zone, as the server's offset when it has the same one all year (a
+    /// server on UTC: `+00:00`).
+    fn report_time_zone(&mut self) {
+        // The session's zone, the server's offsets in January and July.
+        type Zone = (String, Option<i64>, Option<i64>);
+        let read: Result<Option<Zone>, _> = self.conn.query_first(
+            "select @@session.time_zone, \
+                    timestampdiff(minute, convert_tz(d.j, 'SYSTEM', '+00:00'), d.j), \
+                    timestampdiff(minute, convert_tz(d.s, 'SYSTEM', '+00:00'), d.s) \
+               from (select cast(concat(year(now()), '-01-15 12:00:00') as datetime) j, \
+                            cast(concat(year(now()), '-07-15 12:00:00') as datetime) s) d",
+        );
+        let zone = match read {
+            Ok(Some((zone, Some(january), Some(july))))
+                if zone.eq_ignore_ascii_case("SYSTEM") && january == july =>
+            {
+                let sign = if january < 0 { '-' } else { '+' };
+                format!("{sign}{:02}:{:02}", january.abs() / 60, january.abs() % 60)
+            }
+            Ok(Some((zone, ..))) => zone,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("reading the time zone: {e}");
+                return;
+            }
+        };
+        if self.time_zone.as_ref() != Some(&zone) {
+            self.events.send(DbEvent::TimeZone(zone.clone()));
+            self.time_zone = Some(zone);
+        }
     }
 
     /// The statement's warnings, as notices (MySQL's counterpart of

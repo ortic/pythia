@@ -71,6 +71,9 @@ pub struct GridState {
     /// The table the rows come from, as the query names it (one table
     /// only): INSERT statements go into it (#158).
     pub table: Option<String>,
+    /// The time zone MySQL showed the rows' TIMESTAMP values in: INSERT
+    /// statements set it (#213).
+    pub time_zone: Option<String>,
     /// Why a copy failed, for the owner to show (a value held cut short).
     failed: Option<String>,
 }
@@ -177,12 +180,14 @@ pub struct GridOutput {
 
 impl GridState {
     /// How the rows are exported: in the database's SQL, INSERTs into the
-    /// table they come from (else a placeholder name).
+    /// table they come from (else a placeholder name), in the time zone
+    /// they were shown in.
     pub fn export_options(&self) -> pythia_data::Options {
         let defaults = pythia_data::Options::default();
         pythia_data::Options {
             dialect: self.dialect,
             table: self.table.clone().unwrap_or(defaults.table.clone()),
+            time_zone: self.time_zone.clone(),
             ..defaults
         }
     }

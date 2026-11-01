@@ -129,6 +129,15 @@ All notable changes to Pythia are documented here. The format follows
   (#212). A 10 MB value took 1.6 s to appear, on every scroll that
   brought it back too, and 470 MB of memory while it was shown; a cell
   now lays out the first 500 characters of it.
+- MySQL: INSERT statements of TIMESTAMP values keep their instant when
+  they run in another time zone (#213). They were written as shown in
+  the session's zone: `09:00` at `+11:00` came back as `09:00` at
+  `+10:00`, an hour later. Like mysqldump, they now set the zone the
+  values were shown in while they run (`set @old_time_zone =
+  @@time_zone, time_zone = '+11:00';` … `set time_zone =
+  @old_time_zone;`), from *Execute to file* and from the grid. A session
+  on the server's zone writes its offset when it has the same one all
+  year (`+00:00` on UTC).
 
 ## [0.10.0] - 2026-10-30
 

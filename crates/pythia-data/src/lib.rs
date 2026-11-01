@@ -77,6 +77,10 @@ pub struct Options {
     pub delimiter: Option<u8>,
     /// How CSV/TSV write NULL (default: empty).
     pub null_text: String,
+    /// The time zone a MySQL session showed TIMESTAMP values in: INSERT
+    /// statements in MySQL's SQL set it while they run, as mysqldump does
+    /// (#213).
+    pub time_zone: Option<String>,
 }
 
 impl Default for Options {
@@ -88,6 +92,7 @@ impl Default for Options {
             sheet: "Result".into(),
             delimiter: None,
             null_text: String::new(),
+            time_zone: None,
         }
     }
 }
@@ -133,7 +138,17 @@ pub fn export(
         Format::Tsv => delimited(b'\t', columns, rows, options, out),
         Format::Json => json(columns, rows, out),
         Format::Xlsx => xlsx(columns, rows, options, out),
-        Format::Insert => inserts(columns, rows, options, out),
+        Format::Insert => {
+            let zone = insert_time_zone(columns, options);
+            if let Some(zone) = zone {
+                writeln!(out, "{}", set_time_zone(zone))?;
+            }
+            inserts(columns, rows, options, out)?;
+            if zone.is_some() {
+                writeln!(out, "{RESTORE_TIME_ZONE}")?;
+            }
+            Ok(())
+        }
         Format::Markdown => markdown(columns, rows, out),
         Format::Html => html(columns, rows, out),
     }
@@ -209,6 +224,11 @@ impl<W: Write> StreamWriter<W> {
             }
             Format::Json => write!(out, "[")?,
             Format::Markdown => markdown_header(&columns, &mut out)?,
+            Format::Insert => {
+                if let Some(zone) = insert_time_zone(&columns, &options) {
+                    writeln!(out, "{}", set_time_zone(zone))?;
+                }
+            }
             _ => {}
         }
         Ok(Self {
@@ -262,6 +282,10 @@ impl<W: Write> StreamWriter<W> {
         if self.format == Format::Json {
             let close = if self.rows == 0 { "]\n" } else { "\n]\n" };
             write!(self.out, "{close}")?;
+        }
+        if self.format == Format::Insert && insert_time_zone(&self.columns, &self.options).is_some()
+        {
+            writeln!(self.out, "{RESTORE_TIME_ZONE}")?;
         }
         self.out.flush()?;
         Ok(self.out)
@@ -698,6 +722,26 @@ fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     )
 }
 
+/// The zone INSERT statements of `columns` set while they run: in MySQL's
+/// SQL with a TIMESTAMP column (MariaDB's read `TIMESTAMP UNSIGNED`), the
+/// one its values were shown in (#213). A TIMESTAMP is an instant shown in
+/// the session's zone; written as shown, it would move in a session of
+/// another zone.
+fn insert_time_zone<'a>(columns: &[Column], options: &'a Options) -> Option<&'a str> {
+    let zoned = options.dialect.kind() == DbKind::MySql
+        && columns.iter().any(|c| c.type_name.starts_with("TIMESTAMP"));
+    options.time_zone.as_deref().filter(|_| zoned)
+}
+
+fn set_time_zone(zone: &str) -> String {
+    format!(
+        "set @old_time_zone = @@time_zone, time_zone = '{}';",
+        zone.replace('\'', "''")
+    )
+}
+
+const RESTORE_TIME_ZONE: &str = "set time_zone = @old_time_zone;";
+
 fn inserts(
     columns: &[Column],
     rows: &[Vec<Cell>],
@@ -1059,6 +1103,53 @@ mod tests {
             insert(Dialect::SQLSERVER),
             "insert into t (id, [order], born) values (1, N'C:\\x', N'2026-01-02');\n"
         );
+    }
+
+    /// MySQL's INSERTs of TIMESTAMP values set the zone they were shown in
+    /// while they run, streamed too (#213); without a TIMESTAMP, or in
+    /// another database's SQL, they don't.
+    #[test]
+    fn mysql_timestamps_in_their_zone() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let columns = vec![col("ts", "TIMESTAMP"), col("dt", "DATETIME")];
+        let rows = vec![vec![
+            Some("2021-10-07 09:00:00".to_owned()),
+            Some("2021-10-07 09:00:00".to_owned()),
+        ]];
+        let options = |dialect, zone: Option<&str>| Options {
+            table: "t".into(),
+            dialect,
+            time_zone: zone.map(Into::into),
+            ..Options::default()
+        };
+        let insert =
+            "insert into t (ts, dt) values ('2021-10-07 09:00:00', '2021-10-07 09:00:00');";
+        let zoned = format!(
+            "set @old_time_zone = @@time_zone, time_zone = '+11:00';\n{insert}\n\
+             set time_zone = @old_time_zone;\n"
+        );
+        let mysql = options(Dialect::MYSQL, Some("+11:00"));
+        let text = |columns: &[Column], options: &Options| {
+            String::from_utf8(export_to_vec(Format::Insert, columns, &rows, options).unwrap())
+                .unwrap()
+        };
+        assert_eq!(text(&columns, &mysql), zoned);
+        let mut stream =
+            StreamWriter::new(Format::Insert, columns.clone(), mysql.clone(), Vec::new()).unwrap();
+        stream.write(&rows).unwrap();
+        assert_eq!(String::from_utf8(stream.finish().unwrap()).unwrap(), zoned);
+        // A DATETIME has no zone; no zone known, none set.
+        let datetimes = [col("ts", "DATETIME"), col("dt", "DATETIME")];
+        assert_eq!(text(&datetimes, &mysql), format!("{insert}\n"));
+        assert_eq!(
+            text(&columns, &options(Dialect::MYSQL, None)),
+            format!("{insert}\n")
+        );
+        assert!(!text(&columns, &options(Dialect::POSTGRES, Some("+11:00"))).contains("set"));
     }
 
     /// A binary value fetched cut short for the grid isn't written as it

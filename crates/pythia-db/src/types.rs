@@ -201,6 +201,10 @@ pub enum DbEvent {
     Transaction {
         pending: bool,
     },
+    /// The time zone a MySQL session shows TIMESTAMP values in, as `SET
+    /// time_zone` takes it: when it connects, and after a statement that
+    /// changed it. INSERT statements of its results set it (#213).
+    TimeZone(String),
     Notice(String),
     Error(DbError),
     Disconnected,

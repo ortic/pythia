@@ -3019,6 +3019,117 @@ commit;",
     grid_export_refuses("SQLite", &grid_rows(&mut h, connection, sql));
 }
 
+/// MySQL shows a TIMESTAMP in the session's time zone. INSERT statements
+/// of such values, from Execute to file and from the grid, run in a
+/// session of another zone, keep their instant; a DATETIME has no zone.
+#[test]
+fn mysql_timestamps_keep_their_instant() {
+    use pythia_config::DbKind;
+    let env = "PYTHIA_TEST_MYSQL";
+    let connection = "zones@MySQL";
+    let Some(mut h) = connect_to(env, connection, DbKind::MySql) else {
+        return;
+    };
+    let setup = crate::test_db::execute_on(
+        env,
+        DbKind::MySql,
+        &[
+            "drop table if exists fd_ts, fd_ts_copy",
+            "create table fd_ts (id int primary key, ts timestamp null, dt datetime)",
+            "create table fd_ts_copy like fd_ts",
+            "set time_zone = '+11:00'",
+            "insert into fd_ts values (1, '2021-10-07 09:00:00', '2021-10-07 09:00:00'), \
+               (2, null, null)",
+        ],
+    );
+    for result in setup.unwrap() {
+        result.unwrap();
+    }
+    // 2021-10-07 09:00 at +11:00.
+    let instant = "1633557600";
+    let sql = "select * from fd_ts order by id";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("set time_zone = '+11:00';\n{sql};"),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let (columns, rows, options) = {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        (r.columns.clone(), r.rows.clone(), r.grid.export_options())
+    };
+    assert_eq!(rows[0][1].as_deref(), Some("2021-10-07 09:00:00"));
+    let from_file = insert_file(&mut h, sql, "zones");
+    let from_grid =
+        pythia_data::export_to_vec(pythia_data::Format::Insert, &columns, &rows, &options).unwrap();
+    let from_grid: Vec<String> = String::from_utf8(from_grid)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect();
+    // The file runs in a SQL window, too, the zone set back after it.
+    let script: Vec<String> = from_file
+        .iter()
+        .map(|s| s.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1))
+        .collect();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!(
+            "set time_zone = '+10:00';\n{};\ncommit;\nselect unix_timestamp(ts), \
+             @@session.time_zone from fd_ts_copy order by id;",
+            script.join(";\n")
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| &m.text)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let r = w.state.results.last().expect("the query's result");
+        assert_eq!(r.rows[0][0].as_deref(), Some(instant));
+        assert_eq!(r.rows[0][1].as_deref(), Some("+10:00"));
+    }
+    for (name, statements) in [("file", from_file), ("grid", from_grid)] {
+        let copied = crate::test_db::run_on(env, DbKind::MySql, move |client| {
+            client.execute("set time_zone = '+10:00'").unwrap();
+            client.execute("delete from fd_ts_copy").unwrap();
+            for statement in &statements {
+                let statement =
+                    statement.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1);
+                client.execute(&statement).unwrap();
+            }
+            client
+                .query(
+                    "select unix_timestamp(ts), dt, @@session.time_zone from fd_ts_copy \
+                     order by id",
+                    &[],
+                )
+                .unwrap()
+        })
+        .unwrap();
+        let values = |row: &[pythia_db::Cell]| -> Vec<Option<String>> { row.to_vec() };
+        assert_eq!(
+            values(&copied[0]),
+            [
+                Some(instant.into()),
+                Some("2021-10-07 09:00:00".into()),
+                Some("+10:00".into())
+            ],
+            "{name}"
+        );
+        assert_eq!(copied[1][..2], [None, None], "{name}");
+    }
+    crate::test_db::execute_on(env, DbKind::MySql, &["drop table fd_ts, fd_ts_copy"]);
+}
+
 /// Tables in the browser show their indexes, constraints and triggers.
 #[test]
 fn browser_table_parts() {

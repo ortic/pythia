@@ -98,12 +98,35 @@ impl Harness {
         }
     }
 
-    /// Next event that isn't transaction bookkeeping or a notice.
+    /// Next event that isn't transaction or time zone bookkeeping, or a
+    /// notice.
     fn next_result(&mut self) -> DbEvent {
         loop {
             match self.next() {
-                DbEvent::Transaction { .. } | DbEvent::Notice(_) => continue,
+                DbEvent::Transaction { .. } | DbEvent::TimeZone(_) | DbEvent::Notice(_) => {
+                    continue;
+                }
                 event => return event,
+            }
+        }
+    }
+
+    /// Runs a statement that must succeed: the time zone it reported, if
+    /// any (from the connect, too, for the first statement).
+    fn zone_after(&mut self, sql: &str) -> Option<String> {
+        self.session.send(DbRequest::Execute {
+            id: 0,
+            sql: sql.into(),
+            max_rows: 100,
+            binds: vec![],
+        });
+        let mut zone = None;
+        loop {
+            match self.next() {
+                DbEvent::TimeZone(z) => zone = Some(z),
+                DbEvent::Transaction { .. } => return zone,
+                DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                _ => {}
             }
         }
     }
@@ -173,6 +196,34 @@ fn numbers(n: u32) -> String {
         "with recursive r (n) as (select 1 union all select n + 1 from r where n < {n}) \
          select n, concat('row ', n) as label from r"
     )
+}
+
+/// The session says which zone it shows TIMESTAMP values in (#213): when it
+/// connects, the server's own as an offset when it has one all year (the
+/// test servers run on UTC), and again whenever a statement changed it.
+#[test]
+fn time_zone_is_reported() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let connected = h.zone_after("select 1");
+    let system = h.scalar("select @@system_time_zone").unwrap_or_default();
+    if system == "UTC" {
+        assert_eq!(connected.as_deref(), Some("+00:00"));
+    } else {
+        assert!(connected.is_some());
+    }
+    assert_eq!(
+        h.zone_after("set time_zone = '+11:00'").as_deref(),
+        Some("+11:00")
+    );
+    assert_eq!(h.zone_after("select now()"), None);
+    assert_eq!(h.zone_after("set @x = 1"), None);
+    assert_eq!(
+        h.zone_after("set time_zone = 'Europe/Zurich'").as_deref(),
+        Some("Europe/Zurich")
+    );
+    assert_eq!(h.zone_after("set time_zone = 'SYSTEM'"), connected);
 }
 
 #[test]
