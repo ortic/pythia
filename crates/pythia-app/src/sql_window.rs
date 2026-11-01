@@ -582,13 +582,14 @@ impl SqlWindow {
                                 started: std::time::Instant::now(),
                                 sink: Some(sink),
                             });
+                            // Binary values whole, not cut short as for
+                            // the grid (#204).
                             effects.request(
                                 Target::Own,
-                                DbRequest::Execute {
+                                DbRequest::ExecuteWhole {
                                     id,
                                     sql,
                                     max_rows: crate::to_file::BATCH,
-                                    binds: Vec::new(),
                                 },
                             );
                         }
@@ -2096,12 +2097,26 @@ impl SqlWindow {
                                     // The selection if there is one, else all fetched rows.
                                     let (columns, rows) =
                                         selection_data(&result.columns, &result.rows, &result.grid);
-                                    state.export = Some(export_in_background(
-                                        *format,
-                                        columns,
-                                        rows,
-                                        result.grid.export_options(),
-                                    ));
+                                    // Before asking for a file that would stay empty.
+                                    match pythia_data::check_whole(&columns, &rows) {
+                                        Ok(()) => {
+                                            state.export = Some(export_in_background(
+                                                *format,
+                                                columns,
+                                                rows,
+                                                result.grid.export_options(),
+                                            ))
+                                        }
+                                        Err(e) => {
+                                            state.messages.push(Message {
+                                                level: Level::Error,
+                                                text: format!("Export failed: {e}"),
+                                                jump: None,
+                                                stack: Vec::new(),
+                                            });
+                                            state.bottom = BottomTab::Messages;
+                                        }
+                                    }
                                     ui.close();
                                 }
                             }
@@ -2203,6 +2218,15 @@ impl SqlWindow {
                 )
                 .show(ui);
                 state.selection_summary = out.selection_summary;
+                if let Some(text) = result.grid.take_failed() {
+                    state.messages.push(Message {
+                        level: Level::Error,
+                        text,
+                        jump: None,
+                        stack: Vec::new(),
+                    });
+                    state.bottom = BottomTab::Messages;
+                }
                 if let Some((link, row)) = result.grid.take_follow()
                     && let Some(relation) = result
                         .link_relations

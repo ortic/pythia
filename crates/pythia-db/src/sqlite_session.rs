@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
-use crate::sql_text::{hex, release, replace_binds, statement_kind};
+use crate::sql_text::{WHOLE_BATCH_BYTES, hex, release, replace_binds, row_bytes, statement_kind};
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
@@ -93,7 +93,10 @@ pub(crate) fn run(
                 sql,
                 max_rows,
                 binds,
-            } => next = worker.execute(id, &sql, max_rows, &binds, &requests),
+            } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                next = worker.execute(id, &sql, max_rows, &[], &requests, true)
+            }
             // Its result was closed by another request in between.
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
                 id,
@@ -330,7 +333,8 @@ impl Worker {
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
-    /// returns the request that closed it, if any.
+    /// returns the request that closed it, if any. Blobs come `whole` or
+    /// cut short for the grid.
     fn execute(
         &mut self,
         id: u64,
@@ -338,6 +342,7 @@ impl Worker {
         max_rows: usize,
         binds: &[(String, Option<String>)],
         requests: &Receiver<DbRequest>,
+        whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
@@ -355,6 +360,7 @@ impl Worker {
         let fetch = Fetch {
             id,
             max_rows,
+            whole,
             started,
             events: &self.events,
             requests,
@@ -461,6 +467,8 @@ fn run_statement(
 struct Fetch<'a> {
     id: u64,
     max_rows: usize,
+    /// Blobs whole, for a file (#204).
+    whole: bool,
     started: Instant,
     events: &'a Events,
     requests: &'a Receiver<DbRequest>,
@@ -485,7 +493,8 @@ impl Fetch<'_> {
             let mut seen = vec![Seen::default(); if columns.is_none() { names.len() } else { 0 }];
             let mut more = true;
             let mut failed = None;
-            while batch.len() < max_rows {
+            let mut bytes = 0;
+            while batch.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match rows.next() {
                     Ok(Some(row)) => {
                         let mut cells = Vec::with_capacity(names.len());
@@ -494,7 +503,10 @@ impl Fetch<'_> {
                             if let Some(seen) = seen.get_mut(i) {
                                 seen.note(value);
                             }
-                            cells.push(cell(value));
+                            cells.push(cell(value, self.whole));
+                        }
+                        if self.whole {
+                            bytes += row_bytes(&cells);
                         }
                         batch.push(cells);
                     }
@@ -643,8 +655,8 @@ pub(crate) fn affinity(declared: &str) -> Affinity {
 }
 
 /// A value as text: numbers as SQLite writes them (`1.0` for a real),
-/// blobs in hex.
-pub(crate) fn cell(value: ValueRef<'_>) -> Cell {
+/// blobs in hex, cut short unless `whole`.
+pub(crate) fn cell(value: ValueRef<'_>, whole: bool) -> Cell {
     Some(match value {
         ValueRef::Null => return None,
         ValueRef::Integer(i) => i.to_string(),
@@ -652,7 +664,7 @@ pub(crate) fn cell(value: ValueRef<'_>) -> Cell {
         // tiny values.
         ValueRef::Real(f) => format!("{f:?}"),
         ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        ValueRef::Blob(bytes) => hex(bytes),
+        ValueRef::Blob(bytes) => hex(bytes, whole),
     })
 }
 
@@ -767,7 +779,7 @@ fn rows_of(
     while let Some(row) = rows.next()? {
         out.push(
             (0..count)
-                .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null)))
+                .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null), false))
                 .collect(),
         );
     }
@@ -858,11 +870,14 @@ mod tests {
 
     #[test]
     fn cells() {
-        assert_eq!(cell(ValueRef::Real(1.0)).as_deref(), Some("1.0"));
-        assert_eq!(cell(ValueRef::Real(0.1)).as_deref(), Some("0.1"));
-        assert_eq!(cell(ValueRef::Integer(-7)).as_deref(), Some("-7"));
-        assert_eq!(cell(ValueRef::Blob(&[0xca, 0xfe])).as_deref(), Some("CAFE"));
-        assert_eq!(cell(ValueRef::Null), None);
+        assert_eq!(cell(ValueRef::Real(1.0), false).as_deref(), Some("1.0"));
+        assert_eq!(cell(ValueRef::Real(0.1), false).as_deref(), Some("0.1"));
+        assert_eq!(cell(ValueRef::Integer(-7), false).as_deref(), Some("-7"));
+        assert_eq!(
+            cell(ValueRef::Blob(&[0xca, 0xfe]), false).as_deref(),
+            Some("CAFE")
+        );
+        assert_eq!(cell(ValueRef::Null, false), None);
     }
 
     #[test]

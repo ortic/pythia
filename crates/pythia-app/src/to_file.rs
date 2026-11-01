@@ -1,7 +1,8 @@
 //! "Execute to file": streams a query's rows straight into a file, for
 //! results too large for the grid. On Oracle a task on the session reads
 //! them; on the other databases the window fetches the result batch by
-//! batch, as for the grid, and hands each to a [`Sink`].
+//! batch, as for the grid but with binary values whole (#204), and hands
+//! each to a [`Sink`].
 
 use std::fs::File;
 use std::io::BufWriter;

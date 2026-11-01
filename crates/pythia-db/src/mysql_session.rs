@@ -24,7 +24,9 @@ use tracing::{debug, info, warn};
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
-use crate::sql_text::{hex, leading_words, release, replace_binds, statement_kind};
+use crate::sql_text::{
+    WHOLE_BATCH_BYTES, hex, leading_words, release, replace_binds, row_bytes, statement_kind,
+};
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
@@ -92,7 +94,10 @@ pub(crate) fn run(
                 sql,
                 max_rows,
                 binds,
-            } => next = worker.execute(id, &sql, max_rows, &binds, &requests),
+            } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                next = worker.execute(id, &sql, max_rows, &[], &requests, true)
+            }
             // Its result was closed by another request in between.
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
                 id,
@@ -192,7 +197,8 @@ impl Worker {
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
-    /// returns the request that closed it, if any.
+    /// returns the request that closed it, if any. Binary values come
+    /// `whole` or cut short for the grid.
     fn execute(
         &mut self,
         id: u64,
@@ -200,6 +206,7 @@ impl Worker {
         max_rows: usize,
         binds: &[(String, Option<String>)],
         requests: &Receiver<DbRequest>,
+        whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
@@ -217,7 +224,16 @@ impl Worker {
             }
             self.tx.pending = true;
         }
-        let ran = self.run_statement(id, sql, max_rows, binds, requests, started, &mut next);
+        let fetch = Fetch {
+            id,
+            max_rows,
+            whole,
+            started,
+            events: &self.events,
+            requests,
+            kill: &self.kill,
+        };
+        let ran = Self::run_statement(&mut self.conn, sql, binds, fetch, &mut next);
         match ran {
             Ok(outcome) => {
                 self.tx.after(effect);
@@ -258,31 +274,19 @@ impl Worker {
         next
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_statement(
-        &mut self,
-        id: u64,
+        conn: &mut Conn,
         sql: &str,
-        max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
-        started: Instant,
+        fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, mysql::Error> {
-        let fetch = Fetch {
-            id,
-            max_rows,
-            started,
-            events: &self.events,
-            requests,
-            kill: &self.kill,
-        };
         if binds.is_empty() {
-            let result = self.conn.query_iter(sql)?;
+            let result = conn.query_iter(sql)?;
             fetch.stream(result, next)
         } else {
             let (sql, values) = positional(sql, binds);
-            let result = self.conn.exec_iter(sql, Params::Positional(values))?;
+            let result = conn.exec_iter(sql, Params::Positional(values))?;
             fetch.stream(result, next)
         }
     }
@@ -329,6 +333,8 @@ impl Worker {
 struct Fetch<'a> {
     id: u64,
     max_rows: usize,
+    /// Binary values whole, for a file (#204).
+    whole: bool,
     started: Instant,
     events: &'a Events,
     requests: &'a Receiver<DbRequest>,
@@ -357,15 +363,21 @@ impl Fetch<'_> {
         loop {
             let mut rows = Vec::with_capacity(max_rows.min(10_000));
             let mut more = true;
-            while rows.len() < max_rows {
+            let mut bytes = 0;
+            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match result.next() {
-                    Some(Ok(row)) => rows.push(
-                        row.unwrap()
+                    Some(Ok(row)) => {
+                        let cells: Vec<Cell> = row
+                            .unwrap()
                             .iter()
                             .zip(&types)
-                            .map(|(value, ty)| cell(value, ty))
-                            .collect(),
-                    ),
+                            .map(|(value, ty)| cell(value, ty, self.whole))
+                            .collect();
+                        if self.whole {
+                            bytes += row_bytes(&cells);
+                        }
+                        rows.push(cells);
+                    }
                     Some(Err(e)) => {
                         let mut error = DbError::from(e);
                         if error.code == Some(1317) {
@@ -445,7 +457,13 @@ pub(crate) fn all_rows<T: Protocol>(
     let mut rows = Vec::new();
     for row in result.by_ref() {
         let values = row?.unwrap();
-        rows.push(values.iter().zip(&types).map(|(v, c)| cell(v, c)).collect());
+        rows.push(
+            values
+                .iter()
+                .zip(&types)
+                .map(|(v, c)| cell(v, c, false))
+                .collect(),
+        );
     }
     Ok(rows)
 }
@@ -683,10 +701,11 @@ fn is_binary(c: &mysql::Column) -> bool {
         )
 }
 
-pub(crate) fn cell(value: &Value, column: &mysql::Column) -> Cell {
+/// A value as text; binary values cut short unless `whole`.
+pub(crate) fn cell(value: &Value, column: &mysql::Column, whole: bool) -> Cell {
     Some(match value {
         Value::NULL => return None,
-        Value::Bytes(bytes) if is_binary(column) => hex(bytes),
+        Value::Bytes(bytes) if is_binary(column) => hex(bytes, whole),
         Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         Value::Int(v) => v.to_string(),
         Value::UInt(v) => v.to_string(),

@@ -112,6 +112,13 @@ All notable changes to Pythia are documented here. The format follows
   what changed. The open windows are the first Pythia's; one started
   while it runs keeps its own as long as it runs. Two saves at the same
   moment no longer share a temporary file, where one of them failed.
+- *Execute to file* writes binary values whole (#204). On MySQL, SQL
+  Server and SQLite, a value over 4000 bytes was written as the hex of
+  its first 4000 and its size, `89504E47…… (10485760 bytes)`: a 10 MB
+  blob came back as 8020 bytes of text, or not at all. Results in the
+  grid still hold such a value cut short, and *Export* and *Copy as* now
+  refuse it, naming its column, instead of writing part of it; the grid
+  shows its real size (it showed 3.9 KB for 10 MB).
 
 ## [0.10.0] - 2026-10-30
 

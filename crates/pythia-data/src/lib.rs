@@ -102,6 +102,13 @@ pub enum Error {
     Xlsx(#[from] rust_xlsxwriter::XlsxError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A binary value the rows hold cut short (#204).
+    #[error(
+        "{column} holds a binary value of {size} bytes cut short to its first {} for the \
+         grid; Execute to file writes such values whole",
+        pythia_db::SHOWN_BYTES
+    )]
+    Cut { column: String, size: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -114,6 +121,7 @@ pub fn export(
     options: &Options,
     out: &mut dyn Write,
 ) -> Result<()> {
+    check_whole(columns, rows)?;
     match format {
         Format::Csv => delimited(
             options.delimiter.unwrap_or(b','),
@@ -129,6 +137,22 @@ pub fn export(
         Format::Markdown => markdown(columns, rows, out),
         Format::Html => html(columns, rows, out),
     }
+}
+
+/// Fails on the first binary value `rows` hold cut short (as results do
+/// past [`pythia_db::SHOWN_BYTES`]) instead of writing part of it (#204).
+pub fn check_whole(columns: &[Column], rows: &[Vec<Cell>]) -> Result<()> {
+    for row in rows {
+        for (col, cell) in columns.iter().zip(row) {
+            if let Some(size) = cell.as_deref().and_then(pythia_db::cut_size) {
+                return Err(Error::Cut {
+                    column: col.name.clone(),
+                    size,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convenience wrapper returning the exported bytes.
@@ -197,6 +221,7 @@ impl<W: Write> StreamWriter<W> {
     }
 
     pub fn write(&mut self, rows: &[Vec<Cell>]) -> Result<()> {
+        check_whole(&self.columns, rows)?;
         let options = Options {
             header: false,
             ..self.options.clone()
@@ -1028,6 +1053,51 @@ mod tests {
             insert(Dialect::SQLSERVER),
             "insert into t (id, [order], born) values (1, N'C:\\x', N'2026-01-02');\n"
         );
+    }
+
+    /// A binary value fetched cut short for the grid isn't written as it
+    /// is, in any format: the export fails and says what writes it whole.
+    #[test]
+    fn cut_values_are_not_exported() {
+        let columns = [
+            Column {
+                name: "ID".into(),
+                type_name: "INT".into(),
+                numeric: true,
+            },
+            Column {
+                name: "DATA".into(),
+                type_name: "BLOB".into(),
+                numeric: false,
+            },
+        ];
+        let cut = format!("{}… (10485760 bytes)", "89".repeat(4000));
+        let rows = |value: &str| vec![vec![Some("1".to_owned()), Some(value.to_owned())]];
+        for format in Format::ALL {
+            for value in [cut.clone(), format!("0x{cut}")] {
+                let error = export_to_vec(*format, &columns, &rows(&value), &Options::default())
+                    .expect_err("a cut value");
+                let text = error.to_string();
+                assert!(
+                    text.contains("DATA") && text.contains("Execute to file"),
+                    "{format:?}: {text}"
+                );
+            }
+        }
+        let mut stream = StreamWriter::new(
+            Format::Csv,
+            columns.to_vec(),
+            Options::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(stream.write(&rows(&cut)).is_err());
+        // Whole values, and text that only looks like the end of one.
+        let whole = "89".repeat(5000);
+        for value in [whole.as_str(), "it ends… (12 bytes)"] {
+            let csv = export_to_vec(Format::Csv, &columns, &rows(value), &Options::default());
+            assert!(csv.is_ok(), "{value}");
+        }
     }
 
     #[test]

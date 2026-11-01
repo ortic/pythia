@@ -2829,6 +2829,185 @@ fn execute_to_file_servers() {
     }
 }
 
+/// Writes the rows of `sql` into an INSERT file with Execute to file: its
+/// statements, without their `;`.
+fn insert_file(h: &mut Harness<'_, PythiaApp>, sql: &str, name: &str) -> Vec<String> {
+    let path = std::env::temp_dir().join(format!("pythia-{}-{name}.sql", std::process::id()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Some(path.clone())).unwrap();
+    h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+    h.run_steps(2);
+    wait_until(h, "export", |app| !app.test_focused_busy());
+    let message = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(message.contains("rows written"), "{name}: {message}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    text.lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect()
+}
+
+/// A result's columns and rows, and how its grid exports them.
+type GridRows = (
+    Vec<pythia_db::Column>,
+    Vec<Vec<pythia_db::Cell>>,
+    pythia_data::Options,
+);
+
+/// The rows of `sql` as the grid of a SQL window on `connection` has them.
+fn grid_rows(h: &mut Harness<'_, PythiaApp>, connection: &str, sql: &str) -> GridRows {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql.into(),
+        run: true,
+    });
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let r = &w.state.results[0];
+    let grid = (r.columns.clone(), r.rows.clone(), r.grid.export_options());
+    h.state_mut().test_close_focused();
+    grid
+}
+
+/// Execute to file writes binary values whole (#204): a 6 MB value of each
+/// database, written as INSERT statements and run back into a copy of its
+/// table, is the same value. The grid holds such a value cut short; its
+/// exports refuse it rather than write what they hold.
+#[test]
+fn execute_to_file_writes_whole_values() {
+    use pythia_config::DbKind;
+    let sql = "select id, b from fd_blob order by id";
+    // The fetched value is cut short where it ends in its size.
+    let grid_export_refuses = |name: &str, grid: &GridRows| {
+        let (columns, rows, options) = grid;
+        let cut = rows[0][1]
+            .as_deref()
+            .is_some_and(|v| v.ends_with(" bytes)"));
+        let exported =
+            pythia_data::export_to_vec(pythia_data::Format::Insert, columns, rows, options);
+        match exported {
+            Err(e) if cut => assert!(e.to_string().contains("Execute to file"), "{name}: {e}"),
+            Ok(_) if !cut => {}
+            other => panic!("{name}: {:?}", other.map(|b| b.len())),
+        }
+    };
+    // 6 MB in each database's binary type: as hex, within MariaDB's
+    // max_allowed_packet (16 MB).
+    let databases = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "longblob",
+            "repeat(unhex('89504E470D0A1A0A'), 786432)",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "bytea",
+            "decode(repeat('89504E470D0A1A0A', 786432), 'hex')",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "varbinary(max)",
+            "cast(replicate(cast(0x89504E470D0A1A0A as varchar(max)), 786432) \
+             as varbinary(max))",
+        ),
+    ];
+    for (env, kind, binary, value) in databases {
+        let connection = format!("whole@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        let setup = [
+            "drop table if exists fd_blob".to_owned(),
+            "drop table if exists fd_blob_copy".to_owned(),
+            format!("create table fd_blob (id int primary key, b {binary})"),
+            format!("create table fd_blob_copy (id int primary key, b {binary})"),
+            format!("insert into fd_blob select 1, {value}"),
+            "insert into fd_blob values (2, null)".to_owned(),
+        ];
+        let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+        for result in crate::test_db::execute_on(env, kind, &setup).unwrap() {
+            result.unwrap_or_else(|e| panic!("{env}: {e}"));
+        }
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let inserts = insert_file(&mut h, sql, kind.label());
+        assert_eq!(inserts.len(), 2, "{env}");
+        h.state_mut().test_close_focused();
+        let copied = crate::test_db::run_on(env, kind, move |client| {
+            for insert in &inserts {
+                let insert =
+                    insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+                client.execute(&insert).unwrap();
+            }
+            let same = client
+                .query(
+                    "select count(*) from fd_blob a join fd_blob_copy c \
+                       on c.id = a.id and c.b = a.b",
+                    &[],
+                )
+                .unwrap();
+            same[0][0].clone()
+        });
+        assert_eq!(copied, Some(Some("1".into())), "{env}");
+        grid_export_refuses(env, &grid_rows(&mut h, &connection, sql));
+        crate::test_db::execute_on(
+            env,
+            kind,
+            &["drop table fd_blob", "drop table fd_blob_copy"],
+        );
+    }
+
+    // SQLite, on a file of its own.
+    let connection = "whole.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table fd_blob (id integer primary key, b blob);
+create table fd_blob_copy (id integer primary key, b blob);
+insert into fd_blob values (1, randomblob(6291456)), (2, null);
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let inserts = insert_file(&mut h, sql, "sqlite");
+    h.state_mut().test_close_focused();
+    let path = file.0.display().to_string();
+    let copied = crate::test_db::run_with(DbKind::Sqlite, "", "", &path, move |client| {
+        for insert in &inserts {
+            let insert = insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+            client.execute(&insert).unwrap();
+        }
+        let same = client
+            .query(
+                "select count(*) from fd_blob a join fd_blob_copy c on c.id = a.id and c.b = a.b",
+                &[],
+            )
+            .unwrap();
+        same[0][0].clone()
+    });
+    assert_eq!(copied.as_deref(), Some("1"));
+    grid_export_refuses("SQLite", &grid_rows(&mut h, connection, sql));
+}
+
 /// Tables in the browser show their indexes, constraints and triggers.
 #[test]
 fn browser_table_parts() {

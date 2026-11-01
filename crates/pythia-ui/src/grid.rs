@@ -67,6 +67,8 @@ pub struct GridState {
     /// The table the rows come from, as the query names it (one table
     /// only): INSERT statements go into it (#158).
     pub table: Option<String>,
+    /// Why a copy failed, for the owner to show (a value held cut short).
+    failed: Option<String>,
 }
 
 /// A header being dragged to another place.
@@ -194,6 +196,11 @@ impl GridState {
     /// The link the user chose in the context menu, with the row index.
     pub fn take_follow(&mut self) -> Option<(usize, usize)> {
         self.follow.take()
+    }
+
+    /// Why *Copy as* copied nothing, once.
+    pub fn take_failed(&mut self) -> Option<String> {
+        self.failed.take()
     }
 
     /// All column indices in the order shown, hidden ones included.
@@ -1594,11 +1601,11 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
         {
             if ui.button(format.label()).clicked() {
                 let (cols, data) = selection_data(columns, rows, state);
-                if let Ok(bytes) =
-                    pythia_data::export_to_vec(*format, &cols, &data, &state.export_options())
-                {
-                    ui.ctx()
-                        .copy_text(String::from_utf8_lossy(&bytes).into_owned());
+                match pythia_data::export_to_vec(*format, &cols, &data, &state.export_options()) {
+                    Ok(bytes) => ui
+                        .ctx()
+                        .copy_text(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(e) => state.failed = Some(format!("Copy as {}: {e}", format.label())),
                 }
                 ui.close();
             }
@@ -2141,11 +2148,13 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// `0x89504E47… · 12.3 KB` for a hex-encoded value.
+/// `0x89504E47… · 12.3 KB` for a hex-encoded value; one held cut short has
+/// its size after the hex (#204).
 fn binary_summary(hex: &str) -> String {
     let head: String = hex.chars().take(16).collect();
     let more = if hex.len() > 16 { "…" } else { "" };
-    format!("0x{head}{more} · {}", human_bytes(hex.len() / 2))
+    let size = pythia_db::cut_size(hex).map_or(hex.len() / 2, |n| n as usize);
+    format!("0x{head}{more} · {}", human_bytes(size))
 }
 
 fn image_kind(bytes: &[u8]) -> Option<&'static str> {
@@ -2261,6 +2270,9 @@ mod tests {
         );
         assert_eq!(binary_summary("DEADBEEF"), "0xDEADBEEF · 4 bytes");
         assert!(hex_dump(b"Hello", 16).starts_with("00000000  48 65 6C 6C 6F"));
+        // Fetched cut short, a value has its size after the hex.
+        let cut = format!("{}… (10485760 bytes)", "89504E47".repeat(1000));
+        assert_eq!(binary_summary(&cut), "0x89504E4789504E47… · 10.0 MB");
     }
 
     #[test]

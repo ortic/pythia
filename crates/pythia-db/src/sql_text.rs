@@ -85,18 +85,55 @@ pub(crate) fn replace_binds(
     out
 }
 
-/// Uppercase hex, at most 4000 bytes of it like a RAW column.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    const MAX: usize = 4000;
-    let mut out = String::with_capacity(bytes.len().min(MAX) * 2);
-    for b in bytes.iter().take(MAX) {
-        let _ = write!(out, "{b:02X}");
+/// The bytes of a binary value a result holds, like a RAW column; a longer
+/// value is cut short (see [`hex`]).
+pub const SHOWN_BYTES: usize = 4000;
+
+/// How much text a batch of whole values holds (a row past it, at least
+/// one): rows of large blobs come a few at a time, not 1000 (#204).
+pub(crate) const WHOLE_BATCH_BYTES: usize = 64 << 20;
+
+/// Uppercase hex: of the first [`SHOWN_BYTES`] with the value's size after
+/// them, `89504E47…… (10485760 bytes)`, or all of it when the value is
+/// wanted `whole` (#204).
+pub(crate) fn hex(bytes: &[u8], whole: bool) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let shown = if whole {
+        bytes.len()
+    } else {
+        bytes.len().min(SHOWN_BYTES)
+    };
+    let mut out = String::with_capacity(shown * 2 + 24);
+    for &b in &bytes[..shown] {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 15)]));
     }
-    if bytes.len() > MAX {
-        let _ = write!(out, "… ({} bytes)", bytes.len());
+    if shown < bytes.len() {
+        out.push_str(&format!("… ({} bytes)", bytes.len()));
     }
     out
+}
+
+/// The size of a binary value a result holds cut short: the number in
+/// `… (10485760 bytes)` after the hex of its first [`SHOWN_BYTES`] (also
+/// after SQL Server's `0x`). `None` for any other text.
+pub fn cut_size(value: &str) -> Option<u64> {
+    if !value.ends_with(" bytes)") {
+        return None;
+    }
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let (head, tail) = hex.split_at_checked(SHOWN_BYTES * 2)?;
+    let size: u64 = tail
+        .strip_prefix("… (")?
+        .strip_suffix(" bytes)")?
+        .parse()
+        .ok()?;
+    (size > SHOWN_BYTES as u64 && head.bytes().all(|b| b.is_ascii_hexdigit())).then_some(size)
+}
+
+/// The text of a row's values, for [`WHOLE_BATCH_BYTES`].
+pub(crate) fn row_bytes(row: &[Option<String>]) -> usize {
+    row.iter().flatten().map(String::len).sum()
 }
 
 /// `9.4.0` → `(9, 4)`, `10.11.6-MariaDB` → `(10, 11)`, `18.1 (Debian …)` →
@@ -175,6 +212,24 @@ mod tests {
             sql,
             "select * from t where id = $1v or $2 is null and x = ':id' and y = :other"
         );
+    }
+
+    /// Binary values past 4000 bytes are cut short with their size, which
+    /// reads back, unless wanted whole (#204).
+    #[test]
+    fn binary_values() {
+        assert_eq!(hex(&[0xca, 0xfe, 0x01], false), "CAFE01");
+        let big = vec![0xab; 10_000];
+        let cut = hex(&big, false);
+        assert_eq!(cut, format!("{}… (10000 bytes)", "AB".repeat(4000)));
+        assert_eq!(cut_size(&cut), Some(10_000));
+        assert_eq!(cut_size(&format!("0x{cut}")), Some(10_000));
+        let whole = hex(&big, true);
+        assert_eq!(whole, "AB".repeat(10_000));
+        assert_eq!(cut_size(&whole), None);
+        assert_eq!(cut_size(&hex(&[0; 4000], false)), None);
+        assert_eq!(cut_size("ABCD… (10000 bytes)"), None);
+        assert_eq!(row_bytes(&[Some("AB".into()), None, Some("é".into())]), 4);
     }
 
     #[test]
