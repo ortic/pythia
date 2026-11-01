@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use pythia_db::{DbEvent, DbKind, DbRequest};
-use pythia_ui::{FileRequest, Loaded, RowRef, SaveSource, SaveValue};
+use pythia_ui::{FileRequest, Loaded, SaveSource, SaveValue};
 
 use super::{BottomTab, Level, Message, SqlWindow};
 use crate::documents::{DocContext, Effects, Target, request_id};
@@ -120,7 +120,8 @@ enum Done {
     },
     Loaded {
         result: u64,
-        row: RowRef,
+        /// The grid's load, which knows the cell (#344).
+        load: u64,
         col: usize,
         loaded: Loaded,
         path: PathBuf,
@@ -196,7 +197,14 @@ impl SqlWindow {
                     let pick = files.pick.take().expect("the dialog");
                     self.file_chosen(pick, path, cx, effects);
                 }
-                Ok(None) | Err(TryRecvError::Disconnected) => files.pick = None,
+                Ok(None) | Err(TryRecvError::Disconnected) => {
+                    let pick = files.pick.take().expect("the dialog");
+                    if let FileRequest::Load { load, .. } = pick.request
+                        && let Some(r) = self.state.results.iter_mut().find(|r| r.id == pick.result)
+                    {
+                        r.grid.cancel_load(load);
+                    }
+                }
                 Err(TryRecvError::Empty) => {}
             }
         }
@@ -219,14 +227,14 @@ impl SqlWindow {
 
     fn file_chosen(&mut self, pick: Pick, path: PathBuf, cx: &DocContext, effects: &mut Effects) {
         let save = match pick.request {
-            FileRequest::Load { row, col, binary } => {
+            FileRequest::Load { load, col, binary } => {
                 let (tx, rx) = mpsc::channel();
                 let result = pick.result;
                 std::thread::spawn(move || {
                     let done = match read_file(&path, binary) {
                         Ok(loaded) => Done::Loaded {
                             result,
-                            row,
+                            load,
                             col,
                             loaded,
                             path,
@@ -384,7 +392,7 @@ impl SqlWindow {
             }
             Done::Loaded {
                 result,
-                row,
+                load,
                 col,
                 loaded,
                 path,
@@ -402,11 +410,17 @@ impl SqlWindow {
                     .get(col)
                     .map_or("", |c| c.name.as_str())
                     .to_owned();
-                r.grid.load_value(&r.rows, row, col, loaded);
-                self.info(format!(
-                    "Loaded {bytes} bytes from {} into {name}: Apply sends them",
-                    path.display()
-                ));
+                // Into its cell where its row is now, or none (#344).
+                match r.grid.load_file(&r.rows, load, loaded) {
+                    Ok(()) => self.info(format!(
+                        "Loaded {bytes} bytes from {} into {name}: Apply sends them",
+                        path.display()
+                    )),
+                    Err(why) => self.file_failed(format!(
+                        "Load from file: {why}; {} wasn't loaded",
+                        path.display()
+                    )),
+                }
             }
             Done::Failed(text) => self.file_failed(text),
         }

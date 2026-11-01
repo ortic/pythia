@@ -108,6 +108,11 @@ pub struct GridState {
     pub value_files: bool,
     /// *Save to file…* or *Load from file…* chosen, for the owner.
     file_request: Option<FileRequest>,
+    /// The cells files are being loaded into, by load: they follow their
+    /// rows until the file comes (#344).
+    loads: BTreeMap<u64, (RowRef, usize)>,
+    /// The number of the last load.
+    last_load: u64,
 }
 
 /// What the summary of a selection was worked out for: the selection,
@@ -262,9 +267,12 @@ impl std::fmt::Debug for Loaded {
 pub enum FileRequest {
     Save(SaveValue),
     /// Load a file into this cell of the grid being edited: as bytes into a
-    /// binary column, as UTF-8 text into a text column.
+    /// binary column, as UTF-8 text into a text column. The grid keeps the
+    /// cell's row by the load's number, as [`GridState::load_file`] takes
+    /// it: a new row's place changes while the file is chosen and read
+    /// (#344).
     Load {
-        row: RowRef,
+        load: u64,
         col: usize,
         binary: bool,
     },
@@ -470,11 +478,34 @@ impl GridState {
         let Some(binary) = columns.get(col).and_then(|c| file_kind(self.dialect, c)) else {
             return;
         };
-        self.file_request = Some(FileRequest::Load {
-            row: self.row_ref(view_row),
-            col,
-            binary,
-        });
+        self.last_load += 1;
+        let load = self.last_load;
+        self.loads.insert(load, (self.row_ref(view_row), col));
+        self.file_request = Some(FileRequest::Load { load, col, binary });
+    }
+
+    /// Puts the file of `load` into the cell it was chosen for, where its
+    /// row is now (#344). Fails where the row went (Delete / undelete rows,
+    /// Ctrl+Z, Discard) or the result isn't edited any more.
+    pub fn load_file(
+        &mut self,
+        rows: &[Vec<Cell>],
+        load: u64,
+        loaded: Loaded,
+    ) -> Result<(), &'static str> {
+        let Some((row, col)) = self.loads.remove(&load) else {
+            return Err("the new row it was chosen for is gone");
+        };
+        if !self.is_editable() {
+            return Err("the result isn't being edited any more");
+        }
+        self.load_value(rows, row, col, loaded);
+        Ok(())
+    }
+
+    /// Forgets `load`, whose file wasn't chosen.
+    pub fn cancel_load(&mut self, load: u64) {
+        self.loads.remove(&load);
     }
 
     /// Makes a file's value the pending change of a cell (#293), a step
@@ -953,13 +984,13 @@ impl GridState {
     }
 
     /// Moves what is held on a new row by view row, the viewer, the dialog
-    /// and the cell being edited, to where `kept` has its row among the new
-    /// rows now; where it has none, the row went, and the viewer and the
-    /// dialog close and the edit ends. The anchor and the cursor stay on
-    /// the rows there are. Whatever takes new rows away or puts them back
-    /// goes through here (#299, #328): they stayed at their places, on
-    /// other rows or past the rows. Rows added last leave the others where
-    /// they are.
+    /// and the cell being edited, and a file being loaded into it, to where
+    /// `kept` has its row among the new rows now; where it has none, the
+    /// row went, and the viewer and the dialog close, the edit ends and the
+    /// file isn't loaded. The anchor and the cursor stay on the rows there
+    /// are. Whatever takes new rows away or puts them back goes through
+    /// here (#299, #328, #344): they stayed at their places, on other rows
+    /// or past the rows. Rows added last leave the others where they are.
     fn follow_new_rows(&mut self, kept: &[Option<usize>]) {
         let fetched = self.order.len();
         let to = |view_row: usize| match view_row.checked_sub(fetched) {
@@ -978,6 +1009,15 @@ impl GridState {
                 .take()
                 .and_then(|(view_row, col, text)| Some((to(view_row)?, col, text)));
         }
+        // So do the files being loaded into new rows (#344).
+        self.loads.retain(|_, (row, _)| {
+            let RowRef::New(i) = *row else { return true };
+            let Some(k) = kept.get(i).copied().flatten() else {
+                return false;
+            };
+            *row = RowRef::New(k);
+            true
+        });
         let last = self.view_len(&[]).saturating_sub(1);
         for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
             *row = (*row).min(last);
@@ -5767,9 +5807,9 @@ mod tests {
         assert!(matches!(
             state.take_file_request(),
             Some(FileRequest::Load {
-                row: RowRef::Existing(0),
                 col: 1,
-                binary: true
+                binary: true,
+                ..
             })
         ));
         state.request_load(&columns, (0, 0));
@@ -5839,6 +5879,78 @@ mod tests {
     /// What a cell holds of a file's value, as each database shows binary
     /// values: cut short past 4000 bytes, with the size the grid reads
     /// back (#293).
+    /// A file loaded into a new row goes into that row where it is when the
+    /// file comes, or into none where the row went (#344): the row's place
+    /// among the new rows changes while the file is chosen and read. It
+    /// went into the row with the place the chosen one had.
+    #[test]
+    fn a_file_lands_in_the_row_it_was_chosen_for() {
+        let columns = vec![col_of("ID", "INTEGER"), col_of("IMG", "BLOB")];
+        let rows = vec![vec![Some("1".into()), None]];
+        let file = || Loaded::Bytes(Arc::from(&[0xAB][..]));
+        let loaded = |state: &GridState| -> Vec<(RowRef, usize)> {
+            state.changes().unwrap().loaded.keys().copied().collect()
+        };
+        let request = |state: &mut GridState, view_row| {
+            state.request_load(&columns, (view_row, 1));
+            match state.take_file_request() {
+                Some(FileRequest::Load { load, .. }) => load,
+                other => panic!("{other:?}"),
+            }
+        };
+        // Fetched row 1, new rows p, q and r.
+        let pqr = || {
+            let mut state = GridState {
+                dialect: Dialect::SQLITE,
+                value_files: true,
+                ..Default::default()
+            };
+            state.set_editable(None);
+            state.sync(&rows, &columns);
+            for (view_row, id) in [(1, "p"), (2, "q"), (3, "r")] {
+                state.add_row(&rows, 2);
+                state.edit_cell(&rows, view_row, 0, Some(id.into()));
+            }
+            state
+        };
+
+        // r's file, p deleted before it comes: into r, the second new row
+        // now (before: none, past the rows).
+        let mut state = pqr();
+        let to_r = request(&mut state, 3);
+        state.select((1, 0), false);
+        state.delete_rows(2);
+        assert_eq!(state.load_file(&rows, to_r, file()), Ok(()));
+        assert_eq!(loaded(&state), [(RowRef::New(1), 1)]);
+
+        // q's file with p deleted, p brought back by Ctrl+Z before it comes:
+        // into q, the second new row again (before: into p).
+        let mut state = pqr();
+        state.select((1, 0), false);
+        state.delete_rows(2);
+        let to_q = request(&mut state, 1);
+        state.undo(&rows);
+        assert_eq!(state.load_file(&rows, to_q, file()), Ok(()));
+        assert_eq!(loaded(&state), [(RowRef::New(1), 1)]);
+
+        // Discarded, r is gone: no file; the fetched row's file still goes
+        // in, unless editing is done.
+        let mut state = pqr();
+        let (to_r, to_fetched) = (request(&mut state, 3), request(&mut state, 0));
+        state.clear_changes();
+        state.add_row(&rows, 2);
+        state.add_row(&rows, 2);
+        state.add_row(&rows, 2);
+        let gone = state.load_file(&rows, to_r, file());
+        assert_eq!(gone, Err("the new row it was chosen for is gone"));
+        assert_eq!(state.load_file(&rows, to_fetched, file()), Ok(()));
+        assert_eq!(loaded(&state), [(RowRef::Existing(0), 1)]);
+        let to_fetched = request(&mut state, 0);
+        state.set_read_only();
+        let done = state.load_file(&rows, to_fetched, file());
+        assert_eq!(done, Err("the result isn't being edited any more"));
+    }
+
     #[test]
     fn loaded_values_show_as_held() {
         use pythia_db::Dialect;

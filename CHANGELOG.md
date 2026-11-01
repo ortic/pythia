@@ -1035,6 +1035,12 @@ All notable changes to Pythia are documented here. The format follows
   now fetched again, in a new session, with the changes from the one
   that failed on waiting for Apply. In a transaction, which the lost
   connection rolled back, all the changes still wait.
+- *Load from file…* into a new row (#293) puts the file into that row,
+  or into none (#344). The file is chosen and read while the grid goes
+  on: a new row deleted, taken back by Ctrl+Z or discarded meanwhile gave
+  the chosen row's place to another, and the file went there, or nowhere,
+  while the message said it was loaded. Where its row went, the file now
+  isn't loaded, and the message says so.
 
 ## [0.10.0] - 2026-10-30
 

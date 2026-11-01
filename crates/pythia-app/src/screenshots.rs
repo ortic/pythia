@@ -13763,6 +13763,72 @@ fn sqlite_files_round_trip() {
     );
 }
 
+/// A file loaded into a new row lands in that row or in none (#344). The
+/// dialog and the file's bytes are on helper threads, and the new rows can
+/// change meanwhile: here the rows are discarded and two others inserted
+/// before the file comes. Before, it went into the second of them, a row
+/// it wasn't chosen for, and the message said it was loaded.
+#[test]
+fn a_file_loads_into_its_own_row_or_none() {
+    let (mut h, _db) = sqlite_file("lob-row.db");
+    let dir = std::env::temp_dir().join(format!("pythia-lob-row-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("q.bin");
+    std::fs::write(&file, [0xAB; 100]).unwrap();
+    run_script(
+        &mut h,
+        "lob-row.db",
+        "create table lob_row (id integer primary key, img blob);\n\
+         insert into lob_row values (1, X'CAFE');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "lob-row.db".into(),
+        text: "select id, img from lob_row".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let add = |h: &mut Harness<'_, PythiaApp>, ids: &[&str]| {
+        let r = first_result(h);
+        let rows = r.rows.clone();
+        for id in ids {
+            r.grid.add_row(&rows, r.columns.len());
+            let view_row = rows.len() + r.grid.changes().unwrap().inserts.len() - 1;
+            r.grid.edit_cell(&rows, view_row, 0, Some((*id).into()));
+        }
+    };
+    add(&mut h, &["2", "3"]);
+    // Loaded into row 3's img; the rows are discarded and 7 and 8 are
+    // inserted while the file is chosen and read.
+    let before = message_count(&mut h);
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .chosen
+        .push_back(Some(file.clone()));
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (2, 1));
+    }
+    first_result(&mut h).grid.clear_changes();
+    add(&mut h, &["7", "8"]);
+    let said = file_done(&mut h, before);
+    let changes = first_result(&mut h).grid.changes().cloned().unwrap();
+    assert!(changes.loaded.is_empty(), "{:?}: {said}", changes.loaded);
+    let ids: Vec<Option<&str>> = changes.inserts.iter().map(|r| r[0].as_deref()).collect();
+    assert_eq!(ids, [Some("7"), Some("8")], "{said}");
+    assert!(
+        said.starts_with("Load from file: the new row it was chosen for is gone"),
+        "{said}"
+    );
+    h.state_mut().test_close_focused();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// *Load from file…* (#293), from the context menu and the value editor of
 /// a result being edited, not of one that isn't: the file becomes the
 /// cell's pending change, shown by its size, and Undo takes it back; a
