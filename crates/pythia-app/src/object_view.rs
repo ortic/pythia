@@ -82,7 +82,7 @@ impl ObjectView {
     }
 
     pub fn title(&self) -> String {
-        self.object.name.to_lowercase()
+        crate::browser::shown_name(self.dialect, &self.object.name)
     }
 
     #[cfg(test)]
@@ -242,7 +242,12 @@ impl ObjectView {
             {
                 ui.add(icon.image(ui));
             }
-            ui.label(RichText::new(format!("{}.{}", self.object.owner, self.object.name)).strong());
+            // The names as stored, a blank one quoted (#281).
+            let name = match self.object.name.trim() {
+                "" => self.dialect.quote_ident(&self.object.name),
+                _ => self.object.name.clone(),
+            };
+            ui.label(RichText::new(format!("{}.{name}", self.object.owner)).strong());
             ui.weak(self.object.object_type.dictionary_name().to_lowercase());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let Some(connection) = connection else {

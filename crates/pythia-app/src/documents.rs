@@ -45,10 +45,16 @@ pub struct ObjectRef {
 impl ObjectRef {
     /// `owner.name`, or just the name of a user or role (no owner).
     pub fn qualified(&self) -> String {
+        self.qualified_in(pythia_db::Dialect::ORACLE)
+    }
+
+    /// [`qualified`](Self::qualified) as `dialect` writes the names, quoted
+    /// only where it needs it (#268).
+    pub fn qualified_in(&self, dialect: pythia_db::Dialect) -> String {
         if self.owner.is_empty() {
-            return quote_ident(&self.name);
+            return dialect.quote_ident(&self.name);
         }
-        format!("{}.{}", quote_ident(&self.owner), quote_ident(&self.name))
+        dialect.qualified(&self.owner, &self.name)
     }
 }
 

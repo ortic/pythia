@@ -214,6 +214,46 @@ fn a_missing_file_is_only_created_when_asked() {
     assert!(error.contains("not a database"), "{error}");
 }
 
+/// A `file:` URI makes a missing file only when its `mode=rwc` asks for
+/// it (#266), as a path does with `?create`: without a `mode=`, SQLite made
+/// one.
+#[test]
+fn a_file_uri_makes_a_missing_file_only_when_asked() {
+    // `file:` and the path with `/`, as SQLite reads a URI everywhere.
+    let uri = |db: &TempDb, query: &str| {
+        let path = db.path().replace('\\', "/").replace(' ', "%20");
+        let slash = if path.starts_with('/') { "" } else { "///" };
+        format!("file:{slash}{path}{query}")
+    };
+    let db = TempDb::new("uri");
+    for query in ["", "?cache=private", "?mode=rw", "#x"] {
+        let error = Harness::try_connect(params(&uri(&db, query)))
+            .err()
+            .unwrap_or_else(|| panic!("{query}: no file, no connection"));
+        assert!(error.contains("There is no database file"), "{error}");
+        assert!(error.contains("mode=rwc"), "{error}");
+        assert!(!db.0.exists(), "{query}: nothing was made");
+    }
+    let mut h = Harness::connect(&uri(&db, "?mode=rwc"));
+    h.ok("create table t (a)");
+    drop(h);
+    assert!(db.0.exists());
+    // The file there, any URI opens it; `mode=ro` only reads it.
+    let mut h = Harness::connect(&uri(&db, ""));
+    h.ok("insert into t values (1)");
+    assert!(!h.ok("commit"));
+    drop(h);
+    let mut h = Harness::connect(&uri(&db, "?mode=ro"));
+    assert_eq!(h.scalar("select count(*) from t").as_deref(), Some("1"));
+    assert!(h.fails("insert into t values (2)").contains("readonly"));
+    drop(h);
+    // Memory, which no file holds.
+    for memory in ["file:r55_memory?mode=memory&cache=shared", "file::memory:"] {
+        let mut h = Harness::connect(memory);
+        h.ok("create table t (a)");
+    }
+}
+
 #[test]
 fn query_and_fetch_more() {
     let db = TempDb::new("fetch");

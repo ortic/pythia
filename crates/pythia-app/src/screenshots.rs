@@ -1309,6 +1309,354 @@ fn mysql_edit_of_a_view_reading_other_databases() {
     assert_eq!(found[0][0].as_deref(), Some("3 2"), "{messages:?}");
 }
 
+/// *Edit* leaves the object as it was when its new version fails (#286). On
+/// SQLite and for a PostgreSQL materialized view the script dropped it
+/// first, and the drop stayed: the object was gone. A transaction pending
+/// in the window is neither committed nor rolled back. PostgreSQL's
+/// routines, triggers and views are replaced in place.
+#[test]
+fn edit_keeps_what_fails_on_sqlite_and_postgres() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Runs the Edit script of `object` with `old` made `new` in its window,
+    // after `before` there; gives the messages once the window has settled
+    // with its transaction `pending` or not.
+    let edit = |h: &mut Ui,
+                connection: &str,
+                object: &ObjectRef,
+                (old, new): (&str, &str),
+                before: Option<&str>,
+                pending: bool|
+     -> Vec<String> {
+        h.state_mut()
+            .test_object_action(connection, ObjectAction::Edit(object.clone()));
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(&object.name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        assert!(script.contains(old), "{script}");
+        if let Some(sql) = before {
+            h.state_mut()
+                .test_sql_window()
+                .editor
+                .set_text(sql.to_owned());
+            h.state_mut().test_execute_focused();
+            wait_until(h, sql, |app| {
+                !app.test_focused_busy() && app.test_pending_tx()
+            });
+        }
+        let edited = script.replacen(old, new, 1);
+        h.state_mut().test_sql_window().editor.set_text(edited);
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the script to run", |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let w = h.state_mut().test_sql_window();
+        w.state.messages.iter().map(|m| m.text.clone()).collect()
+    };
+    let object = |owner: &str, name: &str, object_type| ObjectRef {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    };
+    let first = |rows: Vec<Vec<pythia_db::Cell>>| rows.first().and_then(|r| r[0].clone());
+
+    // SQLite: a view, a trigger and an index.
+    let connection = "r55-edit.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r55_et (n);
+create view r55_ev as select n, 1 as m from r55_et;
+create trigger r55_eg after insert on r55_et begin select 1; end;
+create index r55_ei on r55_et (n);",
+    );
+    let path = file.0.display().to_string();
+    let lite = |sql: &str| {
+        let sql = sql.to_owned();
+        first(crate::test_db::run_with(
+            DbKind::Sqlite,
+            "",
+            "",
+            &path,
+            move |c| c.query(&sql, &[]).unwrap(),
+        ))
+    };
+    let sql_of = |name: &str| {
+        lite(&format!(
+            "select sql from sqlite_master where name = '{name}'"
+        ))
+    };
+    for (object_type, name, old, failing, new) in [
+        (ObjectType::View, "r55_ev", "1 as m", "1 as m,", "2 as m"),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (ObjectType::Index, "r55_ei", "(n)", "(nx)", "(n desc)"),
+    ] {
+        let o = object("main", name, object_type);
+        let was = sql_of(name);
+        let messages = edit(&mut h, connection, &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("no such column")),
+            "{messages:?}"
+        );
+        assert_eq!(sql_of(name), was, "{name} as it was");
+        let messages = edit(&mut h, connection, &o, (old, new), None, false);
+        h.state_mut().test_close_focused();
+        let now = sql_of(name);
+        assert!(
+            now.as_deref().is_some_and(|s| s.contains(new)),
+            "{now:?} {messages:?}"
+        );
+    }
+    // A change pending in the window: the script doesn't take it in.
+    let trigger = object("main", "r55_eg", ObjectType::Trigger);
+    let insert = "insert into r55_et values (7)";
+    let messages = edit(
+        &mut h,
+        connection,
+        &trigger,
+        ("select 2", "select 3"),
+        Some(insert),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("within a transaction")),
+        "{messages:?}"
+    );
+    assert_eq!(lite("select count(*) from r55_et").as_deref(), Some("0"));
+    assert!(sql_of("r55_eg").is_some_and(|s| s.contains("select 2")));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    // PostgreSQL: a materialized view; a view, function, procedure and
+    // trigger, which are replaced in place.
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r55-edit", DbKind::Postgres) else {
+        return;
+    };
+    let drops = [
+        "drop table if exists r55_et cascade",
+        "drop function if exists r55_ef()",
+        "drop procedure if exists r55_ep()",
+        "drop function if exists r55_etf()",
+    ];
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+        for sql in [
+            "create table r55_et (n int)",
+            "create materialized view r55_emv as select n, 1 as m from r55_et",
+            "create view r55_ev as select n, 1 as m from r55_et",
+            "create function r55_ef() returns int language sql as $$select 1$$",
+            "create procedure r55_ep() language plpgsql as $$begin perform 1; end$$",
+            "create function r55_etf() returns trigger language plpgsql \
+             as $$begin return new; end$$",
+            "create trigger r55_eg before insert on r55_et \
+             for each row execute function r55_etf()",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    let pg_first = |sql: String| {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            first(c.query(&sql, &[]).unwrap())
+        })
+        .flatten()
+    };
+    let definition = |o: &ObjectRef| {
+        pg_first(match o.object_type {
+            ObjectType::View | ObjectType::MaterializedView => format!(
+                "select pg_get_viewdef(c.oid) from pg_class c where c.relname = '{}'",
+                o.name
+            ),
+            ObjectType::Trigger => format!(
+                "select pg_get_triggerdef(t.oid) from pg_trigger t where t.tgname = '{}'",
+                o.name
+            ),
+            _ => format!(
+                "select pg_get_functiondef(p.oid) from pg_proc p where p.proname = '{}'",
+                o.name
+            ),
+        })
+    };
+    for (object_type, name, old, failing, new) in [
+        (
+            ObjectType::MaterializedView,
+            "r55_emv",
+            "1 AS m",
+            "1 AS m,",
+            "2 AS m",
+        ),
+        (ObjectType::View, "r55_ev", "1 AS m", "1 AS m,", "2 AS m"),
+        (
+            ObjectType::Function,
+            "r55_ef",
+            "select 1",
+            "sxlect 1",
+            "select 2",
+        ),
+        (
+            ObjectType::Procedure,
+            "r55_ep",
+            "perform 1",
+            "perfxrm 1",
+            "perform 2",
+        ),
+        (
+            ObjectType::Trigger,
+            "r55_eg",
+            "r55_etf()",
+            "r55_etfx()",
+            "INSERT OR UPDATE",
+        ),
+    ] {
+        let o = object("public", name, object_type);
+        let was = definition(&o);
+        assert!(was.is_some(), "{name}");
+        let messages = edit(&mut h, "r55-edit", &o, (old, failing), None, false);
+        h.state_mut().test_close_focused();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("syntax error") || m.contains("does not exist")),
+            "{name}: {messages:?}"
+        );
+        assert_eq!(definition(&o), was, "{name} as it was");
+        // The materialized view's new version waits for Commit.
+        let block = object_type == ObjectType::MaterializedView;
+        let new = if object_type == ObjectType::Trigger {
+            ("INSERT", new)
+        } else {
+            (old, new)
+        };
+        edit(&mut h, "r55-edit", &o, new, None, block);
+        if block {
+            h.state_mut().test_commit();
+            wait_until(&mut h, "the commit", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        let now = definition(&o);
+        assert!(now.as_deref().is_some_and(|d| d.contains(new.1)), "{now:?}");
+    }
+    // A change pending in the window: neither committed nor rolled back.
+    let view = object("public", "r55_emv", ObjectType::MaterializedView);
+    let was = definition(&view);
+    let messages = edit(
+        &mut h,
+        "r55-edit",
+        &view,
+        ("2 AS m", "2 AS m,"),
+        Some("insert into r55_et values (7)"),
+        true,
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("syntax error")),
+        "{messages:?}"
+    );
+    assert_eq!(definition(&view), was);
+    let rows = pg_first("select count(*) from r55_et".into());
+    assert_eq!(rows.as_deref(), Some("0"));
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "the rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        for sql in drops {
+            c.execute(sql).unwrap();
+        }
+    });
+}
+
+/// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
+/// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
+/// changes before stay pending.
+#[test]
+fn whenever_sqlerror_exit_rollback() {
+    use pythia_config::DbKind;
+
+    // Runs the script after `whenever`; gives whether a change is pending
+    // and the rows of r55_w seen in the window.
+    let run = |h: &mut Ui, connection: &str, whenever: &str| -> (bool, String) {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: format!(
+                "insert into r55_w values (1);\n{whenever}\n\
+                 insert into r55_nosuch values (1);\ninsert into r55_w values (2);"
+            ),
+            run: true,
+        });
+        let pending = whenever.ends_with("exit");
+        wait_until(h, whenever, |app| {
+            !app.test_focused_busy() && app.test_pending_tx() == pending
+        });
+        let messages: Vec<String> = h
+            .state_mut()
+            .test_sql_window()
+            .state
+            .messages
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|m| m.contains("1 remaining")),
+            "{messages:?}"
+        );
+        let w = h.state_mut().test_sql_window();
+        w.editor.set_text("select count(*) from r55_w".to_owned());
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the count", |app| !app.test_focused_busy());
+        let w = h.state_mut().test_sql_window();
+        let count = w.state.results[0].rows[0][0].clone().unwrap_or_default();
+        if pending {
+            h.state_mut().test_rollback();
+            wait_until(h, "the rollback", |app| !app.test_pending_tx());
+        }
+        h.state_mut().test_close_focused();
+        (pending, count)
+    };
+    let check = |h: &mut Ui, connection: &str| {
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit rollback"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK"),
+            (false, "0".into())
+        );
+        assert_eq!(
+            run(h, connection, "whenever sqlerror exit"),
+            (true, "1".into())
+        );
+    };
+
+    let connection = "r55-whenever.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(&mut h, connection, "create table r55_w (n)");
+    check(&mut h, connection);
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-whenever", DbKind::Oracle) {
+        run_script(&mut h, "r55-whenever", "create table r55_w (n number)");
+        check(&mut h, "r55-whenever");
+        run_script(&mut h, "r55-whenever", "drop table r55_w purge");
+    }
+}
+
 /// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote
 /// the value it had found out again to check it, so a value of more than
 /// half of max_allowed_packet made a statement the driver refused, which
@@ -10019,6 +10367,240 @@ fn object_view_of_a_dropped_table() {
             .is_some(),
         "Refresh says it's gone"
     );
+}
+
+/// *Drop…* names the table as its database writes it, in the question and
+/// in the log (#268). They read `"main"."r55_drop"`, Oracle's quoting, on
+/// every database.
+#[test]
+fn drop_names_the_object_as_its_database_writes_it() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Creates and drops each table through the question, which must name
+    // it so, as must the log.
+    let drops = |h: &mut Ui, connection: &str, tables: &[(&str, &str, &str)]| {
+        for (create, owner, name) in tables {
+            let (owner, name) = (owner.to_string(), name.to_string());
+            run_script(h, connection, create);
+            let object = ObjectRef {
+                owner,
+                name: name.clone(),
+                object_type: ObjectType::Table,
+            };
+            let named = match (object.owner.as_str(), name.as_str()) {
+                ("main", "r55_drop") => "main.r55_drop",
+                ("main", _) => "main.\"R55 Drop\"",
+                ("public", _) => "public.\"R55 Drop\"",
+                ("dbo", _) => "dbo.[r55 drop]",
+                ("PYTHIA", "R55_DROP") => "PYTHIA.R55_DROP",
+                ("PYTHIA", _) => "PYTHIA.\"R55 Drop\"",
+                _ => "pythia.`r55 drop`",
+            };
+            let before = h.state().test_log().len();
+            h.state_mut()
+                .test_object_action(connection, ObjectAction::Drop(object));
+            h.run_steps(3);
+            let question = format!("Drop table {named}? This cannot be undone.");
+            assert!(h.query_by_label(&question).is_some(), "{question}");
+            h.get_by_label("Drop").click();
+            wait_until(h, "the drop", |app| {
+                app.test_log()[before..]
+                    .iter()
+                    .any(|l| l.ends_with(" dropped"))
+            });
+            let log = h.state().test_log()[before..].to_vec();
+            let line = format!("table {named} dropped");
+            assert!(log.contains(&line), "{line}: {log:?}");
+        }
+    };
+
+    let connection = "r55-drop.db";
+    let (mut h, _file) = sqlite_file(connection);
+    drops(
+        &mut h,
+        connection,
+        &[
+            ("create table r55_drop (a)", "main", "r55_drop"),
+            ("create table \"R55 Drop\" (a)", "main", "R55 Drop"),
+        ],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    for (env, kind, table) in [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            ("create table `r55 drop` (a int)", "pythia", "r55 drop"),
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            ("create table \"R55 Drop\" (a int)", "public", "R55 Drop"),
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            ("create table [r55 drop] (a int)", "dbo", "r55 drop"),
+        ),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-drop", kind) {
+            drops(&mut h, "r55-drop", &[table]);
+        }
+    }
+    // Oracle's as before.
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-drop", DbKind::Oracle) {
+        drops(
+            &mut h,
+            "r55-drop",
+            &[
+                ("create table r55_drop (a int)", "PYTHIA", "R55_DROP"),
+                ("create table \"R55 Drop\" (a int)", "PYTHIA", "R55 Drop"),
+            ],
+        );
+    }
+}
+
+/// The object browser, an object's tab, Favorites and Recent show a name
+/// with the case that tells it apart (#272). Every name was lowercased, so
+/// PostgreSQL's "R55Case" and r55case, MySQL's R55Case and r55case, and
+/// Oracle's R55_CASE, "R55_Case" and "R55_case" each read the same; Oracle's
+/// uppercase names still read in lowercase.
+#[test]
+fn names_keep_the_case_that_tells_them_apart() {
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    // Creates the tables (name, as shown) and finds each in the browser
+    // once; the second one in its tab, Favorites and Recent too.
+    let check = |h: &mut Ui, owner: &str, script: &str, drops: &str, tables: &[(&str, &str)]| {
+        let connection = "r55-case";
+        run_script(h, connection, script);
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_browser().set_filter("R55");
+        h.state_mut().test_refresh_browser();
+        wait_until(h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        for (_, shown) in tables {
+            assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+        }
+        let (name, shown) = tables[1];
+        let object = ObjectRef {
+            owner: owner.into(),
+            name: name.into(),
+            object_type: ObjectType::Table,
+        };
+        h.state_mut().test_open(OpenRequest::Object {
+            connection: connection.into(),
+            object: object.clone(),
+        });
+        wait_until(h, "its view", |app| !app.test_focused_busy());
+        assert_eq!(h.state().test_focused_title().as_deref(), Some(shown));
+        h.state_mut().test_close_focused();
+        // The folder left out (only invalid objects), Favorites and Recent.
+        h.state_mut().test_browser().test_marks(object);
+        h.run_steps(3);
+        assert_eq!(h.query_all_by_label(shown).count(), 2, "{shown}");
+        run_script(h, connection, drops);
+    };
+
+    let (mut h, _file) = sqlite_file("r55-case");
+    check(
+        &mut h,
+        "main",
+        "create table R55Case (a);\ncreate table r55_other (a)",
+        "drop table R55Case;\ndrop table r55_other",
+        &[("r55_other", "r55_other"), ("R55Case", "R55Case")],
+    );
+    // A harness at a time: each holds a place in the UI lock.
+    drop(h);
+    let both = |create: &str, quoted: &str| {
+        (
+            format!("{create} {quoted} (a int);\n{create} r55case (a int)"),
+            format!("drop table {quoted};\ndrop table r55case"),
+        )
+    };
+    for (env, kind, owner, quoted) in [
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "public",
+            "\"R55Case\"",
+        ),
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql, "pythia", "R55Case"),
+    ] {
+        if let Some(mut h) = connect_to(env, "r55-case", kind) {
+            let (script, drops) = both("create table", quoted);
+            check(
+                &mut h,
+                owner,
+                &script,
+                &drops,
+                &[("r55case", "r55case"), ("R55Case", "R55Case")],
+            );
+        }
+    }
+    if let Some(mut h) = connect_to("PYTHIA_TEST_DB", "r55-case", DbKind::Oracle) {
+        check(
+            &mut h,
+            "PYTHIA",
+            "create table r55_case (a int);\ncreate table \"R55_Case\" (a int);\n\
+             create table \"R55_case\" (a int)",
+            "drop table r55_case;\ndrop table \"R55_Case\";\ndrop table \"R55_case\"",
+            &[
+                ("R55_CASE", "r55_case"),
+                ("R55_Case", "\"R55_Case\""),
+                ("R55_case", "\"R55_case\""),
+            ],
+        );
+    }
+}
+
+/// A SQLite table named `""` shows as `""` (#281): in the browser, where it
+/// was a button without a label, 16 pixels wide, its tab and view,
+/// Favorites and Recent. One named `" "` shows as `" "`.
+#[test]
+fn an_empty_name_shows_as_quotes() {
+    use pythia_db::ObjectType;
+    let connection = "r55-empty.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"\" (a, b);\ncreate table \" \" (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    assert!(h.query_by_label("\" \"").is_some());
+    let entry = h.get_by_label("\"\"");
+    assert!(entry.rect().width() > 20.0, "{:?}", entry.rect());
+    entry.click();
+    h.run_steps(2);
+    let selected = h.state().test_browser_selected();
+    assert_eq!(selected.map(|o| o.name), Some(String::new()));
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: String::new(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"\""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"\"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
 }
 
 /// A name typed after its opening quote is completed and closed (#234):

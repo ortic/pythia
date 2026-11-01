@@ -149,8 +149,8 @@ pub(crate) fn run(
 
 /// Opens the database `path[?ro][&create]`: an existing file (`~` for the
 /// home directory), `:memory:` or a `file:` URI as SQLite takes it. A
-/// missing file is only made with `create`, so a typo doesn't leave an
-/// empty database behind.
+/// missing file is only made with `create` (a URI's `mode=rwc`), so a typo
+/// doesn't leave an empty database behind.
 pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
     let target = Target::parse(connect_string)?;
     let mut flags = OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -162,9 +162,17 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
     let location = match &target.file {
         File::Memory => SHARED_MEMORY.to_owned(),
         File::Uri(uri) => {
-            if !target.read_only {
-                // The URI's `mode=` decides; without one SQLite creates.
+            // Only `mode=rwc` makes a missing file (#266): without a
+            // `mode=`, SQLite would.
+            if target.create {
                 flags |= OpenFlags::SQLITE_OPEN_CREATE;
+            } else if let Some(path) = uri_file(uri)
+                && !path.exists()
+            {
+                return Err(DbError::new(format!(
+                    "There is no database file {} (add mode=rwc to make a new one)",
+                    path.display()
+                )));
             }
             uri.clone()
         }
@@ -225,10 +233,11 @@ impl Target {
             return Err(DbError::new("Which database file? Give its path"));
         }
         if text.starts_with("file:") {
+            let mode = uri_param(text, "mode");
             return Ok(Target {
-                read_only: text.contains("mode=ro"),
+                read_only: mode == Some("ro"),
                 file: File::Uri(text.to_owned()),
-                create: false,
+                create: mode == Some("rwc"),
             });
         }
         let text = text.strip_prefix("sqlite://").unwrap_or(text);
@@ -295,6 +304,59 @@ pub fn sqlite_without_create(connect_string: &str) -> String {
         }
     }
     connect_string.to_owned()
+}
+
+/// The value of a `file:` URI's parameter `key`, as written.
+fn uri_param<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
+    let (_, query) = uri.split('#').next()?.split_once('?')?;
+    query
+        .split('&')
+        .find_map(|p| p.split_once('=').filter(|(k, _)| *k == key))
+        .map(|(_, value)| value)
+}
+
+/// The file a `file:` URI opens, as SQLite reads it: the path after an
+/// empty or `localhost` authority, up to the parameters, `%HH` decoded.
+/// None where no file of this machine is named: memory, a temporary
+/// database (no path), another host or VFS.
+fn uri_file(uri: &str) -> Option<PathBuf> {
+    if uri_param(uri, "mode") == Some("memory") || uri_param(uri, "vfs").is_some() {
+        return None;
+    }
+    let rest = uri.strip_prefix("file:")?;
+    let mut path = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    if let Some(after) = path.strip_prefix("//") {
+        let (authority, rest) = after.split_at(after.find('/').unwrap_or(after.len()));
+        if !matches!(authority, "" | "localhost") {
+            return None;
+        }
+        path = rest;
+    }
+    // `/C:/…` on Windows is the drive's.
+    if cfg!(windows) && path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
+        path = &path[1..];
+    }
+    let bytes = path.as_bytes();
+    let hex = |i: usize| {
+        let digit = |b: Option<&u8>| b.and_then(|&b| (b as char).to_digit(16));
+        Some(digit(bytes.get(i + 1))? * 16 + digit(bytes.get(i + 2))?)
+    };
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match hex(i).filter(|_| bytes[i] == b'%') {
+            Some(byte) => {
+                decoded.push(byte as u8);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    (!path.is_empty() && path != ":memory:").then(|| PathBuf::from(path))
 }
 
 /// `~/x.db` → the home directory's `x.db`.
@@ -877,9 +939,31 @@ mod tests {
         assert_eq!(t.file, File::Path("what?.db".into()));
         assert_eq!(Target::parse(":memory:").unwrap().file, File::Memory);
         let t = Target::parse("file:x.db?mode=ro&cache=private").unwrap();
-        assert!(t.read_only);
+        assert!(t.read_only && !t.create);
         assert!(matches!(t.file, File::Uri(_)));
+        let t = Target::parse("file:x.db?cache=private&mode=rwc").unwrap();
+        assert!(t.create && !t.read_only);
+        assert!(!Target::parse("file:x.db?mode=rw").unwrap().create);
         assert!(Target::parse("  ").is_err());
+    }
+
+    /// The file a URI names, which must be there unless `mode=rwc` (#266).
+    #[test]
+    fn files_of_uris() {
+        for (uri, file) in [
+            ("file:x.db", Some("x.db")),
+            ("file:/data/x.db?cache=private", Some("/data/x.db")),
+            ("file:///data/x.db#top", Some("/data/x.db")),
+            ("file://localhost/data/my%20x.db", Some("/data/my x.db")),
+            ("file:data%3f.db?mode=rw", Some("data?.db")),
+            ("file://elsewhere/data/x.db", None),
+            ("file:x.db?mode=memory", None),
+            ("file::memory:", None),
+            ("file:?mode=ro", None),
+            ("file:x.db?vfs=memdb", None),
+        ] {
+            assert_eq!(uri_file(uri), file.map(PathBuf::from), "{uri}");
+        }
     }
 
     /// What a connection keeps once its file is made (#255).

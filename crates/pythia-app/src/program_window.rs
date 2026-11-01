@@ -210,7 +210,8 @@ impl ProgramWindow {
     }
 
     pub fn title(&self) -> String {
-        self.object.name.to_lowercase()
+        // PL/SQL: Oracle's names (#272).
+        crate::browser::shown_name(pythia_db::Dialect::ORACLE, &self.object.name)
     }
 
     pub fn is_busy(&self) -> bool {

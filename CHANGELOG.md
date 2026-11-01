@@ -63,6 +63,10 @@ All notable changes to Pythia are documented here. The format follows
   starts = 318 rows, got none". The 35 is the line's Id in the plan, and
   no rows are no longer called 318× fewer. The details under the plan
   tree are headed "Line 35: INDEX UNIQUE SCAN".
+- `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails,
+  as in SQL\*Plus (#286), on every database: the SQL window stopped the
+  script and left its changes pending. `WHENEVER SQLERROR EXIT` without
+  `ROLLBACK` still stops without ending the transaction.
 
 ### Fixed
 - INSERT exports on SQL Server wrote a `float` like 1e300 out in full
@@ -598,6 +602,39 @@ All notable changes to Pythia are documented here. The format follows
   database named its own, so that a copy run elsewhere read the
   original's tables. The view is named without its database, as a
   table is.
+- SQLite: a `file:` URI makes a missing database file only with
+  `mode=rwc` (#266), as a path does with `?create`. Without a `mode=`,
+  a URI whose file was mistyped, moved or deleted connected to a new,
+  empty database in its place. It now fails with "There is no database
+  file"; `mode=ro` and `mode=memory` work as before.
+- *Drop…* names the object as its database writes it (#268), in its
+  question and in the log, as do the hover over a browser entry and the
+  log lines of a failed drop and of *Show in object browser*. They
+  quoted every name as Oracle would, on any database: SQLite's
+  `main.t` read `"main"."t"`, MySQL's ``shop.`my t` `` read
+  `"shop"."my t"`, two strings. A MySQL account reads `'user'@'host'`.
+- The object browser shows names with their case (#272). It showed
+  every name in lowercase, so PostgreSQL's `"Foo"` and `foo`, MySQL's
+  `Foo` and `foo` on Linux, and Oracle's `FOO`, `"Foo"` and `"foo"` each
+  looked the same, and SQLite's or SQL Server's `Foo` didn't read as
+  created. Names show as they are; on Oracle an uppercase name still
+  reads in lowercase (`foo`), and one with lowercase letters as SQL
+  writes it (`"Foo"`). So do the tabs, *Favorites* and *Recent*, a
+  table's indexes, constraints and triggers (and their *Copy name*), and
+  the object named in an editor's context menu.
+- SQLite: a table named `""` shows as `""` in the object browser (#281),
+  under *Favorites* and *Recent*, on its tab and in its view's heading
+  (`main.""`). It showed as its icon and a button without a name, 16
+  pixels wide, and its tab had no title. A name of spaces only shows
+  quoted as well (`" "`).
+- *Edit* of a SQLite trigger, view or index, and of a PostgreSQL
+  materialized view, no longer leaves the object dropped when its new
+  version fails (#286). The script dropped it, then created it, and the
+  drop was committed: a typo in the new version made the object go.
+  SQLite's script now runs in a transaction of its own that a failing
+  statement rolls back; with a transaction pending in the window it
+  stops at its `begin`, before anything changed. PostgreSQL's drops and
+  creates the view in one `DO` block, which waits for Commit.
 
 ## [0.10.0] - 2026-10-30
 

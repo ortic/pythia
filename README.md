@@ -371,7 +371,8 @@ for Linux, Windows and macOS.
   makes one). SQLite is built in: nothing to install. A path that doesn't
   exist fails instead of leaving an empty database behind; `?create` makes
   the file, `?ro` opens it read-only, `:memory:` is one in-memory database
-  for all windows, and a `file:` URI works as SQLite takes it.
+  for all windows, and a `file:` URI works as SQLite takes it, except that
+  it makes a missing file only with `mode=rwc`.
 - SQL windows with results, fetching on demand, Break, explain plan
   (`EXPLAIN QUERY PLAN`), *Execute to file* and completion. Each window
   has its own connection to the file, and transactions work as with
@@ -385,7 +386,9 @@ for Linux, Windows and macOS.
   attaches one for every window). Object views show columns, indexes,
   constraints, triggers, what uses a table and what a view uses, and the
   DDL as written, a table's with its indexes. *Edit* opens a view or
-  trigger as a script that drops and creates it again.
+  trigger as a script that drops and creates it again in a transaction of
+  its own, which a failing create rolls back (`WHENEVER SQLERROR EXIT
+  ROLLBACK`), so the object stays as it was.
 - *Edit* on a result of one table changes its rows in place, as on the
   other databases. Rows are found by the table's primary key, a unique
   index on NOT NULL columns, or else its `rowid`, so every table can be

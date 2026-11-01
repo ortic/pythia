@@ -768,7 +768,7 @@ impl Browser {
             }
             (Pending::Action { object, verb }, Ok(_)) => {
                 let ty = object.object_type.dictionary_name().to_lowercase();
-                log.push(format!("{ty} {} {verb}", object.qualified()));
+                log.push(format!("{ty} {} {verb}", named(self.dialect, &object)));
                 self.refresh(&mut effects);
                 effects.invalid_changed = true;
                 if verb == "dropped" {
@@ -776,7 +776,11 @@ impl Browser {
                 }
             }
             (Pending::Action { object, verb }, Err(e)) => {
-                log.push(format!("{} {} failed: {e}", verb, object.qualified()));
+                log.push(format!(
+                    "{} {} failed: {e}",
+                    verb,
+                    named(self.dialect, &object)
+                ));
                 self.refresh(&mut effects);
             }
             (Pending::TestLink(object), Ok(Some(MetaResult::Text(remote)))) => {
@@ -983,7 +987,7 @@ impl Browser {
                 self.reveal = None;
                 effects
                     .log
-                    .push(format!("{} not found", target.qualified()));
+                    .push(format!("{} not found", named(self.dialect, &target)));
             }
         }
 
@@ -1319,7 +1323,7 @@ impl Browser {
                     if !object.valid {
                         paint_invalid_badge(ui, icon_response.rect);
                     }
-                    let mut text = name(object.name.to_lowercase());
+                    let mut text = name(shown_name(self.dialect, &object.name));
                     if !object.valid {
                         text = text.color(ui.visuals().error_fg_color);
                     }
@@ -1330,7 +1334,7 @@ impl Browser {
                         )
                     });
                     let response = response.on_hover_ui(|ui| {
-                        ui.label(RichText::new(r.qualified()).strong());
+                        ui.label(RichText::new(named(self.dialect, &r)).strong());
                         ui.label(object.object_type.dictionary_name().to_lowercase());
                         if !object.valid {
                             ui.colored_label(ui.visuals().error_fg_color, "Invalid");
@@ -1400,7 +1404,8 @@ impl Browser {
                         PartKind::Trigger => Icon::Trigger,
                     };
                     ui.add(icon.sized(ui, small));
-                    let mut text = name(part.name.to_lowercase());
+                    let part_name = shown_name(self.dialect, &part.name);
+                    let mut text = name(part_name.clone());
                     if !part.enabled {
                         text = text.strikethrough().color(ui.visuals().weak_text_color());
                     }
@@ -1413,11 +1418,8 @@ impl Browser {
                     };
                     ui.weak(format!("{tag}{}", part.detail));
                     let state = if part.enabled { "" } else { " (disabled)" };
-                    let label = label.on_hover_text(format!(
-                        "{}{state}\n{tag}{}",
-                        part.name.to_lowercase(),
-                        part.detail
-                    ));
+                    let label =
+                        label.on_hover_text(format!("{part_name}{state}\n{tag}{}", part.detail));
                     let trigger = ObjectRef {
                         owner: table.owner.clone(),
                         name: part.name.clone(),
@@ -1441,7 +1443,7 @@ impl Browser {
                             ui.close();
                         }
                         if ui.button("Copy name").clicked() {
-                            ui.ctx().copy_text(part.name.to_lowercase());
+                            ui.ctx().copy_text(part_name.clone());
                             ui.close();
                         }
                     });
@@ -1454,8 +1456,10 @@ impl Browser {
                         Icon::Procedure
                     };
                     ui.add(icon.sized(ui, small));
-                    let label =
-                        ui.add(egui::Label::new(name(m.name.to_lowercase())).sense(Sense::click()));
+                    let label = ui.add(
+                        egui::Label::new(name(shown_name(self.dialect, &m.name)))
+                            .sense(Sense::click()),
+                    );
                     ui.weak(&m.signature);
                     label.context_menu(|ui| {
                         let subprogram = || Subprogram {
@@ -1527,15 +1531,9 @@ impl Browser {
                         object_type: *object_type,
                     };
                     let selected = self.selected.as_ref() == Some(&account);
-                    // Oracle's names are uppercase; the others' as created.
-                    let shown = if self.dialect == Dialect::ORACLE {
-                        name.to_lowercase()
-                    } else {
-                        (*name).to_owned()
-                    };
                     let response = ui.add(egui::Button::selectable(
                         selected,
-                        RichText::new(shown).font(names.clone()),
+                        RichText::new(shown_name(self.dialect, name)).font(names.clone()),
                     ));
                     let editors = has_form(self.dialect, *object_type);
                     if response.clicked() {
@@ -1563,14 +1561,11 @@ impl Browser {
                         .unwrap_or(Icon::Text);
                     ui.add(icon.sized(ui, small));
                     let selected = self.selected.as_ref() == Some(*object);
-                    let mut text = name(object.name.to_lowercase());
-                    if Some(object.owner.as_str()) != self.schema.as_deref() {
-                        text = name(format!(
-                            "{}.{}",
-                            object.owner.to_lowercase(),
-                            object.name.to_lowercase()
-                        ));
-                    }
+                    let text = if Some(object.owner.as_str()) == self.schema.as_deref() {
+                        name(shown_name(self.dialect, &object.name))
+                    } else {
+                        name(shown_qualified(self.dialect, object))
+                    };
                     let response = self.drag_source(ui, object, |ui| {
                         ui.add(
                             egui::Button::selectable(selected, text).sense(Sense::click_and_drag()),
@@ -1579,7 +1574,7 @@ impl Browser {
                     let response = response.on_hover_text(format!(
                         "{} {}",
                         object.object_type.dictionary_name().to_lowercase(),
-                        object.qualified()
+                        named(self.dialect, object)
                     ));
                     if response.clicked() {
                         actions.push(ObjectAction::Select((*object).clone()));
@@ -1863,7 +1858,7 @@ impl Browser {
             ui.label(format!(
                 "Drop {} {}? This cannot be undone.",
                 object.object_type.dictionary_name().to_lowercase(),
-                object.qualified()
+                named(self.dialect, &object)
             ));
             match (self.dialect.kind(), object.object_type) {
                 (pythia_db::DbKind::Oracle, ObjectType::User) => {
@@ -2103,9 +2098,13 @@ fn drop_sql(dialect: Dialect, o: &ObjectRef) -> String {
 /// says. A routine or trigger ends with `/` like a PL/SQL unit so the
 /// body's `;` stay in it. PostgreSQL's routines and views come with
 /// `CREATE OR REPLACE`, its triggers get it; SQL Server's get `CREATE OR
-/// ALTER`. SQLite has neither: drop, then create, a trigger's body keeping
-/// its `;` without a `/`, and the `;` after a line comment on a line of its
-/// own (#206).
+/// ALTER`. SQLite has neither, nor has PostgreSQL for a materialized view,
+/// but their DDL is transactional: the drop and the create go in one
+/// transaction that a failing create undoes (#286). SQLite's script begins
+/// one (which fails before anything is changed when the window has one
+/// pending) and rolls it back on an error; PostgreSQL's runs both in one
+/// `DO` block. A SQLite trigger's body keeps its `;` without a `/`, and the
+/// `;` after a line comment goes on a line of its own (#206).
 ///
 /// The object is created where it was, whatever the current database or
 /// schema (#248): MySQL's DDL leaves out the database, so the script
@@ -2140,7 +2139,17 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             format!("{}\n", create_or(ddl, "or replace", "TRIGGER"))
         }
         (pythia_db::DbKind::Postgres, ObjectType::MaterializedView) => {
-            format!("drop materialized view if exists {qualified};\n\n{ddl}\n")
+            let ddl = pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Postgres);
+            let mut tag = "$pythia$".to_owned();
+            while ddl.contains(&tag) {
+                tag.insert(tag.len() - 1, '_');
+            }
+            // A column named `found` is the view's, not PL/pgSQL's FOUND.
+            format!(
+                "-- One block: if the create fails, the {kind} stays as it was.\n\
+                 do {tag}\n#variable_conflict use_column\nbegin\n\
+                 drop {kind} if exists {qualified};\n\n{ddl}\nend\n{tag};\n"
+            )
         }
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => {
@@ -2154,7 +2163,10 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
                 in_schema(dialect, ddl, &o.owner)
             };
             format!(
-                "drop {kind} if exists {qualified};\n\n{}\n",
+                "-- A transaction of its own: if the create fails, the {kind} stays\n\
+                 -- as it was.\n\
+                 begin;\nwhenever sqlerror exit rollback\n\n\
+                 drop {kind} if exists {qualified};\n\n{}\n\ncommit;\n",
                 pythia_plsql::terminated(&ddl, pythia_plsql::Syntax::Sqlite)
             )
         }
@@ -2247,6 +2259,15 @@ fn create_or(ddl: &str, words: &str, next: &str) -> String {
 /// A PostgreSQL string literal.
 fn pg_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// The object as its database's SQL names it, as its `DROP` does: quoted
+/// only where it needs it, a MySQL account as `'user'@'host'` (#268).
+fn named(dialect: Dialect, o: &ObjectRef) -> String {
+    if dialect == Dialect::MYSQL && o.object_type.is_database_object() {
+        return mysql_account(&o.name);
+    }
+    o.qualified_in(dialect)
 }
 
 /// A MySQL account as listed (`user@host`, a role without its host) as
@@ -2464,6 +2485,33 @@ impl Template {
             Template::ColumnList => "Column list",
         }
     }
+}
+
+/// `name` as the browser, tabs and titles show it (#272): as it is, so
+/// that names told apart by case read apart. Oracle's names in its default
+/// uppercase read in lowercase, which reads better, and the others as its
+/// SQL writes them (`"Foo"`), so that they don't read like those. A name
+/// that is empty or only spaces reads quoted too.
+pub fn shown_name(dialect: Dialect, name: &str) -> String {
+    if name.trim().is_empty() {
+        // There would be nothing to see or click (#281).
+        dialect.quote_ident(name)
+    } else if dialect != Dialect::ORACLE {
+        name.to_owned()
+    } else if name.chars().any(char::is_lowercase) {
+        dialect.quote_ident(name)
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// `owner.name`, each [`shown_name`], or the name alone without an owner.
+pub fn shown_qualified(dialect: Dialect, o: &ObjectRef) -> String {
+    let name = shown_name(dialect, &o.name);
+    if o.owner.is_empty() {
+        return name;
+    }
+    format!("{}.{name}", shown_name(dialect, &o.owner))
 }
 
 /// `name` as the SQL of `dialect` writes it: quoted where it needs it,
@@ -2832,6 +2880,15 @@ mod tests {
             drop_sql(Dialect::SQLSERVER, &account("reader", ObjectType::Role)),
             "drop role reader"
         );
+        // The question and the log name them so (#268).
+        for (dialect, name, named_so) in [
+            (Dialect::ORACLE, "SCOTT", "SCOTT"),
+            (Dialect::MYSQL, "app@localhost", "'app'@'localhost'"),
+            (Dialect::POSTGRES, "App", "\"App\""),
+            (Dialect::SQLSERVER, "reader", "reader"),
+        ] {
+            assert_eq!(named(dialect, &account(name, ObjectType::User)), named_so);
+        }
     }
 
     fn col(name: &str, pk: Option<u32>) -> TableColumn {
@@ -2882,6 +2939,41 @@ mod tests {
             template(Dialect::MYSQL, Template::Select, &object, &cols),
             "select o.id,\n       o.Total,\n       o.`key`\n  from shop.`Order` o"
         );
+    }
+
+    /// Names keep the case that tells them apart; Oracle's uppercase ones
+    /// read in lowercase (#272).
+    #[test]
+    fn shown_names() {
+        for (dialect, name, shown) in [
+            (Dialect::ORACLE, "EMP", "emp"),
+            (Dialect::ORACLE, "MY TABLE", "my table"),
+            (Dialect::ORACLE, "Emp", "\"Emp\""),
+            (Dialect::ORACLE, "emp", "\"emp\""),
+            (Dialect::POSTGRES, "Emp", "Emp"),
+            (Dialect::POSTGRES, "emp", "emp"),
+            (Dialect::POSTGRES, "EMP", "EMP"),
+            (Dialect::MYSQL, "Emp", "Emp"),
+            (Dialect::SQLSERVER, "Emp", "Emp"),
+            (Dialect::SQLITE, "Emp", "Emp"),
+            (Dialect::SQLITE, "", "\"\""),
+            (Dialect::SQLITE, "  ", "\"  \""),
+            (Dialect::MYSQL, "", "``"),
+            (Dialect::SQLSERVER, " ", "[ ]"),
+        ] {
+            assert_eq!(shown_name(dialect, name), shown, "{dialect:?} {name}");
+        }
+        let emp = |owner: &str| ObjectRef {
+            owner: owner.into(),
+            name: "Emp".into(),
+            object_type: ObjectType::Table,
+        };
+        assert_eq!(shown_qualified(Dialect::ORACLE, &emp("HR")), "hr.\"Emp\"");
+        assert_eq!(
+            shown_qualified(Dialect::POSTGRES, &emp("Sales")),
+            "Sales.Emp"
+        );
+        assert_eq!(shown_qualified(Dialect::POSTGRES, &emp("")), "Emp");
     }
 
     /// Names that need quotes give binds that are binds: a bind ends at a
@@ -3090,6 +3182,35 @@ mod tests {
             ),
             "CREATE or replace TRIGGER t BEFORE INSERT ON app.x FOR EACH ROW EXECUTE FUNCTION app.f();\n"
         );
+        // A materialized view: dropped and created in one block (#286).
+        let view = "create materialized view app.\"Mv\" as\n SELECT 1 AS found;";
+        let script = replace_script(
+            Dialect::POSTGRES,
+            &o("Mv", ObjectType::MaterializedView),
+            view,
+            false,
+        );
+        assert_eq!(
+            script,
+            format!(
+                "-- One block: if the create fails, the materialized view stays as it was.\n\
+                 do $pythia$\n#variable_conflict use_column\nbegin\n\
+                 drop materialized view if exists app.\"Mv\";\n\n{view}\nend\n$pythia$;\n"
+            )
+        );
+        assert_eq!(
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Postgres).len(),
+            1
+        );
+        let tagged = "create materialized view app.v as\n SELECT '$pythia$'::text AS t";
+        let script = replace_script(
+            Dialect::POSTGRES,
+            &o("v", ObjectType::MaterializedView),
+            tagged,
+            false,
+        );
+        assert!(script.contains("do $pythia_$\n"), "{script}");
+        assert!(script.ends_with("AS t;\nend\n$pythia_$;\n"), "{script}");
         let drop = drop_sql(Dialect::POSTGRES, &o("t", ObjectType::Trigger));
         assert!(drop.contains("g.tgname = 't'"), "{drop}");
         assert_eq!(
@@ -3150,6 +3271,14 @@ mod tests {
             name: name.into(),
             object_type,
         };
+        // In a transaction of its own that an error rolls back (#286).
+        let replaced = |kind: &str, drop: &str, create: &str| {
+            format!(
+                "-- A transaction of its own: if the create fails, the {kind} stays\n\
+                 -- as it was.\n\
+                 begin;\nwhenever sqlerror exit rollback\n\n{drop};\n\n{create}\n\ncommit;\n"
+            )
+        };
         let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;\n";
         let script = replace_script(
             Dialect::SQLITE,
@@ -3159,12 +3288,26 @@ mod tests {
         );
         assert_eq!(
             script,
-            "drop trigger if exists main.t;\n\nCREATE TRIGGER t AFTER INSERT ON x BEGIN\n  \
-             update x set n = 1;\nEND;\n"
+            replaced(
+                "trigger",
+                "drop trigger if exists main.t",
+                trigger.trim_end()
+            )
         );
+        let statements: Vec<&str> =
+            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite)
+                .iter()
+                .map(|s| s.text(&script))
+                .collect();
         assert_eq!(
-            pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
-            2
+            statements,
+            [
+                "begin",
+                "whenever sqlerror exit rollback",
+                "drop trigger if exists main.t",
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND",
+                "commit"
+            ]
         );
         // A view as written, a line comment at its end: the `;` goes on a
         // line of its own (#206).
@@ -3172,13 +3315,12 @@ mod tests {
         let script = replace_script(Dialect::SQLITE, &lite("v", ObjectType::View), view, false);
         assert_eq!(
             script,
-            "drop view if exists main.v;\n\nCREATE VIEW v AS select 'foo' as a\nwhere 1\n    \
-             -- and 0; really\n;\n"
+            replaced("view", "drop view if exists main.v", &format!("{view}\n;"))
         );
         let script = format!("{script}select 1;");
         assert_eq!(
             pythia_plsql::split_statements_in(&script, pythia_plsql::Syntax::Sqlite).len(),
-            3
+            6
         );
         assert_eq!(
             drop_sql(Dialect::SQLITE, &lite("order", ObjectType::Table)),
@@ -3197,8 +3339,11 @@ mod tests {
                 trigger,
                 false
             ),
-            "drop trigger if exists aux.t;\n\nCREATE TRIGGER aux.t AFTER INSERT ON x BEGIN\n  \
-             update x set n = 1;\nEND;\n"
+            replaced(
+                "trigger",
+                "drop trigger if exists aux.t",
+                "CREATE TRIGGER aux.t AFTER INSERT ON x BEGIN\n  update x set n = 1;\nEND;"
+            )
         );
         assert_eq!(
             replace_script(
@@ -3207,7 +3352,11 @@ mod tests {
                 "CREATE UNIQUE INDEX IF NOT EXISTS \"i\" ON x (n)",
                 false
             ),
-            "drop index if exists aux.i;\n\nCREATE UNIQUE INDEX IF NOT EXISTS aux.\"i\" ON x (n);\n"
+            replaced(
+                "index",
+                "drop index if exists aux.i",
+                "CREATE UNIQUE INDEX IF NOT EXISTS aux.\"i\" ON x (n);"
+            )
         );
     }
 }
