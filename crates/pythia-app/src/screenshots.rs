@@ -5133,6 +5133,166 @@ create table pythia_ctx_t (id number);",
     run(&mut h, "drop table pythia_ctx_t purge");
 }
 
+/// The ✕ of `tab`, from where the pointer turns into a hand along its tab
+/// bar: its left and right end, and its middle's height.
+fn close_button(h: &mut Ui, tab: crate::app::Tab) -> (f32, f32, f32) {
+    let (bar, index) = h.state().test_tab_bar(tab).expect("tab bar");
+    let y = bar.center().y;
+    let mut buttons: Vec<(f32, f32)> = Vec::new();
+    let mut inside = false;
+    let mut x = bar.min.x;
+    while x < bar.max.x && buttons.len() <= index + 1 {
+        h.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+        h.step();
+        let hand = h.output().platform_output.cursor_icon == egui::CursorIcon::PointingHand;
+        if hand && !inside {
+            buttons.push((x, x));
+        } else if hand && let Some(button) = buttons.last_mut() {
+            button.1 = x;
+        }
+        inside = hand;
+        x += 1.0;
+    }
+    let (from, to) = buttons[index];
+    (from, to, y)
+}
+
+/// Presses (or releases) the primary button at `pos`, for a step: held
+/// longer, a press is no click.
+fn press(h: &mut Ui, pos: egui::Pos2, pressed: bool) {
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    h.event(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+/// A tab's ✕ closes it when it is released on the ✕ (#244): pressed and
+/// released a few points beside it, the tab was closed too.
+#[test]
+fn tab_closes_when_released_on_its_close_button() {
+    let connection = "tabs.db";
+    let (mut h, _file) = sqlite_file(connection);
+    for text in ["select 1", "select 2"] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+    }
+    h.run_steps(3);
+    let tab = crate::app::Tab::Doc(h.state().test_focused());
+    let (from, to, y) = close_button(&mut h, tab);
+    let windows = |h: &Ui| h.state().test_window_connections().len();
+    let open = windows(&h);
+    // Released 4 pt beside it: within egui's distance for a click.
+    press(&mut h, egui::pos2(to - 1.0, y), true);
+    press(&mut h, egui::pos2(to + 3.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open, "released beside the ✕");
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0 + 2.0, y), false);
+    h.run_steps(2);
+    assert_eq!(windows(&h), open - 1, "clicked");
+}
+
+/// Closing a SQL window, or Pythia, with changes to its results that
+/// weren't applied asks first (#245): a value being typed into a cell, and
+/// the changes waiting for Apply, were dropped without a word.
+#[test]
+fn unapplied_result_changes_are_asked_about() {
+    use crate::commands::Command;
+    let connection = "unapplied.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table ua_t (id integer primary key, name text);\n\
+         insert into ua_t values (1, 'one'), (2, 'two');\ncommit;",
+    );
+    let editable = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select id, name from ua_t order by id".into(),
+            run: true,
+        });
+        wait_until(h, "query", |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        h.state().test_focused()
+    };
+    let asked = |h: &Ui| h.query_by_label_contains("weren't applied").is_some();
+
+    // Typing into a cell, then Ctrl+W: asked, Cancel keeps the window.
+    let window = editable(&mut h);
+    h.get_by_label("one").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    h.event(egui::Event::Text("changed".into()));
+    h.run_steps(2);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    assert!(asked(&h), "a value being typed");
+    save(&mut h, "close-unapplied-changes");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused(), window);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    h.get_by_label("Discard and close").click();
+    h.run_steps(2);
+    assert_ne!(h.state().test_focused(), window, "closed");
+
+    // A change waiting for Apply, and the tab's close button.
+    let window = editable(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("edited".into()));
+    }
+    let (from, to, y) = close_button(&mut h, crate::app::Tab::Doc(window));
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0, y), false);
+    h.run_steps(2);
+    assert!(asked(&h), "a change to apply");
+    assert_eq!(h.state().test_focused(), window);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+
+    // Exiting Pythia.
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    let commands = |h: &Ui| -> Vec<egui::ViewportCommand> {
+        h.output()
+            .viewport_output
+            .values()
+            .flat_map(|v| v.commands.clone())
+            .collect()
+    };
+    assert!(commands(&h).contains(&egui::ViewportCommand::CancelClose));
+    if let Some(root) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        root.events.clear();
+    }
+    h.run_steps(2);
+    assert!(asked(&h), "exiting");
+    h.get_by_label("Exit and discard").click();
+    h.step();
+    assert!(commands(&h).contains(&egui::ViewportCommand::Close));
+}
+
 /// Favorites, recently opened objects and the invalid-only filter.
 #[test]
 fn browser_marks() {
@@ -8647,6 +8807,63 @@ fn object_view_of_a_dropped_table() {
             .is_some(),
         "Refresh says it's gone"
     );
+}
+
+/// A name typed after its opening quote is completed and closed (#234):
+/// `` `ord `` became ``` ``order` ```, and after `[` or `"` the popup
+/// didn't open.
+#[test]
+fn completion_after_an_opening_quote() {
+    let connection = "quoted.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \"order\" (id integer, \"unit price\" real)",
+    );
+    // The text, where a letter is typed, and the text once completed.
+    for (text, caret, letter, completed) in [
+        ("select * from `or", 17, "d", "select * from `order`"),
+        ("select * from [o", 16, "r", "select * from [order]"),
+        (
+            "select [u from [order]",
+            9,
+            "n",
+            "select [unit price] from [order]",
+        ),
+        (
+            "select \"u from \"order\"",
+            9,
+            "n",
+            "select \"unit price\" from \"order\"",
+        ),
+    ] {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: text.into(),
+            run: false,
+        });
+        h.run_steps(3);
+        h.state_mut().test_sql_window().editor.select(caret..caret);
+        h.run_steps(2);
+        h.event(egui::Event::Text(letter.into()));
+        let mut open = false;
+        for _ in 0..50 {
+            h.run_steps(1);
+            let editor = &h.state_mut().test_sql_window().editor;
+            if !editor.completion_labels().is_empty() {
+                open = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(open, "{text}: no completion");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state_mut().test_sql_window().editor.text(), completed);
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
 }
 
 /// Maintenance of a SQLite table: its rows, pages and missing statistics,

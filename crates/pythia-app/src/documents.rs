@@ -390,6 +390,14 @@ impl Document {
         }
     }
 
+    /// A SQL window's result changes that weren't applied.
+    pub fn has_unapplied_edits(&self) -> bool {
+        match &self.kind {
+            DocKind::Sql(w) => w.has_unapplied_edits(),
+            _ => false,
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         match &self.kind {
             DocKind::Program(w) => w.is_dirty(),

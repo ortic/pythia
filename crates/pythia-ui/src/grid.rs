@@ -32,6 +32,10 @@ pub struct GridState {
     order: Vec<usize>,
     /// Row count `order` was computed for.
     ordered_rows: usize,
+    /// Counts the times `order` was computed.
+    order_revision: u64,
+    /// The selection's summary, and what it was worked out for.
+    summary: Option<(SummaryKey, Option<String>)>,
     /// Selection anchor and cursor as (view row, column).
     anchor: Option<(usize, usize)>,
     cursor: Option<(usize, usize)>,
@@ -80,6 +84,15 @@ pub struct GridState {
     pub time_zone: Option<String>,
     /// Why a copy failed, for the owner to show (a value held cut short).
     failed: Option<String>,
+}
+
+/// What the summary of a selection was worked out for: the selection,
+/// the rows (where they are, how many) and their order.
+#[derive(PartialEq)]
+struct SummaryKey {
+    selection: Option<(RangeInclusive<usize>, Vec<usize>)>,
+    rows: (usize, usize),
+    order: u64,
 }
 
 /// A header being dragged to another place.
@@ -303,6 +316,7 @@ impl GridState {
         }
         self.order = self.order_of(rows, columns);
         self.ordered_rows = rows.len();
+        self.order_revision += 1;
     }
 
     /// The rows passing the filter, in the order shown.
@@ -330,6 +344,25 @@ impl GridState {
             );
         }
         order
+    }
+
+    /// [`summary`] of the selection, worked out again only when the
+    /// selection or the rows change: over a million selected cells it took
+    /// a quarter of a second, on every frame (#241).
+    fn selection_summary(&mut self, columns: &[Column], rows: &[Vec<Cell>]) -> Option<String> {
+        let key = SummaryKey {
+            selection: self.selection(columns.len()),
+            rows: (rows.as_ptr().addr(), rows.len()),
+            order: self.order_revision,
+        };
+        if let Some((kept, summary)) = &self.summary
+            && *kept == key
+        {
+            return summary.clone();
+        }
+        let summary = summary(columns, rows, self);
+        self.summary = Some((key, summary.clone()));
+        summary
     }
 
     fn set_sort(&mut self, col: usize, rows: &[Vec<Cell>], columns: &[Column]) {
@@ -430,6 +463,18 @@ impl GridState {
 
     pub fn changes(&self) -> Option<&Changes> {
         self.edit.as_ref().map(|e| &e.changes)
+    }
+
+    /// Edits not applied yet: changes waiting for Apply, or a value being
+    /// typed into a cell.
+    pub fn has_unapplied(&self, rows: &[Vec<Cell>]) -> bool {
+        let Some(edit) = &self.edit else {
+            return false;
+        };
+        !edit.changes.is_empty()
+            || edit.active.as_ref().is_some_and(|(row, col, text)| {
+                self.value(rows, *row, *col).unwrap_or_default() != text
+            })
     }
 
     pub fn clear_changes(&mut self) {
@@ -738,7 +783,7 @@ impl<'a> ResultGrid<'a> {
         } else {
             out.reached_end = table(ui, columns, rows, state, id, focus_id);
         }
-        out.selection_summary = summary(columns, rows, state);
+        out.selection_summary = state.selection_summary(columns, rows);
         viewer(ui.ctx(), columns, rows, state, id);
         value_editor(ui.ctx(), columns, rows, state, id);
         out
@@ -3215,6 +3260,74 @@ mod tests {
             started.elapsed().as_secs_f64() < 1.0,
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    /// The summary of a selection is worked out when the selection or the
+    /// rows change, not on every frame (#241): with a million cells selected,
+    /// each frame took a quarter of a second.
+    #[test]
+    fn summary_of_a_large_selection_is_kept() {
+        let columns: Vec<Column> = (0..4)
+            .map(|i| Column {
+                name: format!("N{i}"),
+                type_name: "NUMBER".into(),
+                numeric: true,
+            })
+            .collect();
+        let mut rows: Vec<Vec<Cell>> = (0..250_000)
+            .map(|r| (0..4).map(|c| Some((r * 4 + c).to_string())).collect())
+            .collect();
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        let summary = |rows: &[Vec<Cell>], state: &mut GridState| {
+            let mut summary = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                summary = ResultGrid::new(&columns, rows, state, "grid")
+                    .show(ui)
+                    .selection_summary;
+            });
+            output.textures_delta.clear();
+            summary
+        };
+        summary(&rows, &mut state);
+        state.anchor = Some((0, 0));
+        state.cursor = Some((rows.len() - 1, 3));
+        let started = std::time::Instant::now();
+        let all = summary(&rows, &mut state);
+        let first = started.elapsed();
+        assert_eq!(
+            all.as_deref(),
+            Some("Count 1000000 · Sum 499999500000 · Avg 499999.5 · Min 0 · Max 999999")
+        );
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(summary(&rows, &mut state), all);
+        }
+        assert!(
+            started.elapsed() < first * 3,
+            "10 frames took {:?}, the first one {first:?}",
+            started.elapsed()
+        );
+        // Another selection, more rows, a filter: worked out again.
+        state.cursor = Some((1, 1));
+        assert_eq!(
+            summary(&rows, &mut state).as_deref(),
+            Some("Count 4 · Sum 10 · Avg 2.5 · Min 0 · Max 5")
+        );
+        rows[0][0] = Some("100".into());
+        rows.push(vec![Some("1".into()); 4]);
+        assert_eq!(
+            summary(&rows, &mut state).as_deref(),
+            Some("Count 4 · Sum 110 · Avg 27.5 · Min 1 · Max 100")
+        );
+        // The rows with 99999 and 199999.
+        state.set_filter("99999");
+        state.anchor = Some((0, 0));
+        state.cursor = Some((1, 0));
+        assert_eq!(
+            summary(&rows, &mut state).as_deref(),
+            Some("Count 2 · Sum 299992 · Avg 149996 · Min 99996 · Max 199996")
         );
     }
 

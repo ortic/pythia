@@ -111,6 +111,13 @@ impl Analysis {
         catalog: &dyn Catalog,
         options: &CompletionOptions,
     ) -> Completion {
+        // A quoted name being typed reads as closed at the caret, so the
+        // rest of the statement stays what it is (#234).
+        if let Some(close) = complete::unclosed_quote(&self.tokens, &self.src, offset) {
+            let mut src = self.src.clone();
+            src.insert(offset, close);
+            return Self::new_in(&src, self.syntax).complete_with(offset, catalog, options);
+        }
         let tracker = Tracker::new(catalog);
         let mut completion = complete::complete(&self.sema(&tracker), offset, options);
         completion.missing = tracker.into_missing();

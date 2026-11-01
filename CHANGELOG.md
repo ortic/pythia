@@ -377,6 +377,25 @@ All notable changes to Pythia are documented here. The format follows
   (#233). Only Oracle's keywords were, so INSERT exports of a table with
   such a column failed with ERROR 1064 when they ran, as did editing
   that column in a result, and completion inserted the name bare.
+- Completion after an opening quote writes the name closed (#234). On
+  MySQL, `` `ord `` became ``` ``order` ```, and a name that needs no
+  backticks stayed unclosed; `[` on SQL Server and SQLite did the same,
+  and after `"` the popup didn't open at all. Columns are offered after
+  a quote that isn't closed yet too, and only names are: no keywords or
+  functions.
+- A large selection in a result grid no longer slows down every frame
+  (#241). Its count, sum, average, minimum and maximum were worked out
+  again on each frame: with a million rows selected, a frame took a
+  quarter of a second, and scrolling and typing lagged. They are now
+  worked out when the selection or the rows change.
+- A tab's ✕ closes the tab only when it is released on the ✕ (#244).
+  Pressed, then released a few points beside it, it closed the tab too,
+  so sliding off the ✕ to back out didn't always work.
+- Closing a SQL window, or exiting Pythia, asks first when its results
+  have changes that weren't applied (#245). A value being typed into a
+  cell and the changes waiting for *Apply* were dropped without a word;
+  only an uncommitted transaction was asked about. *Discard and close*
+  (or *Exit and discard*) goes ahead, *Cancel* keeps them.
 
 ## [0.10.0] - 2026-10-30
 

@@ -333,6 +333,15 @@ impl SqlWindow {
         w
     }
 
+    /// Changes to the results that weren't applied, a value being typed
+    /// into a cell included.
+    pub fn has_unapplied_edits(&self) -> bool {
+        self.state
+            .results
+            .iter()
+            .any(|r| r.grid.has_unapplied(&r.rows))
+    }
+
     /// Unsaved changes to a file-backed window.
     pub fn is_dirty(&self) -> bool {
         self.path.is_some() && self.editor.text() != self.saved_text
