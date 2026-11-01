@@ -150,6 +150,12 @@ All notable changes to Pythia are documented here. The format follows
   the next connect had no password. The connect dialog now says under
   *Save password* that passwords aren't saved and why, and the log says
   so for each connection whose password couldn't be saved.
+- Folders of the object browser could stay "loading" for good after the
+  connection was lost and opened again (#215): what the browser had
+  asked for and the lost session hadn't answered yet was never
+  answered. Those folders now say that the connection was lost before
+  they were loaded, and *Refresh* loads them. The same goes for the
+  other lookups on the connection, such as completion's.
 
 ## [0.10.0] - 2026-10-30
 
