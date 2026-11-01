@@ -1095,6 +1095,13 @@ All notable changes to Pythia are documented here. The format follows
   rather than end the result's query (on Oracle, which keeps it open,
   with them). SQL Server finds unqualified names in `dbo` after the
   default schema, PostgreSQL in each schema of the search path.
+- PostgreSQL: a rule whose actions are in parentheses, `create rule …
+  do also (select 1; select 2)`, runs as one statement (#346). The
+  script ended it at the first `;` inside the parentheses, which failed
+  with "syntax error at end of input", and ran the rest on its own. A
+  rule whose parenthesis is still open at the end of the script, as
+  while it is typed, ends at that `;` as before, so the statements
+  after it stay apart.
 
 ## [0.10.0] - 2026-10-30
 

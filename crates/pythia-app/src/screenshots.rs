@@ -8014,6 +8014,51 @@ fn mysql_statements_show_every_result() {
     run_in_window(&mut h, "drop procedure r51_p");
 }
 
+/// PostgreSQL: a rule whose actions are in parentheses is one statement
+/// (#346). The script ended it at their first `;` and sent `create rule …
+/// do also (select 1 as a`, which failed with "syntax error at end of
+/// input"; the rest went as a statement of its own.
+#[test]
+fn postgres_rules_with_several_actions() {
+    let connection = "r75@PostgreSQL";
+    let Some(mut h) = connect_to(
+        "PYTHIA_TEST_POSTGRES",
+        connection,
+        pythia_config::DbKind::Postgres,
+    ) else {
+        return;
+    };
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "drop table if exists r75_r;\ncreate table r75_r (id int);\n\
+         create rule r75_a as on insert to r75_r do also (select 1 as a; select 2 as b);\n\
+         commit",
+    );
+    run_in_window(&mut h, "insert into r75_r values (1)");
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["a = 1", "b = 2"]);
+    run_in_window(&mut h, "rollback;\ndrop table r75_r;\ncommit");
+}
+
 /// On SQL Server and PostgreSQL a statement with several results shows
 /// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
 /// DECLAREs, a procedure's result sets, the SELECTs rules add to an
