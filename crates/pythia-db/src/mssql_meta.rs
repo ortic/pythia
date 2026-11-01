@@ -486,34 +486,110 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let mut ddl = format!("create table {object} (\n    {}\n);", lines.join(",\n    "));
     // Rowstore (types 1 and 2) and columnstore indexes (5 and 6, #252). A
     // nonclustered columnstore index names its columns, which count as
-    // included; a clustered one holds all of them and names none.
+    // included; a clustered one holds all of them and names none. XML (3)
+    // and spatial indexes (4) follow, a secondary XML index after the
+    // primary one it uses, and a columnstore index's ORDER, which SQL
+    // Server has from 2022 (#265). Selective XML indexes aren't written.
+    let ordered = ms
+        .rows(
+            "select col_length('sys.index_columns', 'column_store_order_ordinal')",
+            &[],
+        )?
+        .into_iter()
+        .find_map(first)
+        .is_some();
+    let order = if ordered {
+        "+ coalesce(' order (' \
+            + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
+                        within group (order by ic.column_store_order_ordinal) \
+                 from sys.index_columns ic \
+                where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                  and ic.column_store_order_ordinal > 0) + ')', '')"
+    } else {
+        ""
+    };
     let indexes = ms.rows(
-        "select 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
-                + lower(i.type_desc collate database_default) + ' index ' + quotename(i.name) + ' on ' + @P1 \
-                + case when i.type = 5 then '' else ' (' \
-                    + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                                + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                                within group (order by ic.key_ordinal, ic.index_column_id) \
-                         from sys.index_columns ic \
-                        where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                          and (ic.is_included_column = 0 or i.type = 6)) + ')' end \
-                + coalesce(' include (' \
-                    + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
-                                within group (order by ic.index_column_id) \
-                         from sys.index_columns ic \
-                        where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                          and ic.is_included_column = 1 and i.type = 2) + ')', '') \
-                + coalesce(' where ' + i.filter_definition, '') + ';' \
-           from sys.indexes i \
-          where i.object_id = object_id(@P1) and i.type in (1, 2, 5, 6) \
-            and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
-          order by i.name",
+        &format!(
+            "select 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
+                    + case when x.xml_index_type = 0 then 'primary xml' \
+                           else lower(i.type_desc collate database_default) end \
+                    + ' index ' + quotename(i.name) + ' on ' + @P1 \
+                    + case when i.type = 5 then '' else ' (' \
+                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
+                                    + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
+                                    within group (order by ic.key_ordinal, ic.index_column_id) \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                              and (ic.is_included_column = 0 or i.type = 6)) + ')' end \
+                    + coalesce(' include (' \
+                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
+                                    within group (order by ic.index_column_id) \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                              and ic.is_included_column = 1 and i.type = 2) + ')', '') \
+                    + coalesce(' using xml index ' + quotename(u.name) + ' for ' \
+                               + lower(x.secondary_type_desc collate database_default), '') \
+                    {order} \
+                    + coalesce(' where ' + i.filter_definition, ''), \
+                    lower(s.tessellation_scheme collate database_default), \
+                    t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
+                    lower(t.level_1_grid_desc collate database_default), \
+                    lower(t.level_2_grid_desc collate database_default), \
+                    lower(t.level_3_grid_desc collate database_default), \
+                    lower(t.level_4_grid_desc collate database_default), t.cells_per_object \
+               from sys.indexes i \
+               left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
+               left join sys.indexes u on u.object_id = i.object_id \
+                and u.index_id = x.using_xml_index_id \
+               left join sys.spatial_indexes s on s.object_id = i.object_id \
+                and s.index_id = i.index_id \
+               left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
+                and t.index_id = i.index_id \
+              where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6) \
+                and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
+                and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
+              order by case when x.using_xml_index_id is null then 0 else 1 end, i.name"
+        ),
         &[object],
     )?;
-    for index in indexes.into_iter().filter_map(first) {
-        ddl.push_str(&format!("\n\n{index}"));
+    for row in indexes {
+        let mut values = row.into_iter();
+        let Some(index) = values.next().flatten() else {
+            continue;
+        };
+        let spatial: Vec<Cell> = values.collect();
+        ddl.push_str(&format!("\n\n{index}{};", spatial_options(&spatial)));
     }
     Ok(ddl)
+}
+
+/// `USING … WITH (…)` of a spatial index from its tessellation: the scheme,
+/// the bounding box, the grids' four levels and the cells per object, each
+/// where it has one; nothing for other indexes.
+fn spatial_options(values: &[Cell]) -> String {
+    let [scheme, xmin, ymin, xmax, ymax, l1, l2, l3, l4, cells] = values else {
+        return String::new();
+    };
+    let Some(scheme) = scheme else {
+        return String::new();
+    };
+    let mut options = Vec::new();
+    if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (xmin, ymin, xmax, ymax) {
+        options.push(format!("bounding_box = ({xmin}, {ymin}, {xmax}, {ymax})"));
+    }
+    if let (Some(l1), Some(l2), Some(l3), Some(l4)) = (l1, l2, l3, l4) {
+        options.push(format!(
+            "grids = (level_1 = {l1}, level_2 = {l2}, level_3 = {l3}, level_4 = {l4})"
+        ));
+    }
+    if let Some(cells) = cells {
+        options.push(format!("cells_per_object = {cells}"));
+    }
+    if options.is_empty() {
+        format!(" using {scheme}")
+    } else {
+        format!(" using {scheme} with ({})", options.join(", "))
+    }
 }
 
 /// The plan of `sql` from `SET SHOWPLAN_ALL`: the server compiles the

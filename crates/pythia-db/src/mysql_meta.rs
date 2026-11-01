@@ -48,7 +48,7 @@ pub(crate) fn run(conn: &mut Conn, query: &MetaQuery) -> Result<MetaResult, DbEr
             let ddl = show_create(conn, owner, name, *object_type)?;
             MetaResult::Text(match object_type {
                 // Routine and trigger bodies have `;` of their own.
-                ObjectType::Table | ObjectType::View => format!("{ddl};"),
+                ObjectType::Table | ObjectType::View | ObjectType::Sequence => format!("{ddl};"),
                 _ => ddl,
             })
         }
@@ -126,22 +126,25 @@ fn object_rows(rows: Vec<(String, String, String, Option<String>)>) -> Vec<DbObj
         .collect()
 }
 
+/// The type of a row of `information_schema.tables`: MariaDB lists its
+/// sequences there too (#270).
+const TABLE_TYPE: &str = "case table_type when 'VIEW' then 'VIEW' \
+                                         when 'SEQUENCE' then 'SEQUENCE' else 'TABLE' end";
+
 /// The objects of `object_type` in a schema (the first parameter) whose
 /// uppercase name is like the second, as `(owner, name, type, last change)`.
 fn object_sql(object_type: ObjectType) -> Option<String> {
     Some(match object_type {
-        ObjectType::Table | ObjectType::View => format!(
-            "select table_schema, table_name, \
-                    if(table_type = 'VIEW', 'VIEW', 'TABLE'), \
+        ObjectType::Table | ObjectType::View | ObjectType::Sequence => format!(
+            "select table_schema, table_name, {TABLE_TYPE}, \
                     date_format(coalesce(update_time, create_time), {DDL_TIME}) \
                from information_schema.tables \
-              where table_schema = ? and upper(table_name) like ? \
-                and table_type {} 'VIEW' \
+              where table_schema = ? and upper(table_name) like ? and {} \
               order by table_name",
-            if object_type == ObjectType::View {
-                "="
-            } else {
-                "<>"
+            match object_type {
+                ObjectType::View => "table_type = 'VIEW'",
+                ObjectType::Sequence => "table_type = 'SEQUENCE'",
+                _ => "table_type not in ('VIEW', 'SEQUENCE')",
             }
         ),
         ObjectType::Procedure | ObjectType::Function => format!(
@@ -175,13 +178,12 @@ fn objects(
     Ok(object_rows(conn.exec(sql, (owner, pattern))?))
 }
 
-/// Tables, views, routines and triggers of every schema whose name matches;
-/// the current schema's first, then the shortest names.
+/// Tables, views, sequences, routines and triggers of every schema whose
+/// name matches; the current schema's first, then the shortest names.
 fn find(conn: &mut Conn, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
     let sql = format!(
         "select owner, name, type, changed from ( \
-           select table_schema as owner, table_name as name, \
-                  if(table_type = 'VIEW', 'VIEW', 'TABLE') as type, \
+           select table_schema as owner, table_name as name, {TABLE_TYPE} as type, \
                   date_format(coalesce(update_time, create_time), {DDL_TIME}) as changed \
              from information_schema.tables where upper(table_name) like ? \
            union all \
@@ -314,12 +316,18 @@ const KEY_PART: &str = "coalesce(column_name, concat('(', \
              concat(char(92 using utf8mb4), char(39 using utf8mb4)), char(39 using utf8mb4)), \
      ')'))";
 
-/// A table's indexes, with their key parts as `part` gives them.
+/// A table's indexes, with their key parts as `part` gives them, each with
+/// its prefix length and order as the DDL writes them, `name(5) DESC`
+/// (#283). A spatial index's part has a `sub_part` of 32, but no prefix.
 fn indexes_sql(part: &str) -> String {
     format!(
         "select index_name as INDEX_NAME, index_type as INDEX_TYPE, \
                 if(non_unique = 0, 'UNIQUE', 'NONUNIQUE') as UNIQUENESS, \
-                group_concat({part} order by seq_in_index separator ', ') as COLUMNS \
+                group_concat(concat({part}, \
+                                    if(index_type = 'SPATIAL', '', \
+                                       coalesce(concat('(', sub_part, ')'), '')), \
+                                    if(`collation` = 'D', ' DESC', '')) \
+                             order by seq_in_index separator ', ') as COLUMNS \
            from information_schema.statistics \
           where table_schema = ? and table_name = ? \
           group by index_name, index_type, non_unique \
@@ -488,6 +496,7 @@ fn show_create(
         ObjectType::Procedure => ("procedure", 2),
         ObjectType::Function => ("function", 2),
         ObjectType::Trigger => ("trigger", 2),
+        ObjectType::Sequence => ("sequence", 1),
         other => {
             return Err(DbError::new(format!(
                 "MySQL has no {}",
@@ -502,12 +511,143 @@ fn show_create(
         .and_then(|row| row.get_opt::<Option<String>, _>(column))
         .and_then(Result::ok)
         .flatten();
-    ddl.ok_or_else(|| {
+    let ddl = ddl.ok_or_else(|| {
         DbError::new(format!(
             "No source for {what} {owner}.{name}: it takes the SHOW_ROUTINE privilege, or being \
              its definer, to see it"
         ))
-    })
+    })?;
+    if object_type == ObjectType::View {
+        return view_ddl(conn, owner, name, ddl);
+    }
+    Ok(ddl)
+}
+
+/// A view's DDL with the tables of other databases named with their
+/// database, and those of its own without it, whatever the session's
+/// database (#285). `SHOW CREATE VIEW` leaves out the session's database
+/// instead, MariaDB's only where the view reads no other one: run in the
+/// view's database, as *Edit* runs it, MySQL's read the session's tables
+/// there, and run elsewhere, MariaDB's read the view's own.
+/// `information_schema.views` names every database, and the view's own is
+/// taken out of it; the head up to `AS` is `SHOW CREATE VIEW`'s, with the
+/// view's name alone, as `SHOW CREATE TABLE` names a table.
+fn view_ddl(conn: &mut Conn, owner: &str, name: &str, ddl: String) -> Result<String, DbError> {
+    type View = (String, String, Option<String>, String);
+    let view: Option<View> = conn.exec_first(
+        "select table_schema, table_name, view_definition, check_option \
+           from information_schema.views where table_schema = ? and table_name = ?",
+        (owner, name),
+    )?;
+    // Without SHOW VIEW, the definition is left out.
+    let Some((schema, name, Some(definition), check)) = view else {
+        return Ok(ddl);
+    };
+    let Some(head) = view_head(&ddl, &name).filter(|_| !definition.is_empty()) else {
+        return Ok(ddl);
+    };
+    let check = match check.as_str() {
+        "CASCADED" => " WITH CASCADED CHECK OPTION",
+        "LOCAL" => " WITH LOCAL CHECK OPTION",
+        _ => "",
+    };
+    Ok(format!(
+        "{head}{}{check}",
+        without_database(&definition, &schema)
+    ))
+}
+
+/// `CREATE … VIEW `name` … AS ` of a view's DDL, its name without its
+/// database.
+fn view_head(ddl: &str, name: &str) -> Option<String> {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(ddl, pythia_plsql::Syntax::MySql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let is = |i: usize, word: &str| {
+        tokens
+            .get(i)
+            .is_some_and(|t| t.kind.is_word() && ddl[t.span.clone()].eq_ignore_ascii_case(word))
+    };
+    let view = (0..tokens.len()).find(|&i| is(i, "VIEW"))?;
+    let start = tokens.get(view + 1)?.span.start;
+    let mut last = view + 1;
+    if tokens
+        .get(last + 1)
+        .is_some_and(|t| t.kind == TokenKind::Dot)
+    {
+        last += 2;
+    }
+    let end = tokens.get(last)?.span.end;
+    let r#as = (last + 1..tokens.len()).find(|&i| is(i, "AS"))?;
+    Some(format!(
+        "{}`{}`{} ",
+        &ddl[..start],
+        name.replace('`', "``"),
+        &ddl[end..tokens[r#as].span.end]
+    ))
+}
+
+/// A view's definition as `information_schema` has it, every table named
+/// with its database, without `schema`: `` `shop`.`orders` `` becomes
+/// `` `orders` `` and `` `shop`.`orders`.`id` `` `` `orders`.`id` ``. A
+/// table of the same name in another database keeps it, as does
+/// `` `shop`.`x` `` where `shop` is also an alias, whose column `x` may
+/// be.
+fn without_database(definition: &str, schema: &str) -> String {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(definition, pythia_plsql::Syntax::MySql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let name = |i: usize| -> Option<String> {
+        let t = tokens.get(i)?;
+        let text = &definition[t.span.clone()];
+        match t.kind {
+            TokenKind::QuotedIdent => Some(
+                text.strip_prefix('`')?
+                    .strip_suffix('`')?
+                    .replace("``", "`"),
+            ),
+            TokenKind::Ident => Some(text.to_owned()),
+            _ => None,
+        }
+    };
+    let dot = |i: usize| tokens.get(i).is_some_and(|t| t.kind == TokenKind::Dot);
+    // `a`.`b`, not after a dot: a database's table, or an alias's column.
+    let qualified = |i: usize| {
+        name(i).is_some() && dot(i + 1) && name(i + 2).is_some() && (i == 0 || !dot(i - 1))
+    };
+    // `a`.`b`.`c`: a database's table's column.
+    let column = |i: usize| qualified(i) && dot(i + 3) && name(i + 4).is_some();
+    // Aliases follow their table, `shop`.`orders` `o`, or derived table.
+    let aliases: std::collections::HashSet<String> = (1..tokens.len())
+        .filter(|&i| {
+            !dot(i + 1)
+                && !dot(i - 1)
+                && (name(i - 1).is_some() || tokens[i - 1].kind == TokenKind::RParen)
+        })
+        .filter_map(name)
+        .collect();
+    let others: std::collections::HashSet<String> = (0..tokens.len())
+        .filter(|&i| qualified(i) && name(i).is_some_and(|n| n != schema && !aliases.contains(&n)))
+        .filter_map(|i| name(i + 2))
+        .collect();
+    let mut out = String::with_capacity(definition.len());
+    let mut last = 0;
+    for i in 0..tokens.len() {
+        if qualified(i)
+            && name(i).as_deref() == Some(schema)
+            && (column(i) || !aliases.contains(schema))
+            && name(i + 2).is_none_or(|table| !others.contains(&table))
+        {
+            out.push_str(&definition[last..tokens[i].span.start]);
+            last = tokens[i + 1].span.end;
+        }
+    }
+    out.push_str(&definition[last..]);
+    out
 }
 
 /// The plan of `sql` as `PLAN_TABLE`-like rows (ID, PARENT_ID, DEPTH,
@@ -643,6 +783,49 @@ fn classic_rows(conn: &mut Conn, sql: &str) -> Result<Vec<Vec<Cell>>, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_names_without_their_database() {
+        assert_eq!(
+            view_head(
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER VIEW \
+                 `shop`.`v` (`x`) AS select 1 AS `x`",
+                "v"
+            )
+            .as_deref(),
+            Some(
+                "CREATE ALGORITHM=UNDEFINED DEFINER=`app`@`%` SQL SECURITY DEFINER VIEW \
+                 `v` (`x`) AS "
+            )
+        );
+        assert_eq!(
+            view_head("CREATE VIEW `a``b` AS select 1", "a`b").as_deref(),
+            Some("CREATE VIEW `a``b` AS ")
+        );
+        let strip = |definition: &str| without_database(definition, "shop");
+        assert_eq!(
+            strip(
+                "select `shop`.`t`.`a` AS `a`,`u`.`b` AS `b` from (`shop`.`t` \
+                 join `other`.`u` `u` on(`u`.`id` = `shop`.`t`.`id`)) \
+                 where `shop`.`f`(`u`.`b`) = 'shop.t'"
+            ),
+            "select `t`.`a` AS `a`,`u`.`b` AS `b` from (`t` join `other`.`u` `u` \
+             on(`u`.`id` = `t`.`id`)) where `f`(`u`.`b`) = 'shop.t'"
+        );
+        // Another database's `t`: the view's own keeps its database.
+        assert_eq!(
+            strip("select 1 from (`shop`.`t` join `other`.`t` `o`) join `shop`.`u`"),
+            "select 1 from (`shop`.`t` join `other`.`t` `o`) join `u`"
+        );
+        // `shop` is an alias too: `shop`.`a` may be its column.
+        assert_eq!(
+            strip(
+                "select `shop`.`a` AS `a`,`shop`.`t`.`b` AS `b` from `shop`.`t` \
+                 join `other`.`u` `shop`"
+            ),
+            "select `shop`.`a` AS `a`,`t`.`b` AS `b` from `shop`.`t` join `other`.`u` `shop`"
+        );
+    }
 
     #[test]
     fn plan_tree() {

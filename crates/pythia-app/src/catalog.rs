@@ -113,8 +113,10 @@ mod dictionary {
         kind: DbKind::MySql,
         schemas: "select schema_name from information_schema.schemata order by 1",
         current: "select database()",
+        // MariaDB's sequences are sequences (#270).
         objects: "select table_schema as owner, table_name as name, \
-                         if(table_type = 'VIEW', 'VIEW', 'TABLE') as type \
+                         case table_type when 'VIEW' then 'VIEW' \
+                                         when 'SEQUENCE' then 'SEQUENCE' else 'TABLE' end as type \
                     from information_schema.tables \
                   union all \
                   select routine_schema, routine_name, routine_type \
@@ -893,6 +895,16 @@ mod dictionary_live {
         create: &str,
         table: &str,
     ) -> Option<Vec<(String, String)>> {
+        let (mut live, server) = connect(env, kind)?;
+        live.run("drop table if exists cat_orders");
+        live.run(create);
+        let items = complete_on(&mut live, server.current_schema, names, table);
+        live.run("drop table cat_orders");
+        Some(items)
+    }
+
+    /// A session on the database of `env`, connected.
+    fn connect(env: &str, kind: DbKind) -> Option<(Live, pythia_db::ServerInfo)> {
         let spec = std::env::var(env).ok()?;
         let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
         let (username, password) = credentials.split_once('/').unwrap();
@@ -919,11 +931,7 @@ mod dictionary_live {
         let DbEvent::Connected(server) = live.next() else {
             panic!("not connected")
         };
-        live.run("drop table if exists cat_orders");
-        live.run(create);
-        let items = complete_on(&mut live, server.current_schema, names, table);
-        live.run("drop table cat_orders");
-        Some(items)
+        Some((live, server))
     }
 
     /// Completes the columns after the alias of `table` in `select o.\n  from
@@ -934,14 +942,25 @@ mod dictionary_live {
         names: NameStyle,
         table: &str,
     ) -> Vec<(String, String)> {
-        let mut cache = CatalogCache::new(schema).with_names(names);
         // Code assistance looks unquoted names up in uppercase, quoted ones
         // as written, lexed as the database reads them (#208).
         let src = format!("select o.\n  from {table} o");
-        let analysis = Analysis::new_in(&src, live.dialect.syntax());
+        complete_at(live, schema, names, &src, 9)
+    }
+
+    /// Completes `src` at `at` on `live`; returns `(label, inserted text)`.
+    fn complete_at(
+        live: &mut Live,
+        schema: String,
+        names: NameStyle,
+        src: &str,
+        at: usize,
+    ) -> Vec<(String, String)> {
+        let mut cache = CatalogCache::new(schema).with_names(names);
+        let analysis = Analysis::new_in(src, live.dialect.syntax());
         let mut items = Vec::new();
         for _ in 0..8 {
-            let c = analysis.complete(9, &cache);
+            let c = analysis.complete(at, &cache);
             if c.missing.is_empty() {
                 items = c.items;
                 break;
@@ -976,6 +995,40 @@ mod dictionary_live {
             assert!(has(&items, "Customer", "Customer"), "{table}: {items:?}");
             assert!(has(&items, "order", "`order`"), "{table}: {items:?}");
         }
+    }
+
+    /// MariaDB's sequences complete as sequences (#270): in an expression,
+    /// not after FROM, where they were offered as tables.
+    #[test]
+    fn mariadb_sequences_complete_as_sequences() {
+        let Some((mut live, server)) = connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+            return;
+        };
+        if !server.version.contains("MariaDB") {
+            return;
+        }
+        live.run("drop sequence if exists r53_cat_seq");
+        live.run("drop table if exists r53_cat_tab");
+        live.run("create sequence r53_cat_seq");
+        live.run("create table r53_cat_tab (id int)");
+        let mut labels = |src: &str| -> Vec<String> {
+            let items = complete_at(
+                &mut live,
+                server.current_schema.clone(),
+                NameStyle::Backticks,
+                src,
+                src.len(),
+            );
+            items
+                .into_iter()
+                .map(|(label, _)| label)
+                .filter(|l| l.starts_with("r53_cat"))
+                .collect()
+        };
+        assert_eq!(labels("select * from r53_cat"), ["r53_cat_tab"]);
+        assert_eq!(labels("select r53_cat"), ["r53_cat_seq"]);
+        live.run("drop sequence r53_cat_seq");
+        live.run("drop table r53_cat_tab");
     }
 
     #[test]

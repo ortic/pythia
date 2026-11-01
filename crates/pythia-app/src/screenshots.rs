@@ -1230,6 +1230,85 @@ create index aux.r4_i on r4_t (n);",
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// *Edit* of a MySQL view of another database that reads a table of the
+/// connection's (`PYTHIA_TEST_MYSQL_DBA`, #285): `SHOW CREATE VIEW` left out
+/// the session's database, so the script, which runs in the view's, read
+/// that table there and failed. The DDL names other databases' tables
+/// with their database, its own database's without.
+#[test]
+fn mysql_edit_of_a_view_reading_other_databases() {
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+
+    let mysql = "PYTHIA_TEST_MYSQL_DBA";
+    let Some(mut h) = connect_to(mysql, "dba", DbKind::MySql) else {
+        return;
+    };
+    let ready = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+        for sql in [
+            "drop database if exists r53_ev",
+            "drop table if exists r53_et",
+            "create database r53_ev",
+            "create table r53_et (id int, n int)",
+            "insert into r53_et values (1, 1)",
+            "create table r53_ev.r53_eu (id int, n int)",
+            "insert into r53_ev.r53_eu values (1, 2)",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        let current: Vec<Vec<pythia_db::Cell>> = c.query("select database()", &[]).unwrap();
+        let current = current[0][0].clone().unwrap();
+        c.execute(&format!(
+            "create view r53_ev.r53_evw as select t.n + u.n as s, 1 as k \
+               from `{current}`.r53_et t join r53_ev.r53_eu u on u.id = t.id"
+        ))
+        .unwrap();
+    });
+    assert!(ready.is_some());
+    let view = ObjectRef {
+        owner: "r53_ev".into(),
+        name: "r53_evw".into(),
+        object_type: ObjectType::View,
+    };
+    h.state_mut()
+        .test_object_action("dba", crate::browser::ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r53_evw"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    assert!(script.contains("1 AS `k`"), "{script}");
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text(script.replace("1 AS `k`", "2 AS `k`"));
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| !app.test_focused_busy());
+    let messages: Vec<String> = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .iter()
+        .map(|m| m.text.clone())
+        .collect();
+    let found = crate::test_db::run_on(mysql, DbKind::MySql, |c| {
+        let rows = c
+            .query("select concat(s, ' ', k) from r53_ev.r53_evw", &[])
+            .unwrap();
+        for sql in ["drop database r53_ev", "drop table r53_et"] {
+            c.execute(sql).unwrap();
+        }
+        rows
+    })
+    .unwrap();
+    assert!(
+        !messages.iter().any(|m| m.contains("ERROR")),
+        "{script}\n{messages:?}"
+    );
+    assert_eq!(found[0][0].as_deref(), Some("3 2"), "{messages:?}");
+}
+
 /// Edits a long MySQL value (`PYTHIA_TEST_MYSQL`, #205). The UPDATE wrote
 /// the value it had found out again to check it, so a value of more than
 /// half of max_allowed_packet made a statement the driver refused, which

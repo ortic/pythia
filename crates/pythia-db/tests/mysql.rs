@@ -1292,12 +1292,68 @@ fn functional_index_parts() {
                     "(cast(json_unquote(json_extract(`j`,_utf8mb4'$.name')) as char(30) \
                      charset utf8mb4))"
                 ),
-                ("r41_mix", "id, (lower(`name`))"),
+                ("r41_mix", "id, (lower(`name`)) DESC"),
                 ("r41_q", r"(concat(`name`,_utf8mb4'a\\b\'c'))"),
             ]
         );
     }
     h.ok("drop table r41_fi");
+}
+
+/// An index's key parts read with their prefix length and order, as the
+/// DDL writes them: `name(5)` and `a DESC` read `name` and `a`, as if the
+/// index were on the whole column, in ascending order. A spatial index's
+/// part has no prefix, whatever information_schema says. MariaDB keeps
+/// DESC from 10.8; before, it ignores it.
+#[test]
+fn index_key_parts_as_defined() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let version = h.scalar("select version()").unwrap_or_default();
+    let release: Vec<u32> = version
+        .split(['.', '-'])
+        .take(2)
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let desc = if version.contains("MariaDB") && release < vec![10, 8] {
+        ""
+    } else {
+        " DESC"
+    };
+    h.ok("drop table if exists r53_ix");
+    h.ok(
+        "create table r53_ix (id int primary key, name varchar(30), a int, b int, t text, \
+         g geometry not null, \
+         index r53_p (name(5)), index r53_d (a desc, b), index r53_m (a, name(3) desc), \
+         index r53_t (t(10)), fulltext index r53_ft (t), spatial index r53_g (g))",
+    );
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "r53_ix".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let columns: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|r| (r[0].as_deref().unwrap(), r[3].as_deref().unwrap_or("")))
+        .collect();
+    let (d, m) = (format!("a{desc}, b"), format!("a, name(3){desc}"));
+    assert_eq!(
+        columns,
+        [
+            ("PRIMARY", "id"),
+            ("r53_d", d.as_str()),
+            ("r53_ft", "t"),
+            ("r53_g", "g"),
+            ("r53_m", m.as_str()),
+            ("r53_p", "name(5)"),
+            ("r53_t", "t(10)"),
+        ]
+    );
+    h.ok("drop table r53_ix");
 }
 
 /// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE
@@ -1363,6 +1419,173 @@ fn column_defaults_read_as_sql() {
         ]
     );
     h.ok("drop table r41_df");
+}
+
+/// A view's DDL names the tables of other databases with their database,
+/// and those of its own without it, whatever the session's database (as a
+/// DBA, `PYTHIA_TEST_MYSQL_DBA`, to make the databases): run in another
+/// database, the copy reads that database's tables, and the other
+/// databases' as the view does.
+#[test]
+fn view_ddl_names_other_databases_only() {
+    let Some(params) = std::env::var("PYTHIA_TEST_MYSQL_DBA")
+        .ok()
+        .and_then(|spec| mysql_params(&spec))
+    else {
+        return;
+    };
+    let mut h = Harness::with(params);
+    let schema = h.schema.clone();
+    for sql in [
+        "drop database if exists r53_other".to_owned(),
+        "drop database if exists r53_copy".to_owned(),
+        "drop view if exists r53_v".to_owned(),
+        "drop table if exists r53_t".to_owned(),
+        "create database r53_other".to_owned(),
+        "create database r53_copy".to_owned(),
+        "create table r53_t (id int, a varchar(10))".to_owned(),
+        "insert into r53_t values (1, 'own')".to_owned(),
+        "create table r53_other.r53_u (id int, b varchar(10))".to_owned(),
+        "insert into r53_other.r53_u values (1, 'other')".to_owned(),
+        "create table r53_copy.r53_t (id int, a varchar(10))".to_owned(),
+        "create table r53_copy.r53_u (id int, b varchar(10))".to_owned(),
+        "insert into r53_copy.r53_t values (1, 'copy')".to_owned(),
+        "insert into r53_copy.r53_u values (1, 'copy')".to_owned(),
+        "create view r53_v as select t.a, u.b from r53_t t join r53_other.r53_u u on u.id = t.id"
+            .to_owned(),
+        format!(
+            "create view r53_other.r53_w as \
+             select u.b, t.a from r53_other.r53_u u join `{schema}`.r53_t t on t.id = u.id"
+        ),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = |h: &mut Harness, owner: &str, name: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: owner.into(),
+            name: name.into(),
+            object_type: ObjectType::View,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let v = ddl(&mut h, &schema, "r53_v");
+    let w = ddl(&mut h, "r53_other", "r53_w");
+    assert!(
+        v.contains(" VIEW `r53_v` AS select `t`.`a` AS `a`,`u`.`b` AS `b` from (`r53_t` `t` join `r53_other`.`r53_u` `u` on("),
+        "{v}"
+    );
+    assert!(
+        w.contains(&format!(
+            " VIEW `r53_w` AS select `u`.`b` AS `b`,`t`.`a` AS `a` from (`r53_u` `u` join `{schema}`.`r53_t` `t` on("
+        )),
+        "{w}"
+    );
+    // The same from another database.
+    h.ok("use r53_other");
+    assert_eq!(ddl(&mut h, &schema, "r53_v"), v);
+    assert_eq!(ddl(&mut h, "r53_other", "r53_w"), w);
+    h.ok("use r53_copy");
+    h.ok(&v);
+    h.ok(&w);
+    assert_eq!(
+        h.scalar("select concat(a, ' ', b) from r53_copy.r53_v")
+            .as_deref(),
+        Some("copy other")
+    );
+    assert_eq!(
+        h.scalar("select concat(b, ' ', a) from r53_copy.r53_w")
+            .as_deref(),
+        Some("copy own")
+    );
+    h.ok(&format!("use `{schema}`"));
+    for sql in [
+        "drop database r53_other",
+        "drop database r53_copy",
+        "drop view r53_v",
+        "drop table r53_t",
+    ] {
+        h.ok(sql);
+    }
+}
+
+/// MariaDB's sequences are sequences, not tables: listed and found as
+/// such, with their DDL, which creates them again.
+#[test]
+fn mariadb_sequences_as_sequences() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    if !h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"))
+    {
+        return;
+    }
+    let schema = h.schema.clone();
+    h.ok("drop sequence if exists r53_sq");
+    h.ok("drop table if exists r53_sq_tab");
+    h.ok("create sequence r53_sq start with 10 increment by 5 cache 20");
+    h.ok("create table r53_sq_tab (id int)");
+    let objects = |h: &mut Harness, object_type| -> Vec<(String, ObjectType)> {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: schema.clone(),
+            object_type,
+            filter: Some("r53_sq".into()),
+        }) else {
+            panic!("expected objects")
+        };
+        objects
+            .into_iter()
+            .map(|o| (o.name, o.object_type))
+            .collect()
+    };
+    assert_eq!(
+        objects(&mut h, ObjectType::Table),
+        [("r53_sq_tab".to_owned(), ObjectType::Table)]
+    );
+    assert_eq!(
+        objects(&mut h, ObjectType::Sequence),
+        [("r53_sq".to_owned(), ObjectType::Sequence)]
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "r53_sq".into(),
+        limit: 10,
+    }) else {
+        panic!("expected objects")
+    };
+    let found: Vec<(&str, ObjectType)> = found
+        .iter()
+        .map(|o| (o.name.as_str(), o.object_type))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("r53_sq", ObjectType::Sequence),
+            ("r53_sq_tab", ObjectType::Table)
+        ]
+    );
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "r53_sq".into(),
+        object_type: ObjectType::Sequence,
+    }) else {
+        panic!("expected DDL")
+    };
+    assert!(
+        ddl.starts_with("CREATE SEQUENCE `r53_sq` start with 10 ") && ddl.ends_with(';'),
+        "{ddl}"
+    );
+    h.ok("drop sequence r53_sq");
+    h.ok(&ddl);
+    assert_eq!(
+        h.scalar("select concat_ws(' ', nextval(r53_sq), nextval(r53_sq))")
+            .as_deref(),
+        Some("10 15")
+    );
+    h.ok("drop sequence r53_sq");
+    h.ok("drop table r53_sq_tab");
 }
 
 #[test]

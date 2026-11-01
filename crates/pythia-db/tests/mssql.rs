@@ -1014,6 +1014,131 @@ fn indexes_of_every_kind() {
     h.ok("drop table r43_ix, r43_cs");
 }
 
+/// A table's DDL creates its XML and spatial indexes, with their options,
+/// and an ordered columnstore index with its ORDER (SQL Server 2022): run
+/// elsewhere, the copy has the same indexes.
+#[test]
+fn xml_spatial_and_ordered_indexes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let ordered = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|major| major >= 16);
+    h.ok("drop table if exists r53_copy.r53_xg, r53_copy.r53_ord");
+    h.ok("drop schema if exists r53_copy");
+    h.ok("drop table if exists r53_xg, r53_ord");
+    for sql in [
+        "create table r53_xg (id int constraint r53_xg_pk primary key, doc xml, \
+         shape geometry, place geography)",
+        "create primary xml index r53_xg_doc on r53_xg (doc)",
+        "create xml index r53_xg_path on r53_xg (doc) using xml index r53_xg_doc for path",
+        "create xml index r53_xg_value on r53_xg (doc) using xml index r53_xg_doc for value",
+        "create spatial index r53_xg_auto on r53_xg (shape) using geometry_auto_grid \
+         with (bounding_box = (0, -0.5, 1e7, 50.25), cells_per_object = 12)",
+        "create spatial index r53_xg_grid on r53_xg (shape) using geometry_grid \
+         with (bounding_box = (xmin = -10, ymin = -10, xmax = 10, ymax = 10), \
+         grids = (level_1 = low, level_2 = medium, level_3 = high, level_4 = medium))",
+        "create spatial index r53_xg_place on r53_xg (place)",
+        "create table r53_ord (a int, b int, c int)",
+    ] {
+        h.ok(sql);
+    }
+    h.ok(if ordered {
+        "create clustered columnstore index r53_ord_cs on r53_ord order (b, a)"
+    } else {
+        "create clustered columnstore index r53_ord_cs on r53_ord"
+    });
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let xg_ddl = ddl(&mut h, "r53_xg");
+    let on = format!("on [{schema}].[r53_xg]");
+    for line in [
+        format!("create primary xml index [r53_xg_doc] {on} ([doc]);"),
+        format!(
+            "create xml index [r53_xg_path] {on} ([doc]) using xml index [r53_xg_doc] for path;"
+        ),
+        format!(
+            "create spatial index [r53_xg_auto] {on} ([shape]) using geometry_auto_grid \
+             with (bounding_box = (0, -0.5, 10000000, 50.25), cells_per_object = 12);"
+        ),
+        format!(
+            "create spatial index [r53_xg_grid] {on} ([shape]) using geometry_grid \
+             with (bounding_box = (-10, -10, 10, 10), grids = (level_1 = low, \
+             level_2 = medium, level_3 = high, level_4 = medium), cells_per_object = 16);"
+        ),
+        format!(
+            "create spatial index [r53_xg_place] {on} ([place]) using geography_auto_grid \
+             with (cells_per_object = 12);"
+        ),
+    ] {
+        assert!(xg_ddl.contains(&line), "{line}\n{xg_ddl}");
+    }
+    let ord_ddl = ddl(&mut h, "r53_ord");
+    let line = format!(
+        "create clustered columnstore index [r53_ord_cs] on [{schema}].[r53_ord]{};",
+        if ordered { " order ([b], [a])" } else { "" }
+    );
+    assert!(ord_ddl.contains(&line), "{line}\n{ord_ddl}");
+    // The indexes as the catalog has them, built again from the DDL.
+    let indexes = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', i.name, i.type_desc, x.secondary_type_desc, \
+                                         s.tessellation_scheme, t.bounding_box_xmin, \
+                                         t.bounding_box_ymin, t.bounding_box_xmax, \
+                                         t.bounding_box_ymax, t.level_1_grid_desc, \
+                                         t.level_4_grid_desc, t.cells_per_object) \
+                                collate database_default, '; ') \
+                      within group (order by i.name) \
+               from sys.indexes i \
+               left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
+               left join sys.spatial_indexes s on s.object_id = i.object_id \
+                and s.index_id = i.index_id \
+               left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
+                and t.index_id = i.index_id \
+              where i.object_id in (object_id('[{owner}].[r53_xg]'), object_id('[{owner}].[r53_ord]'))"
+        ))
+    };
+    let before = indexes(&mut h, &schema);
+    h.ok("create schema r53_copy");
+    for (table, ddl) in [("r53_xg", &xg_ddl), ("r53_ord", &ord_ddl)] {
+        for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
+            let sql = statement.text(ddl).replace(
+                &format!("[{schema}].[{table}]"),
+                &format!("[r53_copy].[{table}]"),
+            );
+            h.ok(&sql);
+        }
+    }
+    assert_eq!(indexes(&mut h, "r53_copy"), before);
+    if ordered {
+        assert_eq!(
+            h.scalar(
+                "select string_agg(col_name(object_id, column_id), ', ') \
+                          within group (order by column_store_order_ordinal) \
+                   from sys.index_columns \
+                  where object_id = object_id('r53_copy.r53_ord') and column_store_order_ordinal > 0"
+            )
+            .as_deref(),
+            Some("b, a")
+        );
+    }
+    h.ok("drop table r53_copy.r53_xg, r53_copy.r53_ord");
+    h.ok("drop schema r53_copy");
+    h.ok("drop table r53_xg, r53_ord");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();
