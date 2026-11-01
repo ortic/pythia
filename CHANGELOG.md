@@ -903,6 +903,31 @@ All notable changes to Pythia are documented here. The format follows
   transaction stays as it was. While the window runs a statement, the
   plan analysis says so; the other requests are then looked up on the
   main session as before.
+- PostgreSQL: the DDL of a view or materialized view names every table
+  and function with its schema (#329), as a table's does. It left the
+  schema out where the connection's search path found them, `FROM t`
+  for `public.t`, so that *Edit* in a SQL window whose search path finds
+  another `t` first made the view read that one.
+- PostgreSQL: *Edit* of a materialized view keeps its owner, its lack
+  of data and its storage (#330). The view it made again belonged to the
+  role that ran *Edit*, was populated where it was made `with no data`,
+  and had the default storage parameters, tablespace and access method.
+  The DDL now has them where they aren't the defaults, and `alter
+  materialized view … owner to …` where the owner isn't you. A role that
+  can't give the view back to its owner gets an error, and the view
+  stays as it was.
+- PostgreSQL: the DDL of a table, view, sequence, function or procedure
+  has its grants (#331), as a materialized view's has, a table's with
+  its columns' and its `serial` sequences'. Run elsewhere, a copy had no
+  privileges for any role but its owner, and a routine whose `EXECUTE`
+  was revoked from `PUBLIC` could be run by every role again: its DDL
+  now revokes that too.
+- PostgreSQL: the DDL of an identity column's sequence says that the
+  table's DDL makes it, and sets the identity's options (#332), `alter
+  table shop.orders alter column id set increment by 3 …`. It was a
+  `create sequence`, which next to a copy of the table failed with
+  `relation … already exists`, and elsewhere made a sequence no column
+  used.
 
 ## [0.10.0] - 2026-10-30
 

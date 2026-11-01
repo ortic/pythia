@@ -1422,6 +1422,326 @@ fn identities_keep_their_sequence_names() {
     h.ok("drop schema r62_id, r62_id_copy cascade");
 }
 
+fn ddl_of(h: &mut Harness, owner: &str, name: &str, object_type: ObjectType) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// A view's DDL names its tables and functions with their schemas, as a
+/// table's does (#226): run with another search path, by Edit in a window
+/// that set one, the view reads the same tables as before (#329).
+#[test]
+fn a_views_ddl_names_its_tables_with_their_schemas() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r73_vp, r73_vp_other cascade");
+    h.ok("drop table if exists r73_vp_t");
+    h.ok("drop function if exists r73_vp_f(int)");
+    h.ok("create schema r73_vp");
+    h.ok("create schema r73_vp_other");
+    for (owner, n) in [(schema.as_str(), 1), ("r73_vp_other", 2)] {
+        h.ok(&format!("create table {owner}.r73_vp_t (n int)"));
+        h.ok(&format!("insert into {owner}.r73_vp_t values ({n})"));
+        h.ok(&format!(
+            "create function {owner}.r73_vp_f(x int) returns int language sql \
+             as 'select x * {n}'"
+        ));
+    }
+    // Names the session's path finds.
+    h.ok("create view r73_vp.r73_v as select r73_vp_f(n) as n from r73_vp_t");
+    h.ok("create materialized view r73_vp.r73_mv as select r73_vp_f(n) as n from r73_vp_t");
+    let view = ddl_of(&mut h, "r73_vp", "r73_v", ObjectType::View);
+    let materialized = ddl_of(&mut h, "r73_vp", "r73_mv", ObjectType::MaterializedView);
+    for ddl in [&view, &materialized] {
+        assert!(
+            ddl.contains(&format!(
+                "SELECT {schema}.r73_vp_f(n) AS n\n   FROM {schema}.r73_vp_t"
+            )),
+            "{ddl}"
+        );
+    }
+    h.ok("set search_path = r73_vp_other, public");
+    run_ddl(&mut h, &view, "", "");
+    h.ok("drop materialized view r73_vp.r73_mv");
+    run_ddl(&mut h, &materialized, "", "");
+    h.ok("reset search_path");
+    assert_eq!(
+        h.scalar("select (select n from r73_vp.r73_v) || ' ' || (select n from r73_vp.r73_mv)")
+            .as_deref(),
+        Some("1 1"),
+        "{view}\n\n{materialized}"
+    );
+    h.ok("drop schema r73_vp, r73_vp_other cascade");
+    h.ok("drop table r73_vp_t");
+    h.ok("drop function r73_vp_f(int)");
+}
+
+/// A materialized view's DDL makes it as it is: owned by its owner where
+/// that isn't the role reading it, without data where it has none, with
+/// its storage parameters, tablespace and access method. Run in another
+/// schema by another role, the copy is the same (#330).
+#[test]
+fn a_materialized_view_keeps_its_owner_data_and_storage() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r73_mv, r73_mv_copy cascade");
+    h.ok("drop tablespace if exists r73_ts");
+    h.ok("drop access method if exists r73_heap");
+    h.ok("drop role if exists r73_owner");
+    h.ok("create role r73_owner");
+    h.ok("create schema r73_mv");
+    h.ok("create schema r73_mv_copy");
+    // A tablespace in the data directory, as tests make them.
+    h.ok("set allow_in_place_tablespaces = on");
+    h.ok("create tablespace r73_ts location ''");
+    h.ok("reset allow_in_place_tablespaces");
+    h.ok("create access method r73_heap type table handler heap_tableam_handler");
+    for schema in ["r73_mv", "r73_mv_copy"] {
+        h.ok(&format!("create table {schema}.r73_t (n int, t text)"));
+        h.ok(&format!("insert into {schema}.r73_t values (1, 'a')"));
+    }
+    h.ok("create materialized view r73_mv.r73_full as select n from r73_mv.r73_t");
+    h.ok("create materialized view r73_mv.r73_empty using r73_heap \
+         with (fillfactor = 70, autovacuum_enabled = off, toast.autovacuum_enabled = false) \
+         tablespace r73_ts as select n, t from r73_mv.r73_t with no data");
+    h.ok("alter materialized view r73_mv.r73_empty owner to r73_owner");
+    h.ok("create index r73_empty_n on r73_mv.r73_empty (n)");
+    let full = ddl_of(&mut h, "r73_mv", "r73_full", ObjectType::MaterializedView);
+    assert_eq!(
+        full,
+        "create materialized view r73_mv.r73_full as\n SELECT n\n   FROM r73_mv.r73_t;"
+    );
+    let empty = ddl_of(&mut h, "r73_mv", "r73_empty", ObjectType::MaterializedView);
+    assert!(
+        empty.starts_with(
+            "create materialized view r73_mv.r73_empty using r73_heap \
+             with (fillfactor='70', autovacuum_enabled=off, toast.autovacuum_enabled='false') \
+             tablespace r73_ts as\n SELECT n,\n    t\n   FROM r73_mv.r73_t\nwith no data;\n\n\
+             alter materialized view r73_mv.r73_empty owner to r73_owner;\n\n\
+             CREATE INDEX r73_empty_n ON r73_mv.r73_empty"
+        ),
+        "{empty}"
+    );
+    for ddl in [&full, &empty] {
+        run_ddl(&mut h, ddl, "r73_mv.r73_", "r73_mv_copy.r73_");
+    }
+    let state = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relowner::regrole, c.relispopulated, \
+                                         c.reloptions, s.reloptions, coalesce(t.spcname, '-'), \
+                                         a.amname, i.indexes), \
+                               '; ' order by c.relname) \
+               from pg_class c join pg_am a on a.oid = c.relam \
+               left join pg_class s on s.oid = c.reltoastrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              cross join lateral (select count(*) as indexes from pg_index \
+                                   where indrelid = c.oid) i \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind = 'm'"
+        ))
+    };
+    let me = h
+        .scalar("select current_user::regrole::text")
+        .unwrap_or_default();
+    let was = state(&mut h, "r73_mv");
+    assert_eq!(
+        was,
+        Some(format!(
+            "r73_empty r73_owner f {{fillfactor=70,autovacuum_enabled=off}} \
+             {{autovacuum_enabled=false}} r73_ts r73_heap 1; r73_full {me} t - heap 0"
+        ))
+    );
+    assert_eq!(state(&mut h, "r73_mv_copy"), was, "{empty}");
+    h.ok("drop schema r73_mv, r73_mv_copy cascade");
+    h.ok("drop tablespace r73_ts");
+    h.ok("drop access method r73_heap");
+    h.ok("drop role r73_owner");
+}
+
+/// The DDL of a table, a view, a sequence and a routine has their grants,
+/// as a materialized view's has (#301): run in another schema, the copies
+/// have the same privileges, the table's serial sequence too, and a
+/// routine's EXECUTE that PUBLIC no longer has stays revoked (#331).
+#[test]
+fn the_ddl_has_the_grants() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r73_g, r73_g_copy cascade");
+    h.ok("drop role if exists \"R73 Reader\"");
+    h.ok("create role \"R73 Reader\"");
+    h.ok("create schema r73_g");
+    h.ok("create schema r73_g_copy");
+    for sql in [
+        "create table r73_g.r73_t (id serial, n int, m int)",
+        "grant select, insert on r73_g.r73_t to \"R73 Reader\"",
+        "grant update (n), select (m) on r73_g.r73_t to pg_monitor with grant option",
+        "grant select on r73_g.r73_t to public",
+        "revoke truncate on r73_g.r73_t from current_user",
+        "grant usage on sequence r73_g.r73_t_id_seq to \"R73 Reader\"",
+        "create view r73_g.r73_v as select n from r73_g.r73_t",
+        "grant select on r73_g.r73_v to \"R73 Reader\"",
+        "grant select (n) on r73_g.r73_v to pg_monitor",
+        "create sequence r73_g.r73_s",
+        "grant usage, select on sequence r73_g.r73_s to \"R73 Reader\" with grant option",
+        "grant update on sequence r73_g.r73_s to public",
+        "create function r73_g.r73_f(x int) returns int language sql as 'select x'",
+        "revoke execute on function r73_g.r73_f(int) from public",
+        "grant execute on function r73_g.r73_f(int) to \"R73 Reader\"",
+        "create function r73_g.r73_f(x text) returns text language sql as 'select x'",
+        "create procedure r73_g.r73_p() language sql as 'select 1'",
+        "grant execute on procedure r73_g.r73_p() to pg_monitor with grant option",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r73_g", "r73_t", ObjectType::Table);
+    for grant in [
+        "grant insert, select on r73_g.r73_t to \"R73 Reader\";",
+        "grant update (n), select (m) on r73_g.r73_t to pg_monitor with grant option;",
+        "grant select on r73_g.r73_t to public;",
+        "revoke truncate on r73_g.r73_t from ",
+        "grant usage on sequence r73_g.r73_t_id_seq to \"R73 Reader\";",
+    ] {
+        assert!(table.contains(grant), "{table}");
+    }
+    let function = ddl_of(&mut h, "r73_g", "r73_f", ObjectType::Function);
+    for grant in [
+        "grant execute on function r73_g.r73_f(x integer) to \"R73 Reader\";",
+        "revoke execute on function r73_g.r73_f(x integer) from public;",
+    ] {
+        assert!(function.contains(grant), "{function}");
+    }
+    assert!(
+        !function.contains("on function r73_g.r73_f(x text)"),
+        "{function}"
+    );
+    for (name, object_type) in [
+        ("r73_t", ObjectType::Table),
+        ("r73_v", ObjectType::View),
+        ("r73_s", ObjectType::Sequence),
+        ("r73_f", ObjectType::Function),
+        ("r73_p", ObjectType::Procedure),
+    ] {
+        let ddl = ddl_of(&mut h, "r73_g", name, object_type);
+        run_ddl(&mut h, &ddl, "r73_g.", "r73_g_copy.");
+    }
+    // Each object's and column's privileges, and who has them.
+    let privileges = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "with o (name, acl) as ( \
+               select relname, relacl from pg_class \
+                where relnamespace = '{schema}'::regnamespace \
+               union all \
+               select c.relname || '.' || a.attname, a.attacl \
+                 from pg_class c join pg_attribute a on a.attrelid = c.oid \
+                where c.relnamespace = '{schema}'::regnamespace and a.attnum > 0 \
+               union all \
+               select proname || '(' || pg_get_function_identity_arguments(oid) || ')', proacl \
+                 from pg_proc where pronamespace = '{schema}'::regnamespace) \
+             select string_agg(name || ' ' || coalesce(( \
+                      select string_agg(x.grantee::regrole || ' ' || x.privilege_type \
+                                        || case when x.is_grantable then '*' else '' end, \
+                                        ', ' order by x.grantee::regrole::text, \
+                                                      x.privilege_type) \
+                        from aclexplode(acl) x), 'default'), '; ' order by name) \
+               from o"
+        ))
+    };
+    let was = privileges(&mut h, "r73_g");
+    assert!(
+        was.as_deref()
+            .is_some_and(|p| p.contains("\"R73 Reader\" USAGE; r73_t_id_seq.is_called")),
+        "{was:?}"
+    );
+    assert_eq!(privileges(&mut h, "r73_g_copy"), was, "{table}");
+    h.ok("drop schema r73_g, r73_g_copy cascade");
+    h.ok("drop role \"R73 Reader\"");
+}
+
+/// An identity column's sequence is made by its table's DDL: the
+/// sequence's own DDL says so and sets the identity's options, so that run
+/// next to a copy of the table it gives the copy's identity the same ones
+/// rather than making a sequence of its own; next to a table without the
+/// identity it fails (#332).
+#[test]
+fn an_identitys_sequence_is_made_by_its_table() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r73_is, r73_is_copy cascade");
+    h.ok("create schema r73_is");
+    h.ok("create schema r73_is_copy");
+    h.ok(
+        "create table r73_is.r73_t (id int generated always as identity \
+         (start with 5 increment by 3 maxvalue 1000 cache 2 cycle), \
+         b bigint generated by default as identity (sequence name r73_is.\"R73 B\"), n int)",
+    );
+    h.ok("grant select on sequence r73_is.r73_t_id_seq to pg_monitor");
+    let id = ddl_of(&mut h, "r73_is", "r73_t_id_seq", ObjectType::Sequence);
+    assert_eq!(
+        id,
+        "-- The sequence of the identity column r73_is.r73_t.id, made by the table's DDL.\n\
+         alter table r73_is.r73_t alter column id\n  \
+         set increment by 3 set minvalue 1 set maxvalue 1000\n  \
+         set start with 5 set cache 2 set cycle;\n\n\
+         grant select on sequence r73_is.r73_t_id_seq to pg_monitor;"
+    );
+    let b = ddl_of(&mut h, "r73_is", "R73 B", ObjectType::Sequence);
+    assert!(
+        b.contains(
+            "alter table r73_is.r73_t alter column b\n  \
+             set increment by 1 set minvalue 1 set maxvalue 9223372036854775807\n  \
+             set start with 1 set cache 1 set no cycle;"
+        ),
+        "{b}"
+    );
+    h.ok(
+        "create table r73_is_copy.r73_t (id int generated always as identity, \
+         b bigint generated by default as identity (sequence name r73_is_copy.\"R73 B\"), n int)",
+    );
+    for ddl in [&id, &b] {
+        run_ddl(&mut h, ddl, "r73_is.", "r73_is_copy.");
+    }
+    let sequences = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, s.seqtypid::regtype, s.seqstart, \
+                                         s.seqincrement, s.seqmin, s.seqmax, s.seqcache, \
+                                         s.seqcycle, c.relacl), \
+                               '; ' order by c.relname) \
+               from pg_sequence s join pg_class c on c.oid = s.seqrelid \
+              where c.relnamespace = '{schema}'::regnamespace"
+        ))
+    };
+    let was = sequences(&mut h, "r73_is");
+    assert_eq!(sequences(&mut h, "r73_is_copy"), was, "{id}");
+    // Without the identity, there is nothing to set.
+    h.ok("create table r73_is_copy.r73_plain (id int)");
+    h.fails(
+        id.replace("r73_is.r73_t ", "r73_is_copy.r73_plain ")
+            .split(";\n")
+            .next()
+            .unwrap_or_default(),
+    );
+    h.ok("drop schema r73_is, r73_is_copy cascade");
+}
+
 /// Object filters find names without case whatever their letters: names
 /// collate as C, where upper() changes only ASCII letters, in the test
 /// database and in one whose lc_ctype is C.
