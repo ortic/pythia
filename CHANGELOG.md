@@ -1054,6 +1054,12 @@ All notable changes to Pythia are documented here. The format follows
   `1e300` as a 1 and 300 zeros. A sparse VECTOR shows as Oracle writes
   it, `[6,[0,5],[2.5,1e-30]]`; it showed as `SparseVector {…}`, which
   its INSERT statements wrote and Oracle rejected with ORA-51804.
+- Oracle: a JSON or VECTOR over 4000 bytes can be written (#342), as a
+  CLOB's text since #317: INSERT statements and result editing wrote it
+  as one literal, which holds no more (ORA-01704 from *Execute to file*,
+  *Export tables*, *Copy as* and *Export*, and on *Apply*). A literal of
+  parts now makes each part a CLOB, for CLOBs too: a text with many `&`,
+  such as a JSON of URLs, failed with ORA-01489.
 
 ## [0.10.0] - 2026-10-30
 

@@ -591,4 +591,49 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The INSERTs of a JSON and a VECTOR over the 4000 bytes a literal
+    /// holds (#342), run back into a copy of their table, are the same
+    /// values; they failed with ORA-01704.
+    #[test]
+    fn writes_long_json_and_vectors() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r76_lj", "r76_lj_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!(
+                    "create table {table} (id number primary key, j json, v vector(*, float32))"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        for sql in [
+            "insert into r76_lj (id, j, v) \
+               select 1, json_arrayagg(json_object('k' value level, 's' value 'it''s & \u{e9}') \
+                        returning json), \
+                      to_vector(json_arrayagg(level / 7 returning clob), *, float32) \
+                 from dual connect by level <= 1000",
+            "insert into r76_lj values (2, '{\"a\":[1,2]}', '[1,2]')",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        let rows = texts(&conn, "select * from r76_lj order by id");
+        assert!(rows[0][1].as_ref().unwrap().len() > 8000);
+        assert!(rows[0][2].as_ref().unwrap().len() > 4000);
+        let n = insert_into_copy(
+            &conn,
+            "select * from r76_lj order by id",
+            "r76_lj",
+            "r76_lj_copy",
+        );
+        assert_eq!(n, 2);
+        assert_eq!(texts(&conn, "select * from r76_lj_copy order by id"), rows);
+        for table in ["r76_lj", "r76_lj_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

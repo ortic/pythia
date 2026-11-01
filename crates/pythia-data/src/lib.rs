@@ -711,17 +711,16 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             None => format!("hextoraw({quoted})"),
         },
         // A literal holds 4000 bytes: a CLOB's longer text is a CLOB of
-        // parts (#317). Oracle takes about 250 of them (ORA-01489 beyond),
-        // and parses many slowly: INSERT statements append them in a
+        // parts (#317), each a CLOB of its own: Oracle joins the plain
+        // literals after a CLOB into one VARCHAR2 first, which with many
+        // `&`, each a literal apart, failed with ORA-01489 (#342). Oracle
+        // parses many parts slowly: INSERT statements append them in a
         // PL/SQL block instead (see `oracle_block`).
-        Kind::Text if long_text(col, v) => {
-            let mut parts = text_parts(v).into_iter().map(text_literal);
-            let first = format!("to_clob({})", parts.next().unwrap_or_default());
-            std::iter::once(first)
-                .chain(parts)
-                .collect::<Vec<_>>()
-                .join(" || ")
-        }
+        Kind::Text if long_text(col, v) => text_parts(v)
+            .into_iter()
+            .map(|part| format!("to_clob({})", text_literal(part)))
+            .collect::<Vec<_>>()
+            .join(" || "),
         Kind::Text => text_literal(v),
     }
 }
@@ -745,9 +744,13 @@ const TEXT_LITERAL_BYTES: usize = 4000;
 const TEXT_PART_UNITS: usize = 1000;
 
 /// Whether `v` is a CLOB's, NCLOB's or LONG's text too long for one
-/// literal (#317); the pure-Rust driver types CLOB columns LONG.
+/// literal (#317); the pure-Rust driver types CLOB columns LONG. A JSON's
+/// or VECTOR's too, which Oracle reads from a CLOB (#342).
 fn long_text(col: &Column, v: &str) -> bool {
-    matches!(col.type_name.as_str(), "CLOB" | "NCLOB" | "LONG") && v.len() > TEXT_LITERAL_BYTES
+    matches!(
+        col.type_name.as_str(),
+        "CLOB" | "NCLOB" | "LONG" | "JSON" | "VECTOR"
+    ) && v.len() > TEXT_LITERAL_BYTES
 }
 
 /// `text` in parts of at most [`TEXT_PART_UNITS`] UTF-16 code units.
@@ -1116,7 +1119,8 @@ fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> 
                 ));
             }
         } else if let Some(text) = value.filter(|v| long_text(col, v)) {
-            // An NCLOB takes the CLOB (#317).
+            // An NCLOB takes the CLOB (#317), and so do a JSON and a
+            // VECTOR (#342).
             declare.push_str(&format!("  {var} clob;\n"));
             body.push_str(&format!("  dbms_lob.createtemporary({var}, true);\n"));
             for part in text_parts(text) {
@@ -1953,7 +1957,11 @@ mod tests {
         let clob = col("C", "CLOB");
         assert_eq!(
             sql_literal(&clob, Some(&long)),
-            format!("to_clob('{0}') || '{0}' || '{0}' || '{0}' || 'x'", x(1000))
+            format!(
+                "to_clob('{0}') || to_clob('{0}') || to_clob('{0}') || to_clob('{0}') || \
+                 to_clob('x')",
+                x(1000)
+            )
         );
         for ty in ["NCLOB", "LONG"] {
             assert!(sql_literal(&col("C", ty), Some(&long)).starts_with("to_clob('x"));
@@ -2000,6 +2008,50 @@ mod tests {
             x(7)
         );
         assert_eq!(text, expected);
+    }
+
+    /// A JSON's and a VECTOR's text over 4000 bytes is written as a
+    /// CLOB's (#342), which Oracle reads into either; a shorter one stays
+    /// one literal.
+    #[test]
+    fn oracle_long_json_and_vectors() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let (json, vector) = (col("J", "JSON"), col("V", "VECTOR"));
+        let long_json = format!(r#"["{}"]"#, "x".repeat(4000));
+        let long_vector = format!("[{}]", ["0.5"; 1000].join(","));
+        assert!(sql_literal(&json, Some(&long_json)).starts_with(r#"to_clob('["xxx"#));
+        assert!(sql_literal(&vector, Some(&long_vector)).starts_with("to_clob('[0.5,0.5"));
+        assert_eq!(sql_literal(&vector, Some("[1,2]")), "'[1,2]'");
+        // Each part a CLOB of its own, a text with many `&` too, whose
+        // literals in between Oracle joined into one VARCHAR2 (ORA-01489).
+        let amps = format!(r#"["{}"]"#, "a&".repeat(3000));
+        let literal = sql_literal(&json, Some(&amps));
+        assert_eq!(literal.matches("to_clob(").count(), 7);
+        assert!(literal.starts_with(r#"to_clob('["a' || chr(38) || 'a'"#));
+        assert!(literal.contains(") || to_clob("));
+        assert!(literal.ends_with(r#"chr(38) || '"]')"#), "{literal}");
+        let rows = vec![vec![Some(long_json), Some(long_vector)]];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text = String::from_utf8(
+            export_to_vec(Format::Insert, &[json, vector], &rows, &options).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            text.starts_with("declare\n  pythia$1 clob;\n  pythia$2 clob;\nbegin\n"),
+            "{}",
+            &text[..100]
+        );
+        assert!(
+            text.ends_with("  insert into t (j, v) values (pythia$1, pythia$2);\nend;\n/\n"),
+            "{text}"
+        );
     }
 
     #[test]
