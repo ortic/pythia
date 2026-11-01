@@ -691,6 +691,13 @@ All notable changes to Pythia are documented here. The format follows
   privileges for the roles that had them. They now follow the `CREATE`
   in *Edit*'s block, and in the *DDL* tab; the owner's own privileges
   come with the view.
+- The object browser offers *Edit* for views, PostgreSQL's materialized
+  views and SQLite's indexes (#300), on the databases without program
+  windows, as it did for routines and triggers; so do the editor's
+  context menu and the object view. The README said *Edit* opens SQLite
+  views, but only their triggers had it, and the scripts that replace a
+  view (`CREATE OR REPLACE`, `CREATE OR ALTER`, SQLite's and
+  PostgreSQL's in a transaction of their own) were out of reach.
 
 ## [0.10.0] - 2026-10-30
 

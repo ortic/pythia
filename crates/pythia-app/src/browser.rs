@@ -2296,6 +2296,27 @@ pub struct MenuOptions {
     pub create: bool,
 }
 
+/// The objects *Edit* opens: with program windows (PL/SQL) its stored
+/// units; elsewhere a script that replaces the object with its DDL
+/// ([`replace_script`]), for routines and triggers, and for views,
+/// PostgreSQL's materialized views and SQLite's indexes, whose scripts
+/// leave the object as it was when the new version fails (#240, #286).
+/// The menus offered it for routines and triggers only (#300).
+pub fn has_edit(dialect: Dialect, t: ObjectType) -> bool {
+    if t.has_source() {
+        return true;
+    }
+    if dialect.supports(Feature::PlSql) {
+        return false;
+    }
+    match t {
+        ObjectType::View => true,
+        ObjectType::MaterializedView => dialect == Dialect::POSTGRES,
+        ObjectType::Index => dialect == Dialect::SQLITE,
+        _ => false,
+    }
+}
+
 /// The context menu of a database object, shared by the object browser and
 /// the editors. Returns the chosen action.
 pub fn object_menu(ui: &mut Ui, object: &ObjectRef, options: &MenuOptions) -> Option<ObjectAction> {
@@ -2312,7 +2333,7 @@ pub fn object_menu(ui: &mut Ui, object: &ObjectRef, options: &MenuOptions) -> Op
     if t.has_data() {
         item(ui, "Query data", ObjectAction::Query(object.clone()));
     }
-    if t.has_source() {
+    if has_edit(options.dialect, t) {
         match &options.member {
             Some(member) => item(
                 ui,

@@ -1582,6 +1582,155 @@ create index r55_ei on r55_et (n);",
     });
 }
 
+/// The object browser offers *Edit* where its script replaces the object:
+/// SQLite's views, indexes and triggers, PostgreSQL's views and
+/// materialized views besides its routines and triggers. It was there for
+/// triggers and routines only, though the README says it opens views.
+#[test]
+fn edit_is_offered_where_it_opens_a_script() {
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    // The script of Edit in the context menu of the entry `name`, chosen if
+    // `open`; None if the menu has no Edit. The menu bar has an Edit too:
+    // the menu's is the one below it.
+    let edit_in_menu = |h: &mut Ui, name: &str, open: bool| -> Option<String> {
+        let bar = h.query_all_by_label("Edit").count();
+        h.get_by_label(name).click_secondary();
+        h.run_steps(3);
+        let offered = h.query_all_by_label("Edit").count() > bar;
+        if !offered || !open {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+            return offered.then(String::new);
+        }
+        h.query_all_by_label("Edit")
+            .max_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+            .unwrap()
+            .click();
+        wait_until(h, "the script", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.editor.text().contains(name))
+        });
+        let script = h.state_mut().test_sql_window().editor.text().to_owned();
+        h.state_mut().test_close_focused();
+        Some(script)
+    };
+    let connection = "r64-edit.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table r64_t (n);
+create view r64_v as select n from r64_t;
+create index r64_i on r64_t (n);
+create trigger r64_g after insert on r64_t begin select 1; end;",
+    );
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::Index,
+        ObjectType::Trigger,
+    ]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_v", true).expect("Edit for a view");
+    assert!(
+        script.contains("drop view if exists main.r64_v;") && script.contains("begin;"),
+        "{script}"
+    );
+    let script = edit_in_menu(&mut h, "r64_i", true).expect("Edit for an index");
+    assert!(
+        script.contains("drop index if exists main.r64_i;"),
+        "{script}"
+    );
+    assert!(edit_in_menu(&mut h, "r64_g", false).is_some(), "a trigger");
+    assert!(
+        edit_in_menu(&mut h, "r64_t", false).is_none(),
+        "not a table"
+    );
+    // The view's own Edit, in its view.
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: ObjectRef {
+            owner: "main".into(),
+            name: "r64_v".into(),
+            object_type: ObjectType::View,
+        },
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.query_all_by_label("Edit").count(), 2, "the view's Edit");
+    h.state_mut().test_close_focused();
+    drop(h);
+
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let Some(mut h) = connect_to(pg, "r64-edit", DbKind::Postgres) else {
+        return;
+    };
+    let cleanup = "drop table if exists r64_et cascade";
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+        c.execute(cleanup).unwrap();
+        for sql in [
+            "create table r64_et (n int)",
+            "create view r64_ev as select n from r64_et",
+            "create materialized view r64_emv as select n from r64_et",
+        ] {
+            c.execute(sql).unwrap();
+        }
+    });
+    h.state_mut().test_expand_browser(&[
+        ObjectType::Table,
+        ObjectType::View,
+        ObjectType::MaterializedView,
+    ]);
+    h.state_mut().test_browser().set_filter("R64_E");
+    h.state_mut().test_refresh_browser();
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+    assert!(script.contains("create or replace view"), "{script}");
+    let script = edit_in_menu(&mut h, "r64_emv", true).expect("Edit for a materialized view");
+    assert!(script.contains("do $pythia$"), "{script}");
+    assert!(
+        edit_in_menu(&mut h, "r64_et", false).is_none(),
+        "not a table"
+    );
+    crate::test_db::run_on(pg, DbKind::Postgres, move |c| c.execute(cleanup).unwrap());
+    drop(h);
+
+    // MySQL's and SQL Server's views: CREATE OR REPLACE, CREATE OR ALTER.
+    for (env, kind, words) in [
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql, "or replace"),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer, "or alter"),
+    ] {
+        let Some(mut h) = connect_to(env, "r64-edit", kind) else {
+            continue;
+        };
+        let drops = ["drop view if exists r64_ev", "drop table if exists r64_et"];
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+            c.execute("create table r64_et (n int)").unwrap();
+            c.execute("create view r64_ev as select n from r64_et")
+                .unwrap();
+        });
+        h.state_mut()
+            .test_expand_browser(&[ObjectType::Table, ObjectType::View]);
+        h.state_mut().test_browser().set_filter("R64_E");
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let script = edit_in_menu(&mut h, "r64_ev", true).expect("Edit for a view");
+        assert!(script.to_lowercase().contains(words), "{kind:?}: {script}");
+        crate::test_db::run_on(env, kind, move |c| {
+            for sql in drops {
+                c.execute(sql).unwrap();
+            }
+        });
+    }
+}
+
 /// *Edit* of a PostgreSQL materialized view keeps its indexes, comments
 /// and grants: its DDL had only the CREATE, so the view the script made
 /// again came without them.

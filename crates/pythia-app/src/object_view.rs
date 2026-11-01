@@ -259,7 +259,7 @@ impl ObjectView {
                     effects.extend(self.load());
                     effects.catalog_changed = true;
                 }
-                if self.object.object_type.has_source() {
+                if crate::browser::has_edit(self.dialect, self.object.object_type) {
                     if self.dialect.supports(Feature::PlSql) {
                         if ui.button("Edit").clicked() {
                             effects.open.push(OpenRequest::Program {
