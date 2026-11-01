@@ -822,6 +822,12 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL chooses, `orders_id_seq`, and what reads it by its name
   failed. A name PostgreSQL chose is still left out, so that a copy
   beside the table chooses its own.
+- SQL Server: a table's DDL keeps its columns' collations where they
+  aren't the database's (#323), `[code] varchar(10) collate
+  Latin1_General_CS_AS`. They were left out, so that run elsewhere a
+  case-sensitive or binary column compared without case, and a UTF-8
+  column stored only the letters of the database's code page: `čaj 茶`
+  became `caj ?`.
 
 ## [0.10.0] - 2026-10-30
 

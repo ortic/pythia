@@ -1747,6 +1747,114 @@ fn index_options_and_storage() {
     drop(h);
     drop_database(&mut dba, "r63_opts");
 }
+/// A table's DDL, as `MetaQuery::Ddl` reads it.
+fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: table.into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// Drops the tables of `schema` whose names start with `prefix`, with their
+/// history tables and foreign keys; a temporal table's versioning goes off
+/// first.
+fn drop_tables(h: &mut Harness, schema: &str, prefix: &str) {
+    h.ok(&format!(
+        "declare @sql nvarchar(max) = N''; \
+         select @sql += N'alter table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N' set (system_versioning = off); ' \
+           from sys.tables t \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%' \
+            and t.temporal_type = 2; \
+         select @sql += N'alter table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N' drop constraint ' + quotename(f.name) + N'; ' \
+           from sys.foreign_keys f join sys.tables t on t.object_id = f.parent_object_id \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%'; \
+         select @sql += N'drop table ' + quotename(schema_name(t.schema_id)) + N'.' \
+                        + quotename(t.name) + N'; ' \
+           from sys.tables t \
+          where t.schema_id = schema_id('{schema}') and t.name like '{prefix}%' \
+             or t.object_id in (select h.history_table_id from sys.tables h \
+                                 where h.schema_id = schema_id('{schema}') \
+                                   and h.name like '{prefix}%'); \
+         exec (@sql)"
+    ));
+}
+
+/// A table's DDL collates its columns that aren't in the database's
+/// collation (#323): run elsewhere, a case-sensitive column stays one, and
+/// one in the database's collation takes that database's.
+#[test]
+fn column_collations() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r74_copy_co", "r74_co");
+    h.ok("drop schema if exists r74_copy_co");
+    drop_tables(&mut h, &schema, "r74_co");
+    let default = h
+        .scalar("select cast(databasepropertyex(db_name(), 'Collation') as nvarchar(128))")
+        .expect("the database's collation");
+    h.ok(&format!(
+        "create table r74_co (id int, cs varchar(10) collate Latin1_General_CS_AS not null, \
+         d varchar(10), dd nvarchar(10) collate {default}, \
+         u varchar(max) collate Latin1_General_100_CI_AS_SC_UTF8, \
+         b char(2) collate Latin1_General_BIN2 constraint r74_co_b default 'x', \
+         up as upper(cs), t text collate Latin1_General_CS_AS)"
+    ));
+    let ddl = table_ddl(&mut h, &schema, "r74_co");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r74_co] (\n    \
+               [id] int null,\n    \
+               [cs] varchar(10) collate Latin1_General_CS_AS not null,\n    \
+               [d] varchar(10) null,\n    \
+               [dd] nvarchar(10) null,\n    \
+               [u] varchar(max) collate Latin1_General_100_CI_AS_SC_UTF8 null,\n    \
+               [b] char(2) collate Latin1_General_BIN2 null constraint [r74_co_b] default ('x'),\n    \
+               [up] as (upper([cs])),\n    \
+               [t] text collate Latin1_General_CS_AS null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.collation_name), '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c where c.object_id = object_id('[{owner}].[r74_co]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r74_copy_co");
+    run_ddl_in(&mut h, &ddl, &schema, "r74_copy_co", &["r74_co"]);
+    assert_eq!(catalog(&mut h, "r74_copy_co"), before);
+    // The copy compares and keeps text as the original does.
+    for owner in [schema.as_str(), "r74_copy_co"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r74_co] (id, cs, u, t) values (1, 'a', N'čaj 茶', 'a')"
+        ));
+        assert_eq!(
+            h.scalar(&format!(
+                "select concat((select count(*) from [{owner}].[r74_co] \
+                                 where cs = 'A' or t like 'A'), \
+                               ' ', (select u from [{owner}].[r74_co]))"
+            ))
+            .as_deref(),
+            Some("0 čaj 茶"),
+            "{owner}"
+        );
+    }
+    drop_tables(&mut h, "r74_copy_co", "r74_co");
+    h.ok("drop schema r74_copy_co");
+    drop_tables(&mut h, &schema, "r74_co");
+}
 
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive

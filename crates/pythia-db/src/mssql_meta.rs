@@ -496,7 +496,9 @@ fn ddl(
 }
 
 /// `CREATE TABLE` with its columns and constraints, then its other indexes;
-/// a memory-optimized table declares its indexes in it.
+/// a memory-optimized table declares its indexes in it. A column's
+/// collation is written where it isn't the database's (#323), so that run
+/// elsewhere the others take that database's, as they were made.
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -505,6 +507,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                         then 'as ' + cc.definition \
                              + case when cc.is_persisted = 1 then ' persisted' else '' end \
                         else {COLUMN_TYPE} \
+                             + case when c.collation_name collate database_default \
+                                         <> cast(databasepropertyex(db_name(), 'Collation') \
+                                                 as sysname) collate database_default \
+                                 then ' collate ' + c.collation_name else '' end \
                              + case when ic.object_id is not null \
                                  then ' identity(' + cast(ic.seed_value as varchar(40)) + ', ' \
                                       + cast(ic.increment_value as varchar(40)) + ')' else '' end \
