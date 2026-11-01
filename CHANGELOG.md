@@ -241,6 +241,10 @@ All notable changes to Pythia are documented here. The format follows
   table's columns as they are (`col`, `t.col`, from `*`) can be edited
   now; renamed columns and expressions are read-only, their headers
   dimmed, as are the key columns.
+- The record view no longer freezes on a very long value (#220): a 10 MB
+  value was laid out whole, wrapped, on every frame the record showed.
+  A field now shows its first 10,000 characters and ` …`; *Copy* still
+  copies all of it.
 
 ## [0.10.0] - 2026-10-30
 

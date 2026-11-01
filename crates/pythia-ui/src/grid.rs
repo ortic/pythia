@@ -20,6 +20,10 @@ use pythia_db::{Cell, Column};
 /// than any column is wide, and a 10 MB line isn't laid out whole (#212).
 const SHOWN_CHARS: usize = 500;
 
+/// The characters of a value a field of the record view lays out at most:
+/// a few screens of it, wrapped (#220).
+const RECORD_CHARS: usize = 10_000;
+
 /// Per-result view state, owned by whoever owns the rows.
 #[derive(Default)]
 pub struct GridState {
@@ -1930,7 +1934,7 @@ fn record_view(
                             CellState::Clean => egui::Color32::TRANSPARENT,
                         };
                         let mut text = match state.value(rows, r, col) {
-                            Some(v) => look.text(v),
+                            Some(v) => look.text(record_text(v)),
                             None => look.null(),
                         };
                         if cell_state == CellState::Deleted {
@@ -2172,6 +2176,15 @@ fn cell_text(text: &str) -> String {
         .map_or(first.len(), |(i, _)| i);
     let more = if end < text.len() { " …" } else { "" };
     format!("{}{more}", &first[..end])
+}
+
+/// What a field of the record view shows of a value: at most
+/// [`RECORD_CHARS`] of it, and ` …` when there is more.
+fn record_text(text: &str) -> String {
+    match text.char_indices().nth(RECORD_CHARS) {
+        Some((end, _)) => format!("{} …", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 /// BLOB, RAW and LONG RAW values arrive as hex text.
@@ -2861,5 +2874,35 @@ mod tests {
         let y = |text: &str| drawn.iter().find(|(t, _)| t == text).unwrap().1.y;
         let (a, b) = (y("A"), y("B"));
         assert!(b - a < 40.0, "A at {a}, B at {b}");
+    }
+
+    /// A field of the record view lays out no more of a value than a few
+    /// screens show (#220): 10 MB on one line, wrapped, took 30 s a frame.
+    #[test]
+    fn record_view_cuts_huge_values() {
+        let columns = cols();
+        let huge = "x".repeat(10 << 20);
+        let lines = "line\n".repeat(1 << 20);
+        let ctx = egui::Context::default();
+        for value in [huge, lines] {
+            let rows = vec![vec![Some("1".into()), Some(value.clone())]];
+            let mut state = GridState {
+                record_view: true,
+                ..Default::default()
+            };
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+                let field = drawn
+                    .iter()
+                    .map(|(t, _)| t.as_str())
+                    .find(|t| t.starts_with(&value[..4]))
+                    .expect("the value");
+                let shown = &value[..value.char_indices().nth(RECORD_CHARS).unwrap().0];
+                assert_eq!(field, format!("{shown} …"));
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(elapsed < 2.0, "{elapsed} s");
+        }
     }
 }
