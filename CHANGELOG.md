@@ -1060,6 +1060,11 @@ All notable changes to Pythia are documented here. The format follows
   *Export tables*, *Copy as* and *Export*, and on *Apply*). A literal of
   parts now makes each part a CLOB, for CLOBs too: a text with many `&`,
   such as a JSON of URLs, failed with ORA-01489.
+- Oracle: INSERT statements make each value's literal once (#343).
+  Since #314 every row's literals were made twice, once to see whether
+  the row needed a PL/SQL block, and each BLOB's hex was copied for it:
+  20,000 rows of 2000-byte BLOBs took 1.05 s in a debug build, now
+  78 ms.
 
 ## [0.10.0] - 2026-10-30
 
