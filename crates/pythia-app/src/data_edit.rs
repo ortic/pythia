@@ -124,7 +124,36 @@ struct Query {
     /// DISTINCT, GROUP BY, HAVING or an aggregate: a row of the result
     /// isn't a row of the table.
     grouped: bool,
+    /// The select list, item by item.
+    items: Vec<Item>,
 }
+
+/// An item of a select list, as editing sees it (#218).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    /// `*` or `t.*`: the table's columns, as they are.
+    Star,
+    /// A column of the table as it is: `col`, `t.col`, `"Col"`.
+    Column,
+    /// Anything else: an expression, a column renamed (`x as y`).
+    Other,
+}
+
+/// Words that may come before a select list's first item.
+const LIST_MODIFIERS: &[&str] = &[
+    "ALL",
+    "DISTINCT",
+    "DISTINCTROW",
+    "UNIQUE",
+    "HIGH_PRIORITY",
+    "STRAIGHT_JOIN",
+    "SQL_SMALL_RESULT",
+    "SQL_BIG_RESULT",
+    "SQL_BUFFER_RESULT",
+    "SQL_NO_CACHE",
+    "SQL_CACHE",
+    "SQL_CALC_FOUND_ROWS",
+];
 
 /// `sql` with its quoted names the way the lexer reads them, each where it
 /// is in `sql` so that spans still hold: SQL Server's `[name]` as
@@ -230,6 +259,67 @@ fn parse(sql: &str) -> Option<Query> {
         i += 1;
     };
     let list_end = tokens[from - 1].span.end;
+    // The items, after hints and modifiers: SQL Server's TOP n, TOP (n),
+    // PERCENT and WITH TIES too.
+    let mut start = 1;
+    loop {
+        if kind(start) == Some(TokenKind::Hint) || LIST_MODIFIERS.iter().any(|m| is(start, m)) {
+            start += 1;
+        } else if is(start, "TOP") {
+            start = match kind(start + 1) {
+                Some(TokenKind::LParen) => closing(start + 1)? + 1,
+                _ => start + 2,
+            };
+            if is(start, "PERCENT") {
+                start += 1;
+            }
+            if is(start, "WITH") && is(start + 1, "TIES") {
+                start += 2;
+            }
+        } else {
+            break;
+        }
+    }
+    // Names joined by dots, ending in a name or `*`.
+    let item = |range: std::ops::Range<usize>| {
+        let len = range.len();
+        if len.is_multiple_of(2) {
+            return Item::Other;
+        }
+        let mut found = Item::Column;
+        for (k, j) in range.enumerate() {
+            let fits = if k % 2 == 1 {
+                kind(j) == Some(TokenKind::Dot)
+            } else if k + 1 == len && kind(j) == Some(TokenKind::Operator) && text(j) == "*" {
+                found = Item::Star;
+                true
+            } else {
+                matches!(
+                    kind(j),
+                    Some(TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword)
+                ) && !["NULL", "TRUE", "FALSE"].iter().any(|v| is(j, v))
+            };
+            if !fits {
+                return Item::Other;
+            }
+        }
+        found
+    };
+    let mut items = Vec::new();
+    let mut item_start = start;
+    let mut depth = 0i32;
+    for (j, t) in tokens.iter().enumerate().take(from).skip(start) {
+        match t.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => depth -= 1,
+            TokenKind::Comma if depth == 0 => {
+                items.push(item(item_start..j));
+                item_start = j + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(item(item_start..from));
     let i = from + 1;
     let ident = |i: usize| {
         tokens
@@ -296,6 +386,7 @@ fn parse(sql: &str) -> Option<Query> {
         table,
         list_end,
         grouped,
+        items,
     })
 }
 
@@ -308,6 +399,33 @@ pub fn single_table(sql: &str) -> Option<String> {
 /// be edited.
 pub fn can_edit(sql: &str) -> bool {
     parse(sql).is_some_and(|q| !q.grouped)
+}
+
+/// Which of the first `count` result columns of `sql` are columns of its
+/// table as they are: `col` and `t.col`, and those `*` and `t.*` bring.
+/// Editing writes a cell to the column of its name, which a column renamed
+/// (`description as name`) or an expression isn't (#218). None is when the
+/// select list doesn't match `count` columns.
+pub fn plain_columns(sql: &str, count: usize) -> Vec<bool> {
+    let items = parse(sql.trim().trim_end_matches(';'))
+        .map(|q| q.items)
+        .unwrap_or_default();
+    let stars = items.iter().filter(|i| **i == Item::Star).count();
+    let others = items.len() - stars;
+    // Each `*` brings the one table's columns.
+    let per_star = match count.checked_sub(others) {
+        Some(0) if stars == 0 => 0,
+        Some(n) if stars > 0 && n % stars == 0 => n / stars,
+        _ => return vec![false; count],
+    };
+    items
+        .iter()
+        .flat_map(|item| match item {
+            Item::Star => vec![true; per_star],
+            Item::Column => vec![true],
+            Item::Other => vec![false],
+        })
+        .collect()
 }
 
 /// The columns that identify a row of `table` (as written in a query):
@@ -750,7 +868,9 @@ pub fn dml(
     let mut out = Vec::new();
     let table = &edit.table;
     let key_start = columns.len().saturating_sub(edit.key.width());
-    let editable = |c: usize| c < key_start;
+    // Written under their names: the table's columns as they are (#218).
+    let plain = plain_columns(&edit.source, key_start);
+    let editable = |c: usize| plain.get(c).copied().unwrap_or(false);
     // Where the row is the one fetched; `None` without its key (the key
     // [`row_key`] picks can always be compared).
     let row_is = |row: &[Cell]| match &edit.key {
@@ -945,6 +1065,47 @@ mod tests {
         ] {
             assert!(can_edit(sql), "{sql}");
         }
+    }
+
+    /// The result columns editing writes to, under their names: the
+    /// table's columns as they are (#218).
+    #[test]
+    fn plain_columns_of_select_lists() {
+        assert_eq!(
+            plain_columns("select id, description as name, name as title from t", 3),
+            [true, false, false]
+        );
+        assert_eq!(
+            plain_columns("select t.id, t.\"Name\", s.t.x, [a b], `c` from s.t t", 5),
+            [true; 5]
+        );
+        assert_eq!(
+            plain_columns("select *, upper(name) u from t", 4),
+            [true, true, true, false]
+        );
+        assert_eq!(
+            plain_columns("select t.*, 1, t.* from t;", 5),
+            [true, true, false, true, true]
+        );
+        assert_eq!(
+            plain_columns("select top (5) percent with ties name from t", 1),
+            [true]
+        );
+        assert_eq!(
+            plain_columns("select /*+ full(t) */ distinct name, id from t", 2),
+            [true, true]
+        );
+        assert_eq!(
+            plain_columns(
+                "select name n, -id, (id), id::text, null, t.id + 1, a[1], name = x from t",
+                8
+            ),
+            [false; 8]
+        );
+        // A select list that doesn't match the result: none.
+        assert_eq!(plain_columns("select id, name from t", 3), [false; 3]);
+        assert_eq!(plain_columns("select *, *, x from t", 4), [false; 4]);
+        assert_eq!(plain_columns("update t set x = 1", 1), [false]);
     }
 
     #[test]

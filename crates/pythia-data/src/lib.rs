@@ -77,6 +77,10 @@ pub struct Options {
     pub delimiter: Option<u8>,
     /// How CSV/TSV write NULL (default: empty).
     pub null_text: String,
+    /// The time zone a MySQL session showed TIMESTAMP values in: INSERT
+    /// statements in MySQL's SQL set it while they run, as mysqldump does
+    /// (#213).
+    pub time_zone: Option<String>,
 }
 
 impl Default for Options {
@@ -88,6 +92,7 @@ impl Default for Options {
             sheet: "Result".into(),
             delimiter: None,
             null_text: String::new(),
+            time_zone: None,
         }
     }
 }
@@ -102,6 +107,13 @@ pub enum Error {
     Xlsx(#[from] rust_xlsxwriter::XlsxError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// A binary value the rows hold cut short (#204).
+    #[error(
+        "{column} holds a binary value of {size} bytes cut short to its first {} for the \
+         grid; Execute to file writes such values whole",
+        pythia_db::SHOWN_BYTES
+    )]
+    Cut { column: String, size: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -114,6 +126,7 @@ pub fn export(
     options: &Options,
     out: &mut dyn Write,
 ) -> Result<()> {
+    check_whole(columns, rows)?;
     match format {
         Format::Csv => delimited(
             options.delimiter.unwrap_or(b','),
@@ -123,12 +136,38 @@ pub fn export(
             out,
         ),
         Format::Tsv => delimited(b'\t', columns, rows, options, out),
-        Format::Json => json(columns, rows, out),
+        Format::Json => json(columns, rows, options.dialect, out),
         Format::Xlsx => xlsx(columns, rows, options, out),
-        Format::Insert => inserts(columns, rows, options, out),
+        Format::Insert => {
+            let zone = insert_time_zone(columns, options);
+            if let Some(zone) = zone {
+                writeln!(out, "{}", set_time_zone(zone))?;
+            }
+            inserts(columns, rows, options, out)?;
+            if zone.is_some() {
+                writeln!(out, "{RESTORE_TIME_ZONE}")?;
+            }
+            Ok(())
+        }
         Format::Markdown => markdown(columns, rows, out),
         Format::Html => html(columns, rows, out),
     }
+}
+
+/// Fails on the first binary value `rows` hold cut short (as results do
+/// past [`pythia_db::SHOWN_BYTES`]) instead of writing part of it (#204).
+pub fn check_whole(columns: &[Column], rows: &[Vec<Cell>]) -> Result<()> {
+    for row in rows {
+        for (col, cell) in columns.iter().zip(row) {
+            if let Some(size) = cell.as_deref().and_then(pythia_db::cut_size) {
+                return Err(Error::Cut {
+                    column: col.name.clone(),
+                    size,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Convenience wrapper returning the exported bytes.
@@ -185,6 +224,11 @@ impl<W: Write> StreamWriter<W> {
             }
             Format::Json => write!(out, "[")?,
             Format::Markdown => markdown_header(&columns, &mut out)?,
+            Format::Insert => {
+                if let Some(zone) = insert_time_zone(&columns, &options) {
+                    writeln!(out, "{}", set_time_zone(zone))?;
+                }
+            }
             _ => {}
         }
         Ok(Self {
@@ -197,6 +241,7 @@ impl<W: Write> StreamWriter<W> {
     }
 
     pub fn write(&mut self, rows: &[Vec<Cell>]) -> Result<()> {
+        check_whole(&self.columns, rows)?;
         let options = Options {
             header: false,
             ..self.options.clone()
@@ -219,7 +264,8 @@ impl<W: Write> StreamWriter<W> {
                     } else {
                         ",\n"
                     };
-                    let object = serde_json::to_string_pretty(&json_object(&self.columns, row))?;
+                    let object = json_object(&self.columns, row, self.options.dialect);
+                    let object = serde_json::to_string_pretty(&object)?;
                     write!(self.out, "{sep}{}", indent(&object))?;
                 }
             }
@@ -237,6 +283,10 @@ impl<W: Write> StreamWriter<W> {
         if self.format == Format::Json {
             let close = if self.rows == 0 { "]\n" } else { "\n]\n" };
             write!(self.out, "{close}")?;
+        }
+        if self.format == Format::Insert && insert_time_zone(&self.columns, &self.options).is_some()
+        {
+            writeln!(self.out, "{RESTORE_TIME_ZONE}")?;
         }
         self.out.flush()?;
         Ok(self.out)
@@ -274,14 +324,22 @@ fn delimited(
     Ok(())
 }
 
-fn json(columns: &[Column], rows: &[Vec<Cell>], out: &mut dyn Write) -> Result<()> {
-    let array: Vec<serde_json::Value> = rows.iter().map(|row| json_object(columns, row)).collect();
+fn json(
+    columns: &[Column],
+    rows: &[Vec<Cell>],
+    dialect: Dialect,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let array: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| json_object(columns, row, dialect))
+        .collect();
     serde_json::to_writer_pretty(&mut *out, &array)?;
     writeln!(out)?;
     Ok(())
 }
 
-fn json_object(columns: &[Column], row: &[Cell]) -> serde_json::Value {
+fn json_object(columns: &[Column], row: &[Cell], dialect: Dialect) -> serde_json::Value {
     let object = columns
         .iter()
         .zip(row)
@@ -289,12 +347,35 @@ fn json_object(columns: &[Column], row: &[Cell]) -> serde_json::Value {
             let value = match cell {
                 None => serde_json::Value::Null,
                 Some(v) if col.numeric => number(v).map_or_else(|| v.clone().into(), Into::into),
+                Some(v) if is_boolean(dialect, col) => {
+                    boolean(v).map_or_else(|| v.clone().into(), Into::into)
+                }
                 Some(v) => v.clone().into(),
             };
             (col.name.clone(), value)
         })
         .collect();
     serde_json::Value::Object(object)
+}
+
+/// Columns of booleans (#217): PostgreSQL's and Oracle's `boolean`, SQL
+/// Server's `bit` (PostgreSQL's is a string of bits). MySQL has none.
+fn is_boolean(dialect: Dialect, col: &Column) -> bool {
+    let t = col.type_name.as_str();
+    t.eq_ignore_ascii_case("boolean")
+        || t.eq_ignore_ascii_case("bool")
+        || (dialect.kind() == DbKind::SqlServer && t == "bit")
+}
+
+/// A boolean as the sessions show it: `t`/`f`, `TRUE`/`FALSE`, `1`/`0`.
+fn boolean(text: &str) -> Option<bool> {
+    match text {
+        "t" | "1" => Some(true),
+        "f" | "0" => Some(false),
+        _ if text.eq_ignore_ascii_case("true") => Some(true),
+        _ if text.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses a number for typed output, keeping integers exact.
@@ -647,21 +728,23 @@ pub fn sqlite_number(text: &str) -> bool {
             .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
 }
 
-/// SQLite: numbers as SQLite writes them unquoted (see [`sqlite_number`]),
-/// a blob as the `X'…'` of the hex it is shown as, text quoted (no
+/// SQLite: a blob as the `X'…'` of the hex it is shown as, numbers as
+/// SQLite writes them unquoted (see [`sqlite_number`]), text quoted (no
 /// backslash escapes), a `&` apart as `char(38)` since Pythia's SQL windows
-/// read `&name` as a substitution variable even in a literal (#159).
+/// read `&name` as a substitution variable even in a literal (#159). The
+/// session types a column of blobs BLOB (#209); there hex is a blob, also
+/// when it is all digits (`x'313233'`).
 fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     let Some(v) = value else {
         return "NULL".into();
     };
-    if is_number(col, v) || sqlite_number(v) {
-        return v.to_owned();
-    }
     // An empty blob is shown empty too.
     let hex = v.len() % 2 == 0 && v.chars().all(|c| c.is_ascii_hexdigit());
     if hex && col.type_name.contains("BLOB") {
         return format!("X'{v}'");
+    }
+    if is_number(col, v) || sqlite_number(v) {
+        return v.to_owned();
     }
     apart_from_ampersands(
         v,
@@ -670,6 +753,26 @@ fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
         " || ",
     )
 }
+
+/// The zone INSERT statements of `columns` set while they run: in MySQL's
+/// SQL with a TIMESTAMP column (MariaDB's read `TIMESTAMP UNSIGNED`), the
+/// one its values were shown in (#213). A TIMESTAMP is an instant shown in
+/// the session's zone; written as shown, it would move in a session of
+/// another zone.
+fn insert_time_zone<'a>(columns: &[Column], options: &'a Options) -> Option<&'a str> {
+    let zoned = options.dialect.kind() == DbKind::MySql
+        && columns.iter().any(|c| c.type_name.starts_with("TIMESTAMP"));
+    options.time_zone.as_deref().filter(|_| zoned)
+}
+
+fn set_time_zone(zone: &str) -> String {
+    format!(
+        "set @old_time_zone = @@time_zone, time_zone = '{}';",
+        zone.replace('\'', "''")
+    )
+}
+
+const RESTORE_TIME_ZONE: &str = "set time_zone = @old_time_zone;";
 
 fn inserts(
     columns: &[Column],
@@ -955,6 +1058,10 @@ mod tests {
         assert_eq!(lite(&col("INTEGER", true), Some("7")), "7");
         assert_eq!(lite(&col("BLOB", false), Some("00FF")), "X'00FF'");
         assert_eq!(lite(&col("TEXT", false), Some("00FF")), "'00FF'");
+        // A blob's hex may be all digits: x'313233' and x'10' are no numbers.
+        assert_eq!(lite(&col("BLOB", false), Some("313233")), "X'313233'");
+        assert_eq!(lite(&col("BLOB", false), Some("10")), "X'10'");
+        assert_eq!(lite(&col("BLOB", false), Some("hello")), "'hello'");
         // Numbers as SQLite writes them go in as numbers, others as text.
         assert_eq!(lite(&col("", false), Some("7")), "7");
         assert_eq!(lite(&col("TEXT", false), Some("007")), "'007'");
@@ -1030,12 +1137,146 @@ mod tests {
         );
     }
 
+    /// MySQL's INSERTs of TIMESTAMP values set the zone they were shown in
+    /// while they run, streamed too (#213); without a TIMESTAMP, or in
+    /// another database's SQL, they don't.
+    #[test]
+    fn mysql_timestamps_in_their_zone() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let columns = vec![col("ts", "TIMESTAMP"), col("dt", "DATETIME")];
+        let rows = vec![vec![
+            Some("2021-10-07 09:00:00".to_owned()),
+            Some("2021-10-07 09:00:00".to_owned()),
+        ]];
+        let options = |dialect, zone: Option<&str>| Options {
+            table: "t".into(),
+            dialect,
+            time_zone: zone.map(Into::into),
+            ..Options::default()
+        };
+        let insert =
+            "insert into t (ts, dt) values ('2021-10-07 09:00:00', '2021-10-07 09:00:00');";
+        let zoned = format!(
+            "set @old_time_zone = @@time_zone, time_zone = '+11:00';\n{insert}\n\
+             set time_zone = @old_time_zone;\n"
+        );
+        let mysql = options(Dialect::MYSQL, Some("+11:00"));
+        let text = |columns: &[Column], options: &Options| {
+            String::from_utf8(export_to_vec(Format::Insert, columns, &rows, options).unwrap())
+                .unwrap()
+        };
+        assert_eq!(text(&columns, &mysql), zoned);
+        let mut stream =
+            StreamWriter::new(Format::Insert, columns.clone(), mysql.clone(), Vec::new()).unwrap();
+        stream.write(&rows).unwrap();
+        assert_eq!(String::from_utf8(stream.finish().unwrap()).unwrap(), zoned);
+        // A DATETIME has no zone; no zone known, none set.
+        let datetimes = [col("ts", "DATETIME"), col("dt", "DATETIME")];
+        assert_eq!(text(&datetimes, &mysql), format!("{insert}\n"));
+        assert_eq!(
+            text(&columns, &options(Dialect::MYSQL, None)),
+            format!("{insert}\n")
+        );
+        assert!(!text(&columns, &options(Dialect::POSTGRES, Some("+11:00"))).contains("set"));
+    }
+
+    /// A binary value fetched cut short for the grid isn't written as it
+    /// is, in any format: the export fails and says what writes it whole.
+    #[test]
+    fn cut_values_are_not_exported() {
+        let columns = [
+            Column {
+                name: "ID".into(),
+                type_name: "INT".into(),
+                numeric: true,
+            },
+            Column {
+                name: "DATA".into(),
+                type_name: "BLOB".into(),
+                numeric: false,
+            },
+        ];
+        let cut = format!("{}… (10485760 bytes)", "89".repeat(4000));
+        let rows = |value: &str| vec![vec![Some("1".to_owned()), Some(value.to_owned())]];
+        for format in Format::ALL {
+            for value in [cut.clone(), format!("0x{cut}")] {
+                let error = export_to_vec(*format, &columns, &rows(&value), &Options::default())
+                    .expect_err("a cut value");
+                let text = error.to_string();
+                assert!(
+                    text.contains("DATA") && text.contains("Execute to file"),
+                    "{format:?}: {text}"
+                );
+            }
+        }
+        let mut stream = StreamWriter::new(
+            Format::Csv,
+            columns.to_vec(),
+            Options::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(stream.write(&rows(&cut)).is_err());
+        // Whole values, and text that only looks like the end of one.
+        let whole = "89".repeat(5000);
+        for value in [whole.as_str(), "it ends… (12 bytes)"] {
+            let csv = export_to_vec(Format::Csv, &columns, &rows(value), &Options::default());
+            assert!(csv.is_ok(), "{value}");
+        }
+    }
+
     #[test]
     fn json_types() {
         let v: serde_json::Value = serde_json::from_str(&text(Format::Json)).unwrap();
         assert_eq!(v[0]["ID"], 1);
         assert_eq!(v[1]["ID"], 2.5);
         assert_eq!(v[1]["NAME"], serde_json::Value::Null);
+    }
+
+    /// Booleans are JSON's true and false, not the text shown (#217): a
+    /// JSON reader takes "f" (and "FALSE", "0") for true.
+    #[test]
+    fn json_booleans() {
+        let col = |ty: &str| Column {
+            name: "b".into(),
+            type_name: ty.into(),
+            numeric: false,
+        };
+        let json = |dialect, ty: &str, values: &[Option<&str>]| {
+            let rows: Vec<Vec<Cell>> = values.iter().map(|v| vec![v.map(Into::into)]).collect();
+            let options = Options {
+                dialect,
+                ..Options::default()
+            };
+            let bytes = export_to_vec(Format::Json, &[col(ty)], &rows, &options).unwrap();
+            let mut stream =
+                StreamWriter::new(Format::Json, vec![col(ty)], options, Vec::new()).unwrap();
+            stream.write(&rows).unwrap();
+            let streamed: serde_json::Value =
+                serde_json::from_slice(&stream.finish().unwrap()).unwrap();
+            let whole: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(whole, streamed);
+            whole
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["b"].clone())
+                .collect::<Vec<_>>()
+        };
+        use serde_json::Value::{Bool, Null, String as Text};
+        let pg = json(Dialect::POSTGRES, "boolean", &[Some("t"), Some("f"), None]);
+        assert_eq!(pg, [Bool(true), Bool(false), Null]);
+        let ora = json(Dialect::ORACLE, "BOOLEAN", &[Some("TRUE"), Some("FALSE")]);
+        assert_eq!(ora, [Bool(true), Bool(false)]);
+        let ms = json(Dialect::SQLSERVER, "bit", &[Some("1"), Some("0")]);
+        assert_eq!(ms, [Bool(true), Bool(false)]);
+        // PostgreSQL's bit is a string of bits.
+        let bits = json(Dialect::POSTGRES, "bit", &[Some("101"), Some("1")]);
+        assert_eq!(bits, [Text("101".into()), Text("1".into())]);
     }
 
     #[test]

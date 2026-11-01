@@ -6071,6 +6071,7 @@ fn bar_menu(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
 fn request_key(request: &DbRequest) -> Option<u64> {
     match request {
         DbRequest::Execute { id, .. }
+        | DbRequest::ExecuteWhole { id, .. }
         | DbRequest::FetchMore { id, .. }
         | DbRequest::Meta { id, .. }
         | DbRequest::Task { id, .. }

@@ -1108,6 +1108,34 @@ fn keyed_data_editing_on(db: &Keyed, profile: ConnectionProfile, password: Strin
     wait_until(&mut h, "commit", |app| !app.test_pending_tx());
     h.state_mut().test_close_focused();
 
+    // Renamed, a column under another's name is read-only, as is an
+    // expression; the table's columns as they are can be edited.
+    query(
+        &mut h,
+        "select name as price, price as name, price * 2 as twice, name \
+           from pythia_edit_t order by id",
+    );
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        assert!(r.grid.is_editable());
+        let rows = r.rows.clone();
+        for c in 0..3 {
+            r.grid.edit_cell(&rows, 0, c, Some("1".into()));
+        }
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(0));
+        r.grid.edit_cell(&rows, 0, 3, Some("plain".into()));
+        assert_eq!(r.grid.changes().map(|c| c.count()), Some(1));
+    }
+    apply(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        assert_eq!(w.state.results[0].rows[0][3].as_deref(), Some("plain"));
+    }
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    h.state_mut().test_close_focused();
+
     // Without a key, rows can't be found again.
     query(&mut h, "select * from pythia_edit_n");
     let texts = messages(&mut h);
@@ -2891,6 +2919,8 @@ fn execute_to_file_sqlite() {
         connection,
         "create table notes (id integer primary key, note text);
 insert into notes values (1, 'it''s'), (2, null);
+create table files (id integer primary key, data blob, image image, memo blob);
+insert into files values (1, x'313233', x'cafe', 'hello world');
 commit;",
     );
     h.state_mut().test_open(OpenRequest::Sql {
@@ -2906,6 +2936,15 @@ commit;",
         std::fs::read_to_string(&path).unwrap(),
         "insert into notes (id, note) values (1, 'it''s');\n\
          insert into notes (id, note) values (2, NULL);\n"
+    );
+    // Blobs as blobs, by their values: all digits, in an `image` column;
+    // text in a BLOB column as text.
+    start_export(&mut h, "select * from files", &path);
+    wait_until(&mut h, "inserts", |app| !app.test_focused_busy());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "insert into files (id, data, image, memo) values \
+         (1, X'313233', X'CAFE', 'hello world');\n"
     );
 
     // Break: the incomplete file is removed.
@@ -2926,34 +2965,38 @@ commit;",
 
 /// "Execute to file" on MySQL, PostgreSQL and SQL Server, those of their
 /// variables that are set: 5000 rows fetched batch by batch into a JSON
-/// file.
+/// file. A boolean is JSON's (#217); MySQL has none, its `=` gives 1 or 0.
 #[test]
 fn execute_to_file_servers() {
     use pythia_config::DbKind;
-    // 5000 numbered rows in each database's SQL.
+    use serde_json::json;
+    // 5000 numbered rows in each database's SQL, and whether they are even.
     let databases = [
         (
             "PYTHIA_TEST_MYSQL",
             DbKind::MySql,
-            "select a.n + b.n * 100 + 1 as id from \
+            "select id, id % 2 = 0 as even from (select a.n + b.n * 100 + 1 as id from \
                (with recursive s(n) as (select 0 union all select n + 1 from s where n < 99) \
                 select n from s) a, \
                (with recursive s(n) as (select 0 union all select n + 1 from s where n < 49) \
-                select n from s) b order by 1",
+                select n from s) b) ids order by 1",
+            [json!(0), json!(1)],
         ),
         (
             "PYTHIA_TEST_POSTGRES",
             DbKind::Postgres,
-            "select id from generate_series(1, 5000) id",
+            "select id, id % 2 = 0 as even from generate_series(1, 5000) id",
+            [json!(false), json!(true)],
         ),
         (
             "PYTHIA_TEST_MSSQL",
             DbKind::SqlServer,
             "with s(id) as (select 1 union all select id + 1 from s where id < 5000) \
-             select id from s option (maxrecursion 0)",
+             select id, cast(1 - id % 2 as bit) as even from s option (maxrecursion 0)",
+            [json!(false), json!(true)],
         ),
     ];
-    for (env, kind, sql) in databases {
+    for (env, kind, sql, even) in databases {
         let connection = format!("export@{}", kind.label());
         let Some(mut h) = connect_to(env, &connection, kind) else {
             continue;
@@ -2980,8 +3023,303 @@ fn execute_to_file_servers() {
         let rows = json.as_array().map(Vec::len);
         assert_eq!(rows, Some(5000), "{env}");
         assert_eq!(json[4999]["id"], 5000, "{env}");
+        assert_eq!(
+            [&json[4998]["even"], &json[4999]["even"]],
+            [&even[0], &even[1]],
+            "{env}"
+        );
         std::fs::remove_file(&path).unwrap();
     }
+}
+
+/// Writes the rows of `sql` into an INSERT file with Execute to file: its
+/// statements, without their `;`.
+fn insert_file(h: &mut Harness<'_, PythiaApp>, sql: &str, name: &str) -> Vec<String> {
+    let path = std::env::temp_dir().join(format!("pythia-{}-{name}.sql", std::process::id()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Some(path.clone())).unwrap();
+    h.state_mut().test_sql_window().state.to_file_pick = Some((rx, sql.to_owned()));
+    h.run_steps(2);
+    wait_until(h, "export", |app| !app.test_focused_busy());
+    let message = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .last()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(message.contains("rows written"), "{name}: {message}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    text.lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect()
+}
+
+/// A result's columns and rows, and how its grid exports them.
+type GridRows = (
+    Vec<pythia_db::Column>,
+    Vec<Vec<pythia_db::Cell>>,
+    pythia_data::Options,
+);
+
+/// The rows of `sql` as the grid of a SQL window on `connection` has them.
+fn grid_rows(h: &mut Harness<'_, PythiaApp>, connection: &str, sql: &str) -> GridRows {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: sql.into(),
+        run: true,
+    });
+    wait_until(h, sql, |app| !app.test_focused_busy());
+    let w = h.state_mut().test_sql_window();
+    let r = &w.state.results[0];
+    let grid = (r.columns.clone(), r.rows.clone(), r.grid.export_options());
+    h.state_mut().test_close_focused();
+    grid
+}
+
+/// Execute to file writes binary values whole (#204): a 6 MB value of each
+/// database, written as INSERT statements and run back into a copy of its
+/// table, is the same value. The grid holds such a value cut short; its
+/// exports refuse it rather than write what they hold.
+#[test]
+fn execute_to_file_writes_whole_values() {
+    use pythia_config::DbKind;
+    let sql = "select id, b from fd_blob order by id";
+    // The fetched value is cut short where it ends in its size.
+    let grid_export_refuses = |name: &str, grid: &GridRows| {
+        let (columns, rows, options) = grid;
+        let cut = rows[0][1]
+            .as_deref()
+            .is_some_and(|v| v.ends_with(" bytes)"));
+        let exported =
+            pythia_data::export_to_vec(pythia_data::Format::Insert, columns, rows, options);
+        match exported {
+            Err(e) if cut => assert!(e.to_string().contains("Execute to file"), "{name}: {e}"),
+            Ok(_) if !cut => {}
+            other => panic!("{name}: {:?}", other.map(|b| b.len())),
+        }
+    };
+    // 6 MB in each database's binary type: as hex, within MariaDB's
+    // max_allowed_packet (16 MB).
+    let databases = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "longblob",
+            "repeat(unhex('89504E470D0A1A0A'), 786432)",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "bytea",
+            "decode(repeat('89504E470D0A1A0A', 786432), 'hex')",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "varbinary(max)",
+            "cast(replicate(cast(0x89504E470D0A1A0A as varchar(max)), 786432) \
+             as varbinary(max))",
+        ),
+    ];
+    for (env, kind, binary, value) in databases {
+        let connection = format!("whole@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        let setup = [
+            "drop table if exists fd_blob".to_owned(),
+            "drop table if exists fd_blob_copy".to_owned(),
+            format!("create table fd_blob (id int primary key, b {binary})"),
+            format!("create table fd_blob_copy (id int primary key, b {binary})"),
+            format!("insert into fd_blob select 1, {value}"),
+            "insert into fd_blob values (2, null)".to_owned(),
+        ];
+        let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+        for result in crate::test_db::execute_on(env, kind, &setup).unwrap() {
+            result.unwrap_or_else(|e| panic!("{env}: {e}"));
+        }
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        let inserts = insert_file(&mut h, sql, kind.label());
+        assert_eq!(inserts.len(), 2, "{env}");
+        h.state_mut().test_close_focused();
+        let copied = crate::test_db::run_on(env, kind, move |client| {
+            for insert in &inserts {
+                let insert =
+                    insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+                client.execute(&insert).unwrap();
+            }
+            let same = client
+                .query(
+                    "select count(*) from fd_blob a join fd_blob_copy c \
+                       on c.id = a.id and c.b = a.b",
+                    &[],
+                )
+                .unwrap();
+            same[0][0].clone()
+        });
+        assert_eq!(copied, Some(Some("1".into())), "{env}");
+        grid_export_refuses(env, &grid_rows(&mut h, &connection, sql));
+        crate::test_db::execute_on(
+            env,
+            kind,
+            &["drop table fd_blob", "drop table fd_blob_copy"],
+        );
+    }
+
+    // SQLite, on a file of its own.
+    let connection = "whole.db";
+    let (mut h, file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table fd_blob (id integer primary key, b blob);
+create table fd_blob_copy (id integer primary key, b blob);
+insert into fd_blob values (1, randomblob(6291456)), (2, null);
+commit;",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let inserts = insert_file(&mut h, sql, "sqlite");
+    h.state_mut().test_close_focused();
+    let path = file.0.display().to_string();
+    let copied = crate::test_db::run_with(DbKind::Sqlite, "", "", &path, move |client| {
+        for insert in &inserts {
+            let insert = insert.replacen("insert into fd_blob ", "insert into fd_blob_copy ", 1);
+            client.execute(&insert).unwrap();
+        }
+        let same = client
+            .query(
+                "select count(*) from fd_blob a join fd_blob_copy c on c.id = a.id and c.b = a.b",
+                &[],
+            )
+            .unwrap();
+        same[0][0].clone()
+    });
+    assert_eq!(copied.as_deref(), Some("1"));
+    grid_export_refuses("SQLite", &grid_rows(&mut h, connection, sql));
+}
+
+/// MySQL shows a TIMESTAMP in the session's time zone. INSERT statements
+/// of such values, from Execute to file and from the grid, run in a
+/// session of another zone, keep their instant; a DATETIME has no zone.
+#[test]
+fn mysql_timestamps_keep_their_instant() {
+    use pythia_config::DbKind;
+    let env = "PYTHIA_TEST_MYSQL";
+    let connection = "zones@MySQL";
+    let Some(mut h) = connect_to(env, connection, DbKind::MySql) else {
+        return;
+    };
+    let setup = crate::test_db::execute_on(
+        env,
+        DbKind::MySql,
+        &[
+            "drop table if exists fd_ts, fd_ts_copy",
+            "create table fd_ts (id int primary key, ts timestamp null, dt datetime)",
+            "create table fd_ts_copy like fd_ts",
+            "set time_zone = '+11:00'",
+            "insert into fd_ts values (1, '2021-10-07 09:00:00', '2021-10-07 09:00:00'), \
+               (2, null, null)",
+        ],
+    );
+    for result in setup.unwrap() {
+        result.unwrap();
+    }
+    // 2021-10-07 09:00 at +11:00.
+    let instant = "1633557600";
+    let sql = "select * from fd_ts order by id";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!("set time_zone = '+11:00';\n{sql};"),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let (columns, rows, options) = {
+        let w = h.state_mut().test_sql_window();
+        let r = &w.state.results[0];
+        (r.columns.clone(), r.rows.clone(), r.grid.export_options())
+    };
+    assert_eq!(rows[0][1].as_deref(), Some("2021-10-07 09:00:00"));
+    let from_file = insert_file(&mut h, sql, "zones");
+    let from_grid =
+        pythia_data::export_to_vec(pythia_data::Format::Insert, &columns, &rows, &options).unwrap();
+    let from_grid: Vec<String> = String::from_utf8(from_grid)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches(';').to_owned())
+        .collect();
+    // The file runs in a SQL window, too, the zone set back after it.
+    let script: Vec<String> = from_file
+        .iter()
+        .map(|s| s.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1))
+        .collect();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: format!(
+            "set time_zone = '+10:00';\n{};\ncommit;\nselect unix_timestamp(ts), \
+             @@session.time_zone from fd_ts_copy order by id;",
+            script.join(";\n")
+        ),
+        run: true,
+    });
+    wait_until(&mut h, "script", |app| !app.test_focused_busy());
+    {
+        let w = h.state_mut().test_sql_window();
+        let errors: Vec<&String> = w
+            .state
+            .messages
+            .iter()
+            .filter(|m| m.level == crate::sql_window::Level::Error)
+            .map(|m| &m.text)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let r = w.state.results.last().expect("the query's result");
+        assert_eq!(r.rows[0][0].as_deref(), Some(instant));
+        assert_eq!(r.rows[0][1].as_deref(), Some("+10:00"));
+    }
+    for (name, statements) in [("file", from_file), ("grid", from_grid)] {
+        let copied = crate::test_db::run_on(env, DbKind::MySql, move |client| {
+            client.execute("set time_zone = '+10:00'").unwrap();
+            client.execute("delete from fd_ts_copy").unwrap();
+            for statement in &statements {
+                let statement =
+                    statement.replacen("insert into fd_ts ", "insert into fd_ts_copy ", 1);
+                client.execute(&statement).unwrap();
+            }
+            client
+                .query(
+                    "select unix_timestamp(ts), dt, @@session.time_zone from fd_ts_copy \
+                     order by id",
+                    &[],
+                )
+                .unwrap()
+        })
+        .unwrap();
+        let values = |row: &[pythia_db::Cell]| -> Vec<Option<String>> { row.to_vec() };
+        assert_eq!(
+            values(&copied[0]),
+            [
+                Some(instant.into()),
+                Some("2021-10-07 09:00:00".into()),
+                Some("+10:00".into())
+            ],
+            "{name}"
+        );
+        assert_eq!(copied[1][..2], [None, None], "{name}");
+    }
+    crate::test_db::execute_on(env, DbKind::MySql, &["drop table fd_ts, fd_ts_copy"]);
 }
 
 /// Tables in the browser show their indexes, constraints and triggers.

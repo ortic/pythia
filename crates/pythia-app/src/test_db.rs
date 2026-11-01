@@ -149,14 +149,26 @@ pub fn run_on<T: Send + 'static>(
     kind: pythia_config::DbKind,
     f: impl FnOnce(&mut dyn pythia_db::Client) -> T + Send + 'static,
 ) -> Option<T> {
+    let spec = std::env::var(env).ok()?;
+    let (credentials, connect_string) = spec.rsplit_once('@')?;
+    let (username, password) = credentials.split_once('/')?;
+    Some(run_with(kind, username, password, connect_string, f))
+}
+
+/// [`run_on`] with the login given, e.g. a SQLite file as the connect
+/// string.
+pub fn run_with<T: Send + 'static>(
+    kind: pythia_config::DbKind,
+    username: &str,
+    password: &str,
+    connect_string: &str,
+    f: impl FnOnce(&mut dyn pythia_db::Client) -> T + Send + 'static,
+) -> T {
     use std::sync::mpsc;
     use std::time::Duration;
 
     use pythia_db::{ConnectParams, DbEvent, DbRequest, Session};
 
-    let spec = std::env::var(env).ok()?;
-    let (credentials, connect_string) = spec.rsplit_once('@')?;
-    let (username, password) = credentials.split_once('/')?;
     let (tx, wake) = mpsc::channel();
     let session = Session::connect(
         ConnectParams {
@@ -181,8 +193,8 @@ pub fn run_on<T: Send + 'static>(
     };
     match next() {
         DbEvent::Connected(_) => {}
-        DbEvent::ConnectFailed(e) => panic!("{env}: {e}"),
-        _ => panic!("{env}: not connected"),
+        DbEvent::ConnectFailed(e) => panic!("{connect_string}: {e}"),
+        _ => panic!("{connect_string}: not connected"),
     }
     session.send(DbRequest::Run {
         id: 1,
@@ -191,7 +203,7 @@ pub fn run_on<T: Send + 'static>(
     loop {
         if let DbEvent::TaskDone { result, .. } = next() {
             let any = result.expect("the task ran");
-            return Some(*any.downcast::<T>().expect("its result"));
+            return *any.downcast::<T>().expect("its result");
         }
     }
 }

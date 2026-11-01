@@ -25,7 +25,9 @@ use tracing::{debug, info, warn};
 use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
-use crate::sql_text::{hex, leading_words, release, replace_binds, statement_kind};
+use crate::sql_text::{
+    WHOLE_BATCH_BYTES, hex, leading_words, release, replace_binds, row_bytes, statement_kind,
+};
 use crate::types::{
     Cell, Client, Column, ConnectParams, DbError, DbEvent, DbRequest, ExecSummary, ServerInfo,
 };
@@ -64,6 +66,7 @@ pub(crate) fn run(
         kill,
         autocommit: false,
         tx: Transaction::default(),
+        time_zone: None,
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
@@ -71,6 +74,7 @@ pub(crate) fn run(
             for notice in failed {
                 worker.events.send(DbEvent::Notice(notice));
             }
+            worker.report_time_zone();
         }
         Err(e) => {
             *shared.lock().expect("cancel mutex") = None;
@@ -96,7 +100,10 @@ pub(crate) fn run(
                 sql,
                 max_rows,
                 binds,
-            } => next = worker.execute(id, &sql, max_rows, &binds, &requests),
+            } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                next = worker.execute(id, &sql, max_rows, &[], &requests, true)
+            }
             // Its result was closed by another request in between.
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
                 id,
@@ -152,6 +159,8 @@ struct Worker {
     kill: Canceller,
     autocommit: bool,
     tx: Transaction,
+    /// The time zone last reported (see [`Worker::report_time_zone`]).
+    time_zone: Option<String>,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -197,7 +206,8 @@ impl Worker {
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
-    /// returns the request that closed it, if any.
+    /// returns the request that closed it, if any. Binary values come
+    /// `whole` or cut short for the grid.
     fn execute(
         &mut self,
         id: u64,
@@ -205,6 +215,7 @@ impl Worker {
         max_rows: usize,
         binds: &[(String, Option<String>)],
         requests: &Receiver<DbRequest>,
+        whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
@@ -222,7 +233,16 @@ impl Worker {
             }
             self.tx.pending = true;
         }
-        let ran = self.run_statement(id, sql, max_rows, binds, requests, started, &mut next);
+        let fetch = Fetch {
+            id,
+            max_rows,
+            whole,
+            started,
+            events: &self.events,
+            requests,
+            kill: &self.kill,
+        };
+        let ran = Self::run_statement(&mut self.conn, sql, binds, fetch, &mut next);
         match ran {
             Ok(outcome) => {
                 self.tx.after(effect);
@@ -264,35 +284,32 @@ impl Worker {
                 });
             }
         }
+        // SET time_zone, or a procedure that sets it: the first words tell,
+        // also of an INSERT of megabytes.
+        let head = sql.char_indices().nth(1000).map_or(sql, |(i, _)| &sql[..i]);
+        if matches!(
+            leading_words(head).first().map(String::as_str),
+            Some("SET" | "CALL")
+        ) {
+            self.report_time_zone();
+        }
         self.report_transaction();
         next
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_statement(
-        &mut self,
-        id: u64,
+        conn: &mut Conn,
         sql: &str,
-        max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
-        started: Instant,
+        fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, mysql::Error> {
-        let fetch = Fetch {
-            id,
-            max_rows,
-            started,
-            events: &self.events,
-            requests,
-            kill: &self.kill,
-        };
         if binds.is_empty() {
-            let result = self.conn.query_iter(sql)?;
+            let result = conn.query_iter(sql)?;
             fetch.stream(result, next)
         } else {
             let (sql, values) = positional(sql, binds);
-            let result = self.conn.exec_iter(sql, Params::Positional(values))?;
+            let result = conn.exec_iter(sql, Params::Positional(values))?;
             fetch.stream(result, next)
         }
     }
@@ -319,6 +336,40 @@ impl Worker {
         });
     }
 
+    /// Reports the zone the session shows TIMESTAMP values in, when it
+    /// changed (#213). `SYSTEM`, which another server reads as its own
+    /// zone, as the server's offset when it has the same one all year (a
+    /// server on UTC: `+00:00`).
+    fn report_time_zone(&mut self) {
+        // The session's zone, the server's offsets in January and July.
+        type Zone = (String, Option<i64>, Option<i64>);
+        let read: Result<Option<Zone>, _> = self.conn.query_first(
+            "select @@session.time_zone, \
+                    timestampdiff(minute, convert_tz(d.j, 'SYSTEM', '+00:00'), d.j), \
+                    timestampdiff(minute, convert_tz(d.s, 'SYSTEM', '+00:00'), d.s) \
+               from (select cast(concat(year(now()), '-01-15 12:00:00') as datetime) j, \
+                            cast(concat(year(now()), '-07-15 12:00:00') as datetime) s) d",
+        );
+        let zone = match read {
+            Ok(Some((zone, Some(january), Some(july))))
+                if zone.eq_ignore_ascii_case("SYSTEM") && january == july =>
+            {
+                let sign = if january < 0 { '-' } else { '+' };
+                format!("{sign}{:02}:{:02}", january.abs() / 60, january.abs() % 60)
+            }
+            Ok(Some((zone, ..))) => zone,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("reading the time zone: {e}");
+                return;
+            }
+        };
+        if self.time_zone.as_ref() != Some(&zone) {
+            self.events.send(DbEvent::TimeZone(zone.clone()));
+            self.time_zone = Some(zone);
+        }
+    }
+
     /// The statement's warnings, as notices (MySQL's counterpart of
     /// messages printed by the database).
     fn report_warnings(&mut self) {
@@ -339,6 +390,8 @@ impl Worker {
 struct Fetch<'a> {
     id: u64,
     max_rows: usize,
+    /// Binary values whole, for a file (#204).
+    whole: bool,
     started: Instant,
     events: &'a Events,
     requests: &'a Receiver<DbRequest>,
@@ -367,15 +420,21 @@ impl Fetch<'_> {
         loop {
             let mut rows = Vec::with_capacity(max_rows.min(10_000));
             let mut more = true;
-            while rows.len() < max_rows {
+            let mut bytes = 0;
+            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match result.next() {
-                    Some(Ok(row)) => rows.push(
-                        row.unwrap()
+                    Some(Ok(row)) => {
+                        let cells: Vec<Cell> = row
+                            .unwrap()
                             .iter()
                             .zip(&types)
-                            .map(|(value, ty)| cell(value, ty))
-                            .collect(),
-                    ),
+                            .map(|(value, ty)| cell(value, ty, self.whole))
+                            .collect();
+                        if self.whole {
+                            bytes += row_bytes(&cells);
+                        }
+                        rows.push(cells);
+                    }
                     Some(Err(e)) => {
                         let mut error = DbError::from(e);
                         if error.code == Some(1317) {
@@ -455,7 +514,13 @@ pub(crate) fn all_rows<T: Protocol>(
     let mut rows = Vec::new();
     for row in result.by_ref() {
         let values = row?.unwrap();
-        rows.push(values.iter().zip(&types).map(|(v, c)| cell(v, c)).collect());
+        rows.push(
+            values
+                .iter()
+                .zip(&types)
+                .map(|(v, c)| cell(v, c, false))
+                .collect(),
+        );
     }
     Ok(rows)
 }
@@ -716,10 +781,11 @@ fn is_binary(c: &mysql::Column) -> bool {
         )
 }
 
-pub(crate) fn cell(value: &Value, column: &mysql::Column) -> Cell {
+/// A value as text; binary values cut short unless `whole`.
+pub(crate) fn cell(value: &Value, column: &mysql::Column, whole: bool) -> Cell {
     Some(match value {
         Value::NULL => return None,
-        Value::Bytes(bytes) if is_binary(column) => hex(bytes),
+        Value::Bytes(bytes) if is_binary(column) => hex(bytes, whole),
         Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
         Value::Int(v) => v.to_string(),
         Value::UInt(v) => v.to_string(),

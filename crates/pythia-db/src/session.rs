@@ -193,6 +193,10 @@ impl Worker {
                     max_rows,
                     binds,
                 } => worker.execute(id, &sql, max_rows, &binds),
+                // Values are whole; Execute to file streams through a task.
+                DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                    worker.execute(id, &sql, max_rows, &[])
+                }
                 DbRequest::Meta { id, query } => {
                     let started = Instant::now();
                     let result = meta::run(&worker.conn, &query);

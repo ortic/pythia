@@ -203,6 +203,44 @@ All notable changes to Pythia are documented here. The format follows
   ran together with the next statement, so the SETs never ran, a dumped
   trigger was never created and a table lost its partitions. MariaDB's
   `/*M!…*/` stays a comment.
+- *Execute to file* writes binary values whole (#204). On MySQL, SQL
+  Server and SQLite, a value over 4000 bytes was written as the hex of
+  its first 4000 and its size, `89504E47…… (10485760 bytes)`: a 10 MB
+  blob came back as 8020 bytes of text, or not at all. Results in the
+  grid still hold such a value cut short, and *Export* and *Copy as* now
+  refuse it, naming its column, instead of writing part of it; the grid
+  shows its real size (it showed 3.9 KB for 10 MB).
+- SQLite: blobs are told by their values, not the column's declared type
+  (#209). A blob whose hex is all digits (`x'313233'`) was exported as
+  the number 313233, typing `1234` into a BLOB cell stored a number, and
+  a blob in an `image`, `binary(16)` or untyped column was exported as
+  text, showed as text and gave a false conflict when its row was
+  edited. Text in a BLOB column no longer shows as `0xhello world`.
+- A very long value on one line no longer freezes the result grid
+  (#212). A 10 MB value took 1.6 s to appear, on every scroll that
+  brought it back too, and 470 MB of memory while it was shown; a cell
+  now lays out the first 500 characters of it.
+- MySQL: INSERT statements of TIMESTAMP values keep their instant when
+  they run in another time zone (#213). They were written as shown in
+  the session's zone: `09:00` at `+11:00` came back as `09:00` at
+  `+10:00`, an hour later. Like mysqldump, they now set the zone the
+  values were shown in while they run (`set @old_time_zone =
+  @@time_zone, time_zone = '+11:00';` … `set time_zone =
+  @old_time_zone;`), from *Execute to file* and from the grid. A session
+  on the server's zone writes its offset when it has the same one all
+  year (`+00:00` on UTC).
+- JSON exports write booleans as JSON's `true` and `false` (#217). A
+  PostgreSQL boolean was the string `"t"` or `"f"`, SQL Server's `bit`
+  `"1"` or `"0"`, Oracle's BOOLEAN `"TRUE"` or `"FALSE"`, and a JSON
+  reader takes each of them for true.
+- Editing a result no longer writes into the wrong column when the query
+  renames columns (#218). With `select id, description as name, name as
+  title from t`, a change under `name` was written into the column
+  `name`, without a word when both held the same value; a change under
+  `title` failed (no such column). Only result columns that are the
+  table's columns as they are (`col`, `t.col`, from `*`) can be edited
+  now; renamed columns and expressions are read-only, their headers
+  dimmed, as are the key columns.
 
 ## [0.10.0] - 2026-10-30
 

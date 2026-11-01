@@ -1,7 +1,8 @@
 //! "Execute to file": streams a query's rows straight into a file, for
 //! results too large for the grid. On Oracle a task on the session reads
 //! them; on the other databases the window fetches the result batch by
-//! batch, as for the grid, and hands each to a [`Sink`].
+//! batch, as for the grid but with binary values whole (#204), and hands
+//! each to a [`Sink`].
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -41,8 +42,14 @@ pub struct Sink {
 
 impl Sink {
     /// Creates the file for the rows of `sql`; INSERT statements go into
-    /// the table a one-table query reads (#158), in `dialect`'s SQL.
-    pub fn create(path: &Path, sql: &str, dialect: Dialect) -> Result<Self, DbError> {
+    /// the table a one-table query reads (#158), in `dialect`'s SQL, and set
+    /// the session's `time_zone` on MySQL (#213).
+    pub fn create(
+        path: &Path,
+        sql: &str,
+        dialect: Dialect,
+        time_zone: Option<String>,
+    ) -> Result<Self, DbError> {
         let file =
             File::create(path).map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
         let defaults = Options::default();
@@ -52,6 +59,7 @@ impl Sink {
             options: Options {
                 table: crate::data_edit::single_table(sql).unwrap_or(defaults.table.clone()),
                 dialect,
+                time_zone,
                 ..defaults
             },
             out: Some(BufWriter::with_capacity(1 << 20, file)),
@@ -125,7 +133,7 @@ pub fn run(
     path: &Path,
     progress: &AtomicU64,
 ) -> Result<u64, DbError> {
-    let mut sink = Sink::create(path, sql, Dialect::ORACLE)?;
+    let mut sink = Sink::create(path, sql, Dialect::ORACLE, None)?;
     let mut started = false;
     let streamed = pythia_db::stream_query(conn, sql, BATCH, |columns, rows| {
         if !started {
@@ -185,7 +193,8 @@ mod tests {
                 numeric: false,
             },
         ];
-        let mut sink = Sink::create(&path, "select id, note from notes", Dialect::SQLITE).unwrap();
+        let mut sink =
+            Sink::create(&path, "select id, note from notes", Dialect::SQLITE, None).unwrap();
         sink.columns(&columns).unwrap();
         assert_eq!(
             sink.rows(&[vec![Some("1".into()), Some("it's".into())]])
@@ -204,7 +213,7 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
 
-        let sink = Sink::create(&path, "select 1", Dialect::SQLITE).unwrap();
+        let sink = Sink::create(&path, "select 1", Dialect::SQLITE, None).unwrap();
         assert!(path.exists());
         sink.abandon();
         assert!(!path.exists());

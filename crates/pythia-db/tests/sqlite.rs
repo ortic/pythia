@@ -256,6 +256,60 @@ fn query_and_fetch_more() {
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 
+/// For the grid a blob is cut short with its size; for a file it comes
+/// whole, and a batch ends once it holds 64 MB of text, so rows of large
+/// blobs come a few at a time (#204).
+#[test]
+fn whole_values_for_a_file() {
+    let db = TempDb::new("whole");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table b (id integer primary key, v blob)");
+    h.ok(
+        "insert into b with recursive n(n) as (select 1 union all select n + 1 from n \
+         where n < 40) select n, randomblob(1048576) from n",
+    );
+    let shown = h.scalar("select v from b where id = 1").unwrap();
+    assert_eq!(pythia_db::cut_size(&shown), Some(1048576));
+    assert_eq!(
+        shown.len(),
+        2 * pythia_db::SHOWN_BYTES + "… (1048576 bytes)".len()
+    );
+
+    h.session.send(DbRequest::ExecuteWhole {
+        id: 1,
+        sql: "select id, v from b order by id".into(),
+        max_rows: 1000,
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, more, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    // 64 MB of hex, and the row that goes past it.
+    assert!(
+        more && rows.len() == 32,
+        "{} rows, more: {more}",
+        rows.len()
+    );
+    let mut fetched = rows;
+    h.session.send(DbRequest::FetchMore {
+        id: 1,
+        max_rows: 1000,
+    });
+    let DbEvent::Rows { rows, more, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!((rows.len(), more), (8, false));
+    fetched.extend(rows);
+    for (i, row) in fetched.iter().enumerate() {
+        assert_eq!(row[0], Some((i + 1).to_string()));
+        assert_eq!(
+            row[1].as_ref().map(String::len),
+            Some(2 * 1048576),
+            "row {i}"
+        );
+    }
+}
+
 #[test]
 fn values_types_and_binds() {
     let db = TempDb::new("values");

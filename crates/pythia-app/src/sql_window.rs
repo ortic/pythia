@@ -118,6 +118,9 @@ pub struct RunState {
     /// Where the connection's scripts end their statements (from the
     /// document context, each frame).
     pub syntax: Syntax,
+    /// The zone the session shows MySQL's TIMESTAMP values in, as it last
+    /// said: INSERT statements of its results set it (#213).
+    pub time_zone: Option<String>,
     /// Error stacks to look up, not sent yet.
     stack_lookups: Vec<StackLookup>,
 }
@@ -571,7 +574,8 @@ impl SqlWindow {
                 Ok(Some(path)) if dialect != pythia_db::Dialect::ORACLE => {
                     let sql = sql.clone();
                     self.state.to_file_pick = None;
-                    match crate::to_file::Sink::create(&path, &sql, dialect) {
+                    let zone = self.state.time_zone.clone();
+                    match crate::to_file::Sink::create(&path, &sql, dialect, zone) {
                         Ok(sink) => {
                             let id = request_id();
                             self.state.to_file = Some(crate::to_file::ToFile {
@@ -582,13 +586,14 @@ impl SqlWindow {
                                 started: std::time::Instant::now(),
                                 sink: Some(sink),
                             });
+                            // Binary values whole, not cut short as for
+                            // the grid (#204).
                             effects.request(
                                 Target::Own,
-                                DbRequest::Execute {
+                                DbRequest::ExecuteWhole {
                                     id,
                                     sql,
                                     max_rows: crate::to_file::BATCH,
-                                    binds: Vec::new(),
                                 },
                             );
                         }
@@ -1486,12 +1491,18 @@ impl SqlWindow {
                 };
                 result.grid.dialect = cx.dialect;
                 result.grid.table = crate::data_edit::single_table(&result.sql);
+                result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
                 if let Some(Internal::EditQuery { edit, replaces }) =
                     running.and_then(|r| r.internal.as_ref())
                 {
                     let key_start = result.columns.len().saturating_sub(edit.key.width());
                     result.grid.set_editable(Some(key_start));
+                    // Only the table's columns as they are (#218).
+                    let plain = crate::data_edit::plain_columns(&edit.source, key_start);
+                    result
+                        .grid
+                        .lock_columns((0..key_start).filter(|&c| !plain[c]));
                     result.edit = Some(edit.clone());
                     result.sql = edit.source.clone();
                     replace = replaces
@@ -1760,6 +1771,9 @@ impl SqlWindow {
                 }
             }
             DbEvent::Notice(text) => self.info(text),
+            // A new session says its own zone, if it has one.
+            DbEvent::Connected(_) => self.state.time_zone = None,
+            DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
                 self.state.running = None;
                 self.state.fetching = None;
@@ -2096,12 +2110,26 @@ impl SqlWindow {
                                     // The selection if there is one, else all fetched rows.
                                     let (columns, rows) =
                                         selection_data(&result.columns, &result.rows, &result.grid);
-                                    state.export = Some(export_in_background(
-                                        *format,
-                                        columns,
-                                        rows,
-                                        result.grid.export_options(),
-                                    ));
+                                    // Before asking for a file that would stay empty.
+                                    match pythia_data::check_whole(&columns, &rows) {
+                                        Ok(()) => {
+                                            state.export = Some(export_in_background(
+                                                *format,
+                                                columns,
+                                                rows,
+                                                result.grid.export_options(),
+                                            ))
+                                        }
+                                        Err(e) => {
+                                            state.messages.push(Message {
+                                                level: Level::Error,
+                                                text: format!("Export failed: {e}"),
+                                                jump: None,
+                                                stack: Vec::new(),
+                                            });
+                                            state.bottom = BottomTab::Messages;
+                                        }
+                                    }
                                     ui.close();
                                 }
                             }
@@ -2203,6 +2231,15 @@ impl SqlWindow {
                 )
                 .show(ui);
                 state.selection_summary = out.selection_summary;
+                if let Some(text) = result.grid.take_failed() {
+                    state.messages.push(Message {
+                        level: Level::Error,
+                        text,
+                        jump: None,
+                        stack: Vec::new(),
+                    });
+                    state.bottom = BottomTab::Messages;
+                }
                 if let Some((link, row)) = result.grid.take_follow()
                     && let Some(relation) = result
                         .link_relations

@@ -79,6 +79,15 @@ pub enum DbRequest {
         /// Values for `:name` bind variables, bound as strings (`None` = NULL).
         binds: Vec<(String, Option<String>)>,
     },
+    /// Executes a query as `Execute` does, for writing its rows into a file
+    /// (*Execute to file*): binary values come whole rather than cut short
+    /// to [`crate::SHOWN_BYTES`] for the grid, and a batch also ends once
+    /// it holds 64 MB of text. `FetchMore` fetches the next one (#204).
+    ExecuteWhole {
+        id: u64,
+        sql: String,
+        max_rows: usize,
+    },
     /// Data dictionary lookup; answered with [`DbEvent::Meta`].
     Meta {
         id: u64,
@@ -121,6 +130,12 @@ impl fmt::Debug for DbRequest {
                 .field("sql", sql)
                 .field("max_rows", max_rows)
                 .field("binds", &binds.len())
+                .finish(),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => f
+                .debug_struct("ExecuteWhole")
+                .field("id", id)
+                .field("sql", sql)
+                .field("max_rows", max_rows)
                 .finish(),
             DbRequest::Meta { id, query } => f
                 .debug_struct("Meta")
@@ -186,6 +201,10 @@ pub enum DbEvent {
     Transaction {
         pending: bool,
     },
+    /// The time zone a MySQL session shows TIMESTAMP values in, as `SET
+    /// time_zone` takes it: when it connects, and after a statement that
+    /// changed it. INSERT statements of its results set it (#213).
+    TimeZone(String),
     Notice(String),
     Error(DbError),
     Disconnected,

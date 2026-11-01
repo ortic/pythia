@@ -37,8 +37,8 @@ use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
 use crate::sql_text::{
-    civil_from_days, has_word, hex, leading_words, line_offset, release, replace_binds,
-    statement_kind,
+    WHOLE_BATCH_BYTES, civil_from_days, has_word, hex, leading_words, line_offset, release,
+    replace_binds, row_bytes, statement_kind,
 };
 use crate::ssh::Tunnel;
 use crate::types::{
@@ -133,7 +133,10 @@ pub(crate) fn run(
                 sql,
                 max_rows,
                 binds,
-            } => next = worker.execute(id, &sql, max_rows, &binds, &requests),
+            } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                next = worker.execute(id, &sql, max_rows, &[], &requests, true)
+            }
             // Its result was closed by another request in between.
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
                 id,
@@ -273,6 +276,16 @@ struct Worker {
     pending: bool,
 }
 
+/// How [`Worker::stream_statement`] reads a query's rows.
+struct Fetch<'a> {
+    id: u64,
+    max_rows: usize,
+    /// Binary values whole, for a file (#204).
+    whole: bool,
+    started: Instant,
+    requests: &'a Receiver<DbRequest>,
+}
+
 /// How a statement ended: a query's rows were reported as they were
 /// fetched, anything else is summarized.
 enum Outcome {
@@ -380,7 +393,8 @@ impl Worker {
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
-    /// returns the request that closed it, if any.
+    /// returns the request that closed it, if any. Binary values come
+    /// `whole` or cut short for the grid.
     fn execute(
         &mut self,
         id: u64,
@@ -388,6 +402,7 @@ impl Worker {
         max_rows: usize,
         binds: &[(String, Option<String>)],
         requests: &Receiver<DbRequest>,
+        whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
@@ -406,7 +421,14 @@ impl Worker {
         }
         // A Break pressed while nothing ran doesn't stop this statement.
         let _ = self.cancel.notified().now_or_never();
-        let ran = self.run_statement(id, sql, max_rows, binds, requests, started, &mut next);
+        let fetch = Fetch {
+            id,
+            max_rows,
+            whole,
+            started,
+            requests,
+        };
+        let ran = self.run_statement(sql, binds, fetch, &mut next);
         let failed = match ran {
             Ok(outcome) => {
                 let counts = self.counts();
@@ -481,36 +503,35 @@ impl Worker {
         Ok((rows.unwrap_or(0), open))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_statement(
         &mut self,
-        id: u64,
         sql: &str,
-        max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
-        started: Instant,
+        fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, Failure> {
         // Cancelled once the batch's reply (and its hold on the client) is
         // gone.
-        match self.stream_statement(id, sql, max_rows, binds, requests, started, next)? {
+        match self.stream_statement(sql, binds, fetch, next)? {
             Ran::Outcome(outcome) => Ok(outcome),
             Ran::Break(message) => Err(cancel_running(&self.rt, &mut self.client, message)),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn stream_statement(
         &mut self,
-        id: u64,
         sql: &str,
-        max_rows: usize,
         binds: &[(String, Option<String>)],
-        requests: &Receiver<DbRequest>,
-        started: Instant,
+        fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Ran, Failure> {
+        let Fetch {
+            id,
+            max_rows,
+            whole,
+            started,
+            requests,
+        } = fetch;
         let Worker {
             rt,
             client,
@@ -571,9 +592,16 @@ impl Worker {
             let mut cancelled = false;
             // Result sets after the first.
             let mut sets = 0;
-            while rows.len() < max_rows {
+            let mut bytes = 0;
+            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match wait(rt, cancel, &mut stream) {
-                    Wait::Item(Some(Ok(QueryItem::Row(row)))) => rows.push(cells(&row)),
+                    Wait::Item(Some(Ok(QueryItem::Row(row)))) => {
+                        let cells = cells(&row, whole);
+                        if whole {
+                            bytes += row_bytes(&cells);
+                        }
+                        rows.push(cells);
+                    }
                     // The next result set: the first one is complete.
                     Wait::Item(Some(Ok(QueryItem::Metadata(_)))) => {
                         sets = 1;
@@ -786,7 +814,9 @@ impl Ms<'_> {
                         QueryItem::Metadata(meta) if columns.is_none() => {
                             columns = Some(meta.columns().iter().map(column).collect());
                         }
-                        QueryItem::Row(row) if row.result_index() == 0 => rows.push(cells(&row)),
+                        QueryItem::Row(row) if row.result_index() == 0 => {
+                            rows.push(cells(&row, false))
+                        }
                         _ => {}
                     }
                 }
@@ -1064,12 +1094,13 @@ pub(crate) fn column(c: &tiberius::Column) -> Column {
     }
 }
 
-fn cells(row: &tiberius::Row) -> Vec<Cell> {
-    row.cells().map(|(_, data)| cell(data)).collect()
+fn cells(row: &tiberius::Row, whole: bool) -> Vec<Cell> {
+    row.cells().map(|(_, data)| cell(data, whole)).collect()
 }
 
-/// A value as SQL Server Management Studio shows it.
-fn cell(data: &ColumnData<'_>) -> Cell {
+/// A value as SQL Server Management Studio shows it; binary values cut
+/// short unless `whole`.
+fn cell(data: &ColumnData<'_>, whole: bool) -> Cell {
     // Days from 0001-01-01 and 1900-01-01 to 1970-01-01.
     const FROM_YEAR_1: i64 = -719_162;
     const FROM_1900: i64 = -25_567;
@@ -1083,7 +1114,7 @@ fn cell(data: &ColumnData<'_>) -> Cell {
         ColumnData::Bit(v) => if (*v)? { "1" } else { "0" }.to_owned(),
         ColumnData::String(v) => v.as_deref()?.to_owned(),
         ColumnData::Guid(v) => v.as_ref()?.to_string().to_uppercase(),
-        ColumnData::Binary(v) => format!("0x{}", hex(v.as_deref()?)),
+        ColumnData::Binary(v) => format!("0x{}", hex(v.as_deref()?, whole)),
         ColumnData::Numeric(v) => v.as_ref()?.to_string(),
         ColumnData::Xml(v) => v.as_deref()?.to_string(),
         ColumnData::DateTime(v) => {

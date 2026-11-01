@@ -16,6 +16,10 @@ use egui_extras::{Column as TableColumn, TableBuilder};
 use pythia_data::Format;
 use pythia_db::{Cell, Column};
 
+/// The characters of a value's first line a cell lays out at most: more
+/// than any column is wide, and a 10 MB line isn't laid out whole (#212).
+const SHOWN_CHARS: usize = 500;
+
 /// Per-result view state, owned by whoever owns the rows.
 #[derive(Default)]
 pub struct GridState {
@@ -67,6 +71,11 @@ pub struct GridState {
     /// The table the rows come from, as the query names it (one table
     /// only): INSERT statements go into it (#158).
     pub table: Option<String>,
+    /// The time zone MySQL showed the rows' TIMESTAMP values in: INSERT
+    /// statements set it (#213).
+    pub time_zone: Option<String>,
+    /// Why a copy failed, for the owner to show (a value held cut short).
+    failed: Option<String>,
 }
 
 /// A header being dragged to another place.
@@ -136,6 +145,9 @@ struct Editing {
     /// First of the trailing columns that can't be edited (the ROWID, the
     /// key columns of a MySQL table).
     locked: Option<usize>,
+    /// Other columns that can't be edited: a query's expressions and
+    /// renamed columns (#218).
+    read_only: BTreeSet<usize>,
     changes: Changes,
     /// Cell being edited: (view row, column, text).
     active: Option<(usize, usize, String)>,
@@ -144,7 +156,7 @@ struct Editing {
 
 impl Editing {
     fn is_locked(&self, col: usize) -> bool {
-        self.locked.is_some_and(|l| col >= l)
+        self.locked.is_some_and(|l| col >= l) || self.read_only.contains(&col)
     }
 }
 
@@ -171,12 +183,14 @@ pub struct GridOutput {
 
 impl GridState {
     /// How the rows are exported: in the database's SQL, INSERTs into the
-    /// table they come from (else a placeholder name).
+    /// table they come from (else a placeholder name), in the time zone
+    /// they were shown in.
     pub fn export_options(&self) -> pythia_data::Options {
         let defaults = pythia_data::Options::default();
         pythia_data::Options {
             dialect: self.dialect,
             table: self.table.clone().unwrap_or(defaults.table.clone()),
+            time_zone: self.time_zone.clone(),
             ..defaults
         }
     }
@@ -194,6 +208,11 @@ impl GridState {
     /// The link the user chose in the context menu, with the row index.
     pub fn take_follow(&mut self) -> Option<(usize, usize)> {
         self.follow.take()
+    }
+
+    /// Why *Copy as* copied nothing, once.
+    pub fn take_failed(&mut self) -> Option<String> {
+        self.failed.take()
     }
 
     /// All column indices in the order shown, hidden ones included.
@@ -359,6 +378,14 @@ impl GridState {
             locked,
             ..Editing::default()
         });
+    }
+
+    /// Keeps `columns` of the editable grid read-only, e.g. those that
+    /// aren't the table's column of their name (#218).
+    pub fn lock_columns(&mut self, columns: impl IntoIterator<Item = usize>) {
+        if let Some(edit) = &mut self.edit {
+            edit.read_only.extend(columns);
+        }
     }
 
     /// Changes a cell programmatically (as if edited by the user).
@@ -541,9 +568,9 @@ impl GridState {
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
     /// new rows past the end. Empty cells become NULL.
     pub fn paste(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
-        let Some(locked) = self.edit.as_ref().map(|e| e.locked) else {
+        if self.edit.is_none() {
             return;
-        };
+        }
         self.sync(rows, &[]);
         let visible = self.visible_columns(columns);
         let (r0, c0) = self
@@ -554,7 +581,7 @@ impl GridState {
         let targets: Vec<usize> = visible[from..]
             .iter()
             .copied()
-            .filter(|&c| locked.is_none_or(|l| c < l))
+            .filter(|&c| self.edit.as_ref().is_some_and(|e| !e.is_locked(c)))
             .collect();
         let text = text.strip_suffix('\n').unwrap_or(text);
         let text = text.strip_suffix('\r').unwrap_or(text);
@@ -953,16 +980,25 @@ impl Draw<'_> {
     /// A column's width before the user resized it: its header and the first
     /// rows' values, within limits.
     fn initial_width(&self, c: usize) -> f32 {
+        const MAX_CHARS: usize = 48;
         let content = self
             .rows
             .iter()
             .take(200)
             .filter_map(|r| r.get(c)?.as_deref())
-            .map(|v| v.lines().next().unwrap_or_default().chars().count())
+            // No further than the widest column (#212).
+            .map(|v| {
+                v.lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(MAX_CHARS)
+                    .count()
+            })
             .max()
             .unwrap_or(4);
         let chars = content.max(self.columns[c].name.chars().count() + 2).max(4) as f32;
-        (chars * self.look.char_width + 16.0).min(self.look.char_width * 48.0)
+        (chars * self.look.char_width + 16.0).min(self.look.char_width * MAX_CHARS as f32)
     }
 }
 
@@ -1292,7 +1328,10 @@ fn header_cell(ui: &mut Ui, c: usize, state: &GridState, d: &mut Draw) {
         Some((s, false)) if s == c => " ▼",
         _ => "",
     };
-    let text = RichText::new(format!("{}{arrow}", col.name)).strong();
+    // While editing, the columns that can't be edited are weak (#218).
+    let locked = state.edit.as_ref().is_some_and(|e| e.is_locked(c));
+    let text = RichText::new(format!("{}{arrow}", col.name));
+    let text = if locked { text.weak() } else { text.strong() };
     let layout = if col.numeric {
         Layout::right_to_left(Align::Center)
     } else {
@@ -1314,8 +1353,13 @@ fn header_cell(ui: &mut Ui, c: usize, state: &GridState, d: &mut Draw) {
                 ui.close();
             }
         });
+        let read_only = if locked {
+            "\nRead-only: the key, an expression or a renamed column"
+        } else {
+            ""
+        };
         r.on_hover_text(format!(
-            "{}\nClick to sort, drag to move, right-click for more",
+            "{}{read_only}\nClick to sort, drag to move, right-click for more",
             col.type_name
         ));
     });
@@ -1444,7 +1488,15 @@ fn data_cell(
         .as_ref()
         .and_then(|e| e.active.as_ref())
         .is_some_and(|(r, ec, _)| *r == view_row && *ec == c);
-    let value = state.value(d.rows, view_row, c).map(str::to_owned);
+    // What the cell shows of the value, not a copy of all of it (#212).
+    let binary = is_binary(col);
+    let shown = state.value(d.rows, view_row, c).map(|text| {
+        if binary {
+            binary_summary(text)
+        } else {
+            cell_text(text)
+        }
+    });
     let mut edit_done = None;
     let (_, response) = row.col(|ui| {
         let rect = ui.max_rect();
@@ -1501,22 +1553,16 @@ fn data_cell(
             Layout::left_to_right(Align::Center)
         };
         let strike = cell_state == CellState::Deleted;
-        let binary = is_binary(col);
-        ui.with_layout(layout, |ui| match value.as_deref() {
-            Some(text) if binary => {
+        ui.with_layout(layout, |ui| match shown {
+            Some(summary) if binary => {
                 ui.add(
-                    egui::Label::new(
-                        look.text(binary_summary(text))
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate()
-                    .selectable(false),
+                    egui::Label::new(look.text(summary).color(ui.visuals().weak_text_color()))
+                        .truncate()
+                        .selectable(false),
                 );
             }
             Some(text) => {
-                let first = text.lines().next().unwrap_or_default();
-                let more = if first.len() < text.len() { " …" } else { "" };
-                let mut rich = look.text(format!("{first}{more}"));
+                let mut rich = look.text(text);
                 if strike {
                     rich = rich.strikethrough();
                 }
@@ -1594,11 +1640,11 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
         {
             if ui.button(format.label()).clicked() {
                 let (cols, data) = selection_data(columns, rows, state);
-                if let Ok(bytes) =
-                    pythia_data::export_to_vec(*format, &cols, &data, &state.export_options())
-                {
-                    ui.ctx()
-                        .copy_text(String::from_utf8_lossy(&bytes).into_owned());
+                match pythia_data::export_to_vec(*format, &cols, &data, &state.export_options()) {
+                    Ok(bytes) => ui
+                        .ctx()
+                        .copy_text(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(e) => state.failed = Some(format!("Copy as {}: {e}", format.label())),
                 }
                 ui.close();
             }
@@ -2116,6 +2162,18 @@ fn viewer(
     }
 }
 
+/// What a cell shows of a value: its first line, at most [`SHOWN_CHARS`] of
+/// it, and ` …` when there is more.
+fn cell_text(text: &str) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    let end = first
+        .char_indices()
+        .nth(SHOWN_CHARS)
+        .map_or(first.len(), |(i, _)| i);
+    let more = if end < text.len() { " …" } else { "" };
+    format!("{}{more}", &first[..end])
+}
+
 /// BLOB, RAW and LONG RAW values arrive as hex text.
 fn is_binary(col: &Column) -> bool {
     let t = col.type_name.to_ascii_uppercase();
@@ -2141,11 +2199,13 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
-/// `0x89504E47… · 12.3 KB` for a hex-encoded value.
+/// `0x89504E47… · 12.3 KB` for a hex-encoded value; one held cut short has
+/// its size after the hex (#204).
 fn binary_summary(hex: &str) -> String {
     let head: String = hex.chars().take(16).collect();
     let more = if hex.len() > 16 { "…" } else { "" };
-    format!("0x{head}{more} · {}", human_bytes(hex.len() / 2))
+    let size = pythia_db::cut_size(hex).map_or(hex.len() / 2, |n| n as usize);
+    format!("0x{head}{more} · {}", human_bytes(size))
 }
 
 fn image_kind(bytes: &[u8]) -> Option<&'static str> {
@@ -2261,6 +2321,9 @@ mod tests {
         );
         assert_eq!(binary_summary("DEADBEEF"), "0xDEADBEEF · 4 bytes");
         assert!(hex_dump(b"Hello", 16).starts_with("00000000  48 65 6C 6C 6F"));
+        // Fetched cut short, a value has its size after the hex.
+        let cut = format!("{}… (10485760 bytes)", "89504E47".repeat(1000));
+        assert_eq!(binary_summary(&cut), "0x89504E4789504E47… · 10.0 MB");
     }
 
     #[test]
@@ -2646,6 +2709,32 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    /// A cell lays out no more of a value than it can show (#212): 10 MB on
+    /// one line took 1.6 s to lay out and kept 470 MB per cell.
+    #[test]
+    fn huge_values_are_cut_to_the_cell() {
+        let columns = cols();
+        let huge = format!("{}\nsecond line", "x".repeat(10 << 20));
+        let rows = vec![vec![Some("1".into()), Some(huge)]];
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let cell = drawn
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .find(|t| t.starts_with("xxx"))
+                .expect("the value");
+            assert_eq!(cell, format!("{} …", "x".repeat(SHOWN_CHARS)));
+        }
+        assert!(
+            started.elapsed().as_secs_f64() < 1.0,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// The keys keep reaching the grid after the click that focused it

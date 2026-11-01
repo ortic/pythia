@@ -40,8 +40,8 @@ use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
 use crate::sql_text::{
-    char_offset, has_inner_semicolon, has_word, leading_words, release, replace_binds,
-    statement_kind, word_followed_by,
+    WHOLE_BATCH_BYTES, char_offset, has_inner_semicolon, has_word, leading_words, release,
+    replace_binds, row_bytes, statement_kind, word_followed_by,
 };
 use crate::ssh::Tunnel;
 use crate::types::{
@@ -137,7 +137,10 @@ pub(crate) fn run(
                 sql,
                 max_rows,
                 binds,
-            } => next = worker.execute(id, &sql, max_rows, &binds, &requests),
+            } => next = worker.execute(id, &sql, max_rows, &binds, &requests, false),
+            DbRequest::ExecuteWhole { id, sql, max_rows } => {
+                next = worker.execute(id, &sql, max_rows, &[], &requests, true)
+            }
             // Its result was closed by another request in between.
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
                 id,
@@ -312,7 +315,8 @@ impl Worker {
     }
 
     /// Runs a statement. A query's result stays open for `FetchMore`s;
-    /// returns the request that closed it, if any.
+    /// returns the request that closed it, if any. Values are whole; for
+    /// a file (`whole`) a batch is also kept to [`WHOLE_BATCH_BYTES`].
     fn execute(
         &mut self,
         id: u64,
@@ -320,6 +324,7 @@ impl Worker {
         max_rows: usize,
         binds: &[(String, Option<String>)],
         requests: &Receiver<DbRequest>,
+        whole: bool,
     ) -> Option<DbRequest> {
         let started = Instant::now();
         let mut next = None;
@@ -355,7 +360,14 @@ impl Worker {
         if opened {
             self.tx.pending = true;
         }
-        let ran = self.run_statement(id, &sql, max_rows, requests, started, &mut next);
+        let fetch = Fetch {
+            id,
+            max_rows,
+            whole,
+            started,
+            requests,
+        };
+        let ran = self.run_statement(&sql, fetch, &mut next);
         let failed = match ran {
             Ok(Outcome::Done { affected }) => {
                 let kind = statement_kind(&sql);
@@ -413,11 +425,8 @@ impl Worker {
 
     fn run_statement(
         &mut self,
-        id: u64,
         sql: &str,
-        max_rows: usize,
-        requests: &Receiver<DbRequest>,
-        started: Instant,
+        fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, tokio_postgres::Error> {
         // The simple protocol names a result's columns, not their types.
@@ -441,13 +450,10 @@ impl Worker {
                         .enumerate()
                         .map(|(i, c)| column(c.name(), types.get(i)))
                         .collect();
-                    self.events.send(DbEvent::QueryStarted { id, columns });
-                    let fetch = Fetch {
-                        id,
-                        max_rows,
-                        started,
-                        requests,
-                    };
+                    self.events.send(DbEvent::QueryStarted {
+                        id: fetch.id,
+                        columns,
+                    });
                     let failed = self.fetch(stream, fetch, next);
                     return Ok(Outcome::Query { failed });
                 }
@@ -469,15 +475,23 @@ impl Worker {
         let Fetch {
             id,
             mut max_rows,
+            whole,
             mut started,
             requests,
         } = fetch;
         loop {
             let mut rows = Vec::with_capacity(max_rows.min(10_000));
             let mut more = true;
-            while rows.len() < max_rows {
+            let mut bytes = 0;
+            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match self.rt.block_on(stream.next()) {
-                    Some(Ok(SimpleQueryMessage::Row(row))) => rows.push(cells(&row)),
+                    Some(Ok(SimpleQueryMessage::Row(row))) => {
+                        let cells = cells(&row);
+                        if whole {
+                            bytes += row_bytes(&cells);
+                        }
+                        rows.push(cells);
+                    }
                     Some(Ok(SimpleQueryMessage::CommandComplete(_))) | None => {
                         more = false;
                         break;
@@ -596,6 +610,8 @@ impl Worker {
 struct Fetch<'a> {
     id: u64,
     max_rows: usize,
+    /// For a file: batches kept to [`WHOLE_BATCH_BYTES`] (#204).
+    whole: bool,
     started: Instant,
     requests: &'a Receiver<DbRequest>,
 }
