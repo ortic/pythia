@@ -92,12 +92,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
                 next = worker.execute(id, &sql, max_rows, &[], &requests, true)
             }
             // Its result was closed by another request in between.
-            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
-                id,
-                rows: Vec::new(),
-                more: false,
-                elapsed: Duration::ZERO,
-            }),
+            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::QueryClosed { id }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
                 let result = crate::sqlite_meta::run(&worker.conn, &query);
@@ -642,6 +637,7 @@ impl Fetch<'_> {
                 other => {
                     // Dropping the rows resets the statement: nothing more is
                     // read.
+                    self.events.send(DbEvent::QueryClosed { id });
                     *next = Some(other.unwrap_or(DbRequest::Disconnect));
                     return Outcome::Query { failed: false };
                 }

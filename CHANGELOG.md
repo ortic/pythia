@@ -860,6 +860,49 @@ All notable changes to Pythia are documented here. The format follows
   for up to about 250,000 characters; INSERT statements write such a row
   as a PL/SQL block that appends the parts to a CLOB, for any length. A
   LONG over 4000 bytes still can't be written so.
+- A result whose query was closed with rows left says so (#312): it
+  keeps its `+`, *Fetch all* and scrolling don't fetch from it, and the
+  messages say it shows the rows fetched. The next statement of a script
+  closes it, and on MySQL, PostgreSQL, SQL Server and SQLite any other
+  request to the window's session, such as a Commit or Rollback. *Fetch
+  all* then found nothing more there, and the result looked complete with
+  rows missing; on Oracle the window waited for rows that never came and
+  could run nothing else. *Execute to file* fails in that case rather than
+  end the file early as if it were complete.
+- SQL Server and PostgreSQL: a statement with several results shows
+  each in a tab of its own (#316), as on MySQL (#290): the SELECTs of a
+  T-SQL batch that `DECLARE`s, the result sets of a procedure
+  (`exec sp_help 't'`), the SELECTs rules add to an INSERT. SQL Server
+  showed the first with a notice that there were more; PostgreSQL showed
+  the rows of all under the first one's columns. An error after the
+  first result now fails the statement, which stops a script; it came as
+  a message only. *Execute to file* writes the first result and says how
+  many others there were.
+- The statement history takes in the statements a script ran in one go
+  (#318). Each statement went through the whole history, 2,000 entries,
+  and since #291 a frame hands over up to 1,000: 17 ms of every such
+  frame went to it. The order and the counts stay as they were.
+- A `;` with no statement before it, as in `select 1;;` or on a line of
+  its own, is no statement (#313). It was sent to the database, alone or
+  with the next statement: MySQL answered ERROR 1065 or 1064, Oracle
+  ORA-00900 and SQLite "bad parameter or other API misuse", which
+  stopped the script; PostgreSQL and SQL Server said "; executed".
+- The Output tab of a SQL window lays out only the lines in view
+  (#321), as the Messages tab does since #291. It laid out every line of
+  DBMS_OUTPUT in each frame: with 40,000 a frame took 101 ms.
+- The SQL window highlights `&name` as a substitution variable only
+  where it is one (#322): on Oracle unless `SET DEFINE OFF`, elsewhere
+  after `SET DEFINE ON` (#190). On MySQL, PostgreSQL, SQL Server and
+  SQLite `1&c.id` showed `&c.` as a variable, where `&` is an operator
+  and `c` the alias, as completion reads them since #287.
+- *AI: Analyze Execution Plan* explains in the SQL window's own session
+  (#319), as *Explain Plan* does since #269, and the assistant describes
+  the window's tables by its current schema. On the connection's main
+  session a private temporary table of the window had no plan (ORA-00942),
+  and `alter session set current_schema` didn't count. The window's
+  transaction stays as it was. While the window runs a statement, the
+  plan analysis says so; the other requests are then looked up on the
+  main session as before.
 
 ## [0.10.0] - 2026-10-30
 

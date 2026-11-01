@@ -7250,6 +7250,37 @@ fn messages_lay_out_what_shows() {
     assert!(h.query_by_label("message 39999").is_some());
 }
 
+/// The Output tab lays out the lines it shows, not all of them (#321):
+/// with 40,000 lines of DBMS_OUTPUT a frame took 101 ms. The last one
+/// shows, at the bottom, and lines that come later too.
+#[test]
+fn output_lays_out_what_shows() {
+    let connection = "r66_output.db";
+    let (mut h, _file) = sqlite_file(connection);
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let w = h.state_mut().test_sql_window();
+    w.state
+        .output
+        .extend((0..40_000).map(|i| format!("line {i:05}")));
+    w.state.bottom = crate::sql_window::BottomTab::Output;
+    h.run_steps(3);
+    let laid_out = h.query_all_by_label_contains("line ").count();
+    assert!(laid_out < 200, "{laid_out} lines laid out");
+    assert!(h.query_by_label("line 39999").is_some());
+    h.state_mut()
+        .test_sql_window()
+        .state
+        .output
+        .push("line 40000".into());
+    h.run_steps(3);
+    assert!(h.query_by_label("line 40000").is_some());
+}
+
 /// On MySQL a statement with several results shows each in a tab of its
 /// own (#290): a procedure's SELECTs, and statements kept together after
 /// DELIMITER, also with an error after the first. Only the first showed,
@@ -7333,9 +7364,112 @@ fn mysql_statements_show_every_result() {
     run_in_window(&mut h, "drop procedure r51_p");
 }
 
+/// On SQL Server and PostgreSQL a statement with several results shows
+/// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
+/// DECLAREs, a procedure's result sets, the SELECTs rules add to an
+/// INSERT. SQL Server showed the first with a notice, PostgreSQL the rows
+/// of all under the first one's columns; an error after the first didn't
+/// fail the statement, and now stops the script.
+#[test]
+fn batches_show_every_result() {
+    use pythia_config::DbKind;
+    // Each result's title, columns and first row, and the messages.
+    let shown = |h: &mut Ui, sql: &str| {
+        h.state_mut().test_sql_window().editor.set_text(sql);
+        h.state_mut().test_execute_focused();
+        wait_until(h, sql, |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let results: Vec<String> = w
+            .state
+            .results
+            .iter()
+            .map(|r| {
+                let columns: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+                let row: Vec<&str> = r.rows.first().map_or(Vec::new(), |row| {
+                    row.iter().map(|c| c.as_deref().unwrap_or("")).collect()
+                });
+                format!("{}: {} = {}", r.title, columns.join(" "), row.join(" "))
+            })
+            .collect();
+        let messages: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        (results, messages)
+    };
+    let two = ["Result 1: a = 1", "Result 2: b c = x 2"];
+    let cases = [
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            vec![
+                "declare @n int = 1; select @n as a; select 'x' as b, @n + 1 as c",
+                "exec r66_p",
+            ],
+            "create or alter procedure r66_p as begin select 1 as a; select 'x' as b, 2 as c; end",
+            "declare @n int = 1; select @n as a; select 1 / 0 as b\nGO\nselect 2",
+            // The EXEC's transaction would take the DROP back.
+            "if @@trancount > 0 rollback;\ndrop procedure r66_p",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            vec!["insert into r66_r values (1)"],
+            "drop table if exists r66_r;\ndrop table if exists r66_f;\n\
+             create table r66_r (id int);\ncreate table r66_f (id int);\n\
+             create rule r66_a as on insert to r66_r do also select 1 as a;\n\
+             create rule r66_b as on insert to r66_r do also select 'x' as b, 2 as c;\n\
+             create rule r66_fa as on insert to r66_f do also select 1 as a;\n\
+             create rule r66_fb as on insert to r66_f do also select 1 / 0 as b;\ncommit",
+            "insert into r66_f values (1);\nselect 2",
+            "drop table r66_r;\ndrop table r66_f;\ncommit",
+        ),
+    ];
+    for (env, kind, two_results, setup, failing, cleanup) in cases {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.clone(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        run_in_window(&mut h, setup);
+        for sql in two_results {
+            let (results, messages) = shown(&mut h, sql);
+            assert_eq!(results, two, "{sql}: {messages:?}");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains("1 row selected"))
+                    .count(),
+                2,
+                "{sql}: {messages:?}"
+            );
+            assert!(
+                !messages.iter().any(|m| m.contains("more result set")),
+                "{messages:?}"
+            );
+        }
+        let (results, messages) = shown(&mut h, failing);
+        assert!(
+            results.len() <= 2 && !results.iter().any(|r| r.ends_with("= 2")),
+            "{connection}: {results:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.starts_with("Failed after"))
+                && messages
+                    .iter()
+                    .any(|m| m.contains("1 remaining statement(s) skipped")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(&mut h, cleanup);
+    }
+}
+
 /// On SQLite `&` is an operator: completion after `1&c.` offers the
 /// alias's columns (#287), which it didn't, reading `&c.` as a
-/// substitution variable. After `SET DEFINE ON` it is one.
+/// substitution variable. After `SET DEFINE ON` it is one, for the
+/// editor's highlighting too, whose setting this is (#322).
 #[test]
 fn completion_after_a_bitwise_and() {
     let connection = "r51_and.db";
@@ -7483,6 +7617,213 @@ fn explain_runs_in_the_windows_session() {
     );
     drop(h);
     crate::test_db::as_dba(&["drop table system.r51_p purge"]);
+}
+
+/// A result whose query was closed with rows left says so and keeps its
+/// `+` (#312): the next statement of a script closes it, and on MySQL,
+/// PostgreSQL, SQL Server and SQLite, which read one result at a time, so
+/// does a Rollback. Fetch all found nothing more there, and the result
+/// looked complete with 500 of its 1,000 rows; on Oracle it waited for
+/// rows that never came. Oracle keeps a query open over a Rollback: Fetch
+/// all fetches the rest. SQLite, and the servers whose test databases are
+/// set.
+#[test]
+fn closed_queries_say_so() {
+    use pythia_config::DbKind;
+    let (mut h, _file) = sqlite_file("r66_closed.db");
+    closed_case(
+        &mut h,
+        "r66_closed.db",
+        "with recursive n(n) as (select 1 union all select n + 1 from n where n < 1000) \
+         select n from n",
+        false,
+    );
+    drop(h);
+    let servers = [
+        (
+            "PYTHIA_TEST_MYSQL",
+            DbKind::MySql,
+            "with recursive n (n) as (select 1 union all select n + 1 from n where n < 1000) \
+             select n from n",
+        ),
+        (
+            "PYTHIA_TEST_POSTGRES",
+            DbKind::Postgres,
+            "select generate_series(1, 1000) as n",
+        ),
+        (
+            "PYTHIA_TEST_MSSQL",
+            DbKind::SqlServer,
+            "select top 1000 row_number() over (order by (select null)) as n \
+             from sys.all_objects a cross join sys.all_objects b",
+        ),
+    ];
+    for (env, kind, rows) in servers {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        closed_case(&mut h, &connection, rows, false);
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    closed_case(
+        &mut h,
+        &connection,
+        "select level as n from dual connect by level <= 1000",
+        true,
+    );
+}
+
+/// Result 1 of `rows` and another statement, and of `rows` and a
+/// Rollback, in a window of its own on `connection`.
+fn closed_case(h: &mut Ui, connection: &str, rows: &str, oracle: bool) {
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    // Its rows, its +, whether its query ended.
+    let first = |h: &Ui| {
+        let r = &h.state().test_sql_window_ref().unwrap().state.results[0];
+        (r.rows.len(), r.more, r.ended)
+    };
+    let said = |h: &Ui, text: &str| {
+        let w = h.state().test_sql_window_ref().unwrap();
+        w.state.messages.iter().any(|m| m.text.starts_with(text))
+    };
+    let shows = "Result 1 shows the 500 rows fetched";
+
+    run_in_window(h, &format!("{rows};\nselect 1"));
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().state.results.len(),
+        2,
+        "{connection}"
+    );
+    let clicked = fetch_all(h, 0);
+    assert_eq!(first(h), (500, true, true), "{connection}: fetched all");
+    assert!(!clicked && said(h, shows), "{connection}");
+    // A Fetch all on its way meanwhile is answered.
+    let id = h.state().test_sql_window_ref().unwrap().state.results[0].id;
+    h.state_mut().test_on_sql_window(|w, _| {
+        w.state.fetching = Some(id);
+        let mut effects = crate::documents::Effects::default();
+        effects.request(
+            crate::documents::Target::Own,
+            pythia_db::DbRequest::FetchMore {
+                id,
+                max_rows: usize::MAX,
+            },
+        );
+        effects
+    });
+    wait_until(h, "the closed query's answer", |app| {
+        !app.test_focused_busy()
+    });
+    assert_eq!(first(h), (500, true, true), "{connection}: answered");
+
+    run_in_window(h, rows);
+    h.state_mut().test_rollback();
+    wait_until(h, "rollback", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.messages.iter().any(|m| m.text == "Rolled back"))
+    });
+    if oracle {
+        assert_eq!(first(h), (500, true, false), "{connection}: rolled back");
+        assert!(fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (1000, false, false), "{connection}: fetched all");
+    } else {
+        assert!(!fetch_all(h, 0), "{connection}");
+        assert_eq!(first(h), (500, true, true), "{connection}: rolled back");
+        assert!(said(h, shows), "{connection}");
+    }
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+}
+
+/// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
+/// database, which failed on MySQL (ERROR 1065), Oracle (ORA-00900) and
+/// SQLite and stopped the script, and said "; executed" on PostgreSQL and
+/// SQL Server; a `;` on a line of its own went with the next statement,
+/// which failed on MySQL and Oracle. SQLite, and the servers whose test
+/// databases are set.
+#[test]
+fn lone_semicolons_are_skipped() {
+    use pythia_config::DbKind;
+    let script = |from_dual: &str| {
+        format!("select 1{from_dual};;\nselect 2{from_dual};\n;\nselect 3{from_dual};")
+    };
+    let check = |h: &mut Ui, connection: &str, from_dual: &str| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: String::new(),
+            run: false,
+        });
+        h.run_steps(2);
+        assert_eq!(
+            run_in_window(h, &script(from_dual)).as_deref(),
+            Some("3"),
+            "{connection}"
+        );
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(w.state.results.len(), 3, "{connection}: {messages:?}");
+        assert!(
+            messages.iter().all(|m| m.contains("1 row selected")),
+            "{connection}: {messages:?}"
+        );
+        run_in_window(h, ";\n");
+        let w = h.state().test_sql_window_ref().unwrap();
+        let messages: Vec<&str> = w.state.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(messages, ["Nothing to execute"], "{connection}");
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    };
+    let (mut h, _file) = sqlite_file("r66_semicolons.db");
+    check(&mut h, "r66_semicolons.db", "");
+    drop(h);
+    for (env, kind) in [
+        ("PYTHIA_TEST_MYSQL", DbKind::MySql),
+        ("PYTHIA_TEST_POSTGRES", DbKind::Postgres),
+        ("PYTHIA_TEST_MSSQL", DbKind::SqlServer),
+    ] {
+        let connection = format!("r66@{}", kind.label());
+        let Some(mut h) = connect_to(env, &connection, kind) else {
+            continue;
+        };
+        check(&mut h, &connection, "");
+    }
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    check(&mut h, &connection, " from dual");
+}
+
+/// Clicks Fetch all on result `index` and waits for its rows; false if the
+/// result doesn't offer it.
+fn fetch_all(h: &mut Ui, index: usize) -> bool {
+    h.state_mut().test_sql_window().state.bottom = crate::sql_window::BottomTab::Result(index);
+    h.run_steps(2);
+    let Some(button) = h
+        .query_by_label("Fetch all")
+        .or_else(|| h.query_by_label("All"))
+    else {
+        return false;
+    };
+    button.click();
+    h.run_steps(1);
+    wait_until(h, "Fetch all", |app| !app.test_focused_busy());
+    true
 }
 
 /// Closing a SQL window, or Pythia, with changes to its results that
@@ -9300,6 +9641,85 @@ fn ai_with_database() {
     }
     conn.execute("drop table pythia_ai_invoices purge", &[])
         .unwrap();
+}
+
+/// AI: Analyze Execution Plan explains in the SQL window's own session
+/// (#319), as Explain plan does (#269): the window's private temporary
+/// table counts, which on the connection's main session failed with
+/// ORA-00942, and its transaction stays as it was. While the window runs
+/// a statement, it says so.
+#[test]
+fn ai_plans_in_the_windows_session() {
+    use std::sync::{Arc, Mutex};
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let mut h = headless_harness();
+    let requests: Arc<Mutex<Vec<String>>> = Default::default();
+    let seen = requests.clone();
+    h.state_mut()
+        .test_ai(Arc::new(move |request: &pythia_ai::ChatRequest| {
+            let last = request.messages.last().unwrap().content.clone();
+            seen.lock().unwrap().push(last);
+            Ok("A full scan.".into())
+        }));
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r66_ai_t purge'; \
+         exception when others then null; end;\n/\n\
+         create table r66_ai_t (id number);\n\
+         create private temporary table ora$ptt_r66 (id number) on commit preserve definition;\n\
+         insert into r66_ai_t values (1);",
+    );
+    assert!(h.state().test_pending_tx());
+    let analyze = |h: &mut Ui| {
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select * from ora$ptt_r66 where id = 1");
+        h.run_steps(2);
+        h.state_mut()
+            .test_command(crate::commands::Command::AiAnalyzePlan);
+    };
+    analyze(&mut h);
+    wait_until(&mut h, "the plan analysis", |app| {
+        app.test_ai_answers() == 1
+    });
+    {
+        let sent = &requests.lock().unwrap()[0];
+        assert!(sent.contains("## Execution plan (EXPLAIN PLAN)"), "{sent}");
+        assert!(sent.contains("ORA$PTT_R66"), "{sent}");
+        assert!(!sent.contains("EXPLAIN PLAN failed"), "{sent}");
+    }
+    assert!(h.state().test_pending_tx());
+    assert_eq!(
+        run_in_window(&mut h, "select count(*) from r66_ai_t").as_deref(),
+        Some("1")
+    );
+
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("begin dbms_session.sleep(3); end;");
+    h.state_mut().test_execute_focused();
+    h.run_steps(2);
+    assert!(h.state().test_focused_busy());
+    analyze(&mut h);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("running a statement").is_some());
+    assert_eq!(h.state().test_ai_answers(), 1);
+    wait_until(&mut h, "the block", |app| !app.test_focused_busy());
+    h.state_mut().test_rollback();
+    wait_until(&mut h, "rollback", |app| !app.test_pending_tx());
+    run_in_window(&mut h, "drop table r66_ai_t purge");
 }
 
 /// Settings → AI with a configured backend.

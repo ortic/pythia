@@ -132,6 +132,36 @@ pub fn lex_line_in(line: &str, state: LineState, syntax: Syntax) -> (Vec<LineTok
     (tokens, end_state)
 }
 
+/// [`lex_line_in`] with `&name` a substitution variable or not: where `&`
+/// doesn't substitute (#190) it is an operator, and what follows it the
+/// names and `.` they are, as completion reads them (#287, #322).
+pub fn lex_line_with(
+    line: &str,
+    state: LineState,
+    syntax: Syntax,
+    substitution: bool,
+) -> (Vec<LineToken>, LineState) {
+    let (tokens, end) = lex_line_in(line, state, syntax);
+    if substitution {
+        return (tokens, end);
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if token.kind != TokenKind::SubstVar {
+            out.push(token);
+            continue;
+        }
+        let text = &line[token.range.clone()];
+        let rest = token.range.start + text.len() - text.trim_start_matches('&').len();
+        out.extend((token.range.start..rest).map(|at| LineToken {
+            range: at..at + 1,
+            kind: TokenKind::Operator,
+        }));
+        out.extend(code(&line[rest..token.range.end], rest, syntax));
+    }
+    (out, end)
+}
+
 /// Text lexed as code, its tokens moved by `at`.
 fn code(text: &str, at: usize, syntax: Syntax) -> Vec<LineToken> {
     tokenize_in(text, syntax)
@@ -420,6 +450,9 @@ fn string_terminated(text: &str, syntax: Syntax) -> bool {
 pub struct Highlighter {
     states: Vec<LineState>,
     syntax: Syntax,
+    /// `&name` is a substitution variable; `None` on Oracle only, as a
+    /// SQL window has it without `SET DEFINE` (#190).
+    substitution: Option<bool>,
 }
 
 impl Highlighter {
@@ -429,11 +462,18 @@ impl Highlighter {
 
     pub fn with_syntax(rope: &Rope, syntax: Syntax) -> Self {
         let mut h = Self {
-            states: vec![LineState::Normal; rope.len_lines()],
+            states: Vec::new(),
             syntax,
+            substitution: None,
         };
-        h.relex(rope, 0, rope.len_lines());
+        h.reset(rope);
         h
+    }
+
+    /// Lexes all lines again, of a new text.
+    pub fn reset(&mut self, rope: &Rope) {
+        self.states = vec![LineState::Normal; rope.len_lines()];
+        self.relex(rope, 0, rope.len_lines());
     }
 
     /// The lexing of the database the text is for.
@@ -443,8 +483,25 @@ impl Highlighter {
 
     pub fn set_syntax(&mut self, rope: &Rope, syntax: Syntax) {
         if syntax != self.syntax {
-            *self = Self::with_syntax(rope, syntax);
+            self.syntax = syntax;
+            self.reset(rope);
         }
+    }
+
+    /// Whether `&name` is highlighted as a substitution variable (#322).
+    pub fn substitution(&self) -> bool {
+        self.substitution.unwrap_or(self.syntax == Syntax::Oracle)
+    }
+
+    /// Lines start in the same states either way: a variable ends on its
+    /// line.
+    pub fn set_substitution(&mut self, substitution: bool) {
+        self.substitution = Some(substitution);
+    }
+
+    /// The tokens of line `line` (its `text`), as highlighted.
+    pub fn line_tokens(&self, text: &str, line: usize) -> Vec<LineToken> {
+        lex_line_with(text, self.state(line), self.syntax, self.substitution()).0
     }
 
     pub fn state(&self, line: usize) -> LineState {
@@ -510,6 +567,79 @@ mod tests {
             .map(|t| (t.kind, &line[t.range]))
             .collect();
         (tokens, end)
+    }
+
+    /// `&name` is highlighted as a variable only where it substitutes
+    /// (#322): on Oracle unless `SET DEFINE OFF`, elsewhere after `SET
+    /// DEFINE ON`. Otherwise `&` is an operator, and the alias and `.`
+    /// after it what they are, as completion reads them (#287).
+    #[test]
+    fn ampersands_where_nothing_substitutes() {
+        let line = "where 1&c.id = 1 and c.f&&c.m > 0 # &x";
+        let highlighted = |syntax, substitution: Option<bool>| {
+            let rope = Rope::from_str(line);
+            let mut h = Highlighter::with_syntax(&rope, syntax);
+            if let Some(on) = substitution {
+                h.set_substitution(on);
+            }
+            h.line_tokens(line, 0)
+                .into_iter()
+                .filter(|t| t.kind != TokenKind::Whitespace)
+                .map(|t| (t.kind, &line[t.range]))
+                .collect::<Vec<_>>()
+        };
+        let operators = [
+            (TokenKind::Keyword, "where"),
+            (TokenKind::Number, "1"),
+            (TokenKind::Operator, "&"),
+            (TokenKind::Ident, "c"),
+            (TokenKind::Dot, "."),
+            (TokenKind::Ident, "id"),
+            (TokenKind::Operator, "="),
+            (TokenKind::Number, "1"),
+            (TokenKind::Keyword, "and"),
+            (TokenKind::Ident, "c"),
+            (TokenKind::Dot, "."),
+            (TokenKind::Ident, "f"),
+            (TokenKind::Operator, "&"),
+            (TokenKind::Operator, "&"),
+            (TokenKind::Ident, "c"),
+            (TokenKind::Dot, "."),
+            (TokenKind::Ident, "m"),
+            (TokenKind::Operator, ">"),
+            (TokenKind::Number, "0"),
+            (TokenKind::LineComment, "# &x"),
+        ];
+        for syntax in [
+            Syntax::MySql,
+            Syntax::Postgres,
+            Syntax::TSql,
+            Syntax::Sqlite,
+        ] {
+            let tokens = highlighted(syntax, None);
+            assert!(
+                !tokens.iter().any(|(kind, _)| *kind == TokenKind::SubstVar),
+                "{syntax:?}: {tokens:?}"
+            );
+            assert!(highlighted(syntax, Some(true)).contains(&(TokenKind::SubstVar, "&c.")));
+        }
+        assert_eq!(highlighted(Syntax::MySql, None), operators);
+        assert_eq!(highlighted(Syntax::MySql, Some(false)), operators);
+        // Oracle substitutes until SET DEFINE OFF.
+        assert!(highlighted(Syntax::Oracle, None).contains(&(TokenKind::SubstVar, "&c.")));
+        assert!(
+            !highlighted(Syntax::Oracle, Some(false))
+                .iter()
+                .any(|(kind, _)| *kind == TokenKind::SubstVar)
+        );
+        // The setting stays with a new text and another syntax.
+        let mut rope = Rope::from_str(line);
+        let mut h = Highlighter::with_syntax(&rope, Syntax::MySql);
+        h.set_substitution(true);
+        rope = Rope::from_str("select &a from t");
+        h.reset(&rope);
+        h.set_syntax(&rope, Syntax::Postgres);
+        assert!(h.substitution());
     }
 
     #[test]

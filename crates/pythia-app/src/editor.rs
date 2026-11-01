@@ -22,9 +22,6 @@ pub struct Editor {
     syntax_markers: Vec<Marker>,
     /// Breakpoints and the current execution line while debugging.
     debug_markers: Vec<Marker>,
-    /// `&name` is a substitution variable, as a SQL window's `SET DEFINE`
-    /// says; `None` on Oracle only (#190).
-    substitution: Option<bool>,
 }
 
 impl Default for Editor {
@@ -93,7 +90,6 @@ impl Editor {
             compile_markers: Vec::new(),
             syntax_markers: Vec::new(),
             debug_markers: Vec::new(),
-            substitution: None,
         }
     }
 
@@ -125,15 +121,15 @@ impl Editor {
         self.inner.syntax()
     }
 
-    /// Code assistance reads `&name` as a substitution variable, or `&` as
-    /// an operator (#287).
+    /// Code assistance and highlighting read `&name` as a substitution
+    /// variable, or `&` as an operator (#287, #322), as a SQL window's `SET
+    /// DEFINE` says; until set, on Oracle only (#190).
     pub fn set_substitution(&mut self, substitution: bool) {
-        self.substitution = Some(substitution);
+        self.inner.set_substitution(substitution);
     }
 
     pub fn substitution(&self) -> bool {
-        self.substitution
-            .unwrap_or(self.syntax() == pythia_plsql::Syntax::Oracle)
+        self.inner.substitution()
     }
 
     pub fn cursor(&self) -> usize {

@@ -445,6 +445,113 @@ fn queries_see_commits_and_lock_nothing() {
     a.ok("drop table fresh_t");
 }
 
+/// The events of statement `id` up to the transaction state that ends
+/// them, or up to rows that wait for a FetchMore.
+fn outline(h: &mut Harness, id: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        out.push(match h.next() {
+            DbEvent::Transaction { .. } => return out,
+            DbEvent::Notice(_) => continue,
+            DbEvent::QueryStarted { id: of, columns } if of == id => {
+                let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                format!("cols {}", names.join(" "))
+            }
+            DbEvent::Rows {
+                id: of, rows, more, ..
+            } if of == id => format!("rows {} {more}", rows.len()),
+            DbEvent::Failed { id: of, error, .. } if of == id => {
+                format!(
+                    "failed {}",
+                    error.message.split(':').next().unwrap_or_default()
+                )
+            }
+            other => format!("{other:?}"),
+        });
+        // Waiting for a FetchMore: no transaction state comes yet.
+        if out.last().is_some_and(|e| e.ends_with(" true")) {
+            return out;
+        }
+    }
+}
+
+/// Every result of a statement is a result of its own (#316): those of a
+/// text of several statements, and the SELECTs rules add to an INSERT,
+/// whose rows showed as one result under the first one's columns. An
+/// error after a result fails the statement.
+#[test]
+fn several_results_of_one_statement() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r66_r");
+    h.ok("create table r66_r (id int)");
+    h.ok("create rule r66_a as on insert to r66_r do also select 1 as a");
+    h.ok("create rule r66_b as on insert to r66_r do also select 'x' as b, 2 as c");
+    let id = 66;
+    let run = |h: &mut Harness, sql: &str, max_rows: usize| {
+        h.execute(id, sql, max_rows);
+        outline(h, id)
+    };
+    let more = "MoreResults { id: 66 }";
+    let two = ["cols a", more, "rows 1 false", "cols b c", "rows 1 false"];
+    assert_eq!(run(&mut h, "insert into r66_r values (1)", 10), two);
+    assert_eq!(
+        run(&mut h, "select 1 as a; select 'x' as b, 2 as c", 10),
+        two
+    );
+    assert_eq!(
+        run(
+            &mut h,
+            "create temp table r66_t (id int); select 3 as d",
+            10
+        ),
+        ["cols d", "rows 1 false"]
+    );
+    assert_eq!(
+        run(&mut h, "select 1 as a; select * from r66_no_such_table", 10),
+        ["cols a", more, "rows 1 false", "failed ERROR 42P01"]
+    );
+    // A result fetched batch by batch: the next one comes after its last.
+    let paged = "select n from generate_series(1, 15) n; select 'end' as e";
+    assert_eq!(run(&mut h, paged, 10), ["cols n", "rows 10 true"]);
+    h.session.send(DbRequest::FetchMore { id, max_rows: 10 });
+    assert_eq!(
+        outline(&mut h, id),
+        [more, "rows 5 false", "cols e", "rows 1 false"]
+    );
+    // One result, as before, with its types.
+    h.execute(id, "select 1 as a", 10);
+    let DbEvent::QueryStarted { columns, .. } = h.next_result() else {
+        panic!("expected QueryStarted")
+    };
+    assert!(columns[0].numeric);
+    assert_eq!(outline(&mut h, id), ["rows 1 false"]);
+    // A file has the first, and the others are said.
+    h.session.send(DbRequest::ExecuteWhole {
+        id,
+        sql: "select 1 as a; select 2 as b; select 3 as c".into(),
+        max_rows: 10,
+    });
+    let mut notices = Vec::new();
+    let mut shown = Vec::new();
+    loop {
+        match h.next() {
+            DbEvent::Transaction { .. } => break,
+            DbEvent::Notice(text) => notices.push(text),
+            DbEvent::QueryStarted { .. } => shown.push("cols"),
+            DbEvent::Rows { .. } => shown.push("rows"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(shown, ["cols", "rows"]);
+    assert_eq!(
+        notices,
+        ["The statement returned 2 more result(s); only the first was written to the file"]
+    );
+    h.ok("drop table r66_r");
+}
+
 #[test]
 fn closing_an_open_result_stops_the_server() {
     let Some(mut h) = Harness::connect() else {
@@ -457,27 +564,35 @@ fn closing_an_open_result_stops_the_server() {
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
 
     let started = Instant::now();
-    assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
+    h.execute(3, "select 'next'", 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 3, .. }
+    ));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("next"));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
 
-    // Fetching more of the closed result reports that there is no more.
+    // Fetching more of the closed result says it is closed.
     h.session.send(DbRequest::FetchMore {
         id: 1,
         max_rows: 10,
     });
-    let DbEvent::Rows { id, rows, more, .. } = h.next_result() else {
-        panic!("expected Rows")
-    };
-    assert_eq!((id, rows.len(), more), (1, 0, false));
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
 
     // A small result that is closed early needs no cancel.
     h.execute(2, "select n from generate_series(1, 30) n", 10);
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::Commit);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 2 }));
 
     // The cancel didn't hit a later statement.
     for i in 0..3 {

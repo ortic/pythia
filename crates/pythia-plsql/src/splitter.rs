@@ -505,7 +505,9 @@ impl<'a> Splitter<'a> {
         // What ends statements instead of `;` after MySQL's `DELIMITER x`.
         let mut delimiter = None;
         while i < self.tokens.len() {
-            if self.tokens[i].kind.is_trivia() {
+            // A `;` with no statement before it ends none (#313): `select
+            // 1;;`, a `;` on a line of its own.
+            if self.tokens[i].kind.is_trivia() || self.tokens[i].kind == TokenKind::Semicolon {
                 i += 1;
                 continue;
             }
@@ -679,6 +681,54 @@ mod tests {
             .iter()
             .map(|s| (s.kind, s.text(src)))
             .collect()
+    }
+
+    /// A `;` without a statement before it is none, and starts none
+    /// (#313): `select 1;;` sent `;` to the database, and a `;` on a line
+    /// of its own went with the next statement.
+    #[test]
+    fn lone_semicolons() {
+        for syntax in [
+            Syntax::Oracle,
+            Syntax::MySql,
+            Syntax::Postgres,
+            Syntax::TSql,
+            Syntax::Sqlite,
+        ] {
+            let sql = |src: &'static str| -> Vec<&'static str> {
+                split_in(src, syntax).into_iter().map(|(_, s)| s).collect()
+            };
+            assert_eq!(sql("select 1;;"), ["select 1"], "{syntax:?}");
+            assert_eq!(
+                sql("select 1;\n;\nselect 2;\n ; /* a */ ;\n"),
+                ["select 1", "select 2"],
+                "{syntax:?}"
+            );
+            assert_eq!(sql(";"), Vec::<&str>::new(), "{syntax:?}");
+            assert_eq!(sql(" ; -- a\n;"), Vec::<&str>::new(), "{syntax:?}");
+        }
+        // T-SQL's `;WITH`.
+        assert_eq!(
+            split_in(
+                "select 1\n;with c as (select 1 as a) select a from c",
+                Syntax::TSql
+            ),
+            [
+                (StatementKind::Sql, "select 1"),
+                (
+                    StatementKind::Sql,
+                    "with c as (select 1 as a) select a from c"
+                )
+            ]
+        );
+        // After MySQL's DELIMITER too.
+        assert_eq!(
+            split_in("DELIMITER //\nselect 1 //\n;\nselect 2 //", Syntax::MySql),
+            [
+                (StatementKind::Sql, "select 1"),
+                (StatementKind::Sql, "select 2")
+            ]
+        );
     }
 
     #[test]

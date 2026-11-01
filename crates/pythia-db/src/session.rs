@@ -406,7 +406,10 @@ impl Worker {
     }
 
     fn execute(&mut self, id: u64, sql: &str, max_rows: usize, binds: &[(String, Option<String>)]) {
-        self.open_query = None;
+        // The last query's rows left can't be fetched after it.
+        if let Some(open) = self.open_query.take() {
+            self.events.send(DbEvent::QueryClosed { id: open.id });
+        }
         let started = Instant::now();
         let done = match self.execute_inner(id, sql, max_rows, binds, started) {
             Ok(done) => done,
@@ -493,9 +496,10 @@ impl Worker {
     }
 
     fn fetch_more(&mut self, id: u64, max_rows: usize) {
-        if self.open_query.as_ref().is_some_and(|q| q.id == id)
-            && let Some(rows) = self.fetch(max_rows, Instant::now())
-        {
+        if self.open_query.as_ref().is_none_or(|q| q.id != id) {
+            // Closed by a statement after it in between.
+            self.events.send(DbEvent::QueryClosed { id });
+        } else if let Some(rows) = self.fetch(max_rows, Instant::now()) {
             self.events.send(rows);
         }
     }

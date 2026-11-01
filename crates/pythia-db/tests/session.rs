@@ -136,6 +136,46 @@ fn query_fetch_more_and_output() {
     assert_eq!(output, ["hello"]);
 }
 
+/// A query stays open over a Rollback; the next statement closes it with
+/// its rows left, and says so, as does a FetchMore after.
+#[test]
+fn the_next_statement_closes_a_query() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let execute = |h: &mut Harness, id, sql: &str| {
+        h.session.send(DbRequest::Execute {
+            id,
+            sql: sql.into(),
+            max_rows: 10,
+            binds: vec![],
+        })
+    };
+    execute(&mut h, 1, "select level from dual connect by level <= 25");
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 1, .. }
+    ));
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::Rollback);
+    assert!(matches!(h.next_result(), DbEvent::Notice(n) if n == "Rolled back"));
+    h.session.send(DbRequest::FetchMore { id: 1, max_rows: 5 });
+    let DbEvent::Rows { rows, more, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!((rows.len(), more), (5, true));
+
+    execute(&mut h, 2, "select 'next' from dual");
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 2, .. }
+    ));
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: false, .. }));
+    h.session.send(DbRequest::FetchMore { id: 1, max_rows: 5 });
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
+}
+
 #[test]
 fn errors_carry_ora_code() {
     let Some(mut h) = Harness::connect() else {
@@ -642,6 +682,8 @@ fn killed_session_is_reported_as_lost() {
         max_rows: 1,
         binds: vec![],
     });
+    // It closes the first query, whose one row filled its batch.
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
     match h.next_result() {
         DbEvent::Failed { error, .. } => assert!(error.is_connection_lost(), "{error:?}"),
         other => panic!("expected failure, got {other:?}"),

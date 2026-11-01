@@ -858,7 +858,11 @@ fn closing_an_open_result_stops_the_server() {
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
 
     let started = Instant::now();
-    let DbEvent::QueryStarted { .. } = h.run(2, "select 'next'") else {
+    assert!(matches!(
+        h.run(2, "select 'next'"),
+        DbEvent::QueryClosed { id: 1 }
+    ));
+    let DbEvent::QueryStarted { .. } = h.next_result() else {
         panic!("expected the next query to run")
     };
     let DbEvent::Rows { rows, .. } = h.next_result() else {
@@ -871,15 +875,12 @@ fn closing_an_open_result_stops_the_server() {
         started.elapsed()
     );
 
-    // Fetching more of the closed result reports that there is no more.
+    // Fetching more of the closed result says it is closed.
     h.session.send(DbRequest::FetchMore {
         id: 1,
         max_rows: 10,
     });
-    let DbEvent::Rows { id, rows, more, .. } = h.next_result() else {
-        panic!("expected Rows")
-    };
-    assert_eq!((id, rows.len(), more), (1, 0, false));
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
 
     // The kill didn't hit a later statement.
     for i in 0..3 {

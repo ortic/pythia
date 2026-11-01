@@ -505,6 +505,7 @@ impl PythiaApp {
         if !self.history.dirty {
             return;
         }
+        self.history.tidy();
         if let Some(paths) = &self.paths {
             // Another Pythia's statements stay (#196).
             match load_toml::<History>(&history_file(paths)) {
@@ -1657,6 +1658,14 @@ impl PythiaApp {
                 .is_some_and(|c| c.is_connected())
         {
             Some("Connect first: the plan comes from the database")
+        } else if task == Task::AnalyzePlan
+            && matches!(doc.map(|(_, d)| &d.kind), Some(DocKind::Sql(w)) if w.is_running())
+        {
+            // As Explain plan does (#269, #319).
+            Some(
+                "The plan is made in this window's session, which is running a statement: try \
+                 again once it's done",
+            )
         } else {
             None
         };
@@ -1703,6 +1712,11 @@ impl PythiaApp {
             parts.push(crate::ai::context::connection_part(server));
         }
         parts.extend(request.parts);
+        // A SQL window's are looked up in its own session, which sees what
+        // its statements did (#319), unless it is running one.
+        let window = origin.as_ref().map(|o| o.doc).filter(|doc| {
+            matches!(self.docs.get(doc).map(|d| &d.kind), Some(DocKind::Sql(w)) if !w.is_running())
+        });
         let entry = self
             .assistant
             .add(request.task, parts, origin, source, &backend);
@@ -1711,12 +1725,36 @@ impl PythiaApp {
                 let id = request_id();
                 self.assistant.look_up(entry, id);
                 let task = crate::ai::lookup::task(request.lookup);
-                self.conns.send_main(&name, DbRequest::Task { id, task });
+                let request = DbRequest::Task { id, task };
+                match window {
+                    Some(doc) => {
+                        let conn = self.conns.get(&name).expect("connected");
+                        let autocommit = self.autocommit_for(doc, conn);
+                        let conn = self.conns.get_mut(&name).expect("connected");
+                        conn.doc_session(doc, autocommit, &self.notify)
+                            .session
+                            .send(request);
+                    }
+                    None => {
+                        self.conns.send_main(&name, request);
+                    }
+                }
             }
             _ => self
                 .assistant
                 .ask(entry, &self.settings.ai, self.notify.callback()),
         }
+    }
+
+    /// The assistant's dictionary lookups are done: on to the model.
+    fn looked_up(&mut self, result: pythia_db::TaskResult) {
+        let parts = result.map_err(|e| e.to_string()).and_then(|any| {
+            any.downcast::<Vec<pythia_ai::Part>>()
+                .map(|parts| *parts)
+                .map_err(|_| "unexpected lookup result".to_owned())
+        });
+        self.assistant
+            .on_lookup(parts, &self.settings.ai, self.notify.callback());
     }
 
     fn assistant_actions(&mut self, actions: Vec<crate::ai::PanelAction>) {
@@ -3491,6 +3529,10 @@ impl PythiaApp {
                 // session's would: to a document or the browser.
                 SessionKey::Main | SessionKey::Meta => self.main_event(&name, event),
                 SessionKey::Doc(id) => match event {
+                    // A SQL window's lookups for the assistant (#319).
+                    DbEvent::TaskDone { id: task, result } if self.assistant.is_lookup(task) => {
+                        self.looked_up(result);
+                    }
                     DbEvent::TaskDone { id: task, result }
                         if self.debug_session_task == Some(task) =>
                     {
@@ -3699,13 +3741,7 @@ impl PythiaApp {
                 }
             }
             DbEvent::TaskDone { id, result } if self.assistant.is_lookup(id) => {
-                let parts = result.map_err(|e| e.to_string()).and_then(|any| {
-                    any.downcast::<Vec<pythia_ai::Part>>()
-                        .map(|parts| *parts)
-                        .map_err(|_| "unexpected lookup result".to_owned())
-                });
-                self.assistant
-                    .on_lookup(parts, &self.settings.ai, self.notify.callback());
+                self.looked_up(result);
             }
             DbEvent::Meta { id, result } if self.finder.pending == Some(id) => match result {
                 Ok(MetaResult::Objects(objects)) => self.finder.results(id, objects),
@@ -4720,6 +4756,8 @@ impl PythiaApp {
             None => {}
         }
         let connection = self.current_connection();
+        // Once a frame, for all the statements that ran in it (#318).
+        self.history.tidy();
         if let Some(sql) = self
             .history_dialog
             .ui(ctx, &self.history, connection.as_deref())

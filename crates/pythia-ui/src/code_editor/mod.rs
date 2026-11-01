@@ -300,6 +300,17 @@ impl CodeEditor {
         self.state.highlighter.syntax()
     }
 
+    /// Highlights `&name` as a substitution variable, or `&` as an operator
+    /// (#322), as a SQL window's `SET DEFINE` says; until set, on Oracle
+    /// only.
+    pub fn set_substitution(&mut self, substitution: bool) {
+        self.state.highlighter.set_substitution(substitution);
+    }
+
+    pub fn substitution(&self) -> bool {
+        self.state.highlighter.substitution()
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.state.rope.len_bytes()
     }

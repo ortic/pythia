@@ -1,9 +1,10 @@
 //! SQL Server sessions: the requests and events of an Oracle session, served
 //! by `tiberius` on a runtime of the worker's own.
 //!
-//! Statements are batches. A query's rows (of its first result set) are
-//! read while the worker waits for `FetchMore`s; any other request closes
-//! the result, and the driver reads the rest of it before the next request.
+//! Statements are batches, each of whose result sets is a result. A
+//! result's rows are read while the worker waits for `FetchMore`s; any
+//! other request closes it, and the driver reads the rest of the batch
+//! before the next request.
 //!
 //! Break sends TDS's attention signal, which stops the batch on the server
 //! at once. The server acknowledges it with a reply of its own, which
@@ -132,12 +133,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
                 next = worker.execute(id, &sql, max_rows, &[], &requests, true)
             }
             // Its result was closed by another request in between.
-            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::Rows {
-                id,
-                rows: Vec::new(),
-                more: false,
-                elapsed: Duration::ZERO,
-            }),
+            DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::QueryClosed { id }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
                 let result = crate::mssql_meta::run(&mut worker.ms(), &query);
@@ -587,7 +583,7 @@ impl Worker {
             None => return Ok(Ran::Break("Cancelled")),
         };
 
-        let columns = loop {
+        let mut columns = loop {
             let item = wait(rt, cancel, &mut stream);
             report_messages(&mut stream, events);
             match item {
@@ -600,95 +596,114 @@ impl Worker {
                 Wait::Cancel => return Ok(Ran::Break("Cancelled")),
             }
         };
-        events.send(DbEvent::QueryStarted { id, columns });
 
-        let mut max_rows = max_rows;
         let mut started = started;
+        // Each result set of the batch is a result, fetched in batches; the
+        // next comes once all rows of the one before were read, announced
+        // by `MoreResults` before its last rows, as on MySQL (#290, #316).
         loop {
-            let mut rows = Vec::with_capacity(max_rows.min(10_000));
-            let mut more = true;
-            let mut cancelled = false;
-            // Result sets after the first.
-            let mut sets = 0;
-            let mut bytes = 0;
-            while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
-                match wait(rt, cancel, &mut stream) {
-                    Wait::Item(Some(Ok(QueryItem::Row(row)))) => {
-                        let cells = cells(&row, whole);
-                        if whole {
-                            bytes += row_bytes(&cells);
+            events.send(DbEvent::QueryStarted { id, columns });
+            let mut max_rows = max_rows;
+            // What follows the result: the next one's columns, or the error
+            // that ends the batch.
+            let after = loop {
+                let mut rows = Vec::with_capacity(max_rows.min(10_000));
+                let mut after = None;
+                let mut more = true;
+                let mut cancelled = false;
+                let mut bytes = 0;
+                while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
+                    match wait(rt, cancel, &mut stream) {
+                        Wait::Item(Some(Ok(QueryItem::Row(row)))) => {
+                            let cells = cells(&row, whole);
+                            if whole {
+                                bytes += row_bytes(&cells);
+                            }
+                            rows.push(cells);
                         }
-                        rows.push(cells);
-                    }
-                    // The next result set: the first one is complete.
-                    Wait::Item(Some(Ok(QueryItem::Metadata(_)))) => {
-                        sets = 1;
-                        more = false;
-                        break;
-                    }
-                    Wait::Item(None) => {
-                        more = false;
-                        break;
-                    }
-                    Wait::Item(Some(Err(e))) => {
-                        report_messages(&mut stream, events);
-                        return Err(failed(e));
-                    }
-                    Wait::Cancel => {
-                        cancelled = true;
-                        break;
-                    }
-                }
-            }
-            if cancelled {
-                events.send(DbEvent::Rows {
-                    id,
-                    rows,
-                    more: false,
-                    elapsed: started.elapsed(),
-                });
-                report_messages(&mut stream, events);
-                return Ok(Ran::Break("Cancelled while fetching"));
-            }
-            events.send(DbEvent::Rows {
-                id,
-                rows,
-                more,
-                elapsed: started.elapsed(),
-            });
-            report_messages(&mut stream, events);
-            if !more {
-                // The rest of the batch runs; only its first result shows.
-                while let Some(item) = rt.block_on(stream.next()) {
-                    report_messages(&mut stream, events);
-                    match item {
-                        Ok(QueryItem::Metadata(_)) => sets += 1,
-                        Ok(QueryItem::Row(_)) => {}
-                        Err(e) => {
-                            events.send(DbEvent::Error(failed_error(e, sql)));
+                        Wait::Item(Some(Ok(QueryItem::Metadata(meta)))) => {
+                            after = Some(Ok(meta.columns().iter().map(column).collect()));
+                            more = false;
+                            break;
+                        }
+                        Wait::Item(Some(Err(e))) => {
+                            after = Some(Err(e));
+                            more = false;
+                            break;
+                        }
+                        Wait::Item(None) => {
+                            more = false;
+                            break;
+                        }
+                        Wait::Cancel => {
+                            cancelled = true;
                             break;
                         }
                     }
                 }
-                if sets > 0 {
+                if cancelled {
+                    events.send(DbEvent::Rows {
+                        id,
+                        rows,
+                        more: false,
+                        elapsed: started.elapsed(),
+                    });
+                    report_messages(&mut stream, events);
+                    return Ok(Ran::Break("Cancelled while fetching"));
+                }
+                // A file has the first result only.
+                if after.is_some() && !whole {
+                    events.send(DbEvent::MoreResults { id });
+                }
+                events.send(DbEvent::Rows {
+                    id,
+                    rows,
+                    more,
+                    elapsed: started.elapsed(),
+                });
+                report_messages(&mut stream, events);
+                if !more {
+                    break after;
+                }
+                match requests.recv() {
+                    Ok(DbRequest::FetchMore {
+                        id: wanted,
+                        max_rows: n,
+                    }) if wanted == id => {
+                        max_rows = n;
+                        started = Instant::now();
+                    }
+                    other => {
+                        // The driver reads the rest before the next request.
+                        events.send(DbEvent::QueryClosed { id });
+                        *next = Some(other.unwrap_or(DbRequest::Disconnect));
+                        return Ok(Ran::Outcome(Outcome::Query));
+                    }
+                }
+            };
+            match after {
+                None => return Ok(Ran::Outcome(Outcome::Query)),
+                Some(Err(e)) => return Err(failed(e)),
+                Some(Ok(_)) if whole => {
+                    // The rest of the batch runs, and is said.
+                    let mut sets = 1;
+                    while let Some(item) = rt.block_on(stream.next()) {
+                        report_messages(&mut stream, events);
+                        match item {
+                            Ok(QueryItem::Metadata(_)) => sets += 1,
+                            Ok(QueryItem::Row(_)) => {}
+                            Err(e) => return Err(failed(e)),
+                        }
+                    }
                     events.send(DbEvent::Notice(format!(
-                        "The batch returned {sets} more result set(s); only the first is shown"
+                        "The batch returned {sets} more result set(s); only the first was \
+                         written to the file"
                     )));
-                }
-                return Ok(Ran::Outcome(Outcome::Query));
-            }
-            match requests.recv() {
-                Ok(DbRequest::FetchMore {
-                    id: wanted,
-                    max_rows: n,
-                }) if wanted == id => {
-                    max_rows = n;
-                    started = Instant::now();
-                }
-                other => {
-                    // The driver reads the rest before the next request.
-                    *next = Some(other.unwrap_or(DbRequest::Disconnect));
                     return Ok(Ran::Outcome(Outcome::Query));
+                }
+                Some(Ok(next_columns)) => {
+                    columns = next_columns;
+                    started = Instant::now();
                 }
             }
         }
