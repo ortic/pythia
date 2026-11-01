@@ -681,7 +681,11 @@ fn view_ddl(
 /// `CREATE SEQUENCE` of a sequence as stored, without its `;`, and its oid,
 /// if there is one. `owned` names the column that owns it (`serial`, `OWNED
 /// BY`), so that a copy goes with the copy's column (#307); a table's DDL
-/// makes the column the owner after the table.
+/// makes the column the owner after the table. An identity column's
+/// sequence is made by its table's DDL (#263): its own says so and sets the
+/// identity's options, which next to a copy of the table gives the copy's
+/// identity the same and elsewhere fails, where a `CREATE SEQUENCE` made a
+/// sequence no column uses (#332).
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -689,12 +693,12 @@ fn sequence_ddl(
     owned: bool,
 ) -> Result<Option<(String, String)>, DbError> {
     let row = pg.first(
-        "select c.oid, format_type(s.seqtypid, null), s.seqincrement, s.seqmin, s.seqmax, \
-                s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
+        "select c.oid, d.deptype, format_type(s.seqtypid, null), s.seqincrement, s.seqmin, \
+                s.seqmax, s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
            from pg_sequence s join pg_class c on c.oid = s.seqrelid \
            join pg_namespace n on n.oid = c.relnamespace \
            left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
-                and d.refclassid = 'pg_class'::regclass and d.deptype = 'a' \
+                and d.refclassid = 'pg_class'::regclass and d.deptype in ('a', 'i') \
            left join pg_class t on t.oid = d.refobjid \
            left join pg_namespace tn on tn.oid = t.relnamespace \
            left join pg_attribute a on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
@@ -702,15 +706,36 @@ fn sequence_ddl(
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let (oid, row) = row.split_at(1);
+        let (head, row) = row.split_at(2);
         let (v, column) = row.split_at(7);
         let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
-        let owned_by = match column {
-            [Some(schema), Some(table), Some(column)] if owned => format!(
-                "\n  owned by {}.{}",
+        let oid = head[0].clone().unwrap_or_default();
+        let column = match column {
+            [Some(schema), Some(table), Some(column)] => Some((
                 Dialect::POSTGRES.qualified(schema, table),
-                Dialect::POSTGRES.quote_ident(column)
-            ),
+                Dialect::POSTGRES.quote_ident(column),
+            )),
+            _ => None,
+        };
+        if let Some((table, column)) = &column
+            && head[1].as_deref() == Some("i")
+        {
+            let alter = format!(
+                "-- The sequence of the identity column {table}.{column}, made by the table's DDL.\n\
+                 alter table {table} alter column {column}\n  \
+                 set increment by {} set minvalue {} set maxvalue {}\n  \
+                 set start with {} set cache {} set {}",
+                v[1],
+                v[2],
+                v[3],
+                v[4],
+                v[5],
+                if v[6] == "t" { "cycle" } else { "no cycle" }
+            );
+            return (oid, alter);
+        }
+        let owned_by = match column {
+            Some((table, column)) if owned => format!("\n  owned by {table}.{column}"),
             _ => String::new(),
         };
         let create = format!(
@@ -725,7 +750,7 @@ fn sequence_ddl(
             v[5],
             if v[6] == "t" { " cycle" } else { "" }
         );
-        (oid[0].clone().unwrap_or_default(), create)
+        (oid, create)
     }))
 }
 

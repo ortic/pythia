@@ -841,6 +841,12 @@ All notable changes to Pythia are documented here. The format follows
   privileges for any role but its owner, and a routine whose `EXECUTE`
   was revoked from `PUBLIC` could be run by every role again: its DDL
   now revokes that too.
+- PostgreSQL: the DDL of an identity column's sequence says that the
+  table's DDL makes it, and sets the identity's options (#332), `alter
+  table shop.orders alter column id set increment by 3 …`. It was a
+  `create sequence`, which next to a copy of the table failed with
+  `relation … already exists`, and elsewhere made a sequence no column
+  used.
 
 ## [0.10.0] - 2026-10-30
 
