@@ -1181,35 +1181,62 @@ impl PythiaApp {
     }
 
     /// Closes windows; for those with an open transaction it asks first
-    /// whether to commit or roll it back.
+    /// whether to commit or roll it back, and for those whose results have
+    /// changes that weren't applied whether to discard them (#245).
     fn close_windows(&mut self, ids: Vec<DocId>) {
-        let (open, idle): (Vec<DocId>, Vec<DocId>) =
-            ids.into_iter().partition(|id| self.has_pending_tx(*id));
+        let (asked, idle): (Vec<DocId>, Vec<DocId>) = ids
+            .into_iter()
+            .partition(|id| self.has_pending_tx(*id) || self.has_unapplied_edits(*id));
         for id in idle {
             self.remove_window(id);
         }
-        if open.is_empty() {
+        let Some(&first) = asked.first() else {
             return;
-        }
-        let names: Vec<String> = open
-            .iter()
-            .filter_map(|id| self.docs.get(id))
-            .map(Document::title)
-            .collect();
-        let text = match names.as_slice() {
-            [one] => format!("{one} has uncommitted changes."),
-            many => format!("{} have uncommitted changes.", many.join(", ")),
         };
-        if let Some(&first) = open.first() {
-            self.open_tab(Tab::Doc(first));
+        let titles = |keep: &dyn Fn(DocId) -> bool| -> Vec<String> {
+            asked
+                .iter()
+                .filter(|id| keep(**id))
+                .filter_map(|id| self.docs.get(id))
+                .map(Document::title)
+                .collect()
+        };
+        let open = titles(&|id| self.has_pending_tx(id));
+        let edited = titles(&|id| self.has_unapplied_edits(id));
+        let mut text = Vec::new();
+        match open.as_slice() {
+            [] => {}
+            [one] => text.push(format!("{one} has uncommitted changes.")),
+            many => text.push(format!("{} have uncommitted changes.", many.join(", "))),
         }
-        self.confirm = Some(Confirm {
-            action: ConfirmAction::CloseWindows(open),
-            title: "Uncommitted transaction".into(),
-            text,
-            yes: "Commit and close",
-            other: Some("Roll back and close"),
+        if !edited.is_empty() {
+            text.push(unapplied_text(&edited, "Closing"));
+        }
+        let text = text.join(" ");
+        self.open_tab(Tab::Doc(first));
+        self.confirm = Some(if open.is_empty() {
+            Confirm {
+                action: ConfirmAction::DiscardWindows(asked),
+                title: "Changes not applied".into(),
+                text,
+                yes: "Discard and close",
+                other: None,
+            }
+        } else {
+            Confirm {
+                action: ConfirmAction::CloseWindows(asked),
+                title: "Uncommitted transaction".into(),
+                text,
+                yes: "Commit and close",
+                other: Some("Roll back and close"),
+            }
         });
+    }
+
+    fn has_unapplied_edits(&self, id: DocId) -> bool {
+        self.docs
+            .get(&id)
+            .is_some_and(Document::has_unapplied_edits)
     }
 
     /// Takes a window's tab out of the dock and closes it.
@@ -4422,17 +4449,45 @@ impl PythiaApp {
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && !self.quit_confirmed && self.conns.any_pending_tx() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm = Some(Confirm {
-                action: ConfirmAction::Quit,
-                title: "Uncommitted transaction".into(),
-                text: "There are sessions with uncommitted changes. Exiting rolls them back."
-                    .into(),
-                yes: "Exit and roll back",
-                other: None,
-            });
+        if !close_requested || self.quit_confirmed {
+            return;
         }
+        let pending = self.conns.any_pending_tx();
+        let edited: Vec<String> = self
+            .docs
+            .values()
+            .filter(|d| d.has_unapplied_edits())
+            .map(Document::title)
+            .collect();
+        if !pending && edited.is_empty() {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let mut text = Vec::new();
+        if pending {
+            text.push(
+                "There are sessions with uncommitted changes. Exiting rolls them back.".to_owned(),
+            );
+        }
+        if !edited.is_empty() {
+            text.push(unapplied_text(&edited, "Exiting"));
+        }
+        self.confirm = Some(Confirm {
+            action: ConfirmAction::Quit,
+            title: if pending {
+                "Uncommitted transaction"
+            } else {
+                "Changes not applied"
+            }
+            .into(),
+            text: text.join(" "),
+            yes: if pending {
+                "Exit and roll back"
+            } else {
+                "Exit and discard"
+            },
+            other: None,
+        });
     }
 
     fn about_ui(&mut self, ctx: &egui::Context) {
@@ -4667,6 +4722,11 @@ impl PythiaApp {
                         self.quit_confirmed = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    ConfirmAction::DiscardWindows(ids) => {
+                        for id in ids {
+                            self.remove_window(id);
+                        }
+                    }
                     ConfirmAction::CloseWindows(_) | ConfirmAction::Activate(_) => {}
                 }
             }
@@ -4838,6 +4898,12 @@ impl eframe::App for PythiaApp {
             .focused
             .and_then(|id| self.docs.get(&id))
             .map(Document::title);
+        let unapplied: HashSet<DocId> = self
+            .docs
+            .iter()
+            .filter(|(_, d)| d.has_unapplied_edits())
+            .map(|(id, _)| *id)
+            .collect();
         let mut viewer = Viewer {
             docs: &mut self.docs,
             browser: &mut self.browser,
@@ -4865,6 +4931,7 @@ impl eframe::App for PythiaApp {
             close_asked: Vec::new(),
             rebind: Vec::new(),
             pending_tx: &pending_tx,
+            unapplied: &unapplied,
             active: self.active.as_deref(),
             kept_open: Vec::new(),
         };
@@ -5624,6 +5691,8 @@ struct Viewer<'a> {
     rebind: Vec<(DocId, String)>,
     /// Documents whose session has a pending transaction.
     pending_tx: &'a HashSet<DocId>,
+    /// Documents whose results have changes that weren't applied.
+    unapplied: &'a HashSet<DocId>,
     /// The active connection.
     active: Option<&'a str>,
     /// Tabs whose close button was released beside it.
@@ -5811,8 +5880,8 @@ impl TabViewer for Viewer<'_> {
             return egui_dock::widgets::tab_viewer::OnCloseResponse::Ignore;
         }
         if let Tab::Doc(id) = tab {
-            if self.pending_tx.contains(id) {
-                // Asked first: commit, roll back or keep it.
+            if self.pending_tx.contains(id) || self.unapplied.contains(id) {
+                // Asked first: commit, roll back, discard or keep it.
                 self.close_asked.push(*id);
                 return egui_dock::widgets::tab_viewer::OnCloseResponse::Ignore;
             }
@@ -5841,6 +5910,20 @@ impl TabViewer for Viewer<'_> {
             style.tab_body.inner_margin = egui::Margin::ZERO;
             style
         })
+    }
+}
+
+/// What closing or exiting (`doing`) does to the changes in the results of
+/// the windows `titles` that weren't applied.
+fn unapplied_text(titles: &[String], doing: &str) -> String {
+    match titles {
+        [one] => {
+            format!("{one} has changes in its results that weren't applied. {doing} discards them.")
+        }
+        many => format!(
+            "{} have changes in their results that weren't applied. {doing} discards them.",
+            many.join(", ")
+        ),
     }
 }
 

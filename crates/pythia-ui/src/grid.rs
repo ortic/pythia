@@ -459,6 +459,18 @@ impl GridState {
         self.edit.as_ref().map(|e| &e.changes)
     }
 
+    /// Edits not applied yet: changes waiting for Apply, or a value being
+    /// typed into a cell.
+    pub fn has_unapplied(&self, rows: &[Vec<Cell>]) -> bool {
+        let Some(edit) = &self.edit else {
+            return false;
+        };
+        !edit.changes.is_empty()
+            || edit.active.as_ref().is_some_and(|(row, col, text)| {
+                self.value(rows, *row, *col).unwrap_or_default() != text
+            })
+    }
+
     pub fn clear_changes(&mut self) {
         if let Some(e) = &mut self.edit {
             e.changes = Changes::default();

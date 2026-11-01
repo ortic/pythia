@@ -281,6 +281,11 @@ All notable changes to Pythia are documented here. The format follows
 - A tab's ✕ closes the tab only when it is released on the ✕ (#244).
   Pressed, then released a few points beside it, it closed the tab too,
   so sliding off the ✕ to back out didn't always work.
+- Closing a SQL window, or exiting Pythia, asks first when its results
+  have changes that weren't applied (#245). A value being typed into a
+  cell and the changes waiting for *Apply* were dropped without a word;
+  only an uncommitted transaction was asked about. *Discard and close*
+  (or *Exit and discard*) goes ahead, *Cancel* keeps them.
 
 ## [0.10.0] - 2026-10-30
 

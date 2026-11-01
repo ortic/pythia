@@ -5010,6 +5010,99 @@ fn tab_closes_when_released_on_its_close_button() {
     assert_eq!(windows(&h), open - 1, "clicked");
 }
 
+/// Closing a SQL window, or Pythia, with changes to its results that
+/// weren't applied asks first (#245): a value being typed into a cell, and
+/// the changes waiting for Apply, were dropped without a word.
+#[test]
+fn unapplied_result_changes_are_asked_about() {
+    use crate::commands::Command;
+    let connection = "unapplied.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table ua_t (id integer primary key, name text);\n\
+         insert into ua_t values (1, 'one'), (2, 'two');\ncommit;",
+    );
+    let editable = |h: &mut Ui| {
+        h.state_mut().test_open(OpenRequest::Sql {
+            connection: connection.into(),
+            text: "select id, name from ua_t order by id".into(),
+            run: true,
+        });
+        wait_until(h, "query", |app| !app.test_focused_busy());
+        h.state_mut()
+            .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+        wait_until(h, "editing", |app| !app.test_focused_busy());
+        h.run_steps(2);
+        h.state().test_focused()
+    };
+    let asked = |h: &Ui| h.query_by_label_contains("weren't applied").is_some();
+
+    // Typing into a cell, then Ctrl+W: asked, Cancel keeps the window.
+    let window = editable(&mut h);
+    h.get_by_label("one").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    h.event(egui::Event::Text("changed".into()));
+    h.run_steps(2);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    assert!(asked(&h), "a value being typed");
+    save(&mut h, "close-unapplied-changes");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused(), window);
+    h.state_mut().test_command(Command::CloseTab);
+    h.run_steps(2);
+    h.get_by_label("Discard and close").click();
+    h.run_steps(2);
+    assert_ne!(h.state().test_focused(), window, "closed");
+
+    // A change waiting for Apply, and the tab's close button.
+    let window = editable(&mut h);
+    {
+        let w = h.state_mut().test_sql_window();
+        let r = &mut w.state.results[0];
+        let rows = r.rows.clone();
+        r.grid.edit_cell(&rows, 1, 1, Some("edited".into()));
+    }
+    let (from, to, y) = close_button(&mut h, crate::app::Tab::Doc(window));
+    press(&mut h, egui::pos2((from + to) / 2.0, y), true);
+    press(&mut h, egui::pos2((from + to) / 2.0, y), false);
+    h.run_steps(2);
+    assert!(asked(&h), "a change to apply");
+    assert_eq!(h.state().test_focused(), window);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+
+    // Exiting Pythia.
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    h.step();
+    let commands = |h: &Ui| -> Vec<egui::ViewportCommand> {
+        h.output()
+            .viewport_output
+            .values()
+            .flat_map(|v| v.commands.clone())
+            .collect()
+    };
+    assert!(commands(&h).contains(&egui::ViewportCommand::CancelClose));
+    if let Some(root) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        root.events.clear();
+    }
+    h.run_steps(2);
+    assert!(asked(&h), "exiting");
+    h.get_by_label("Exit and discard").click();
+    h.step();
+    assert!(commands(&h).contains(&egui::ViewportCommand::Close));
+}
+
 /// Favorites, recently opened objects and the invalid-only filter.
 #[test]
 fn browser_marks() {
