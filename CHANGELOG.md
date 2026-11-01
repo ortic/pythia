@@ -396,6 +396,13 @@ All notable changes to Pythia are documented here. The format follows
   cell and the changes waiting for *Apply* were dropped without a word;
   only an uncommitted transaction was asked about. *Discard and close*
   (or *Exit and discard*) goes ahead, *Cancel* keeps them.
+- The connect dialog no longer saves a connection over another one
+  (#246). *Save* under another saved connection's name replaced that
+  connection and its saved passwords; *Connect* after renaming one saved
+  it as a new connection next to the old one, "super" next to "Super".
+  A name another connection has, in any case, is now refused with a
+  message, for *Save* and *Connect*; a connection can still change the
+  case of its own name, and *Connect* renames it as *Save* does.
 
 ## [0.10.0] - 2026-10-30
 

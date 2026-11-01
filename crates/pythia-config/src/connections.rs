@@ -142,6 +142,40 @@ impl Connections {
             None => self.profiles.push(profile),
         }
     }
+
+    /// The profile other than `previous` (the one being changed) whose
+    /// display name is `name`, but for case: saving under `name` would
+    /// replace it. None when `name` is `previous`'s own.
+    pub fn taken_by(&self, name: &str, previous: Option<&str>) -> Option<&ConnectionProfile> {
+        if previous == Some(name) {
+            return None;
+        }
+        let name = name.to_lowercase();
+        self.profiles.iter().find(|p| {
+            let other = p.display_name();
+            Some(other.as_str()) != previous && other.to_lowercase() == name
+        })
+    }
+
+    /// Saves `profile` in place of `previous`, the profile it was (by its
+    /// display name), or as a new one. When another profile has its name,
+    /// but for case, that one stays and the error is its name (#246).
+    pub fn save(
+        &mut self,
+        profile: ConnectionProfile,
+        previous: Option<&str>,
+    ) -> Result<(), String> {
+        let name = profile.display_name();
+        if let Some(other) = self.taken_by(&name, previous) {
+            return Err(other.display_name());
+        }
+        let was = previous.unwrap_or(&name);
+        match self.profiles.iter_mut().find(|p| p.display_name() == was) {
+            Some(existing) => *existing = profile,
+            None => self.upsert(profile),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +211,60 @@ mod tests {
             let text = toml::to_string(&profile).unwrap();
             assert!(text.contains(&format!("kind = \"{name}\"")), "{text}");
         }
+    }
+
+    #[test]
+    fn saved_under_their_own_name() {
+        let profile = |name: &str, user: &str| ConnectionProfile {
+            name: name.into(),
+            username: user.into(),
+            ..Default::default()
+        };
+        let mut saved = Connections {
+            profiles: vec![profile("super", "a"), profile("other", "b")],
+        };
+        let listed = |saved: &Connections| -> Vec<(String, String)> {
+            saved
+                .profiles
+                .iter()
+                .map(|p| (p.name.clone(), p.username.clone()))
+                .collect()
+        };
+        // Another one's name, but for case: refused, it stays.
+        for name in ["super", "Super", "SUPER"] {
+            let refused = Err("super".to_owned());
+            assert_eq!(saved.save(profile(name, "b"), Some("other")), refused);
+            assert_eq!(saved.save(profile(name, "new"), None), refused);
+        }
+        assert_eq!(
+            listed(&saved),
+            [("super".into(), "a".into()), ("other".into(), "b".into())]
+        );
+        // Its own name in another case: renamed, in its place.
+        assert_eq!(saved.save(profile("Super", "a"), Some("super")), Ok(()));
+        assert_eq!(saved.save(profile("Super", "a2"), Some("Super")), Ok(()));
+        assert_eq!(saved.save(profile("third", "c"), None), Ok(()));
+        assert_eq!(
+            listed(&saved),
+            [
+                ("Super".into(), "a2".into()),
+                ("other".into(), "b".into()),
+                ("third".into(), "c".into())
+            ]
+        );
+        // Unnamed ones go by user@database.
+        let mut saved = Connections {
+            profiles: vec![ConnectionProfile {
+                username: "hr".into(),
+                connect_string: "xe".into(),
+                ..Default::default()
+            }],
+        };
+        let other = ConnectionProfile {
+            name: "HR@XE".into(),
+            ..Default::default()
+        };
+        assert_eq!(saved.save(other, None), Err("hr@xe".to_owned()));
     }
 
     #[test]
