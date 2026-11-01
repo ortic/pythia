@@ -635,6 +635,12 @@ All notable changes to Pythia are documented here. The format follows
   statement rolls back; with a transaction pending in the window it
   stops at its `begin`, before anything changed. PostgreSQL's drops and
   creates the view in one `DO` block, which waits for Commit.
+- SQL Server: *Indexes*, *Constraints*, *Triggers* and a table's *DDL*
+  work on SQL Server 2016 and in a database at compatibility level 100
+  (#294), as one moved from SQL Server 2008 is. On 2016 they failed with
+  "'string_agg' is not a recognized built-in function name", and at
+  level 100 all but *Triggers* with "Incorrect syntax near '('". What
+  they show is as before.
 
 ## [0.10.0] - 2026-10-30
 

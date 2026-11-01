@@ -23,6 +23,12 @@ fn params() -> Option<ConnectParams> {
     from_spec(&std::env::var("PYTHIA_TEST_MSSQL").ok()?)
 }
 
+/// The DBA's login (`PYTHIA_TEST_MSSQL_DBA`), for tests that make
+/// databases of their own.
+fn dba_params() -> Option<ConnectParams> {
+    from_spec(&std::env::var("PYTHIA_TEST_MSSQL_DBA").ok()?)
+}
+
 /// The database through the SSH server, trusting the host keys kept in
 /// `known_hosts`.
 fn ssh_params(known_hosts: &Path) -> Option<ConnectParams> {
@@ -1137,6 +1143,161 @@ fn xml_spatial_and_ordered_indexes() {
     h.ok("drop table r53_copy.r53_xg, r53_copy.r53_ord");
     h.ok("drop schema r53_copy");
     h.ok("drop table r53_xg, r53_ord");
+}
+
+/// A database of the test's own, made afresh by `dba` and set up with
+/// `setup` (`{db}` is its name); the harness is connected to it, in
+/// autocommit.
+fn own_database(dba: &mut Harness, name: &str, setup: &[&str]) -> Harness {
+    drop_database(dba, name);
+    dba.ok(&format!("create database [{name}]"));
+    for sql in setup {
+        dba.ok(&sql.replace("{db}", name));
+    }
+    let mut params = dba_params().expect("the DBA's login");
+    let (server, rest) = params.connect_string.rsplit_once('/').expect("a database");
+    let options = rest.find('?').map_or("", |i| &rest[i..]);
+    params.connect_string = format!("{server}/{name}{options}");
+    let h = Harness::with(params);
+    h.session.send(DbRequest::SetAutocommit(true));
+    h
+}
+
+/// Drops a database `own_database` made, and the sessions still in it.
+fn drop_database(dba: &mut Harness, name: &str) {
+    dba.ok(&format!(
+        "if db_id('{name}') is not null begin \
+           alter database [{name}] set single_user with rollback immediate; \
+           drop database [{name}]; \
+         end"
+    ));
+}
+
+/// A table's details and DDL as lines: Indexes, Constraints and Triggers,
+/// each with its columns' names first, then the DDL.
+fn table_dictionary(h: &mut Harness, owner: &str, table: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for detail in [Detail::Indexes, Detail::Constraints, Detail::Triggers] {
+        let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+            owner: owner.into(),
+            name: table.into(),
+            detail,
+        }) else {
+            panic!("expected a table")
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        lines.push(names.join(" | "));
+        for row in rows {
+            let values: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+            lines.push(values.join(" | "));
+        }
+    }
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: table.into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    lines.extend(ddl.lines().map(str::to_owned));
+    lines
+}
+
+/// Indexes, Constraints, Triggers and a table's DDL in a database at
+/// compatibility level 100, as one from SQL Server 2008 is, read as at
+/// 160 (#294): there string_agg's WITHIN GROUP is a syntax error, and SQL
+/// Server 2016 has no string_agg at all.
+#[test]
+fn dictionary_at_compatibility_level_100() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(&mut dba, "r63_compat", &[]);
+    for sql in [
+        "create table r63_dept (deptno int constraint r63_dept_pk primary key, \
+         site int not null, name varchar(30) not null, \
+         constraint r63_dept_site unique (site desc, deptno))",
+        "create table r63_emp (empno int constraint r63_emp_pk primary key nonclustered, \
+         deptno int, site int, sal decimal(8,2) constraint r63_emp_sal default 0, \
+         [na,me] varchar(30), \
+         constraint r63_emp_fk foreign key (site, deptno) references r63_dept (site, deptno) \
+           on delete cascade, \
+         constraint r63_emp_sal_ck check (sal >= 0))",
+        "create clustered index r63_emp_name on r63_emp ([na,me], empno desc)",
+        "create index r63_emp_cover on r63_emp (deptno) include (sal, [na,me]) \
+         where deptno is not null",
+        "create nonclustered columnstore index r63_emp_store on r63_emp (sal, site)",
+        "create trigger r63_emp_tr on r63_emp after delete, insert, update as set nocount on",
+        "create trigger r63_emp_ins on r63_emp after insert as set nocount on",
+    ] {
+        h.ok(sql);
+    }
+    let read = |h: &mut Harness| {
+        let mut lines = table_dictionary(h, "dbo", "r63_dept");
+        lines.extend(table_dictionary(h, "dbo", "r63_emp"));
+        lines
+    };
+    // As string_agg made them.
+    let expected = [
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
+        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  | ",
+        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  | ",
+        "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
+        "r63_dept_pk | Primary key | deptno | ",
+        "r63_dept_site | Unique | site, deptno | ",
+        "TRIGGER_NAME | TRIGGERING_EVENT | TIMING | STATUS",
+        "create table [dbo].[r63_dept] (",
+        "    [deptno] int not null,",
+        "    [site] int not null,",
+        "    [name] varchar(30) not null,",
+        "    constraint [r63_dept_pk] primary key clustered ([deptno]),",
+        "    constraint [r63_dept_site] unique nonclustered ([site] desc, [deptno])",
+        ");",
+        "GO",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
+        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  | ",
+        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL)",
+        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  | ",
+        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  | ",
+        "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
+        "r63_emp_pk | Primary key | empno | ",
+        "r63_emp_fk | Foreign key | site, deptno | dbo.r63_dept",
+        "r63_emp_sal_ck | Check | ([sal]>=(0)) | ",
+        "r63_emp_sal | Default | sal ((0)) | ",
+        "TRIGGER_NAME | TRIGGERING_EVENT | TIMING | STATUS",
+        "r63_emp_ins | INSERT | AFTER | ENABLED",
+        "r63_emp_tr | INSERT, UPDATE, DELETE | AFTER | ENABLED",
+        "create table [dbo].[r63_emp] (",
+        "    [empno] int not null,",
+        "    [deptno] int null,",
+        "    [site] int null,",
+        "    [sal] decimal(8,2) null constraint [r63_emp_sal] default ((0)),",
+        "    [na,me] varchar(30) null,",
+        "    constraint [r63_emp_pk] primary key nonclustered ([empno]),",
+        "    constraint [r63_emp_fk] foreign key ([site], [deptno]) references [dbo].[r63_dept] \
+         ([site], [deptno]) on delete cascade,",
+        "    constraint [r63_emp_sal_ck] check ([sal]>=(0))",
+        ");",
+        "",
+        "create nonclustered index [r63_emp_cover] on [dbo].[r63_emp] ([deptno]) \
+         include ([sal], [na,me]) where ([deptno] IS NOT NULL);",
+        "",
+        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
+        "",
+        "create nonclustered columnstore index [r63_emp_store] on [dbo].[r63_emp] \
+         ([sal], [site]);",
+        "GO",
+    ];
+    for level in [160, 100] {
+        h.ok(&format!(
+            "alter database current set compatibility_level = {level}"
+        ));
+        assert_eq!(read(&mut h), expected, "at {level}");
+    }
+    drop(h);
+    drop_database(&mut dba, "r63_compat");
 }
 
 /// Waits for a session's connect to fail.

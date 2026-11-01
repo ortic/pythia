@@ -4,6 +4,8 @@
 //! of their own, so it is put together from the catalog; routines, views
 //! and triggers keep their source as written.
 
+use std::collections::HashMap;
+
 use crate::dialect::Dialect;
 use crate::meta::{
     CompileError, DbObject, Detail, MetaQuery, MetaResult, ObjectType, PlanStep, TableColumn,
@@ -220,23 +222,12 @@ fn details(
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
     let sql = match detail {
-        // Every column of a columnstore index (types 5 and 6) counts as
-        // included: they are its columns, not INCLUDE columns (#252).
         Detail::Indexes => {
             "select i.name as INDEX_NAME, i.type_desc as INDEX_TYPE, \
                     case when i.is_primary_key = 1 then 'PRIMARY' when i.is_unique = 1 then 'UNIQUE' \
                          else 'NONUNIQUE' end as UNIQUENESS, \
-                    (select string_agg(col_name(ic.object_id, ic.column_id) \
-                              + case when ic.is_descending_key = 1 then ' DESC' else '' end, ', ') \
-                              within group (order by ic.key_ordinal, ic.index_column_id) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and (ic.is_included_column = 0 or i.type in (5, 6))) as COLUMNS, \
-                    (select string_agg(col_name(ic.object_id, ic.column_id), ', ') \
-                              within group (order by ic.index_column_id) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and ic.is_included_column = 1 and i.type not in (5, 6)) as [INCLUDE], \
+                    cast(null as nvarchar(4000)) as COLUMNS, \
+                    cast(null as nvarchar(4000)) as [INCLUDE], \
                     i.filter_definition as [WHERE] \
                from sys.indexes i where i.object_id = object_id(@P1) and i.type > 0 \
               order by i.is_primary_key desc, i.name"
@@ -245,20 +236,11 @@ fn details(
             "select name as CONSTRAINT_NAME, type as TYPE, definition as DEFINITION, \
                     ref as [REFERENCES] \
                from (select k.name, case k.type when 'PK' then 'Primary key' else 'Unique' end \
-                            as type, \
-                            (select string_agg(col_name(ic.object_id, ic.column_id), ', ') \
-                                      within group (order by ic.key_ordinal) \
-                               from sys.index_columns ic \
-                              where ic.object_id = k.parent_object_id \
-                                and ic.index_id = k.unique_index_id) as definition, \
+                            as type, cast(null as nvarchar(4000)) as definition, \
                             null as ref, case k.type when 'PK' then 1 else 2 end as ord \
                        from sys.key_constraints k where k.parent_object_id = object_id(@P1) \
                      union all \
-                     select f.name, 'Foreign key', \
-                            (select string_agg(col_name(fc.parent_object_id, fc.parent_column_id), ', ') \
-                                      within group (order by fc.constraint_column_id) \
-                               from sys.foreign_key_columns fc \
-                              where fc.constraint_object_id = f.object_id), \
+                     select f.name, 'Foreign key', null, \
                             object_schema_name(f.referenced_object_id) + '.' \
                               + object_name(f.referenced_object_id), 3 \
                        from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
@@ -272,9 +254,7 @@ fn details(
               order by ord, name"
         }
         Detail::Triggers => {
-            "select t.name as TRIGGER_NAME, \
-                    (select string_agg(e.type_desc, ', ') from sys.trigger_events e \
-                      where e.object_id = t.object_id) as TRIGGERING_EVENT, \
+            "select t.name as TRIGGER_NAME, cast(null as nvarchar(4000)) as TRIGGERING_EVENT, \
                     case when t.is_instead_of_trigger = 1 then 'INSTEAD OF' else 'AFTER' end \
                       as TIMING, \
                     case when t.is_disabled = 1 then 'DISABLED' else 'ENABLED' end as STATUS \
@@ -320,8 +300,105 @@ fn details(
         }
         Detail::Link => return Err(DbError::unsupported("Linked servers", Dialect::SQLSERVER)),
     };
-    let (columns, rows) = ms.query(sql, &[&bracketed(owner, name)])?;
+    let object = bracketed(owner, name);
+    let (columns, mut rows) = ms.query(sql, &[&object])?;
+    // The lists the queries leave NULL, by the row's name: an index's
+    // columns and INCLUDE columns, a key's columns, a trigger's events.
+    // Every column of a columnstore index (types 5 and 6) counts as
+    // included: they are its columns, not INCLUDE columns (#252).
+    let (lists, filled): (&str, &[(usize, &str)]) = match detail {
+        Detail::Indexes => (
+            "select i.name, case when ic.is_included_column = 0 or i.type in (5, 6) \
+                                 then 'columns' else 'include' end, \
+                    col_name(ic.object_id, ic.column_id) \
+                      + case when ic.is_descending_key = 1 then ' DESC' else '' end \
+               from sys.indexes i \
+               join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+              where i.object_id = object_id(@P1) and i.type > 0 \
+              order by ic.key_ordinal, ic.index_column_id",
+            &[(3, "columns"), (4, "include")],
+        ),
+        Detail::Constraints => (
+            "select k.name, 'columns', col_name(ic.object_id, ic.column_id), ic.key_ordinal \
+               from sys.key_constraints k \
+               join sys.index_columns ic on ic.object_id = k.parent_object_id \
+                and ic.index_id = k.unique_index_id \
+              where k.parent_object_id = object_id(@P1) \
+             union all \
+             select f.name, 'columns', col_name(fc.parent_object_id, fc.parent_column_id), \
+                    fc.constraint_column_id \
+               from sys.foreign_keys f \
+               join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+              where f.parent_object_id = object_id(@P1) \
+              order by 4",
+            &[(2, "columns")],
+        ),
+        Detail::Triggers => (
+            "select t.name, 'events', e.type_desc \
+               from sys.triggers t join sys.trigger_events e on e.object_id = t.object_id \
+              where t.parent_id = object_id(@P1) \
+              order by e.type",
+            &[(1, "events")],
+        ),
+        _ => ("", &[]),
+    };
+    if !filled.is_empty() {
+        let lists = Lists::read(ms, lists, &object)?;
+        for row in &mut rows {
+            let Some(name) = row.first().cloned().flatten() else {
+                continue;
+            };
+            for &(column, list) in filled {
+                if let Some(cell @ None) = row.get_mut(column) {
+                    *cell = lists.get(&name, list).map(str::to_owned);
+                }
+            }
+        }
+    }
     Ok(MetaResult::Table { columns, rows })
+}
+
+/// Lists of names, as `string_agg(…, ', ') within group (order by …)` made
+/// them: SQL Server has string_agg from 2017 only, and below compatibility
+/// level 110, as in a database from 2008, WITHIN GROUP is a syntax error
+/// (#294). So the lists are joined here, from rows of (name, list, item)
+/// in their order, by the name of the index, constraint or trigger and the
+/// list's; NULL items are left out, as string_agg does. FOR XML PATH fails
+/// on a name with a control character.
+struct Lists(HashMap<(String, String), String>);
+
+impl Lists {
+    fn read(ms: &mut Ms<'_>, sql: &str, object: &str) -> Result<Self, DbError> {
+        let mut lists: HashMap<(String, String), String> = HashMap::new();
+        for row in ms.rows(sql, &[object])? {
+            let mut values = row.into_iter();
+            let (Some(Some(name)), Some(Some(list)), Some(Some(item))) =
+                (values.next(), values.next(), values.next())
+            else {
+                continue;
+            };
+            let joined = lists.entry((name, list)).or_default();
+            if !joined.is_empty() {
+                joined.push_str(", ");
+            }
+            joined.push_str(&item);
+        }
+        Ok(Self(lists))
+    }
+
+    /// `name`'s `list`, joined; `None` without items.
+    fn get(&self, name: &str, list: &str) -> Option<&str> {
+        self.0
+            .get(&(name.to_owned(), list.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// `before` and the list in parentheses; nothing without items.
+    fn clause(&self, before: &str, name: &str, list: &str) -> String {
+        self.get(name, list)
+            .map(|items| format!("{before}({items})"))
+            .unwrap_or_default()
+    }
 }
 
 /// An object's DDL; `runnable` ends it with `GO`, as T-SQL scripts do.
@@ -438,50 +515,74 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
+    // A key's columns, a foreign key's and the ones it references, and the
+    // columns of the indexes, quoted, as lists (see Lists).
+    let lists = Lists::read(
+        ms,
+        "select k.name, 'columns', quotename(col_name(ic.object_id, ic.column_id)) \
+                  + case when ic.is_descending_key = 1 then ' desc' else '' end, ic.key_ordinal \
+           from sys.key_constraints k \
+           join sys.index_columns ic on ic.object_id = k.parent_object_id \
+            and ic.index_id = k.unique_index_id and ic.is_included_column = 0 \
+          where k.parent_object_id = object_id(@P1) \
+         union all \
+         select f.name, 'columns', quotename(col_name(fc.parent_object_id, fc.parent_column_id)), \
+                fc.constraint_column_id \
+           from sys.foreign_keys f \
+           join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+          where f.parent_object_id = object_id(@P1) \
+         union all \
+         select f.name, 'references', \
+                quotename(col_name(fc.referenced_object_id, fc.referenced_column_id)), \
+                fc.constraint_column_id \
+           from sys.foreign_keys f \
+           join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+          where f.parent_object_id = object_id(@P1) \
+          order by 4",
+        object,
+    )?;
+    // Each constraint as (name, its line up to the columns, what follows
+    // them: a foreign key's REFERENCES and its actions).
     let constraints = ms.rows(
-        "select line from ( \
-           select 'constraint ' + quotename(k.name) \
+        "select name, line, refs, actions from ( \
+           select k.name, 'constraint ' + quotename(k.name) \
                   + case k.type when 'PK' then ' primary key ' else ' unique ' end \
-                  + lower(i.type_desc collate database_default) + ' (' \
-                  + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                              + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                              within group (order by ic.key_ordinal) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and ic.is_included_column = 0) + ')' as line, \
-                  case k.type when 'PK' then 1 else 2 end as ord, k.name \
+                  + lower(i.type_desc collate database_default) as line, \
+                  null as refs, '' as actions, case k.type when 'PK' then 1 else 2 end as ord \
              from sys.key_constraints k \
              join sys.indexes i on i.object_id = k.parent_object_id and i.index_id = k.unique_index_id \
             where k.parent_object_id = object_id(@P1) \
            union all \
-           select 'constraint ' + quotename(f.name) + ' foreign key (' \
-                  + (select string_agg(quotename(col_name(fc.parent_object_id, fc.parent_column_id)), ', ') \
-                              within group (order by fc.constraint_column_id) \
-                       from sys.foreign_key_columns fc where fc.constraint_object_id = f.object_id) \
-                  + ') references ' + quotename(object_schema_name(f.referenced_object_id)) + '.' \
-                  + quotename(object_name(f.referenced_object_id)) + ' (' \
-                  + (select string_agg(quotename(col_name(fc.referenced_object_id, \
-                                                          fc.referenced_column_id)), ', ') \
-                              within group (order by fc.constraint_column_id) \
-                       from sys.foreign_key_columns fc where fc.constraint_object_id = f.object_id) \
-                  + ')' \
-                  + case f.delete_referential_action when 1 then ' on delete cascade' \
-                         when 2 then ' on delete set null' when 3 then ' on delete set default' \
-                         else '' end \
+           select f.name, 'constraint ' + quotename(f.name) + ' foreign key', \
+                  ' references ' + quotename(object_schema_name(f.referenced_object_id)) + '.' \
+                  + quotename(object_name(f.referenced_object_id)), \
+                  case f.delete_referential_action when 1 then ' on delete cascade' \
+                       when 2 then ' on delete set null' when 3 then ' on delete set default' \
+                       else '' end \
                   + case f.update_referential_action when 1 then ' on update cascade' \
                          when 2 then ' on update set null' when 3 then ' on update set default' \
-                         else '' end, 3, f.name \
+                         else '' end, 3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
            union all \
-           select 'constraint ' + quotename(c.name) + ' check ' + c.definition, 4, c.name \
+           select c.name, 'constraint ' + quotename(c.name) + ' check ' + c.definition, null, '', 4 \
              from sys.check_constraints c where c.parent_object_id = object_id(@P1) \
          ) x order by ord, name",
         &[object],
     )?;
+    let constraints = constraints.into_iter().filter_map(|row| {
+        let mut values = row.into_iter();
+        let mut next = || values.next().flatten();
+        let (name, line, refs, actions) = (next()?, next()?, next(), next().unwrap_or_default());
+        let columns = lists.clause(" ", &name, "columns");
+        let references = refs
+            .map(|refs| format!("{refs}{}", lists.clause(" ", &name, "references")))
+            .unwrap_or_default();
+        Some(format!("{line}{columns}{references}{actions}"))
+    });
     let lines: Vec<String> = columns
         .into_iter()
-        .chain(constraints)
         .filter_map(first)
+        .chain(constraints)
         .collect();
     let mut ddl = format!("create table {object} (\n    {}\n);", lines.join(",\n    "));
     // Rowstore (types 1 and 2) and columnstore indexes (5 and 6, #252). A
@@ -499,66 +600,78 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .find_map(first)
         .is_some();
     let order = if ordered {
-        "+ coalesce(' order (' \
-            + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
-                        within group (order by ic.column_store_order_ordinal) \
-                 from sys.index_columns ic \
-                where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                  and ic.column_store_order_ordinal > 0) + ')', '')"
+        "union all \
+         select i.name, 'order', quotename(col_name(ic.object_id, ic.column_id)), \
+                ic.column_store_order_ordinal, 0 \
+           from sys.indexes i \
+           join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+          where i.object_id = object_id(@P1) and ic.column_store_order_ordinal > 0"
     } else {
         ""
     };
-    let indexes = ms.rows(
+    // An index's columns, its INCLUDE columns and its ORDER, quoted.
+    let lists = Lists::read(
+        ms,
         &format!(
-            "select 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
-                    + case when x.xml_index_type = 0 then 'primary xml' \
-                           else lower(i.type_desc collate database_default) end \
-                    + ' index ' + quotename(i.name) + ' on ' + @P1 \
-                    + case when i.type = 5 then '' else ' (' \
-                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                                    + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                                    within group (order by ic.key_ordinal, ic.index_column_id) \
-                             from sys.index_columns ic \
-                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                              and (ic.is_included_column = 0 or i.type = 6)) + ')' end \
-                    + coalesce(' include (' \
-                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
-                                    within group (order by ic.index_column_id) \
-                             from sys.index_columns ic \
-                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                              and ic.is_included_column = 1 and i.type = 2) + ')', '') \
-                    + coalesce(' using xml index ' + quotename(u.name) + ' for ' \
-                               + lower(x.secondary_type_desc collate database_default), '') \
-                    {order} \
-                    + coalesce(' where ' + i.filter_definition, ''), \
-                    lower(s.tessellation_scheme collate database_default), \
-                    t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
-                    lower(t.level_1_grid_desc collate database_default), \
-                    lower(t.level_2_grid_desc collate database_default), \
-                    lower(t.level_3_grid_desc collate database_default), \
-                    lower(t.level_4_grid_desc collate database_default), t.cells_per_object \
+            "select i.name, case when i.type = 5 then null \
+                                 when ic.is_included_column = 0 or i.type = 6 then 'columns' \
+                                 when i.type = 2 then 'include' end, \
+                    quotename(col_name(ic.object_id, ic.column_id)) \
+                      + case when ic.is_descending_key = 1 then ' desc' else '' end, \
+                    ic.key_ordinal, ic.index_column_id \
                from sys.indexes i \
-               left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
-               left join sys.indexes u on u.object_id = i.object_id \
-                and u.index_id = x.using_xml_index_id \
-               left join sys.spatial_indexes s on s.object_id = i.object_id \
-                and s.index_id = i.index_id \
-               left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
-                and t.index_id = i.index_id \
-              where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6) \
-                and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
-                and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
-              order by case when x.using_xml_index_id is null then 0 else 1 end, i.name"
+               join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+              where i.object_id = object_id(@P1) \
+             {order} \
+              order by 4, 5"
         ),
+        object,
+    )?;
+    // Each index as (name, its statement up to the columns, a secondary XML
+    // index's USING, its WHERE) and a spatial index's tessellation.
+    let indexes = ms.rows(
+        "select i.name, 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
+                + case when x.xml_index_type = 0 then 'primary xml' \
+                       else lower(i.type_desc collate database_default) end \
+                + ' index ' + quotename(i.name) + ' on ' + @P1, \
+                coalesce(' using xml index ' + quotename(u.name) + ' for ' \
+                         + lower(x.secondary_type_desc collate database_default), ''), \
+                coalesce(' where ' + i.filter_definition, ''), \
+                lower(s.tessellation_scheme collate database_default), \
+                t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
+                lower(t.level_1_grid_desc collate database_default), \
+                lower(t.level_2_grid_desc collate database_default), \
+                lower(t.level_3_grid_desc collate database_default), \
+                lower(t.level_4_grid_desc collate database_default), t.cells_per_object \
+           from sys.indexes i \
+           left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
+           left join sys.indexes u on u.object_id = i.object_id \
+            and u.index_id = x.using_xml_index_id \
+           left join sys.spatial_indexes s on s.object_id = i.object_id \
+            and s.index_id = i.index_id \
+           left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
+            and t.index_id = i.index_id \
+          where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6) \
+            and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
+            and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
+          order by case when x.using_xml_index_id is null then 0 else 1 end, i.name",
         &[object],
     )?;
     for row in indexes {
         let mut values = row.into_iter();
-        let Some(index) = values.next().flatten() else {
+        let mut next = || values.next().flatten();
+        let (Some(name), Some(index)) = (next(), next()) else {
             continue;
         };
+        let (using, filter) = (next().unwrap_or_default(), next().unwrap_or_default());
         let spatial: Vec<Cell> = values.collect();
-        ddl.push_str(&format!("\n\n{index}{};", spatial_options(&spatial)));
+        ddl.push_str(&format!(
+            "\n\n{index}{}{}{using}{}{filter}{};",
+            lists.clause(" ", &name, "columns"),
+            lists.clause(" include ", &name, "include"),
+            lists.clause(" order ", &name, "order"),
+            spatial_options(&spatial)
+        ));
     }
     Ok(ddl)
 }
