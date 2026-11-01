@@ -1307,6 +1307,69 @@ fn identities_keep_their_sequence_names() {
     h.ok("drop schema r62_id, r62_id_copy cascade");
 }
 
+fn ddl_of(h: &mut Harness, owner: &str, name: &str, object_type: ObjectType) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: name.into(),
+        object_type,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// A view's DDL names its tables and functions with their schemas, as a
+/// table's does (#226): run with another search path, by Edit in a window
+/// that set one, the view reads the same tables as before (#329).
+#[test]
+fn a_views_ddl_names_its_tables_with_their_schemas() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r73_vp, r73_vp_other cascade");
+    h.ok("drop table if exists r73_vp_t");
+    h.ok("drop function if exists r73_vp_f(int)");
+    h.ok("create schema r73_vp");
+    h.ok("create schema r73_vp_other");
+    for (owner, n) in [(schema.as_str(), 1), ("r73_vp_other", 2)] {
+        h.ok(&format!("create table {owner}.r73_vp_t (n int)"));
+        h.ok(&format!("insert into {owner}.r73_vp_t values ({n})"));
+        h.ok(&format!(
+            "create function {owner}.r73_vp_f(x int) returns int language sql \
+             as 'select x * {n}'"
+        ));
+    }
+    // Names the session's path finds.
+    h.ok("create view r73_vp.r73_v as select r73_vp_f(n) as n from r73_vp_t");
+    h.ok("create materialized view r73_vp.r73_mv as select r73_vp_f(n) as n from r73_vp_t");
+    let view = ddl_of(&mut h, "r73_vp", "r73_v", ObjectType::View);
+    let materialized = ddl_of(&mut h, "r73_vp", "r73_mv", ObjectType::MaterializedView);
+    for ddl in [&view, &materialized] {
+        assert!(
+            ddl.contains(&format!(
+                "SELECT {schema}.r73_vp_f(n) AS n\n   FROM {schema}.r73_vp_t"
+            )),
+            "{ddl}"
+        );
+    }
+    h.ok("set search_path = r73_vp_other, public");
+    run_ddl(&mut h, &view, "", "");
+    h.ok("drop materialized view r73_vp.r73_mv");
+    run_ddl(&mut h, &materialized, "", "");
+    h.ok("reset search_path");
+    assert_eq!(
+        h.scalar("select (select n from r73_vp.r73_v) || ' ' || (select n from r73_vp.r73_mv)")
+            .as_deref(),
+        Some("1 1"),
+        "{view}\n\n{materialized}"
+    );
+    h.ok("drop schema r73_vp, r73_vp_other cascade");
+    h.ok("drop table r73_vp_t");
+    h.ok("drop function r73_vp_f(int)");
+}
+
 /// Object filters find names without case whatever their letters: names
 /// collate as C, where upper() changes only ASCII letters, in the test
 /// database and in one whose lc_ctype is C.

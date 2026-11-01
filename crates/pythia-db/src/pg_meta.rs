@@ -504,59 +504,14 @@ fn ddl(
             object_type.dictionary_name().to_lowercase()
         ))
     };
-    let dialect = Dialect::POSTGRES;
     match object_type {
         // Every name with its schema, as pg_dump writes them: run with
         // another search path, the DDL still means the same tables (#226).
         ObjectType::Table => on_path(pg, "", || table_ddl(pg, owner, name)),
+        // A view's too: Edit runs its DDL in a window whose search path may
+        // find other tables and functions first (#329).
         ObjectType::View | ObjectType::MaterializedView => {
-            let (owner, name) = stored(pg, owner, name)?;
-            let row = pg
-                .first(
-                    "select pg_get_viewdef(c.oid, true), c.oid, \
-                            obj_description(c.oid, 'pg_class') from pg_class c \
-                       join pg_namespace n on n.oid = c.relnamespace \
-                      where n.nspname = $1 and c.relname = $2",
-                    &[&owner, &name],
-                )?
-                .ok_or_else(missing)?;
-            let mut row = row.into_iter();
-            let definition = row.next().flatten().ok_or_else(missing)?;
-            let oid = row.next().flatten().unwrap_or_default();
-            let comment = row.next().flatten();
-            let qualified = dialect.qualified(&owner, &name);
-            let create = if object_type == ObjectType::View {
-                "create or replace view"
-            } else {
-                "create materialized view"
-            };
-            let mut ddl = format!(
-                "{create} {qualified} as\n{}",
-                definition.trim_end().trim_end_matches(';')
-            );
-            // A view is replaced in place, but Edit drops a materialized
-            // view and creates it again from this: without them the new
-            // one would come without its indexes, comments and grants
-            // (#301).
-            let mut rest = String::new();
-            if object_type == ObjectType::MaterializedView {
-                indexes_and_comments(
-                    pg,
-                    &mut rest,
-                    &oid,
-                    "materialized view",
-                    &qualified,
-                    comment,
-                )?;
-                grants(pg, &mut rest, &oid, &qualified)?;
-            }
-            if rest.is_empty() {
-                ddl.push_str(end);
-            } else {
-                ddl.push(';');
-                ddl.push_str(&rest);
-            }
-            Ok(ddl)
+            on_path(pg, "", || view_ddl(pg, owner, name, object_type, end))?.ok_or_else(missing)
         }
         ObjectType::Function | ObjectType::Procedure => {
             let rows = pg.rows(
@@ -604,6 +559,64 @@ fn ddl(
             other.plural().to_lowercase()
         ))),
     }
+}
+
+/// `CREATE` of a view or materialized view as stored, if there is one. A
+/// view is replaced in place, but Edit drops a materialized view and
+/// creates it again from this: without them the new one would come without
+/// its indexes, comments and grants (#301).
+fn view_ddl(
+    pg: &Pg<'_>,
+    owner: &str,
+    name: &str,
+    object_type: ObjectType,
+    end: &str,
+) -> Result<Option<String>, DbError> {
+    let (owner, name) = stored(pg, owner, name)?;
+    let Some(row) = pg.first(
+        "select pg_get_viewdef(c.oid, true), c.oid, obj_description(c.oid, 'pg_class') \
+           from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+          where n.nspname = $1 and c.relname = $2",
+        &[&owner, &name],
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut row = row.into_iter();
+    let Some(definition) = row.next().flatten() else {
+        return Ok(None);
+    };
+    let oid = row.next().flatten().unwrap_or_default();
+    let comment = row.next().flatten();
+    let qualified = Dialect::POSTGRES.qualified(&owner, &name);
+    let create = if object_type == ObjectType::View {
+        "create or replace view"
+    } else {
+        "create materialized view"
+    };
+    let mut ddl = format!(
+        "{create} {qualified} as\n{}",
+        definition.trim_end().trim_end_matches(';')
+    );
+    let mut rest = String::new();
+    if object_type == ObjectType::MaterializedView {
+        indexes_and_comments(
+            pg,
+            &mut rest,
+            &oid,
+            "materialized view",
+            &qualified,
+            comment,
+        )?;
+        grants(pg, &mut rest, &oid, &qualified)?;
+    }
+    if rest.is_empty() {
+        ddl.push_str(end);
+    } else {
+        ddl.push(';');
+        ddl.push_str(&rest);
+    }
+    Ok(Some(ddl))
 }
 
 /// `CREATE SEQUENCE` of a sequence as stored, if there is one. `owned`

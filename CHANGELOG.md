@@ -822,6 +822,11 @@ All notable changes to Pythia are documented here. The format follows
   PostgreSQL chooses, `orders_id_seq`, and what reads it by its name
   failed. A name PostgreSQL chose is still left out, so that a copy
   beside the table chooses its own.
+- PostgreSQL: the DDL of a view or materialized view names every table
+  and function with its schema (#329), as a table's does. It left the
+  schema out where the connection's search path found them, `FROM t`
+  for `public.t`, so that *Edit* in a SQL window whose search path finds
+  another `t` first made the view read that one.
 
 ## [0.10.0] - 2026-10-30
 
