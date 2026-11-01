@@ -220,16 +220,23 @@ fn details(
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
     let sql = match detail {
+        // Every column of a columnstore index (types 5 and 6) counts as
+        // included: they are its columns, not INCLUDE columns (#252).
         Detail::Indexes => {
             "select i.name as INDEX_NAME, i.type_desc as INDEX_TYPE, \
                     case when i.is_primary_key = 1 then 'PRIMARY' when i.is_unique = 1 then 'UNIQUE' \
                          else 'NONUNIQUE' end as UNIQUENESS, \
                     (select string_agg(col_name(ic.object_id, ic.column_id) \
                               + case when ic.is_descending_key = 1 then ' DESC' else '' end, ', ') \
-                              within group (order by ic.key_ordinal) \
+                              within group (order by ic.key_ordinal, ic.index_column_id) \
                        from sys.index_columns ic \
                       where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and ic.is_included_column = 0) as COLUMNS, \
+                        and (ic.is_included_column = 0 or i.type in (5, 6))) as COLUMNS, \
+                    (select string_agg(col_name(ic.object_id, ic.column_id), ', ') \
+                              within group (order by ic.index_column_id) \
+                       from sys.index_columns ic \
+                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                        and ic.is_included_column = 1 and i.type not in (5, 6)) as [INCLUDE], \
                     i.filter_definition as [WHERE] \
                from sys.indexes i where i.object_id = object_id(@P1) and i.type > 0 \
               order by i.is_primary_key desc, i.name"
@@ -477,23 +484,28 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .filter_map(first)
         .collect();
     let mut ddl = format!("create table {object} (\n    {}\n);", lines.join(",\n    "));
+    // Rowstore (types 1 and 2) and columnstore indexes (5 and 6, #252). A
+    // nonclustered columnstore index names its columns, which count as
+    // included; a clustered one holds all of them and names none.
     let indexes = ms.rows(
         "select 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
-                + lower(i.type_desc collate database_default) + ' index ' + quotename(i.name) + ' on ' + @P1 + ' (' \
-                + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                            + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                            within group (order by ic.key_ordinal) \
-                     from sys.index_columns ic \
-                    where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                      and ic.is_included_column = 0) + ')' \
-                + coalesce(' include (' \
-                    + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
+                + lower(i.type_desc collate database_default) + ' index ' + quotename(i.name) + ' on ' + @P1 \
+                + case when i.type = 5 then '' else ' (' \
+                    + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
+                                + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
+                                within group (order by ic.key_ordinal, ic.index_column_id) \
                          from sys.index_columns ic \
                         where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                          and ic.is_included_column = 1) + ')', '') \
+                          and (ic.is_included_column = 0 or i.type = 6)) + ')' end \
+                + coalesce(' include (' \
+                    + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
+                                within group (order by ic.index_column_id) \
+                         from sys.index_columns ic \
+                        where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                          and ic.is_included_column = 1 and i.type = 2) + ')', '') \
                 + coalesce(' where ' + i.filter_definition, '') + ';' \
            from sys.indexes i \
-          where i.object_id = object_id(@P1) and i.type in (1, 2) \
+          where i.object_id = object_id(@P1) and i.type in (1, 2, 5, 6) \
             and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
           order by i.name",
         &[object],
