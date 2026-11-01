@@ -24,6 +24,11 @@ const SHOWN_CHARS: usize = 500;
 /// a few screens of it, wrapped (#220).
 const RECORD_CHARS: usize = 10_000;
 
+/// The changes Ctrl+Z can take back at most, and the cells their states
+/// hold together, oldest left out first (#257).
+const UNDO_STEPS: usize = 100;
+const UNDO_CELLS: usize = 1_000_000;
+
 /// Per-result view state, owned by whoever owns the rows.
 #[derive(Default)]
 pub struct GridState {
@@ -155,6 +160,13 @@ impl Changes {
     pub fn count(&self) -> usize {
         self.updates.len() + self.inserts.len() + self.deletes.len()
     }
+
+    /// The cells these changes hold, for the size of the undo history.
+    fn cells(&self) -> usize {
+        self.updates.values().map(BTreeMap::len).sum::<usize>()
+            + self.inserts.iter().map(Vec::len).sum::<usize>()
+            + self.deletes.len()
+    }
 }
 
 #[derive(Default)]
@@ -166,6 +178,9 @@ struct Editing {
     /// renamed columns (#218).
     read_only: BTreeSet<usize>,
     changes: Changes,
+    /// The changes as they were before each of the last ones, for Ctrl+Z
+    /// (#257).
+    undo: Vec<Changes>,
     /// Cell being edited: (view row, column, text).
     active: Option<(usize, usize, String)>,
     focus_editor: bool,
@@ -497,22 +512,24 @@ impl GridState {
     /// Changes a cell programmatically (as if edited by the user).
     pub fn edit_cell(&mut self, rows: &[Vec<Cell>], view_row: usize, col: usize, value: Cell) {
         self.sync(rows, &[]);
-        self.set_value(rows, view_row, col, value);
+        self.undoable(|s| s.set_value(rows, view_row, col, value));
     }
 
     /// Adds a new row programmatically (as if by the user).
     pub fn add_row(&mut self, rows: &[Vec<Cell>], columns: usize) {
         self.sync(rows, &[]);
-        self.insert_row(columns);
+        self.undoable(|s| s.insert_row(columns));
     }
 
     /// Marks a fetched row for deletion programmatically (as if by the user).
     pub fn delete_row(&mut self, rows: &[Vec<Cell>], view_row: usize) {
         self.sync(rows, &[]);
-        if let RowRef::Existing(r) = self.row_ref(view_row)
-            && let Some(edit) = &mut self.edit
-        {
-            edit.changes.deletes.insert(r);
+        if let RowRef::Existing(r) = self.row_ref(view_row) {
+            self.undoable(|s| {
+                if let Some(edit) = &mut s.edit {
+                    edit.changes.deletes.insert(r);
+                }
+            });
         }
     }
 
@@ -541,17 +558,66 @@ impl GridState {
     }
 
     /// Replaces the pending changes, e.g. with those kept for the rows
-    /// fetched again.
+    /// fetched again. The changes before them were made to other rows:
+    /// there's nothing to take back.
     pub fn set_changes(&mut self, changes: Changes) {
         if let Some(e) = &mut self.edit {
             e.changes = changes;
+            e.undo.clear();
         }
     }
 
     pub fn clear_changes(&mut self) {
         if let Some(e) = &mut self.edit {
             e.changes = Changes::default();
+            e.undo.clear();
             e.active = None;
+        }
+    }
+
+    /// Makes `change` to the pending changes a step Ctrl+Z takes back
+    /// (#257).
+    fn undoable(&mut self, change: impl FnOnce(&mut Self)) {
+        let before = self.edit.as_ref().map(|e| e.changes.clone());
+        change(self);
+        let (Some(before), Some(edit)) = (before, &mut self.edit) else {
+            return;
+        };
+        if edit.changes == before {
+            return;
+        }
+        edit.undo.push(before);
+        let mut cells = 0;
+        let kept = edit
+            .undo
+            .iter()
+            .rev()
+            .take(UNDO_STEPS)
+            .take_while(|c| {
+                cells += c.cells();
+                cells <= UNDO_CELLS
+            })
+            .count()
+            .max(1);
+        edit.undo.drain(..edit.undo.len() - kept);
+    }
+
+    /// Whether Ctrl+Z has a change to take back.
+    fn can_undo(&self) -> bool {
+        self.edit.as_ref().is_some_and(|e| !e.undo.is_empty())
+    }
+
+    /// Takes back the last change not applied (#257).
+    fn undo(&mut self, rows: &[Vec<Cell>]) {
+        let Some(edit) = &mut self.edit else { return };
+        let Some(before) = edit.undo.pop() else {
+            return;
+        };
+        edit.changes = before;
+        // Rows inserted may be gone again.
+        let last = self.view_len(rows).saturating_sub(1);
+        for (row, _) in [&mut self.anchor, &mut self.cursor].into_iter().flatten() {
+            *row = (*row).min(last);
         }
     }
 
@@ -661,9 +727,13 @@ impl GridState {
             return;
         };
         let refs: Vec<RowRef> = rows.map(|r| self.row_ref(r)).collect();
+        self.undoable(|s| s.delete_refs(&refs));
+    }
+
+    fn delete_refs(&mut self, refs: &[RowRef]) {
         let Some(edit) = &mut self.edit else { return };
         let mut new_rows: Vec<usize> = Vec::new();
-        for r in refs {
+        for &r in refs {
             match r {
                 RowRef::Existing(r) => {
                     if !edit.changes.deletes.remove(&r) {
@@ -684,11 +754,13 @@ impl GridState {
         let Some((r, c)) = self.selection(columns) else {
             return;
         };
-        for row in r {
-            for &col in &c {
-                self.set_value(rows, row, col, None);
+        self.undoable(|s| {
+            for row in r {
+                for &col in &c {
+                    s.set_value(rows, row, col, None);
+                }
             }
-        }
+        });
     }
 
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
@@ -698,6 +770,10 @@ impl GridState {
             return;
         }
         self.sync(rows, &[]);
+        self.undoable(|s| s.paste_text(rows, columns, text));
+    }
+
+    fn paste_text(&mut self, rows: &[Vec<Cell>], columns: usize, text: &str) {
         let visible = self.visible_columns(columns);
         let (r0, c0) = self
             .cursor
@@ -732,11 +808,7 @@ impl GridState {
 
     fn start_edit(&mut self, rows: &[Vec<Cell>], cell: (usize, usize), initial: Option<String>) {
         let value = self.value(rows, cell.0, cell.1).map(str::to_owned);
-        // The inline editor is one line; it would lose line breaks.
-        let long = value
-            .as_deref()
-            .is_some_and(|v| v.contains('\n') || v.chars().count() > 200);
-        if long && initial.is_none() {
+        if !fits_inline(value.as_deref()) && initial.is_none() {
             self.open_value_editor(rows, cell);
             return;
         }
@@ -780,9 +852,99 @@ impl GridState {
             return;
         };
         if commit {
-            self.set_value(rows, r, c, Some(text));
+            self.undoable(|s| s.set_value(rows, r, c, Some(text)));
         }
     }
+
+    /// Ends an edit as `end` says.
+    fn end_edit(&mut self, rows: &[Vec<Cell>], columns: usize, end: EditEnd) {
+        match end {
+            EditEnd::Drop => self.finish_edit(rows, false),
+            EditEnd::Keep => self.finish_edit(rows, true),
+            EditEnd::Next(back) => self.edit_next(rows, columns, back),
+        }
+    }
+
+    /// Keeps the value being typed and edits the next cell that can be
+    /// edited, or the one before it (`back`): along the row, then on to
+    /// the next one (#254). Past the last cell, the cursor stays.
+    fn edit_next(&mut self, rows: &[Vec<Cell>], columns: usize, back: bool) {
+        let Some((r, c)) = self
+            .edit
+            .as_ref()
+            .and_then(|e| e.active.as_ref())
+            .map(|(r, c, _)| (*r, *c))
+        else {
+            return;
+        };
+        self.finish_edit(rows, true);
+        let visible = self.visible_columns(columns);
+        let Some(edit) = &self.edit else { return };
+        let editable: Vec<usize> = visible
+            .into_iter()
+            .filter(|&col| !edit.is_locked(col))
+            .collect();
+        let Some(at) = editable.iter().position(|&col| col == c) else {
+            return;
+        };
+        // Cells counted along the rows.
+        let at = r * editable.len() + at;
+        let next = if back {
+            at.checked_sub(1)
+        } else {
+            Some(at + 1).filter(|&n| n < self.view_len(rows) * editable.len())
+        };
+        let Some(next) = next else { return };
+        let cell = (next / editable.len(), editable[next % editable.len()]);
+        self.select(cell, false);
+        self.scroll_to_cursor = true;
+        // A value the one-line editor can't hold waits for Enter or F2,
+        // which open the dialog.
+        if fits_inline(self.value(rows, cell.0, cell.1)) {
+            self.start_edit(rows, cell, None);
+        }
+    }
+}
+
+/// How the edit of a cell ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditEnd {
+    /// Escape: what was typed is dropped.
+    Drop,
+    /// Enter, or the focus went elsewhere: the value is kept.
+    Keep,
+    /// Tab (`true`: Shift+Tab): the value is kept and the next cell (the
+    /// one before) is edited.
+    Next(bool),
+}
+
+/// How a key ends the edit of a cell this frame, if one does.
+fn edit_end(i: &egui::InputState, lost_focus: bool) -> Option<EditEnd> {
+    // The key's own modifiers: Shift may be let go of in the same frame.
+    let tab = i.events.iter().find_map(|e| match e {
+        egui::Event::Key {
+            key: Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } => Some(modifiers.shift),
+        _ => None,
+    });
+    if i.key_pressed(Key::Escape) {
+        Some(EditEnd::Drop)
+    } else if let Some(back) = tab {
+        Some(EditEnd::Next(back))
+    } else if i.key_pressed(Key::Enter) || lost_focus {
+        Some(EditEnd::Keep)
+    } else {
+        None
+    }
+}
+
+/// Whether the one-line editor can hold a value: it would lose line
+/// breaks, and long text goes to the dialog.
+fn fits_inline(value: Option<&str>) -> bool {
+    value.is_none_or(|v| !v.contains('\n') && v.chars().count() <= 200)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,6 +1048,7 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
     let mut select_all = false;
     let mut start_edit = None;
     let mut set_null = false;
+    let mut undo = false;
     let mut paste = None;
     let editable = state.is_editable();
     ui.input(|i| {
@@ -894,7 +1057,10 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
         for e in &i.events {
             match e {
                 egui::Event::Key {
-                    key, pressed: true, ..
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
                 } => match key {
                     Key::ArrowUp => nr = nr.saturating_sub(1),
                     Key::ArrowDown => nr = (nr + 1).min(row_count - 1),
@@ -909,6 +1075,7 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
                     Key::A if ctrl => select_all = true,
                     Key::Enter | Key::F2 if editable => start_edit = Some(None),
                     Key::Delete if editable => set_null = true,
+                    Key::Z if modifiers.command && !modifiers.shift && editable => undo = true,
                     Key::Enter => open_viewer = true,
                     _ => {}
                 },
@@ -934,6 +1101,9 @@ fn handle_keys(ui: &mut Ui, state: &mut GridState, columns: &[Column], rows: &[V
     }
     if set_null {
         state.set_null(rows, columns.len());
+    }
+    if undo {
+        state.undo(rows);
     }
     if let Some(text) = paste {
         state.paste(rows, columns.len(), &text);
@@ -1067,7 +1237,7 @@ struct Interactions {
     row_clicked: Option<usize>,
     open_viewer: Option<(usize, usize)>,
     menu_cell: Option<(usize, usize)>,
-    edit_done: Option<bool>,
+    edit_done: Option<EditEnd>,
     edit_click: Option<(usize, usize)>,
     column: Option<ColumnAction>,
     /// Widths of the columns drawn: (column, width).
@@ -1297,8 +1467,8 @@ fn table(
         let sum: f32 = frozen_cols.iter().filter_map(|c| state.widths.get(c)).sum();
         state.frozen_width = Some(d.numbers_width() + sum + spacing * (d.frozen + 1) as f32);
     }
-    if let Some(commit) = act.edit_done {
-        state.finish_edit(rows, commit);
+    if let Some(end) = act.edit_done {
+        state.end_edit(rows, columns.len(), end);
         ui.memory_mut(|m| m.request_focus(focus_id));
     }
     if let Some(cell) = act.edit_click {
@@ -1645,17 +1815,8 @@ fn data_cell(
             if std::mem::take(&mut edit.focus_editor) {
                 r.request_focus();
             }
-            let (enter, escape) = ui.input(|i| {
-                (
-                    i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab),
-                    i.key_pressed(Key::Escape),
-                )
-            });
-            if escape {
-                edit_done = Some(false);
-            } else if enter || r.lost_focus() {
-                edit_done = Some(true);
-            }
+            let lost_focus = r.lost_focus();
+            edit_done = ui.input(|i| edit_end(i, lost_focus));
             return;
         }
         if selected {
@@ -1736,11 +1897,19 @@ fn context_menu(ui: &mut Ui, columns: &[Column], rows: &[Vec<Cell>], state: &mut
             ui.close();
         }
         if ui.button("Insert row").clicked() {
-            state.insert_row(columns.len());
+            state.undoable(|s| s.insert_row(columns.len()));
             ui.close();
         }
         if ui.button("Delete / undelete rows").clicked() {
             state.delete_rows(columns.len());
+            ui.close();
+        }
+        if ui
+            .add_enabled(state.can_undo(), egui::Button::new("Undo"))
+            .on_hover_text("Take back the last change (Ctrl+Z)")
+            .clicked()
+        {
+            state.undo(rows);
             ui.close();
         }
         ui.separator();
@@ -2167,17 +2336,8 @@ fn record_view(
                             if std::mem::take(&mut edit.focus_editor) {
                                 response.request_focus();
                             }
-                            let (enter, escape) = ui.input(|i| {
-                                (
-                                    i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab),
-                                    i.key_pressed(Key::Escape),
-                                )
-                            });
-                            if escape {
-                                edit_done = Some(false);
-                            } else if enter || response.lost_focus() {
-                                edit_done = Some(true);
-                            }
+                            let lost_focus = response.lost_focus();
+                            edit_done = ui.input(|i| edit_end(i, lost_focus));
                             ui.end_row();
                             continue;
                         }
@@ -2244,8 +2404,8 @@ fn record_view(
                 });
         });
     state.scroll_to_cursor = false;
-    if let Some(commit) = edit_done {
-        state.finish_edit(rows, commit);
+    if let Some(end) = edit_done {
+        state.end_edit(rows, columns.len(), end);
         ui.memory_mut(|m| m.request_focus(focus_id));
     }
 }
@@ -2333,7 +2493,7 @@ fn value_editor(
     if let Some(value) = result {
         let (view_row, col) = (ed.view_row, ed.col);
         state.value_editor = None;
-        state.set_value(rows, view_row, col, value);
+        state.undoable(|s| s.set_value(rows, view_row, col, value));
     } else if !open {
         state.value_editor = None;
     }
@@ -3655,6 +3815,170 @@ mod tests {
         assert_eq!(
             state.changes().unwrap().updates[&1][&1].as_deref(),
             Some("b")
+        );
+    }
+
+    /// Tab keeps the value typed and edits the next cell, Shift+Tab the
+    /// one before (#254): the value typed next went into the cell just
+    /// edited, in place of what Tab had kept.
+    #[test]
+    fn tab_edits_the_next_cell() {
+        let (columns, rows) = three();
+        let tab = |shift: bool| egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: if shift {
+                egui::Modifiers::SHIFT
+            } else {
+                egui::Modifiers::NONE
+            },
+        };
+        let text = |s: &str| egui::Event::Text(s.into());
+        let active = |state: &GridState| state.edit.as_ref().unwrap().active.clone();
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        // The middle column is read-only: Tab goes past it.
+        state.lock_columns([1]);
+        // The row's number reads 1 too.
+        click(&ctx, &columns, &rows, &mut state, "x", 1);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::ArrowLeft)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::F2)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![text("0")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 2, "p".into())));
+        assert_eq!(state.cursor, Some((0, 2)));
+        frame(&ctx, &columns, &rows, &mut state, vec![text("2")]);
+        // At the end of the row, Tab goes on to the next one.
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((1, 0, "2".into())));
+        let updates = &state.changes().unwrap().updates;
+        assert_eq!(updates[&0][&0].as_deref(), Some("10"));
+        assert_eq!(updates[&0][&2].as_deref(), Some("p2"));
+        // Shift+Tab goes back, past the read-only column again.
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(true)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 2, "p2".into())));
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(true)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), Some((0, 0, "10".into())));
+        // Escape drops only what was typed in the cell being edited.
+        frame(&ctx, &columns, &rows, &mut state, vec![text("9")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::Escape)]);
+        assert_eq!(active(&state), None);
+        assert_eq!(
+            state.changes().unwrap().updates[&0][&0].as_deref(),
+            Some("10")
+        );
+        // Past the last cell, Tab keeps the value and stays.
+        state.cursor = Some((1, 2));
+        frame(&ctx, &columns, &rows, &mut state, vec![key(Key::F2)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![text("!")]);
+        frame(&ctx, &columns, &rows, &mut state, vec![tab(false)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert_eq!(active(&state), None);
+        assert_eq!(state.cursor, Some((1, 2)));
+        assert_eq!(
+            state.changes().unwrap().updates[&1][&2].as_deref(),
+            Some("q!")
+        );
+    }
+
+    /// Ctrl+Z takes back the last change not applied, one at a time
+    /// (#257): a cell set to NULL by mistake could only be taken back
+    /// with Discard, and every other change with it.
+    #[test]
+    fn changes_are_undone_one_at_a_time() {
+        let (c, r) = (cols(), rows());
+        let undo = egui::Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let updates = |state: &GridState| state.changes().unwrap().updates.clone();
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        // A value typed, then a cell set to NULL with Delete.
+        click(&ctx, &c, &r, &mut state, "a", 1);
+        frame(
+            &ctx,
+            &c,
+            &r,
+            &mut state,
+            vec![egui::Event::Text("b".into())],
+        );
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::ArrowUp)]);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Delete)]);
+        assert_eq!(updates(&state)[&0][&1], None);
+        assert_eq!(updates(&state)[&1][&1].as_deref(), Some("b"));
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert!(!updates(&state).contains_key(&0), "{:?}", updates(&state));
+        assert_eq!(updates(&state)[&1][&1].as_deref(), Some("b"));
+        // A paste that added a row, a row marked for deletion.
+        state.cursor = Some((2, 0));
+        state.anchor = state.cursor;
+        state.paste(&r, 2, "7\tp\n8\tq");
+        state.delete_row(&r, 0);
+        assert_eq!(state.changes().unwrap().inserts.len(), 1);
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert!(state.changes().unwrap().deletes.is_empty());
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        let changes = state.changes().unwrap();
+        assert!(changes.inserts.is_empty());
+        assert!(!changes.updates.contains_key(&2), "{changes:?}");
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert!(state.changes().unwrap().is_empty());
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert!(state.changes().unwrap().is_empty());
+        // In the cell's editor, Ctrl+Z is the editor's.
+        state.edit_cell(&r, 0, 0, None);
+        state.start_edit(&r, (1, 1), Some("typed".into()));
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        frame(&ctx, &c, &r, &mut state, vec![undo.clone()]);
+        assert_eq!(updates(&state)[&0][&0], None);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Escape)]);
+        // Discard leaves nothing to take back.
+        state.clear_changes();
+        frame(&ctx, &c, &r, &mut state, vec![undo]);
+        assert!(state.changes().unwrap().is_empty());
+    }
+
+    /// In the record view, Tab edits the next field (#254).
+    #[test]
+    fn tab_edits_the_next_field_of_the_record() {
+        let (c, r) = (cols(), rows());
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        state.cursor = Some((0, 0));
+        state.set_record_view(&r, true);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        click(&ctx, &c, &r, &mut state, "10", 1);
+        frame(
+            &ctx,
+            &c,
+            &r,
+            &mut state,
+            vec![egui::Event::Text("1".into())],
+        );
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Tab)]);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        assert_eq!(
+            state.edit.as_ref().unwrap().active,
+            Some((0, 1, "x".into()))
+        );
+        assert_eq!(
+            state.changes().unwrap().updates[&0][&0].as_deref(),
+            Some("1")
         );
     }
 

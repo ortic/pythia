@@ -11,8 +11,8 @@ mod splitter;
 
 pub use format::{
     Case, CommaStyle, FormatOptions, Formatted, Wrap, describe as describe_format,
-    equivalent as only_layout_differs, format, format_range, infer as infer_format,
-    kept_as_written,
+    equivalent as only_layout_differs, equivalent_in as only_layout_differs_in, format, format_in,
+    format_range, format_range_in, infer as infer_format, kept_as_written, kept_as_written_in,
 };
 pub use header::{UnitHeader, trigger_body_line, unit_header};
 pub use keywords::{is_keyword, is_reserved};

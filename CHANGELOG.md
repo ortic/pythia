@@ -446,6 +446,27 @@ All notable changes to Pythia are documented here. The format follows
   without columns, and a covering index `(a) include (b, c)` as one on
   `a` alone; a columnstore index's columns are now under *Columns*, and
   *Include* has the INCLUDE columns, as on PostgreSQL.
+- Tab in a cell being edited goes on to the next cell and edits it
+  (#254). It kept the value but left the cursor where it was, so the
+  value typed next went into the same cell and replaced it. Shift+Tab
+  edits the cell before; read-only columns are passed over, and at the
+  end of a row Tab goes on to the next one. In the record view, Tab goes
+  to the next field.
+- A change to a result being edited can be taken back before *Apply*
+  (#257). A cell set to NULL with Delete by mistake, or a paste over the
+  wrong cells, could only be taken back with *Discard*, which dropped
+  every other change too. Ctrl+Z in the grid, or *Undo* in the cell's
+  menu, now takes back the last change, one at a time.
+- *Format Code* no longer changes strings, comments and quoted names on
+  MySQL, PostgreSQL, SQL Server and SQLite (#259). It read every window
+  as Oracle's SQL: MySQL's `'it\'s FROM here'` got a line break and a
+  space inside and `from` in lower case, a `#` comment was cut and its
+  rest became code, `[Order]` became `[ order ]`, and PostgreSQL's
+  `E'…'` and `$$…$$` strings broke the same way; the rest of the
+  statement, such as its ORDER BY, wasn't laid out. The formatter now
+  reads the text as the window's database does, also when formatting on
+  save or as typed, and when checking what *AI: Format Unsupported
+  Statements* answers.
 
 ## [0.10.0] - 2026-10-30
 

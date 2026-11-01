@@ -1793,7 +1793,7 @@ impl PythiaApp {
         };
         editor.format_all(&options);
         let text = editor.text().to_owned();
-        let kept = pythia_plsql::kept_as_written(&text, &options);
+        let kept = pythia_plsql::kept_as_written_in(&text, editor.syntax(), &options);
         if kept.is_empty() {
             self.log("Format with AI: the formatter handles every statement here");
             return;
@@ -1858,6 +1858,7 @@ impl PythiaApp {
             return;
         };
         let mut text = editor.text().to_owned();
+        let syntax = editor.syntax();
         let total = run.jobs.len();
         let mut laid_out = 0;
         // Where kept statements start, and why they were kept.
@@ -1885,7 +1886,7 @@ impl PythiaApp {
                 Ok(_) if text.get(j.range.clone()) != Some(j.original.as_str()) => {
                     "it was edited meanwhile".into()
                 }
-                Ok(code) if !pythia_plsql::only_layout_differs(&j.original, &code) => {
+                Ok(code) if !pythia_plsql::only_layout_differs_in(&j.original, &code, syntax) => {
                     "the answer changed more than the layout".into()
                 }
                 Ok(code) => {
@@ -2974,7 +2975,12 @@ impl PythiaApp {
                 let message = match editor {
                     Some(editor) => {
                         let mut message = format_editor(editor, &options);
-                        let kept = pythia_plsql::kept_as_written(editor.text(), &options).len();
+                        let kept = pythia_plsql::kept_as_written_in(
+                            editor.text(),
+                            editor.syntax(),
+                            &options,
+                        )
+                        .len();
                         if kept > 0 {
                             message.push_str(&format!(
                                 "; {kept} statement(s) kept as written (unsupported or not safe to change)"
@@ -6067,9 +6073,12 @@ fn format_editor(
 ) -> String {
     let text = editor.text().to_owned();
     let line = editor.line_col().0;
+    // Strings, comments and quoted names as the window's database reads
+    // them (#259).
+    let syntax = editor.syntax();
     let formatted = match editor.selection() {
-        Some(sel) => pythia_plsql::format_range(&text, sel, options),
-        None => pythia_plsql::format(&text, options),
+        Some(sel) => pythia_plsql::format_range_in(&text, sel, syntax, options),
+        None => pythia_plsql::format_in(&text, syntax, options),
     };
     if !formatted.changed {
         return "Already formatted".into();
