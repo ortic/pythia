@@ -467,6 +467,19 @@ All notable changes to Pythia are documented here. The format follows
   reads the text as the window's database does, also when formatting on
   save or as typed, and when checking what *AI: Format Unsupported
   Statements* answers.
+- SQLite: a database file made with *New…* is no longer made again,
+  empty, once it's moved or deleted (#255). The connection was saved
+  with `?create`, so connecting again, or a new window while connected,
+  made an empty database in its place without a word. `?create` now
+  makes the file for the connect it's given to: the connection is saved
+  and opens its other sessions without it, and a file that's gone says
+  "There is no database file".
+- SQL Server's `float` and `real`, and MySQL's DOUBLE and FLOAT in a
+  query with bind variables, keep their exponent (#261). 2e-20 showed as
+  `0.00000000000000000002` and 1e-300 as 302 characters, which the grid
+  cut short to `0.0000…`, as if it were 0; *Copy* and the CSV exports
+  wrote them so. They now read `2e-20` and `1e-300`, as on SQLite and
+  PostgreSQL; values from 1e-4 to 1e16 stay as they were (`2.5`, `100`).
 
 ## [0.10.0] - 2026-10-30
 

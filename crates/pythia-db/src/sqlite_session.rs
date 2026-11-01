@@ -273,6 +273,30 @@ enum Opt {
     Create,
 }
 
+/// `connect_string` without `?create`, which makes the file for the
+/// connect it is given to only: kept, it made an empty database where the
+/// file had been moved or deleted (#255). Other options stay, and so does
+/// a `file:` URI, whose `mode=` is SQLite's.
+pub fn sqlite_without_create(connect_string: &str) -> String {
+    let text = connect_string.trim();
+    if !text.starts_with("file:")
+        && let Some((path, options)) = text.rsplit_once('?')
+        && options.split('&').all(|o| Target::option(o).is_some())
+    {
+        let kept: Vec<&str> = options
+            .split('&')
+            .filter(|o| !matches!(Target::option(o), Some(Opt::Create)))
+            .collect();
+        if kept.is_empty() {
+            return path.to_owned();
+        }
+        if kept.len() < options.split('&').count() {
+            return format!("{path}?{}", kept.join("&"));
+        }
+    }
+    connect_string.to_owned()
+}
+
 /// `~/x.db` → the home directory's `x.db`.
 fn expand_home(path: &str) -> PathBuf {
     let rest = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"));
@@ -856,6 +880,25 @@ mod tests {
         assert!(t.read_only);
         assert!(matches!(t.file, File::Uri(_)));
         assert!(Target::parse("  ").is_err());
+    }
+
+    /// What a connection keeps once its file is made (#255).
+    #[test]
+    fn create_is_for_one_connect() {
+        for (given, kept) in [
+            ("/data/app.db?create", "/data/app.db"),
+            ("C:\\data\\app.db?ro&create", "C:\\data\\app.db?ro"),
+            ("app.db?Create&ro", "app.db?ro"),
+            ("sqlite://app.db?mode=rwc", "sqlite://app.db"),
+            ("/data/app.db?ro", "/data/app.db?ro"),
+            ("/data/app.db", "/data/app.db"),
+            // A `?` of the file name's own, a URI's mode, memory.
+            ("what?create.db", "what?create.db"),
+            ("file:x.db?mode=rwc", "file:x.db?mode=rwc"),
+            (":memory:", ":memory:"),
+        ] {
+            assert_eq!(sqlite_without_create(given), kept, "{given}");
+        }
     }
 
     #[test]

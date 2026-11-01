@@ -123,6 +123,20 @@ pub(crate) fn hex(bytes: &[u8], whole: bool) -> String {
     out
 }
 
+/// A float as text, as SQLite's values are: with an exponent below 1e-4
+/// and from 1e16 (`2e-20`, `1e300`), the shortest that reads back, and
+/// plainly in between (`2.5`, `100`), without SQLite's `.0`. Written out,
+/// 1e-300 is 302 characters, which the grid shows cut short as
+/// `0.0000…` (#261).
+pub(crate) fn float_text<F: std::fmt::Debug + std::fmt::Display>(value: F) -> String {
+    let shortest = format!("{value:?}");
+    if shortest.contains('e') {
+        shortest
+    } else {
+        value.to_string()
+    }
+}
+
 /// The size of a binary value a result holds cut short: the number in
 /// `… (10485760 bytes)` after the hex of its first [`SHOWN_BYTES`] (also
 /// after SQL Server's `0x`). `None` for any other text.
@@ -244,6 +258,28 @@ mod tests {
         assert_eq!(cut_size(&hex(&[0; 4000], false)), None);
         assert_eq!(cut_size("ABCD… (10000 bytes)"), None);
         assert_eq!(row_bytes(&[Some("AB".into()), None, Some("é".into())]), 4);
+    }
+
+    /// Floats keep their exponent where SQLite's do (#261).
+    #[test]
+    fn floats() {
+        for (value, text) in [
+            (2e-20, "2e-20"),
+            (-1e-300, "-1e-300"),
+            (2e20, "2e20"),
+            (1e16, "1e16"),
+            (3e15, "3000000000000000"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-5"),
+            (2.5, "2.5"),
+            (100.0, "100"),
+            (0.0, "0"),
+            (f64::INFINITY, "inf"),
+        ] {
+            assert_eq!(float_text(value), text, "{value}");
+        }
+        assert_eq!(float_text(2.5e-7_f32), "2.5e-7");
+        assert_eq!(float_text(0.1_f32), "0.1");
     }
 
     #[test]

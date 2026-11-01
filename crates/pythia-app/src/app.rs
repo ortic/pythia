@@ -3389,8 +3389,11 @@ impl PythiaApp {
             previous,
         } = request;
         let name = profile.display_name();
+        // Saved and shown again as the connection keeps it, without a
+        // SQLite file's `?create` (#255).
+        let kept = crate::connections::kept_profile(&profile);
         if save_profile && self.paths.is_some() {
-            if !self.save_profile(&profile, previous.as_deref()) {
+            if !self.save_profile(&kept, previous.as_deref()) {
                 return;
             }
             // Renamed: its passwords go with it.
@@ -3412,7 +3415,7 @@ impl PythiaApp {
             ssh if ssh.enabled => self.log(format!("Connecting to {name} through {}…", ssh.host)),
             _ => self.log(format!("Connecting to {name}…")),
         }
-        self.last_profile = Some(profile.clone());
+        self.last_profile = Some(kept);
         self.connecting =
             Some(
                 self.conns
@@ -5684,6 +5687,11 @@ impl PythiaApp {
 
     pub fn test_connect_dialog_error(&self) -> Option<&str> {
         self.connect_dialog.test_error()
+    }
+
+    /// As if the connect dialog's *…* (or *New…*, `new`) picked `path`.
+    pub fn test_pick_database_file(&mut self, new: bool, path: std::path::PathBuf) {
+        self.connect_dialog.test_pick_file(new, path);
     }
 
     /// As if the keychain took a connection's passwords, or not.

@@ -8201,6 +8201,118 @@ fn connections_are_saved_under_their_own_name() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A database file made with *New…* (`?create`) is made by that connect
+/// only (#255). The connection was saved and shown again with
+/// `?create`, and the other windows opened their sessions with it: once
+/// the file was moved or deleted, a new window, connecting again or the
+/// saved connection made an empty database in its place without a word.
+#[test]
+fn a_new_database_file_is_made_once() {
+    let dir = std::env::temp_dir().join(format!("pythia-made-once-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = pythia_config::Paths {
+        config_dir: dir.clone(),
+        data_dir: dir.clone(),
+    };
+    let file = dir.join("once.db");
+    let path = file.display().to_string();
+    let connections_file = paths.connections_file();
+    let profile = ConnectionProfile {
+        name: "once.db".into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: path.clone(),
+        ..Default::default()
+    };
+    pythia_config::save_toml(
+        &connections_file,
+        &pythia_config::Connections {
+            profiles: vec![profile.clone()],
+        },
+    )
+    .unwrap();
+    let in_file = || -> Vec<String> {
+        let saved: pythia_config::Connections =
+            pythia_config::load_toml(&connections_file).unwrap();
+        saved
+            .profiles
+            .into_iter()
+            .map(|p| p.connect_string)
+            .collect()
+    };
+    let start = |paths: pythia_config::Paths| {
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1440.0, 900.0))
+            .with_pixels_per_point(1.5)
+            .build_eframe(move |cc| PythiaApp::new(cc, Some(paths)));
+        h.run_steps(2);
+        h
+    };
+    // Connect, and what the dialog says about it.
+    let connect = |h: &mut Harness<'_, PythiaApp>| {
+        h.get_by_label("Connect").click();
+        wait_until(h, "connect", |app| {
+            app.test_connected_to("once.db") || app.test_connect_dialog_error().is_some()
+        });
+        h.state().test_connect_dialog_error().map(str::to_owned)
+    };
+    let missing = |error: Option<String>| {
+        error.is_some_and(|e| e.starts_with(&format!("There is no database file {path}")))
+    };
+    let _lock = UI_LOCK.shared();
+    let mut h = start(paths.clone());
+    h.state_mut().test_show_connections(vec![profile]);
+    h.run_steps(2);
+    h.state_mut().test_pick_database_file(true, file.clone());
+    h.run_steps(2);
+    assert_eq!(connect(&mut h), None);
+    assert!(file.exists());
+    assert_eq!(in_file(), [path.as_str()], "saved without ?create");
+
+    // Gone while connected: a new window doesn't make it again.
+    std::fs::remove_file(&file).unwrap();
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "once.db".into(),
+        text: "select count(*) from sqlite_schema".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    let messages: Vec<String> = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .messages
+        .iter()
+        .map(|m| m.text.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("There is no database file")),
+        "{messages:?}"
+    );
+    assert!(!file.exists(), "made again by a window");
+
+    // Nor connecting again from the dialog, which shows the connection.
+    h.state_mut()
+        .test_command(crate::commands::Command::Connect);
+    h.run_steps(2);
+    let error = connect(&mut h);
+    assert!(missing(error.clone()), "{error:?}");
+    assert!(!file.exists(), "made again by Connect");
+    drop(h);
+
+    // Nor the saved connection.
+    let mut h = start(paths);
+    h.get_by_label("once.db").click();
+    h.run_steps(2);
+    let error = connect(&mut h);
+    assert!(missing(error.clone()), "{error:?}");
+    assert!(!file.exists(), "made again by the saved connection");
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A MySQL connection (`PYTHIA_TEST_MYSQL=user/password@host:port/database`):
 /// queries, transactions, browser and object views work; what MySQL can't
 /// do is left out of the menus, the toolbar and the browser.

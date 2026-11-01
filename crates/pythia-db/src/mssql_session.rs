@@ -37,8 +37,8 @@ use crate::dialect::Dialect;
 use crate::meta::{MetaQuery, MetaResult};
 use crate::session::{CancelSlot, Canceller, Events};
 use crate::sql_text::{
-    WHOLE_BATCH_BYTES, civil_from_days, has_word, hex, leading_words, line_offset, release,
-    replace_binds, row_bytes, statement_kind,
+    WHOLE_BATCH_BYTES, civil_from_days, float_text, has_word, hex, leading_words, line_offset,
+    release, replace_binds, row_bytes, statement_kind,
 };
 use crate::ssh::Tunnel;
 use crate::types::{
@@ -1109,8 +1109,8 @@ fn cell(data: &ColumnData<'_>, whole: bool) -> Cell {
         ColumnData::I16(v) => v.as_ref()?.to_string(),
         ColumnData::I32(v) => v.as_ref()?.to_string(),
         ColumnData::I64(v) => v.as_ref()?.to_string(),
-        ColumnData::F32(v) => v.as_ref()?.to_string(),
-        ColumnData::F64(v) => v.as_ref()?.to_string(),
+        ColumnData::F32(v) => float_text(*v.as_ref()?),
+        ColumnData::F64(v) => float_text(*v.as_ref()?),
         ColumnData::Bit(v) => if (*v)? { "1" } else { "0" }.to_owned(),
         ColumnData::String(v) => v.as_deref()?.to_owned(),
         ColumnData::Guid(v) => v.as_ref()?.to_string().to_uppercase(),

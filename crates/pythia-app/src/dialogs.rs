@@ -851,6 +851,14 @@ impl ConnectDialog {
         self.connect_request(&SavedConnections::default())
     }
 
+    /// As if *…* (or *New…*, `new`) picked `path`.
+    #[cfg(test)]
+    pub fn test_pick_file(&mut self, new: bool, path: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((new, Some(path))).expect("receiver kept");
+        self.picking_file = Some(rx);
+    }
+
     #[cfg(test)]
     pub fn test_error(&self) -> Option<&str> {
         self.error.as_deref()
