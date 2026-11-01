@@ -23,6 +23,12 @@ fn params() -> Option<ConnectParams> {
     from_spec(&std::env::var("PYTHIA_TEST_MSSQL").ok()?)
 }
 
+/// The DBA's login (`PYTHIA_TEST_MSSQL_DBA`), for tests that make
+/// databases of their own.
+fn dba_params() -> Option<ConnectParams> {
+    from_spec(&std::env::var("PYTHIA_TEST_MSSQL_DBA").ok()?)
+}
+
 /// The database through the SSH server, trusting the host keys kept in
 /// `known_hosts`.
 fn ssh_params(known_hosts: &Path) -> Option<ConnectParams> {
@@ -1137,6 +1143,609 @@ fn xml_spatial_and_ordered_indexes() {
     h.ok("drop table r53_copy.r53_xg, r53_copy.r53_ord");
     h.ok("drop schema r53_copy");
     h.ok("drop table r53_xg, r53_ord");
+}
+
+/// A database of the test's own, made afresh by `dba` and set up with
+/// `setup` (`{db}` is its name); the harness is connected to it, in
+/// autocommit.
+fn own_database(dba: &mut Harness, name: &str, setup: &[&str]) -> Harness {
+    drop_database(dba, name);
+    dba.ok(&format!("create database [{name}]"));
+    for sql in setup {
+        dba.ok(&sql.replace("{db}", name));
+    }
+    let mut params = dba_params().expect("the DBA's login");
+    let (server, rest) = params.connect_string.rsplit_once('/').expect("a database");
+    let options = rest.find('?').map_or("", |i| &rest[i..]);
+    params.connect_string = format!("{server}/{name}{options}");
+    let h = Harness::with(params);
+    h.session.send(DbRequest::SetAutocommit(true));
+    h
+}
+
+/// Drops a database `own_database` made, and the sessions still in it.
+fn drop_database(dba: &mut Harness, name: &str) {
+    dba.ok(&format!(
+        "if db_id('{name}') is not null begin \
+           alter database [{name}] set single_user with rollback immediate; \
+           drop database [{name}]; \
+         end"
+    ));
+}
+
+/// A table's details and DDL as lines: Indexes, Constraints and Triggers,
+/// each with its columns' names first, then the DDL.
+fn table_dictionary(h: &mut Harness, owner: &str, table: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for detail in [Detail::Indexes, Detail::Constraints, Detail::Triggers] {
+        let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+            owner: owner.into(),
+            name: table.into(),
+            detail,
+        }) else {
+            panic!("expected a table")
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        lines.push(names.join(" | "));
+        for row in rows {
+            let values: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+            lines.push(values.join(" | "));
+        }
+    }
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: owner.into(),
+        name: table.into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    lines.extend(ddl.lines().map(str::to_owned));
+    lines
+}
+
+/// Indexes, Constraints, Triggers and a table's DDL in a database at
+/// compatibility level 100, as one from SQL Server 2008 is, read as at
+/// 160 (#294): there string_agg's WITHIN GROUP is a syntax error, and SQL
+/// Server 2016 has no string_agg at all.
+#[test]
+fn dictionary_at_compatibility_level_100() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(&mut dba, "r63_compat", &[]);
+    for sql in [
+        "create table r63_dept (deptno int constraint r63_dept_pk primary key, \
+         site int not null, name varchar(30) not null, \
+         constraint r63_dept_site unique (site desc, deptno))",
+        "create table r63_emp (empno int constraint r63_emp_pk primary key nonclustered, \
+         deptno int, site int, sal decimal(8,2) constraint r63_emp_sal default 0, \
+         [na,me] varchar(30), \
+         constraint r63_emp_fk foreign key (site, deptno) references r63_dept (site, deptno) \
+           on delete cascade, \
+         constraint r63_emp_sal_ck check (sal >= 0))",
+        "create clustered index r63_emp_name on r63_emp ([na,me], empno desc)",
+        "create index r63_emp_cover on r63_emp (deptno) include (sal, [na,me]) \
+         where deptno is not null",
+        "create nonclustered columnstore index r63_emp_store on r63_emp (sal, site)",
+        "create trigger r63_emp_tr on r63_emp after delete, insert, update as set nocount on",
+        "create trigger r63_emp_ins on r63_emp after insert as set nocount on",
+    ] {
+        h.ok(sql);
+    }
+    let read = |h: &mut Harness| {
+        let mut lines = table_dictionary(h, "dbo", "r63_dept");
+        lines.extend(table_dictionary(h, "dbo", "r63_emp"));
+        lines
+    };
+    // As string_agg made them.
+    let expected = [
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
+        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  | ",
+        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  | ",
+        "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
+        "r63_dept_pk | Primary key | deptno | ",
+        "r63_dept_site | Unique | site, deptno | ",
+        "TRIGGER_NAME | TRIGGERING_EVENT | TIMING | STATUS",
+        "create table [dbo].[r63_dept] (",
+        "    [deptno] int not null,",
+        "    [site] int not null,",
+        "    [name] varchar(30) not null,",
+        "    constraint [r63_dept_pk] primary key clustered ([deptno]),",
+        "    constraint [r63_dept_site] unique nonclustered ([site] desc, [deptno])",
+        ");",
+        "GO",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
+        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  | ",
+        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL)",
+        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  | ",
+        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  | ",
+        "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
+        "r63_emp_pk | Primary key | empno | ",
+        "r63_emp_fk | Foreign key | site, deptno | dbo.r63_dept",
+        "r63_emp_sal_ck | Check | ([sal]>=(0)) | ",
+        "r63_emp_sal | Default | sal ((0)) | ",
+        "TRIGGER_NAME | TRIGGERING_EVENT | TIMING | STATUS",
+        "r63_emp_ins | INSERT | AFTER | ENABLED",
+        "r63_emp_tr | INSERT, UPDATE, DELETE | AFTER | ENABLED",
+        "create table [dbo].[r63_emp] (",
+        "    [empno] int not null,",
+        "    [deptno] int null,",
+        "    [site] int null,",
+        "    [sal] decimal(8,2) null constraint [r63_emp_sal] default ((0)),",
+        "    [na,me] varchar(30) null,",
+        "    constraint [r63_emp_pk] primary key nonclustered ([empno]),",
+        "    constraint [r63_emp_fk] foreign key ([site], [deptno]) references [dbo].[r63_dept] \
+         ([site], [deptno]) on delete cascade,",
+        "    constraint [r63_emp_sal_ck] check ([sal]>=(0))",
+        ");",
+        "",
+        "create nonclustered index [r63_emp_cover] on [dbo].[r63_emp] ([deptno]) \
+         include ([sal], [na,me]) where ([deptno] IS NOT NULL);",
+        "",
+        "create clustered index [r63_emp_name] on [dbo].[r63_emp] ([na,me], [empno] desc);",
+        "",
+        "create nonclustered columnstore index [r63_emp_store] on [dbo].[r63_emp] \
+         ([sal], [site]);",
+        "GO",
+    ];
+    for level in [160, 100] {
+        h.ok(&format!(
+            "alter database current set compatibility_level = {level}"
+        ));
+        assert_eq!(read(&mut h), expected, "at {level}");
+    }
+    drop(h);
+    drop_database(&mut dba, "r63_compat");
+}
+
+/// The indexes of `tables` in `owner` as the catalog has them, and whether
+/// each table is memory-optimized and how durable.
+fn catalog_indexes(h: &mut Harness, owner: &str, tables: &[&str]) -> Vec<String> {
+    let names: Vec<String> = tables.iter().map(|t| format!("'{t}'")).collect();
+    let names = names.join(", ");
+    let tables = h.scalar(&format!(
+        "select string_agg(concat_ws(' ', t.name, t.is_memory_optimized, \
+                                     t.durability_desc collate database_default), '; ') \
+                  within group (order by t.name) \
+           from sys.tables t where t.schema_id = schema_id('{owner}') and t.name in ({names})"
+    ));
+    let indexes = h.scalar(&format!(
+        "select string_agg(x.line collate database_default, '; ') within group (order by x.line) \
+           from (select concat_ws(' ', object_name(i.object_id), i.name, \
+                                  i.type_desc collate database_default, i.is_unique, \
+                                  i.is_primary_key, i.is_unique_constraint, h.bucket_count, \
+                                  c.columns) as line \
+                   from sys.indexes i \
+                   left join sys.hash_indexes h on h.object_id = i.object_id \
+                    and h.index_id = i.index_id \
+                  outer apply (select string_agg(col_name(ic.object_id, ic.column_id) \
+                                                 + case when ic.is_descending_key = 1 \
+                                                        then ' desc' else '' end, ',') \
+                                        within group (order by ic.key_ordinal, \
+                                                               ic.index_column_id) as columns \
+                                 from sys.index_columns ic \
+                                where ic.object_id = i.object_id \
+                                  and ic.index_id = i.index_id) c \
+                  where i.object_id in (select object_id from sys.tables \
+                                         where schema_id = schema_id('{owner}') \
+                                           and name in ({names}))) x"
+    ));
+    [tables, indexes].into_iter().flatten().collect()
+}
+
+/// Runs a table's DDL with the tables `tables` of `schema` named in `copy`.
+fn run_ddl_in(h: &mut Harness, ddl: &str, schema: &str, copy: &str, tables: &[&str]) {
+    for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
+        let mut sql = statement.text(ddl).to_owned();
+        for table in tables {
+            sql = sql.replace(
+                &format!("[{schema}].[{table}]"),
+                &format!("[{copy}].[{table}]"),
+            );
+        }
+        h.ok(&sql);
+    }
+}
+
+/// A memory-optimized table's DDL makes it memory-optimized again, as
+/// durable, with its hash indexes and their bucket counts, and with the
+/// indexes declared in it: CREATE INDEX can't make them (#302).
+#[test]
+fn memory_optimized_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(
+        &mut dba,
+        "r63_mem",
+        &[
+            "alter database [{db}] add filegroup [{db}_mo] contains memory_optimized_data",
+            "declare @path nvarchar(400) = \
+               cast(serverproperty('InstanceDefaultDataPath') as nvarchar(400)) + '{db}_mo'; \
+             exec('alter database [{db}] add file (name = [{db}_mo], filename = ''' \
+                  + @path + ''') to filegroup [{db}_mo]')",
+        ],
+    );
+    for sql in [
+        "create table r63_mo (\
+           id int not null constraint r63_mo_pk primary key nonclustered hash \
+             with (bucket_count = 1000), \
+           a int not null, \
+           b nvarchar(20) null, \
+           c int identity(1, 1) not null, \
+           n int not null constraint r63_mo_n default 0 constraint r63_mo_n_ck check (n >= 0), \
+           constraint r63_mo_b unique nonclustered (b), \
+           index r63_mo_a nonclustered (a desc, id), \
+           index r63_mo_hash hash (a, id) with (bucket_count = 64)\
+         ) with (memory_optimized = on)",
+        "create table r63_mod (\
+           id int not null constraint r63_mod_pk primary key nonclustered, \
+           mo int null constraint r63_mod_fk references r63_mo (id), \
+           v varchar(10) null, \
+           index r63_mod_cs clustered columnstore\
+         ) with (memory_optimized = on)",
+        "create table r63_mos (id int not null primary key nonclustered hash \
+         with (bucket_count = 8)) with (memory_optimized = on, durability = schema_only)",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "dbo".into(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let mo = ddl(&mut h, "r63_mo");
+    assert_eq!(
+        mo,
+        "create table [dbo].[r63_mo] (\n    \
+           [id] int not null,\n    \
+           [a] int not null,\n    \
+           [b] nvarchar(20) null,\n    \
+           [c] int identity(1, 1) not null,\n    \
+           [n] int not null constraint [r63_mo_n] default ((0)),\n    \
+           constraint [r63_mo_pk] primary key nonclustered hash ([id]) \
+             with (bucket_count = 1024),\n    \
+           constraint [r63_mo_b] unique nonclustered ([b]),\n    \
+           constraint [r63_mo_n_ck] check ([n]>=(0)),\n    \
+           index [r63_mo_a] nonclustered ([a] desc, [id]),\n    \
+           index [r63_mo_hash] nonclustered hash ([a], [id]) with (bucket_count = 64)\n\
+         ) with (memory_optimized = on, durability = schema_and_data);\nGO\n"
+    );
+    let mo_d = ddl(&mut h, "r63_mod");
+    assert!(
+        mo_d.contains(
+            "    constraint [r63_mod_fk] foreign key ([mo]) references [dbo].[r63_mo] ([id]),\n    \
+             index [r63_mod_cs] clustered columnstore\n\
+             ) with (memory_optimized = on, durability = schema_and_data);"
+        ),
+        "{mo_d}"
+    );
+    let mo_s = ddl(&mut h, "r63_mos");
+    assert!(
+        mo_s.ends_with(") with (memory_optimized = on, durability = schema_only);\nGO\n"),
+        "{mo_s}"
+    );
+    // Run in another schema, the DDL makes the same tables.
+    let tables = ["r63_mo", "r63_mod", "r63_mos"];
+    let before = catalog_indexes(&mut h, "dbo", &tables);
+    h.ok("create schema r63_copy");
+    for ddl in [&mo, &mo_d, &mo_s] {
+        run_ddl_in(&mut h, ddl, "dbo", "r63_copy", &tables);
+    }
+    assert_eq!(catalog_indexes(&mut h, "r63_copy", &tables), before);
+    drop(h);
+    drop_database(&mut dba, "r63_mem");
+}
+
+/// A table's DDL creates its selective XML indexes, with their namespaces
+/// and their paths' types, and the secondary ones on a path of theirs
+/// (#311): run elsewhere, the copy has the same indexes.
+#[test]
+fn selective_xml_indexes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r63_copy.r63_sx");
+    h.ok("drop schema if exists r63_copy");
+    h.ok("drop table if exists r63_sx");
+    for sql in [
+        "create table r63_sx (id int constraint r63_sx_pk primary key, doc xml)",
+        "create selective xml index [r63 sel] on r63_sx (doc) \
+         with xmlnamespaces ('urn:a' as a, default 'urn:it''s') \
+         for ([p 1] = '/a:x/a:y', p2 = '/a:x/a:z' as xquery 'xs:string' maxlength(20) singleton, \
+              p3 = '/a:x/@n' as sql int, p4 = '/a:x/w' as xquery 'node()', \
+              p5 = '/a:x/v' as sql nvarchar(30) singleton, p6 = '/a:x/u' as xquery 'xs:double', \
+              p7 = '/a:x/t' as sql decimal(9,2), p8 = '/a:x/s' as sql varchar(max), \
+              p9 = '/x' as xquery 'xs:string')",
+        "create xml index r63_sx_n on r63_sx (doc) using xml index [r63 sel] for (p3)",
+        "create xml index r63_sx_v on r63_sx (doc) using xml index [r63 sel] for (p5)",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "r63_sx".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    let on = format!("on [{schema}].[r63_sx] ([doc])");
+    for line in [
+        format!(
+            "create selective xml index [r63 sel] {on} \
+             with xmlnamespaces ('urn:a' as [a], default 'urn:it''s') \
+             for ([p 1] = '/a:x/a:y', [p2] = '/a:x/a:z' as xquery 'xs:string' maxlength(20) \
+             singleton, [p3] = '/a:x/@n' as sql int, [p4] = '/a:x/w' as xquery 'node()', \
+             [p5] = '/a:x/v' as sql nvarchar(30) singleton, [p6] = '/a:x/u' as xquery 'xs:double', \
+             [p7] = '/a:x/t' as sql decimal(9,2), [p8] = '/a:x/s' as sql varchar(max), \
+             [p9] = '/x' as xquery 'xs:string');"
+        ),
+        format!("create xml index [r63_sx_n] {on} using xml index [r63 sel] for ([p3]);"),
+        format!("create xml index [r63_sx_v] {on} using xml index [r63 sel] for ([p5]);"),
+    ] {
+        assert!(ddl.contains(&line), "{line}\n{ddl}");
+    }
+    let selective = ddl.find("create selective").expect("the selective index");
+    assert!(
+        ddl.find("[r63_sx_n]").is_some_and(|at| at > selective),
+        "{ddl}"
+    );
+    // The indexes, paths and namespaces as the catalog has them.
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let table = format!("object_id('[{owner}].[r63_sx]')");
+        [
+            format!(
+                "select string_agg(concat_ws(' ', i.name, x.xml_index_type, u.name, p.name) \
+                                   collate database_default, '; ') within group (order by i.name) \
+                   from sys.xml_indexes x join sys.indexes i on i.object_id = x.object_id \
+                    and i.index_id = x.index_id \
+                   left join sys.indexes u on u.object_id = x.object_id \
+                    and u.index_id = x.using_xml_index_id \
+                   left join sys.selective_xml_index_paths p on p.object_id = x.object_id \
+                    and p.index_id = x.using_xml_index_id and p.path_id = x.path_id \
+                  where x.object_id = {table}"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', p.path_id, p.name, p.path, p.path_type, \
+                                             p.xquery_type_description, p.xquery_max_length, \
+                                             p.is_node, type_name(p.user_type_id), p.max_length, \
+                                             p.precision, p.scale, p.is_singleton) \
+                                   collate database_default, '; ') \
+                          within group (order by p.path_id) \
+                   from sys.selective_xml_index_paths p where p.object_id = {table}"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', n.is_default_uri, n.uri, n.prefix) \
+                                   collate database_default, '; ') \
+                          within group (order by n.is_default_uri) \
+                   from sys.selective_xml_index_namespaces n where n.object_id = {table}"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    assert!(before.iter().all(Option::is_some), "{before:?}");
+    h.ok("create schema r63_copy");
+    run_ddl_in(&mut h, &ddl, &schema, "r63_copy", &["r63_sx"]);
+    assert_eq!(catalog(&mut h, "r63_copy"), before);
+    h.ok("drop table r63_copy.r63_sx");
+    h.ok("drop schema r63_copy");
+    h.ok("drop table r63_sx");
+}
+
+/// The indexes of the tables in `owner` whose names start with `prefix`,
+/// with their options and storage, and how each partition is compressed,
+/// as the catalog has them.
+fn catalog_storage(h: &mut Harness, owner: &str, prefix: &str, xml: bool) -> Vec<String> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%'"
+    );
+    let xml_compression = if xml { "p.xml_compression_desc" } else { "''" };
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, l.name), '; ') within group (order by t.name) \
+               from sys.tables t left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
+              where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(x.line collate database_default, '; ') within group (order by x.line) \
+               from (select concat_ws(' ', object_name(i.object_id), i.name, \
+                                      i.type_desc collate database_default, i.fill_factor, \
+                                      i.is_padded, i.ignore_dup_key, i.allow_row_locks, \
+                                      i.allow_page_locks, i.optimize_for_sequential_key, \
+                                      i.compression_delay, s.no_recompute, s.is_incremental, \
+                                      d.name, c.columns) as line \
+                       from sys.indexes i \
+                       left join sys.stats s on s.object_id = i.object_id and s.stats_id = i.index_id \
+                       left join sys.data_spaces d on d.data_space_id = i.data_space_id \
+                      outer apply (select string_agg(col_name(ic.object_id, ic.column_id) \
+                                                     + ' ' + cast(ic.key_ordinal as varchar(3)) \
+                                                     + ' ' + cast(ic.partition_ordinal as varchar(3)) \
+                                                     + ' ' + cast(ic.is_included_column as varchar(3)), \
+                                                     ',') \
+                                            within group (order by ic.index_column_id) as columns \
+                                     from sys.index_columns ic \
+                                    where ic.object_id = i.object_id \
+                                      and ic.index_id = i.index_id) c \
+                      where i.object_id in ({tables})) x"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(p.object_id), i.name, p.partition_number, \
+                                         p.data_compression_desc, {xml_compression}) \
+                                 collate database_default, '; ') \
+                      within group (order by object_name(p.object_id), i.name, p.partition_number) \
+               from sys.partitions p join sys.indexes i on i.object_id = p.object_id \
+                and i.index_id = p.index_id \
+              where p.object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .filter_map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A table's DDL has its indexes' options where they aren't the defaults,
+/// their compression, also by partition, and the filegroup or partition
+/// scheme of the table, its indexes and its LOB data (#315): run in another
+/// schema, it makes the same indexes, stored alike. An index on a partition
+/// scheme has the partitioning column, which isn't one of its columns.
+#[test]
+fn index_options_and_storage() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(
+        &mut dba,
+        "r63_opts",
+        &[
+            "alter database [{db}] add filegroup [r63_fg]",
+            "declare @path nvarchar(400) = \
+               cast(serverproperty('InstanceDefaultDataPath') as nvarchar(400)) + '{db}_fg.ndf'; \
+             exec('alter database [{db}] add file (name = [{db}_fg], filename = ''' \
+                  + @path + ''') to filegroup [r63_fg]')",
+        ],
+    );
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // OPTIMIZE_FOR_SEQUENTIAL_KEY came with SQL Server 2019, XML_COMPRESSION
+    // with 2022.
+    let (sequential, xml) = (major >= 15, major >= 16);
+    let sequential_key = if sequential {
+        ", optimize_for_sequential_key = on"
+    } else {
+        ""
+    };
+    h.ok(
+        "create table r63_o (id int not null, a int, b varchar(10), d varchar(max), \
+           constraint r63_o_pk primary key clustered (id) \
+             with (fillfactor = 80, pad_index = on, data_compression = page) on [r63_fg], \
+           constraint r63_o_a unique (a) \
+             with (ignore_dup_key = on, allow_row_locks = off, statistics_norecompute = on) \
+             on [primary]) \
+         on [r63_fg] textimage_on [primary]",
+    );
+    h.ok(&format!(
+        "create index r63_o_b on r63_o (b) \
+         with (allow_page_locks = off{sequential_key}, data_compression = row) on [r63_fg]"
+    ));
+    for sql in [
+        "create partition function r63_pf (int) as range right for values (10, 20)",
+        "create partition scheme r63_ps as partition r63_pf to ([primary], [r63_fg], [primary])",
+        "create index r63_o_plain on r63_o (b, a)",
+        "create table r63_h (id int, v int) on [r63_fg] with (data_compression = row)",
+        "create table r63_p (id int not null, v int, w int) on r63_ps (id)",
+        "create index r63_p_v on r63_p (v) include (w) \
+         with (data_compression = page on partitions (1, 3), \
+               data_compression = row on partitions (2), statistics_incremental = on)",
+        "create unique index r63_p_id on r63_p (id desc) on [primary]",
+        "create table r63_c (id int not null, v int) on r63_ps (id)",
+        "create clustered columnstore index r63_c_cs on r63_c \
+         with (data_compression = columnstore_archive on partitions (2, 3), \
+               compression_delay = 5) \
+         on r63_ps (id)",
+        "create table r63_g (id int constraint r63_g_pk primary key, shape geometry)",
+        "create spatial index r63_g_s on r63_g (shape) using geometry_auto_grid \
+         with (bounding_box = (0, 0, 10, 10), fillfactor = 60, pad_index = on) on [r63_fg]",
+    ] {
+        h.ok(sql);
+    }
+    if xml {
+        h.ok("create table r63_x (id int, doc xml) with (xml_compression = on)");
+    }
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "dbo".into(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let mut tables = vec!["r63_o", "r63_h", "r63_p", "r63_c", "r63_g"];
+    if xml {
+        tables.push("r63_x");
+    }
+    let ddls: Vec<String> = tables.iter().map(|t| ddl(&mut h, t)).collect();
+    let mut lines = vec![
+        "    constraint [r63_o_pk] primary key clustered ([id]) \
+         with (pad_index = on, fillfactor = 80, data_compression = page),"
+            .to_owned(),
+        "    constraint [r63_o_a] unique nonclustered ([a]) \
+         with (ignore_dup_key = on, statistics_norecompute = on, allow_row_locks = off) \
+         on [PRIMARY]\n) on [r63_fg] textimage_on [PRIMARY];"
+            .to_owned(),
+        format!(
+            "create nonclustered index [r63_o_b] on [dbo].[r63_o] ([b]) \
+             with (allow_page_locks = off{sequential_key}, data_compression = row);"
+        ),
+        "create nonclustered index [r63_o_plain] on [dbo].[r63_o] ([b], [a]);".to_owned(),
+        ") on [r63_fg] with (data_compression = row);".to_owned(),
+        ") on [r63_ps] ([id]);".to_owned(),
+        "create unique nonclustered index [r63_p_id] on [dbo].[r63_p] ([id] desc) on [PRIMARY];"
+            .to_owned(),
+        "create nonclustered index [r63_p_v] on [dbo].[r63_p] ([v]) include ([w]) \
+         with (statistics_incremental = on, data_compression = page on partitions (1, 3), \
+         data_compression = row on partitions (2));"
+            .to_owned(),
+        "create clustered columnstore index [r63_c_cs] on [dbo].[r63_c] \
+         with (compression_delay = 5, data_compression = columnstore_archive on partitions (2 to 3));"
+            .to_owned(),
+        "create spatial index [r63_g_s] on [dbo].[r63_g] ([shape]) using geometry_auto_grid \
+         with (bounding_box = (0, 0, 10, 10), cells_per_object = 8, pad_index = on, \
+         fillfactor = 60) on [r63_fg];"
+            .to_owned(),
+    ];
+    if xml {
+        lines.push(") with (xml_compression = on);".to_owned());
+    }
+    let all = ddls.join("\n");
+    for line in lines {
+        assert!(all.contains(&line), "{line}\n{all}");
+    }
+    // Indexes leaves out the partitioning column an index on a partition
+    // scheme has too.
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: "dbo".into(),
+        name: "r63_p".into(),
+        detail: Detail::Indexes,
+    }) else {
+        panic!("expected a table")
+    };
+    let p_v = rows
+        .iter()
+        .find(|r| r[0].as_deref() == Some("r63_p_v"))
+        .expect("r63_p_v");
+    assert_eq!(
+        (p_v[3].as_deref(), p_v[4].as_deref()),
+        (Some("v"), Some("w"))
+    );
+    let before = catalog_storage(&mut h, "dbo", "r63_", xml);
+    h.ok("create schema r63_copy");
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, "dbo", "r63_copy", &tables);
+    }
+    assert_eq!(catalog_storage(&mut h, "r63_copy", "r63_", xml), before);
+    drop(h);
+    drop_database(&mut dba, "r63_opts");
 }
 
 /// Waits for a session's connect to fail.

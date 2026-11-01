@@ -739,6 +739,36 @@ All notable changes to Pythia are documented here. The format follows
   views, but only their triggers had it, and the scripts that replace a
   view (`CREATE OR REPLACE`, `CREATE OR ALTER`, SQLite's and
   PostgreSQL's in a transaction of their own) were out of reach.
+- SQL Server: *Indexes*, *Constraints*, *Triggers* and a table's *DDL*
+  work on SQL Server 2016 and in a database at compatibility level 100
+  (#294), as one moved from SQL Server 2008 is. On 2016 they failed with
+  "'string_agg' is not a recognized built-in function name", and at
+  level 100 all but *Triggers* with "Incorrect syntax near '('". What
+  they show is as before.
+- SQL Server: a memory-optimized table's DDL makes a memory-optimized
+  table (#302), `with (memory_optimized = on, durability = …)`, and
+  declares its indexes in it, hash indexes with their bucket count. It
+  made a disk-based table, left out the hash indexes, and created the
+  other ones with CREATE INDEX, which such a table refuses; a hash key
+  without its bucket count made the DDL fail.
+- SQL Server: a table's DDL has its selective XML indexes (#311), with
+  their namespaces and paths (`as sql int`, `as xquery 'xs:string'
+  maxlength(20)`, `singleton`), and the secondary ones on their paths.
+  They were left out, so that run elsewhere the DDL made a table whose
+  XML queries had no index to use.
+- SQL Server: a table's DDL has its indexes' and keys' options where
+  they aren't the defaults (#315): `ignore_dup_key = on`, `fillfactor`,
+  `pad_index`, `allow_row_locks = off`, `allow_page_locks = off`,
+  `statistics_norecompute`, `statistics_incremental`,
+  `optimize_for_sequential_key`, `compression_delay`, and their
+  `data_compression` and `xml_compression`, by partition where they
+  differ. The table, its indexes and its LOB data keep their filegroup
+  or partition scheme (`on [fg2]`, `on [ps] ([id])`, `textimage_on`), and
+  a heap its compression. They were left out, so that run elsewhere a
+  key that ignored duplicates rejected them, and tables and indexes were
+  made uncompressed and unpartitioned on the default filegroup. An index
+  on a partition scheme no longer gets the partitioning column as its
+  first column, in the DDL and in *Indexes*.
 
 ## [0.10.0] - 2026-10-30
 

@@ -4,6 +4,8 @@
 //! of their own, so it is put together from the catalog; routines, views
 //! and triggers keep their source as written.
 
+use std::collections::HashMap;
+
 use crate::dialect::Dialect;
 use crate::meta::{
     CompileError, DbObject, Detail, MetaQuery, MetaResult, ObjectType, PlanStep, TableColumn,
@@ -36,6 +38,12 @@ const COLUMN_TYPE: &str = "case when t.name in ('varchar', 'char', 'varbinary', 
                                 when t.name in ('datetime2', 'time', 'datetimeoffset') \
                                   then t.name + '(' + cast(c.scale as varchar(10)) + ')' \
                                 else t.name end";
+
+/// Whether `sys.index_columns ic` is a column the index was made with: on a
+/// partition scheme, an index has the partitioning column too, neither a
+/// key nor an included column, unless it was given (#315).
+const INDEX_COLUMN: &str = "not (ic.key_ordinal = 0 and ic.is_included_column = 0 \
+                                 and ic.partition_ordinal > 0)";
 
 pub(crate) fn run(ms: &mut Ms<'_>, query: &MetaQuery) -> Result<MetaResult, DbError> {
     Ok(match query {
@@ -220,23 +228,12 @@ fn details(
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
     let sql = match detail {
-        // Every column of a columnstore index (types 5 and 6) counts as
-        // included: they are its columns, not INCLUDE columns (#252).
         Detail::Indexes => {
             "select i.name as INDEX_NAME, i.type_desc as INDEX_TYPE, \
                     case when i.is_primary_key = 1 then 'PRIMARY' when i.is_unique = 1 then 'UNIQUE' \
                          else 'NONUNIQUE' end as UNIQUENESS, \
-                    (select string_agg(col_name(ic.object_id, ic.column_id) \
-                              + case when ic.is_descending_key = 1 then ' DESC' else '' end, ', ') \
-                              within group (order by ic.key_ordinal, ic.index_column_id) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and (ic.is_included_column = 0 or i.type in (5, 6))) as COLUMNS, \
-                    (select string_agg(col_name(ic.object_id, ic.column_id), ', ') \
-                              within group (order by ic.index_column_id) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and ic.is_included_column = 1 and i.type not in (5, 6)) as [INCLUDE], \
+                    cast(null as nvarchar(4000)) as COLUMNS, \
+                    cast(null as nvarchar(4000)) as [INCLUDE], \
                     i.filter_definition as [WHERE] \
                from sys.indexes i where i.object_id = object_id(@P1) and i.type > 0 \
               order by i.is_primary_key desc, i.name"
@@ -245,20 +242,11 @@ fn details(
             "select name as CONSTRAINT_NAME, type as TYPE, definition as DEFINITION, \
                     ref as [REFERENCES] \
                from (select k.name, case k.type when 'PK' then 'Primary key' else 'Unique' end \
-                            as type, \
-                            (select string_agg(col_name(ic.object_id, ic.column_id), ', ') \
-                                      within group (order by ic.key_ordinal) \
-                               from sys.index_columns ic \
-                              where ic.object_id = k.parent_object_id \
-                                and ic.index_id = k.unique_index_id) as definition, \
+                            as type, cast(null as nvarchar(4000)) as definition, \
                             null as ref, case k.type when 'PK' then 1 else 2 end as ord \
                        from sys.key_constraints k where k.parent_object_id = object_id(@P1) \
                      union all \
-                     select f.name, 'Foreign key', \
-                            (select string_agg(col_name(fc.parent_object_id, fc.parent_column_id), ', ') \
-                                      within group (order by fc.constraint_column_id) \
-                               from sys.foreign_key_columns fc \
-                              where fc.constraint_object_id = f.object_id), \
+                     select f.name, 'Foreign key', null, \
                             object_schema_name(f.referenced_object_id) + '.' \
                               + object_name(f.referenced_object_id), 3 \
                        from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
@@ -272,9 +260,7 @@ fn details(
               order by ord, name"
         }
         Detail::Triggers => {
-            "select t.name as TRIGGER_NAME, \
-                    (select string_agg(e.type_desc, ', ') from sys.trigger_events e \
-                      where e.object_id = t.object_id) as TRIGGERING_EVENT, \
+            "select t.name as TRIGGER_NAME, cast(null as nvarchar(4000)) as TRIGGERING_EVENT, \
                     case when t.is_instead_of_trigger = 1 then 'INSTEAD OF' else 'AFTER' end \
                       as TIMING, \
                     case when t.is_disabled = 1 then 'DISABLED' else 'ENABLED' end as STATUS \
@@ -320,8 +306,109 @@ fn details(
         }
         Detail::Link => return Err(DbError::unsupported("Linked servers", Dialect::SQLSERVER)),
     };
-    let (columns, rows) = ms.query(sql, &[&bracketed(owner, name)])?;
+    let object = bracketed(owner, name);
+    let (columns, mut rows) = ms.query(sql, &[&object])?;
+    // The lists the queries leave NULL, by the row's name: an index's
+    // columns and INCLUDE columns, a key's columns, a trigger's events.
+    // Every column of a columnstore index (types 5 and 6) counts as
+    // included: they are its columns, not INCLUDE columns (#252).
+    let (lists, filled): (String, &[(usize, &str)]) = match detail {
+        Detail::Indexes => (
+            format!(
+                "select i.name, case when ic.is_included_column = 0 or i.type in (5, 6) \
+                                 then 'columns' else 'include' end, \
+                    col_name(ic.object_id, ic.column_id) \
+                      + case when ic.is_descending_key = 1 then ' DESC' else '' end \
+               from sys.indexes i \
+               join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+              where i.object_id = object_id(@P1) and i.type > 0 and {INDEX_COLUMN} \
+              order by ic.key_ordinal, ic.index_column_id"
+            ),
+            &[(3, "columns"), (4, "include")],
+        ),
+        Detail::Constraints => (
+            "select k.name, 'columns', col_name(ic.object_id, ic.column_id), ic.key_ordinal \
+               from sys.key_constraints k \
+               join sys.index_columns ic on ic.object_id = k.parent_object_id \
+                and ic.index_id = k.unique_index_id \
+              where k.parent_object_id = object_id(@P1) \
+             union all \
+             select f.name, 'columns', col_name(fc.parent_object_id, fc.parent_column_id), \
+                    fc.constraint_column_id \
+               from sys.foreign_keys f \
+               join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+              where f.parent_object_id = object_id(@P1) \
+              order by 4"
+                .to_owned(),
+            &[(2, "columns")],
+        ),
+        Detail::Triggers => (
+            "select t.name, 'events', e.type_desc \
+               from sys.triggers t join sys.trigger_events e on e.object_id = t.object_id \
+              where t.parent_id = object_id(@P1) \
+              order by e.type"
+                .to_owned(),
+            &[(1, "events")],
+        ),
+        _ => (String::new(), &[]),
+    };
+    if !filled.is_empty() {
+        let lists = Lists::read(ms, &lists, &object)?;
+        for row in &mut rows {
+            let Some(name) = row.first().cloned().flatten() else {
+                continue;
+            };
+            for &(column, list) in filled {
+                if let Some(cell @ None) = row.get_mut(column) {
+                    *cell = lists.get(&name, list).map(str::to_owned);
+                }
+            }
+        }
+    }
     Ok(MetaResult::Table { columns, rows })
+}
+
+/// Lists of names, as `string_agg(…, ', ') within group (order by …)` made
+/// them: SQL Server has string_agg from 2017 only, and below compatibility
+/// level 110, as in a database from 2008, WITHIN GROUP is a syntax error
+/// (#294). So the lists are joined here, from rows of (name, list, item)
+/// in their order, by the name of the index, constraint or trigger and the
+/// list's; NULL items are left out, as string_agg does. FOR XML PATH fails
+/// on a name with a control character.
+struct Lists(HashMap<(String, String), String>);
+
+impl Lists {
+    fn read(ms: &mut Ms<'_>, sql: &str, object: &str) -> Result<Self, DbError> {
+        let mut lists: HashMap<(String, String), String> = HashMap::new();
+        for row in ms.rows(sql, &[object])? {
+            let mut values = row.into_iter();
+            let (Some(Some(name)), Some(Some(list)), Some(Some(item))) =
+                (values.next(), values.next(), values.next())
+            else {
+                continue;
+            };
+            let joined = lists.entry((name, list)).or_default();
+            if !joined.is_empty() {
+                joined.push_str(", ");
+            }
+            joined.push_str(&item);
+        }
+        Ok(Self(lists))
+    }
+
+    /// `name`'s `list`, joined; `None` without items.
+    fn get(&self, name: &str, list: &str) -> Option<&str> {
+        self.0
+            .get(&(name.to_owned(), list.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// `before` and the list in parentheses; nothing without items.
+    fn clause(&self, before: &str, name: &str, list: &str) -> String {
+        self.get(name, list)
+            .map(|items| format!("{before}({items})"))
+            .unwrap_or_default()
+    }
 }
 
 /// An object's DDL; `runnable` ends it with `GO`, as T-SQL scripts do.
@@ -408,7 +495,8 @@ fn ddl(
     })
 }
 
-/// `CREATE TABLE` with its columns and constraints, then its other indexes.
+/// `CREATE TABLE` with its columns and constraints, then its other indexes;
+/// a memory-optimized table declares its indexes in it.
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -438,140 +526,512 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
+    // A memory-optimized table's durability (#302): CREATE INDEX can't make
+    // its indexes, they are declared in CREATE TABLE. Its LOB data's
+    // filegroup where it isn't the table's, and whether the table is a heap
+    // (0) or its clustered index (1) holds its rows (#315).
+    let table = ms
+        .rows(
+            "select case when t.is_memory_optimized = 1 \
+                         then lower(t.durability_desc collate database_default) end, \
+                    case when t.lob_data_space_id not in (0, i.data_space_id) \
+                         then quotename(l.name) end, \
+                    i.index_id \
+               from sys.tables t \
+               join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
+               left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
+              where t.object_id = object_id(@P1)",
+            &[object],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let mut table = table.into_iter();
+    let (durability, textimage, rows_in) = (
+        table.next().flatten(),
+        table.next().flatten(),
+        table.next().flatten().unwrap_or_default(),
+    );
+    // Catalog columns of later versions: a columnstore index's ORDER
+    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019) and XML_COMPRESSION (2022).
+    let later = ms
+        .rows(
+            "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
+                    col_length('sys.indexes', 'optimize_for_sequential_key'), \
+                    col_length('sys.partitions', 'xml_compression')",
+            &[],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    let storage = index_storage(ms, object, has(1), has(2))?;
+    let no_storage = Storage::default();
+    let storage_of = |index: &str| storage.get(index).unwrap_or(&no_storage);
+    let table_storage = storage_of(&rows_in);
+    // A key's columns, a foreign key's and the ones it references, and the
+    // columns of the indexes, quoted, as lists (see Lists).
+    let lists = Lists::read(
+        ms,
+        "select k.name, 'columns', quotename(col_name(ic.object_id, ic.column_id)) \
+                  + case when ic.is_descending_key = 1 then ' desc' else '' end, ic.key_ordinal \
+           from sys.key_constraints k \
+           join sys.index_columns ic on ic.object_id = k.parent_object_id \
+            and ic.index_id = k.unique_index_id and ic.is_included_column = 0 \
+          where k.parent_object_id = object_id(@P1) \
+         union all \
+         select f.name, 'columns', quotename(col_name(fc.parent_object_id, fc.parent_column_id)), \
+                fc.constraint_column_id \
+           from sys.foreign_keys f \
+           join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+          where f.parent_object_id = object_id(@P1) \
+         union all \
+         select f.name, 'references', \
+                quotename(col_name(fc.referenced_object_id, fc.referenced_column_id)), \
+                fc.constraint_column_id \
+           from sys.foreign_keys f \
+           join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
+          where f.parent_object_id = object_id(@P1) \
+          order by 4",
+        object,
+    )?;
+    // Each constraint as (name, its line up to the columns, what follows
+    // them: a foreign key's REFERENCES and its actions, a key's index).
     let constraints = ms.rows(
-        "select line from ( \
-           select 'constraint ' + quotename(k.name) \
+        "select name, line, refs, actions, ix from ( \
+           select k.name, 'constraint ' + quotename(k.name) \
                   + case k.type when 'PK' then ' primary key ' else ' unique ' end \
-                  + lower(i.type_desc collate database_default) + ' (' \
-                  + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                              + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                              within group (order by ic.key_ordinal) \
-                       from sys.index_columns ic \
-                      where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                        and ic.is_included_column = 0) + ')' as line, \
-                  case k.type when 'PK' then 1 else 2 end as ord, k.name \
+                  + lower(i.type_desc collate database_default) as line, \
+                  null as refs, '' as actions, i.index_id as ix, \
+                  case k.type when 'PK' then 1 else 2 end as ord \
              from sys.key_constraints k \
              join sys.indexes i on i.object_id = k.parent_object_id and i.index_id = k.unique_index_id \
             where k.parent_object_id = object_id(@P1) \
            union all \
-           select 'constraint ' + quotename(f.name) + ' foreign key (' \
-                  + (select string_agg(quotename(col_name(fc.parent_object_id, fc.parent_column_id)), ', ') \
-                              within group (order by fc.constraint_column_id) \
-                       from sys.foreign_key_columns fc where fc.constraint_object_id = f.object_id) \
-                  + ') references ' + quotename(object_schema_name(f.referenced_object_id)) + '.' \
-                  + quotename(object_name(f.referenced_object_id)) + ' (' \
-                  + (select string_agg(quotename(col_name(fc.referenced_object_id, \
-                                                          fc.referenced_column_id)), ', ') \
-                              within group (order by fc.constraint_column_id) \
-                       from sys.foreign_key_columns fc where fc.constraint_object_id = f.object_id) \
-                  + ')' \
-                  + case f.delete_referential_action when 1 then ' on delete cascade' \
-                         when 2 then ' on delete set null' when 3 then ' on delete set default' \
-                         else '' end \
+           select f.name, 'constraint ' + quotename(f.name) + ' foreign key', \
+                  ' references ' + quotename(object_schema_name(f.referenced_object_id)) + '.' \
+                  + quotename(object_name(f.referenced_object_id)), \
+                  case f.delete_referential_action when 1 then ' on delete cascade' \
+                       when 2 then ' on delete set null' when 3 then ' on delete set default' \
+                       else '' end \
                   + case f.update_referential_action when 1 then ' on update cascade' \
                          when 2 then ' on update set null' when 3 then ' on update set default' \
-                         else '' end, 3, f.name \
+                         else '' end, null, 3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
            union all \
-           select 'constraint ' + quotename(c.name) + ' check ' + c.definition, 4, c.name \
+           select c.name, 'constraint ' + quotename(c.name) + ' check ' + c.definition, null, '', \
+                  null, 4 \
              from sys.check_constraints c where c.parent_object_id = object_id(@P1) \
          ) x order by ord, name",
         &[object],
     )?;
-    let lines: Vec<String> = columns
+    let constraints = constraints.into_iter().filter_map(|row| {
+        let mut values = row.into_iter();
+        let mut next = || values.next().flatten();
+        let (name, line, refs) = (next()?, next()?, next());
+        let (actions, index) = (next().unwrap_or_default(), next());
+        let columns = lists.clause(" ", &name, "columns");
+        let references = refs
+            .map(|refs| format!("{refs}{}", lists.clause(" ", &name, "references")))
+            .unwrap_or_default();
+        let storage = index.map(|index| storage_of(&index).clauses(&[], table_storage));
+        Some(format!(
+            "{line}{columns}{references}{actions}{}",
+            storage.unwrap_or_default()
+        ))
+    });
+    let mut lines: Vec<String> = columns
         .into_iter()
-        .chain(constraints)
         .filter_map(first)
+        .chain(constraints)
         .collect();
-    let mut ddl = format!("create table {object} (\n    {}\n);", lines.join(",\n    "));
+    let mut indexes = Vec::new();
     // Rowstore (types 1 and 2) and columnstore indexes (5 and 6, #252). A
     // nonclustered columnstore index names its columns, which count as
     // included; a clustered one holds all of them and names none. XML (3)
     // and spatial indexes (4) follow, a secondary XML index after the
     // primary one it uses, and a columnstore index's ORDER, which SQL
-    // Server has from 2022 (#265). Selective XML indexes aren't written.
-    let ordered = ms
-        .rows(
-            "select col_length('sys.index_columns', 'column_store_order_ordinal')",
-            &[],
-        )?
-        .into_iter()
-        .find_map(first)
-        .is_some();
-    let order = if ordered {
-        "+ coalesce(' order (' \
-            + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
-                        within group (order by ic.column_store_order_ordinal) \
-                 from sys.index_columns ic \
-                where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                  and ic.column_store_order_ordinal > 0) + ')', '')"
+    // Server has from 2022 (#265). A selective XML index has its
+    // namespaces and paths, a secondary one the path it is on (#311).
+    let order = if has(0) {
+        "union all \
+         select i.name, 'order', quotename(col_name(ic.object_id, ic.column_id)), \
+                ic.column_store_order_ordinal, 0 \
+           from sys.indexes i \
+           join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+          where i.object_id = object_id(@P1) and ic.column_store_order_ordinal > 0"
     } else {
         ""
     };
-    let indexes = ms.rows(
+    // An index's columns, its INCLUDE columns and its ORDER, quoted; a
+    // selective XML index's namespaces and paths, as they are declared.
+    let lists = Lists::read(
+        ms,
         &format!(
-            "select 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
-                    + case when x.xml_index_type = 0 then 'primary xml' \
-                           else lower(i.type_desc collate database_default) end \
-                    + ' index ' + quotename(i.name) + ' on ' + @P1 \
-                    + case when i.type = 5 then '' else ' (' \
-                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)) \
-                                    + case when ic.is_descending_key = 1 then ' desc' else '' end, ', ') \
-                                    within group (order by ic.key_ordinal, ic.index_column_id) \
-                             from sys.index_columns ic \
-                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                              and (ic.is_included_column = 0 or i.type = 6)) + ')' end \
-                    + coalesce(' include (' \
-                        + (select string_agg(quotename(col_name(ic.object_id, ic.column_id)), ', ') \
-                                    within group (order by ic.index_column_id) \
-                             from sys.index_columns ic \
-                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
-                              and ic.is_included_column = 1 and i.type = 2) + ')', '') \
-                    + coalesce(' using xml index ' + quotename(u.name) + ' for ' \
-                               + lower(x.secondary_type_desc collate database_default), '') \
-                    {order} \
-                    + coalesce(' where ' + i.filter_definition, ''), \
-                    lower(s.tessellation_scheme collate database_default), \
-                    t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
-                    lower(t.level_1_grid_desc collate database_default), \
-                    lower(t.level_2_grid_desc collate database_default), \
-                    lower(t.level_3_grid_desc collate database_default), \
-                    lower(t.level_4_grid_desc collate database_default), t.cells_per_object \
+            "select i.name, case when i.type = 5 then null \
+                                 when ic.is_included_column = 0 or i.type = 6 then 'columns' \
+                                 when i.type = 2 then 'include' end, \
+                    quotename(col_name(ic.object_id, ic.column_id)) \
+                      + case when ic.is_descending_key = 1 then ' desc' else '' end, \
+                    ic.key_ordinal, ic.index_column_id \
                from sys.indexes i \
-               left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
-               left join sys.indexes u on u.object_id = i.object_id \
-                and u.index_id = x.using_xml_index_id \
-               left join sys.spatial_indexes s on s.object_id = i.object_id \
-                and s.index_id = i.index_id \
-               left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
-                and t.index_id = i.index_id \
-              where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6) \
-                and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
-                and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
-              order by case when x.using_xml_index_id is null then 0 else 1 end, i.name"
+               join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
+              where i.object_id = object_id(@P1) and {INDEX_COLUMN} \
+             {order} \
+             union all \
+             select i.name, 'namespaces', \
+                    case when n.is_default_uri = 1 then 'default ' else '' end \
+                      + '''' + replace(n.uri, '''', '''''') + '''' \
+                      + coalesce(' as ' + quotename(n.prefix), ''), \
+                    row_number() over (order by n.is_default_uri, n.prefix), 0 \
+               from sys.indexes i \
+               join sys.selective_xml_index_namespaces n on n.object_id = i.object_id \
+                and n.index_id = i.index_id \
+              where i.object_id = object_id(@P1) \
+             union all \
+             select i.name, 'paths', \
+                    quotename(c.name) + ' = ''' \
+                      + replace(c.path collate database_default, '''', '''''') + '''' \
+                      + case when c.path_type = 1 then ' as sql ' + {COLUMN_TYPE} \
+                             when c.is_node = 1 then ' as xquery ''node()''' \
+                             when c.is_xquery_type_inferred = 0 \
+                                  and c.xquery_type_description is not null \
+                               or c.is_xquery_max_length_inferred = 0 and c.xquery_max_length > 0 \
+                               then ' as xquery' \
+                                    + coalesce(' ''' + case when c.is_xquery_type_inferred = 0 \
+                                                            then c.xquery_type_description \
+                                                                 collate database_default end \
+                                               + '''', '') \
+                                    + case when c.is_xquery_max_length_inferred = 0 \
+                                                and c.xquery_max_length > 0 \
+                                           then ' maxlength(' \
+                                                + cast(c.xquery_max_length as varchar(10)) + ')' \
+                                           else '' end \
+                             else '' end \
+                      + case when c.is_singleton = 1 then ' singleton' else '' end, \
+                    c.path_id, 0 \
+               from sys.indexes i \
+               join sys.selective_xml_index_paths c on c.object_id = i.object_id \
+                and c.index_id = i.index_id \
+               left join sys.types t on t.user_type_id = c.user_type_id \
+              where i.object_id = object_id(@P1) \
+              order by 4, 5"
         ),
+        object,
+    )?;
+    // Each index as (name, quoted, UNIQUE, its kind, a secondary XML
+    // index's USING, its WHERE) and a spatial index's tessellation. Hash
+    // indexes (7) are a memory-optimized table's (#302).
+    let rows = ms.rows(
+        "select i.index_id, i.name, quotename(i.name), \
+                case when i.is_unique = 1 then 'unique ' else '' end, \
+                case x.xml_index_type when 0 then 'primary xml' when 2 then 'selective xml' \
+                     else lower(i.type_desc collate database_default) end, \
+                coalesce(' using xml index ' + quotename(u.name) + ' for ' \
+                         + coalesce(lower(x.secondary_type_desc collate database_default), \
+                                    '(' + quotename(p.name) + ')'), ''), \
+                coalesce(' where ' + i.filter_definition, ''), \
+                lower(s.tessellation_scheme collate database_default), \
+                t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
+                lower(t.level_1_grid_desc collate database_default), \
+                lower(t.level_2_grid_desc collate database_default), \
+                lower(t.level_3_grid_desc collate database_default), \
+                lower(t.level_4_grid_desc collate database_default), t.cells_per_object \
+           from sys.indexes i \
+           left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
+           left join sys.indexes u on u.object_id = i.object_id \
+            and u.index_id = x.using_xml_index_id \
+           left join sys.selective_xml_index_paths p on p.object_id = i.object_id \
+            and p.index_id = x.using_xml_index_id and p.path_id = x.path_id \
+           left join sys.spatial_indexes s on s.object_id = i.object_id \
+            and s.index_id = i.index_id \
+           left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
+            and t.index_id = i.index_id \
+          where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6, 7) \
+            and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
+          order by case when x.using_xml_index_id is null then 0 else 1 end, i.name",
         &[object],
     )?;
-    for row in indexes {
+    for row in rows {
         let mut values = row.into_iter();
-        let Some(index) = values.next().flatten() else {
+        let mut next = || values.next().flatten();
+        let (Some(id), Some(name), Some(quoted)) = (next(), next(), next()) else {
             continue;
         };
+        let kind = format!(
+            "{}{}",
+            next().unwrap_or_default(),
+            next().unwrap_or_default()
+        );
+        let (using, filter) = (next().unwrap_or_default(), next().unwrap_or_default());
         let spatial: Vec<Cell> = values.collect();
-        ddl.push_str(&format!("\n\n{index}{};", spatial_options(&spatial)));
+        let (scheme, spatial) = spatial_options(&spatial);
+        let columns = lists.clause(" ", &name, "columns");
+        let storage = storage_of(&id).clauses(&spatial, table_storage);
+        if durability.is_some() {
+            lines.push(format!("index {quoted} {kind}{columns}{storage}"));
+            continue;
+        }
+        indexes.push(format!(
+            "create {kind} index {quoted} on {object}{columns}{}{}{}{using}{}{filter}{scheme}\
+             {storage};",
+            lists.clause(" with xmlnamespaces ", &name, "namespaces"),
+            lists.clause(" for ", &name, "paths"),
+            lists.clause(" include ", &name, "include"),
+            lists.clause(" order ", &name, "order"),
+        ));
+    }
+    // The table's filegroup or partition scheme, and its LOB data's, then
+    // its options: a memory-optimized table's, a heap's compression.
+    let mut ddl = format!("create table {object} (\n    {}\n)", lines.join(",\n    "));
+    if let Some(on) = table_storage.on.as_ref().filter(|_| !table_storage.default) {
+        ddl.push_str(&format!(" on {on}"));
+    }
+    if let Some(textimage) = textimage {
+        ddl.push_str(&format!(" textimage_on {textimage}"));
+    }
+    let mut options = Vec::new();
+    if let Some(durability) = durability {
+        options.push("memory_optimized = on".to_owned());
+        options.push(format!("durability = {durability}"));
+    }
+    if rows_in == "0" {
+        options.extend(table_storage.options.iter().cloned());
+    }
+    if !options.is_empty() {
+        ddl.push_str(&format!(" with ({})", options.join(", ")));
+    }
+    ddl.push(';');
+    for index in indexes {
+        ddl.push_str(&format!("\n\n{index}"));
     }
     Ok(ddl)
 }
 
-/// `USING … WITH (…)` of a spatial index from its tessellation: the scheme,
+/// What an index has that isn't the default: its options, for `with (…)`,
+/// and the filegroup or partition scheme it is on (`[ps] ([column])`), and
+/// whether that is the database's default filegroup.
+#[derive(Default)]
+struct Storage {
+    options: Vec<String>,
+    on: Option<String>,
+    default: bool,
+}
+
+impl Storage {
+    /// ` with (…)`, `first` before the index's options, and ` on …` where
+    /// the index isn't on `table`'s filegroup or partition scheme, where
+    /// CREATE INDEX puts it.
+    fn clauses(&self, first: &[String], table: &Storage) -> String {
+        let options: Vec<&str> = first
+            .iter()
+            .chain(&self.options)
+            .map(String::as_str)
+            .collect();
+        let mut clauses = String::new();
+        if !options.is_empty() {
+            clauses.push_str(&format!(" with ({})", options.join(", ")));
+        }
+        if let Some(on) = self.on.as_ref().filter(|&on| table.on.as_ref() != Some(on)) {
+            clauses.push_str(&format!(" on {on}"));
+        }
+        clauses
+    }
+}
+
+/// Each index's storage, by its index_id: a hash index's bucket count
+/// (#302), the options of CREATE INDEX that aren't the defaults, its
+/// compression, by partition where they differ, and its filegroup or
+/// partition scheme (#315). Columnstore indexes and a memory-optimized
+/// table's take no rowstore options (their locks read as off), an XML
+/// index no filegroup, a heap only its compression and filegroup.
+/// `sequential` and `xml` tell whether the catalog has
+/// OPTIMIZE_FOR_SEQUENTIAL_KEY (2019) and XML_COMPRESSION (2022).
+fn index_storage(
+    ms: &mut Ms<'_>,
+    object: &str,
+    sequential: bool,
+    xml: bool,
+) -> Result<HashMap<String, Storage>, DbError> {
+    let sequential = if sequential {
+        "i.optimize_for_sequential_key"
+    } else {
+        "0"
+    };
+    let rows = ms.rows(
+        &format!(
+            "select i.index_id, i.type, tb.is_memory_optimized, h.bucket_count, i.is_padded, \
+                    i.fill_factor, i.ignore_dup_key, st.no_recompute, st.is_incremental, \
+                    i.allow_row_locks, i.allow_page_locks, {sequential}, i.compression_delay, \
+                    case when i.type <> 3 and i.data_space_id <> 0 \
+                         then quotename(d.name) + coalesce(' (' + quotename(pc.name) + ')', '') end, \
+                    case when i.data_space_id = (select f.data_space_id from sys.filegroups f \
+                                                  where f.is_default = 1 and f.type = 'FG') \
+                         then 1 else 0 end \
+               from sys.indexes i \
+               join sys.tables tb on tb.object_id = i.object_id \
+               left join sys.hash_indexes h on h.object_id = i.object_id and h.index_id = i.index_id \
+               left join sys.stats st on st.object_id = i.object_id and st.stats_id = i.index_id \
+               left join sys.data_spaces d on d.data_space_id = i.data_space_id \
+              outer apply (select col_name(ic.object_id, ic.column_id) as name \
+                             from sys.index_columns ic \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id \
+                              and ic.partition_ordinal = 1) pc \
+              where i.object_id = object_id(@P1)"
+        ),
+        &[object],
+    )?;
+    let xml = if xml {
+        "lower(p.xml_compression_desc)"
+    } else {
+        "'off'"
+    };
+    let mut partitions: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
+    for row in ms.rows(
+        &format!(
+            "select p.index_id, p.partition_number, lower(p.data_compression_desc), {xml} \
+               from sys.partitions p where p.object_id = object_id(@P1) \
+              order by p.index_id, p.partition_number"
+        ),
+        &[object],
+    )? {
+        let mut values = row.into_iter().map(Option::unwrap_or_default);
+        let (Some(index), Some(number)) = (values.next(), values.next()) else {
+            continue;
+        };
+        let (data, xml) = (
+            values.next().unwrap_or_default(),
+            values.next().unwrap_or_default(),
+        );
+        partitions
+            .entry(index)
+            .or_default()
+            .push((number.parse().unwrap_or_default(), data, xml));
+    }
+    let mut storage = HashMap::new();
+    for row in rows {
+        let get = |i: usize| row.get(i).cloned().flatten();
+        let on = |i: usize| get(i).as_deref() == Some("1");
+        let off = |i: usize| get(i).as_deref() == Some("0");
+        let Some(id) = get(0) else {
+            continue;
+        };
+        let kind = get(1).unwrap_or_default();
+        let memory_optimized = on(2);
+        let columnstore = matches!(kind.as_str(), "5" | "6");
+        let mut options = Vec::new();
+        if let Some(buckets) = get(3) {
+            options.push(format!("bucket_count = {buckets}"));
+        }
+        if !memory_optimized && !columnstore && kind != "0" {
+            if on(4) {
+                options.push("pad_index = on".to_owned());
+            }
+            if let Some(fill) = get(5).filter(|f| f != "0") {
+                options.push(format!("fillfactor = {fill}"));
+            }
+            if on(6) {
+                options.push("ignore_dup_key = on".to_owned());
+            }
+            // An XML index takes no statistics options.
+            if on(7) && kind != "3" {
+                options.push("statistics_norecompute = on".to_owned());
+            }
+            if on(8) && kind != "3" {
+                options.push("statistics_incremental = on".to_owned());
+            }
+            if off(9) {
+                options.push("allow_row_locks = off".to_owned());
+            }
+            if off(10) {
+                options.push("allow_page_locks = off".to_owned());
+            }
+            if on(11) {
+                options.push("optimize_for_sequential_key = on".to_owned());
+            }
+        }
+        if let Some(delay) = get(12).filter(|d| d != "0") {
+            options.push(format!("compression_delay = {delay}"));
+        }
+        if !memory_optimized && let Some(parts) = partitions.get(&id) {
+            let data: Vec<(u32, &str)> = parts.iter().map(|(n, d, _)| (*n, d.as_str())).collect();
+            let default = if columnstore { "columnstore" } else { "none" };
+            options.extend(by_partition("data_compression", &data, default));
+            let xml: Vec<(u32, &str)> = parts.iter().map(|(n, _, x)| (*n, x.as_str())).collect();
+            options.extend(by_partition("xml_compression", &xml, "off"));
+        }
+        storage.insert(
+            id,
+            Storage {
+                options,
+                on: get(13),
+                default: on(14),
+            },
+        );
+    }
+    Ok(storage)
+}
+
+/// `name = value` where partitions have a value that isn't `default`: one
+/// for all of them alike, else each value `on partitions (…)`.
+fn by_partition(name: &str, partitions: &[(u32, &str)], default: &str) -> Vec<String> {
+    let Some(&(_, first)) = partitions.first() else {
+        return Vec::new();
+    };
+    if partitions.iter().all(|&(_, value)| value == first) {
+        return if first == default {
+            Vec::new()
+        } else {
+            vec![format!("{name} = {first}")]
+        };
+    }
+    let mut values: Vec<&str> = Vec::new();
+    for &(_, value) in partitions {
+        if value != default && !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let numbers: Vec<u32> = partitions
+                .iter()
+                .filter(|&&(_, v)| v == value)
+                .map(|&(n, _)| n)
+                .collect();
+            format!("{name} = {value} on partitions ({})", ranges(&numbers))
+        })
+        .collect()
+}
+
+/// Partition numbers in order as `1, 3 to 5`.
+fn ranges(numbers: &[u32]) -> String {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < numbers.len() {
+        let mut j = i;
+        while j + 1 < numbers.len() && numbers[j + 1] == numbers[j] + 1 {
+            j += 1;
+        }
+        ranges.push(if j > i {
+            format!("{} to {}", numbers[i], numbers[j])
+        } else {
+            numbers[i].to_string()
+        });
+        i = j + 1;
+    }
+    ranges.join(", ")
+}
+
+/// ` using …` of a spatial index and its options from its tessellation:
 /// the bounding box, the grids' four levels and the cells per object, each
 /// where it has one; nothing for other indexes.
-fn spatial_options(values: &[Cell]) -> String {
+fn spatial_options(values: &[Cell]) -> (String, Vec<String>) {
     let [scheme, xmin, ymin, xmax, ymax, l1, l2, l3, l4, cells] = values else {
-        return String::new();
+        return Default::default();
     };
     let Some(scheme) = scheme else {
-        return String::new();
+        return Default::default();
     };
     let mut options = Vec::new();
     if let (Some(xmin), Some(ymin), Some(xmax), Some(ymax)) = (xmin, ymin, xmax, ymax) {
@@ -585,11 +1045,7 @@ fn spatial_options(values: &[Cell]) -> String {
     if let Some(cells) = cells {
         options.push(format!("cells_per_object = {cells}"));
     }
-    if options.is_empty() {
-        format!(" using {scheme}")
-    } else {
-        format!(" using {scheme} with ({})", options.join(", "))
-    }
+    (format!(" using {scheme}"), options)
 }
 
 /// The plan of `sql` from `SET SHOWPLAN_ALL`: the server compiles the
@@ -744,6 +1200,50 @@ fn object_name(object: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_by_partition() {
+        assert_eq!(ranges(&[1, 3, 4, 5, 7, 8]), "1, 3 to 5, 7 to 8");
+        assert_eq!(ranges(&[2]), "2");
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            by_partition("data_compression", &[(1, "none"), (2, "none")], "none"),
+            none
+        );
+        assert_eq!(
+            by_partition("data_compression", &[(1, "page"), (2, "page")], "none"),
+            ["data_compression = page"]
+        );
+        assert_eq!(
+            by_partition(
+                "data_compression",
+                &[
+                    (1, "page"),
+                    (2, "row"),
+                    (3, "page"),
+                    (4, "none"),
+                    (5, "row")
+                ],
+                "none"
+            ),
+            [
+                "data_compression = page on partitions (1, 3)",
+                "data_compression = row on partitions (2, 5)"
+            ]
+        );
+        assert_eq!(
+            by_partition(
+                "data_compression",
+                &[
+                    (1, "columnstore"),
+                    (2, "columnstore_archive"),
+                    (3, "columnstore_archive")
+                ],
+                "columnstore"
+            ),
+            ["data_compression = columnstore_archive on partitions (2 to 3)"]
+        );
+    }
 
     #[test]
     fn plan_arguments() {
