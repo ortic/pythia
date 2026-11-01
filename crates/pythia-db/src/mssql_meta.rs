@@ -608,7 +608,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // included; a clustered one holds all of them and names none. XML (3)
     // and spatial indexes (4) follow, a secondary XML index after the
     // primary one it uses, and a columnstore index's ORDER, which SQL
-    // Server has from 2022 (#265). Selective XML indexes aren't written.
+    // Server has from 2022 (#265). A selective XML index has its
+    // namespaces and paths, a secondary one the path it is on (#311).
     let ordered = ms
         .rows(
             "select col_length('sys.index_columns', 'column_store_order_ordinal')",
@@ -627,7 +628,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     } else {
         ""
     };
-    // An index's columns, its INCLUDE columns and its ORDER, quoted.
+    // An index's columns, its INCLUDE columns and its ORDER, quoted; a
+    // selective XML index's namespaces and paths, as they are declared.
     let lists = Lists::read(
         ms,
         &format!(
@@ -641,6 +643,43 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                join sys.index_columns ic on ic.object_id = i.object_id and ic.index_id = i.index_id \
               where i.object_id = object_id(@P1) \
              {order} \
+             union all \
+             select i.name, 'namespaces', \
+                    case when n.is_default_uri = 1 then 'default ' else '' end \
+                      + '''' + replace(n.uri, '''', '''''') + '''' \
+                      + coalesce(' as ' + quotename(n.prefix), ''), \
+                    row_number() over (order by n.is_default_uri, n.prefix), 0 \
+               from sys.indexes i \
+               join sys.selective_xml_index_namespaces n on n.object_id = i.object_id \
+                and n.index_id = i.index_id \
+              where i.object_id = object_id(@P1) \
+             union all \
+             select i.name, 'paths', \
+                    quotename(c.name) + ' = ''' \
+                      + replace(c.path collate database_default, '''', '''''') + '''' \
+                      + case when c.path_type = 1 then ' as sql ' + {COLUMN_TYPE} \
+                             when c.is_node = 1 then ' as xquery ''node()''' \
+                             when c.is_xquery_type_inferred = 0 \
+                                  and c.xquery_type_description is not null \
+                               or c.is_xquery_max_length_inferred = 0 and c.xquery_max_length > 0 \
+                               then ' as xquery' \
+                                    + coalesce(' ''' + case when c.is_xquery_type_inferred = 0 \
+                                                            then c.xquery_type_description \
+                                                                 collate database_default end \
+                                               + '''', '') \
+                                    + case when c.is_xquery_max_length_inferred = 0 \
+                                                and c.xquery_max_length > 0 \
+                                           then ' maxlength(' \
+                                                + cast(c.xquery_max_length as varchar(10)) + ')' \
+                                           else '' end \
+                             else '' end \
+                      + case when c.is_singleton = 1 then ' singleton' else '' end, \
+                    c.path_id, 0 \
+               from sys.indexes i \
+               join sys.selective_xml_index_paths c on c.object_id = i.object_id \
+                and c.index_id = i.index_id \
+               left join sys.types t on t.user_type_id = c.user_type_id \
+              where i.object_id = object_id(@P1) \
               order by 4, 5"
         ),
         object,
@@ -650,10 +689,11 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // indexes (7) are a memory-optimized table's (#302).
     let rows = ms.rows(
         "select i.name, quotename(i.name), case when i.is_unique = 1 then 'unique ' else '' end, \
-                case when x.xml_index_type = 0 then 'primary xml' \
+                case x.xml_index_type when 0 then 'primary xml' when 2 then 'selective xml' \
                      else lower(i.type_desc collate database_default) end, \
                 coalesce(' using xml index ' + quotename(u.name) + ' for ' \
-                         + lower(x.secondary_type_desc collate database_default), ''), \
+                         + coalesce(lower(x.secondary_type_desc collate database_default), \
+                                    '(' + quotename(p.name) + ')'), ''), \
                 coalesce(' where ' + i.filter_definition, ''), \
                 lower(s.tessellation_scheme collate database_default), \
                 t.bounding_box_xmin, t.bounding_box_ymin, t.bounding_box_xmax, t.bounding_box_ymax, \
@@ -665,13 +705,14 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
            left join sys.xml_indexes x on x.object_id = i.object_id and x.index_id = i.index_id \
            left join sys.indexes u on u.object_id = i.object_id \
             and u.index_id = x.using_xml_index_id \
+           left join sys.selective_xml_index_paths p on p.object_id = i.object_id \
+            and p.index_id = x.using_xml_index_id and p.path_id = x.path_id \
            left join sys.spatial_indexes s on s.object_id = i.object_id \
             and s.index_id = i.index_id \
            left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
             and t.index_id = i.index_id \
           where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6, 7) \
             and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
-            and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
           order by case when x.using_xml_index_id is null then 0 else 1 end, i.name",
         &[object],
     )?;
@@ -695,7 +736,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
             continue;
         }
         indexes.push(format!(
-            "create {kind} index {quoted} on {object}{columns}{}{using}{}{filter}{}{with};",
+            "create {kind} index {quoted} on {object}{columns}{}{}{}{using}{}{filter}{}{with};",
+            lists.clause(" with xmlnamespaces ", &name, "namespaces"),
+            lists.clause(" for ", &name, "paths"),
             lists.clause(" include ", &name, "include"),
             lists.clause(" order ", &name, "order"),
             spatial_options(&spatial)

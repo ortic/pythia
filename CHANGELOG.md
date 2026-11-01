@@ -647,6 +647,11 @@ All notable changes to Pythia are documented here. The format follows
   made a disk-based table, left out the hash indexes, and created the
   other ones with CREATE INDEX, which such a table refuses; a hash key
   without its bucket count made the DDL fail.
+- SQL Server: a table's DDL has its selective XML indexes (#311), with
+  their namespaces and paths (`as sql int`, `as xquery 'xs:string'
+  maxlength(20)`, `singleton`), and the secondary ones on their paths.
+  They were left out, so that run elsewhere the DDL made a table whose
+  XML queries had no index to use.
 
 ## [0.10.0] - 2026-10-30
 

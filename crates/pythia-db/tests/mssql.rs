@@ -1446,6 +1446,106 @@ fn memory_optimized_tables() {
     drop_database(&mut dba, "r63_mem");
 }
 
+/// A table's DDL creates its selective XML indexes, with their namespaces
+/// and their paths' types, and the secondary ones on a path of theirs
+/// (#311): run elsewhere, the copy has the same indexes.
+#[test]
+fn selective_xml_indexes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r63_copy.r63_sx");
+    h.ok("drop schema if exists r63_copy");
+    h.ok("drop table if exists r63_sx");
+    for sql in [
+        "create table r63_sx (id int constraint r63_sx_pk primary key, doc xml)",
+        "create selective xml index [r63 sel] on r63_sx (doc) \
+         with xmlnamespaces ('urn:a' as a, default 'urn:it''s') \
+         for ([p 1] = '/a:x/a:y', p2 = '/a:x/a:z' as xquery 'xs:string' maxlength(20) singleton, \
+              p3 = '/a:x/@n' as sql int, p4 = '/a:x/w' as xquery 'node()', \
+              p5 = '/a:x/v' as sql nvarchar(30) singleton, p6 = '/a:x/u' as xquery 'xs:double', \
+              p7 = '/a:x/t' as sql decimal(9,2), p8 = '/a:x/s' as sql varchar(max), \
+              p9 = '/x' as xquery 'xs:string')",
+        "create xml index r63_sx_n on r63_sx (doc) using xml index [r63 sel] for (p3)",
+        "create xml index r63_sx_v on r63_sx (doc) using xml index [r63 sel] for (p5)",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.clone(),
+        name: "r63_sx".into(),
+        object_type: ObjectType::Table,
+    }) else {
+        panic!("expected DDL")
+    };
+    let on = format!("on [{schema}].[r63_sx] ([doc])");
+    for line in [
+        format!(
+            "create selective xml index [r63 sel] {on} \
+             with xmlnamespaces ('urn:a' as [a], default 'urn:it''s') \
+             for ([p 1] = '/a:x/a:y', [p2] = '/a:x/a:z' as xquery 'xs:string' maxlength(20) \
+             singleton, [p3] = '/a:x/@n' as sql int, [p4] = '/a:x/w' as xquery 'node()', \
+             [p5] = '/a:x/v' as sql nvarchar(30) singleton, [p6] = '/a:x/u' as xquery 'xs:double', \
+             [p7] = '/a:x/t' as sql decimal(9,2), [p8] = '/a:x/s' as sql varchar(max), \
+             [p9] = '/x' as xquery 'xs:string');"
+        ),
+        format!("create xml index [r63_sx_n] {on} using xml index [r63 sel] for ([p3]);"),
+        format!("create xml index [r63_sx_v] {on} using xml index [r63 sel] for ([p5]);"),
+    ] {
+        assert!(ddl.contains(&line), "{line}\n{ddl}");
+    }
+    let selective = ddl.find("create selective").expect("the selective index");
+    assert!(
+        ddl.find("[r63_sx_n]").is_some_and(|at| at > selective),
+        "{ddl}"
+    );
+    // The indexes, paths and namespaces as the catalog has them.
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let table = format!("object_id('[{owner}].[r63_sx]')");
+        [
+            format!(
+                "select string_agg(concat_ws(' ', i.name, x.xml_index_type, u.name, p.name) \
+                                   collate database_default, '; ') within group (order by i.name) \
+                   from sys.xml_indexes x join sys.indexes i on i.object_id = x.object_id \
+                    and i.index_id = x.index_id \
+                   left join sys.indexes u on u.object_id = x.object_id \
+                    and u.index_id = x.using_xml_index_id \
+                   left join sys.selective_xml_index_paths p on p.object_id = x.object_id \
+                    and p.index_id = x.using_xml_index_id and p.path_id = x.path_id \
+                  where x.object_id = {table}"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', p.path_id, p.name, p.path, p.path_type, \
+                                             p.xquery_type_description, p.xquery_max_length, \
+                                             p.is_node, type_name(p.user_type_id), p.max_length, \
+                                             p.precision, p.scale, p.is_singleton) \
+                                   collate database_default, '; ') \
+                          within group (order by p.path_id) \
+                   from sys.selective_xml_index_paths p where p.object_id = {table}"
+            ),
+            format!(
+                "select string_agg(concat_ws(' ', n.is_default_uri, n.uri, n.prefix) \
+                                   collate database_default, '; ') \
+                          within group (order by n.is_default_uri) \
+                   from sys.selective_xml_index_namespaces n where n.object_id = {table}"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    assert!(before.iter().all(Option::is_some), "{before:?}");
+    h.ok("create schema r63_copy");
+    run_ddl_in(&mut h, &ddl, &schema, "r63_copy", &["r63_sx"]);
+    assert_eq!(catalog(&mut h, "r63_copy"), before);
+    h.ok("drop table r63_copy.r63_sx");
+    h.ok("drop schema r63_copy");
+    h.ok("drop table r63_sx");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();
