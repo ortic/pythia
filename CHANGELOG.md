@@ -445,6 +445,11 @@ All notable changes to Pythia are documented here. The format follows
   edits the cell before; read-only columns are passed over, and at the
   end of a row Tab goes on to the next one. In the record view, Tab goes
   to the next field.
+- A change to a result being edited can be taken back before *Apply*
+  (#257). A cell set to NULL with Delete by mistake, or a paste over the
+  wrong cells, could only be taken back with *Discard*, which dropped
+  every other change too. Ctrl+Z in the grid, or *Undo* in the cell's
+  menu, now takes back the last change, one at a time.
 
 ## [0.10.0] - 2026-10-30
 
