@@ -641,6 +641,12 @@ All notable changes to Pythia are documented here. The format follows
   "'string_agg' is not a recognized built-in function name", and at
   level 100 all but *Triggers* with "Incorrect syntax near '('". What
   they show is as before.
+- SQL Server: a memory-optimized table's DDL makes a memory-optimized
+  table (#302), `with (memory_optimized = on, durability = …)`, and
+  declares its indexes in it, hash indexes with their bucket count. It
+  made a disk-based table, left out the hash indexes, and created the
+  other ones with CREATE INDEX, which such a table refuses; a hash key
+  without its bucket count made the DDL fail.
 
 ## [0.10.0] - 2026-10-30
 

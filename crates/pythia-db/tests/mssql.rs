@@ -1300,6 +1300,152 @@ fn dictionary_at_compatibility_level_100() {
     drop_database(&mut dba, "r63_compat");
 }
 
+/// The indexes of `tables` in `owner` as the catalog has them, and whether
+/// each table is memory-optimized and how durable.
+fn catalog_indexes(h: &mut Harness, owner: &str, tables: &[&str]) -> Vec<String> {
+    let names: Vec<String> = tables.iter().map(|t| format!("'{t}'")).collect();
+    let names = names.join(", ");
+    let tables = h.scalar(&format!(
+        "select string_agg(concat_ws(' ', t.name, t.is_memory_optimized, \
+                                     t.durability_desc collate database_default), '; ') \
+                  within group (order by t.name) \
+           from sys.tables t where t.schema_id = schema_id('{owner}') and t.name in ({names})"
+    ));
+    let indexes = h.scalar(&format!(
+        "select string_agg(x.line collate database_default, '; ') within group (order by x.line) \
+           from (select concat_ws(' ', object_name(i.object_id), i.name, \
+                                  i.type_desc collate database_default, i.is_unique, \
+                                  i.is_primary_key, i.is_unique_constraint, h.bucket_count, \
+                                  c.columns) as line \
+                   from sys.indexes i \
+                   left join sys.hash_indexes h on h.object_id = i.object_id \
+                    and h.index_id = i.index_id \
+                  outer apply (select string_agg(col_name(ic.object_id, ic.column_id) \
+                                                 + case when ic.is_descending_key = 1 \
+                                                        then ' desc' else '' end, ',') \
+                                        within group (order by ic.key_ordinal, \
+                                                               ic.index_column_id) as columns \
+                                 from sys.index_columns ic \
+                                where ic.object_id = i.object_id \
+                                  and ic.index_id = i.index_id) c \
+                  where i.object_id in (select object_id from sys.tables \
+                                         where schema_id = schema_id('{owner}') \
+                                           and name in ({names}))) x"
+    ));
+    [tables, indexes].into_iter().flatten().collect()
+}
+
+/// Runs a table's DDL with the tables `tables` of `schema` named in `copy`.
+fn run_ddl_in(h: &mut Harness, ddl: &str, schema: &str, copy: &str, tables: &[&str]) {
+    for statement in pythia_plsql::split_statements_in(ddl, pythia_plsql::Syntax::TSql) {
+        let mut sql = statement.text(ddl).to_owned();
+        for table in tables {
+            sql = sql.replace(
+                &format!("[{schema}].[{table}]"),
+                &format!("[{copy}].[{table}]"),
+            );
+        }
+        h.ok(&sql);
+    }
+}
+
+/// A memory-optimized table's DDL makes it memory-optimized again, as
+/// durable, with its hash indexes and their bucket counts, and with the
+/// indexes declared in it: CREATE INDEX can't make them (#302).
+#[test]
+fn memory_optimized_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(
+        &mut dba,
+        "r63_mem",
+        &[
+            "alter database [{db}] add filegroup [{db}_mo] contains memory_optimized_data",
+            "declare @path nvarchar(400) = \
+               cast(serverproperty('InstanceDefaultDataPath') as nvarchar(400)) + '{db}_mo'; \
+             exec('alter database [{db}] add file (name = [{db}_mo], filename = ''' \
+                  + @path + ''') to filegroup [{db}_mo]')",
+        ],
+    );
+    for sql in [
+        "create table r63_mo (\
+           id int not null constraint r63_mo_pk primary key nonclustered hash \
+             with (bucket_count = 1000), \
+           a int not null, \
+           b nvarchar(20) null, \
+           c int identity(1, 1) not null, \
+           n int not null constraint r63_mo_n default 0 constraint r63_mo_n_ck check (n >= 0), \
+           constraint r63_mo_b unique nonclustered (b), \
+           index r63_mo_a nonclustered (a desc, id), \
+           index r63_mo_hash hash (a, id) with (bucket_count = 64)\
+         ) with (memory_optimized = on)",
+        "create table r63_mod (\
+           id int not null constraint r63_mod_pk primary key nonclustered, \
+           mo int null constraint r63_mod_fk references r63_mo (id), \
+           v varchar(10) null, \
+           index r63_mod_cs clustered columnstore\
+         ) with (memory_optimized = on)",
+        "create table r63_mos (id int not null primary key nonclustered hash \
+         with (bucket_count = 8)) with (memory_optimized = on, durability = schema_only)",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = |h: &mut Harness, table: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: "dbo".into(),
+            name: table.into(),
+            object_type: ObjectType::Table,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let mo = ddl(&mut h, "r63_mo");
+    assert_eq!(
+        mo,
+        "create table [dbo].[r63_mo] (\n    \
+           [id] int not null,\n    \
+           [a] int not null,\n    \
+           [b] nvarchar(20) null,\n    \
+           [c] int identity(1, 1) not null,\n    \
+           [n] int not null constraint [r63_mo_n] default ((0)),\n    \
+           constraint [r63_mo_pk] primary key nonclustered hash ([id]) \
+             with (bucket_count = 1024),\n    \
+           constraint [r63_mo_b] unique nonclustered ([b]),\n    \
+           constraint [r63_mo_n_ck] check ([n]>=(0)),\n    \
+           index [r63_mo_a] nonclustered ([a] desc, [id]),\n    \
+           index [r63_mo_hash] nonclustered hash ([a], [id]) with (bucket_count = 64)\n\
+         ) with (memory_optimized = on, durability = schema_and_data);\nGO\n"
+    );
+    let mo_d = ddl(&mut h, "r63_mod");
+    assert!(
+        mo_d.contains(
+            "    constraint [r63_mod_fk] foreign key ([mo]) references [dbo].[r63_mo] ([id]),\n    \
+             index [r63_mod_cs] clustered columnstore\n\
+             ) with (memory_optimized = on, durability = schema_and_data);"
+        ),
+        "{mo_d}"
+    );
+    let mo_s = ddl(&mut h, "r63_mos");
+    assert!(
+        mo_s.ends_with(") with (memory_optimized = on, durability = schema_only);\nGO\n"),
+        "{mo_s}"
+    );
+    // Run in another schema, the DDL makes the same tables.
+    let tables = ["r63_mo", "r63_mod", "r63_mos"];
+    let before = catalog_indexes(&mut h, "dbo", &tables);
+    h.ok("create schema r63_copy");
+    for ddl in [&mo, &mo_d, &mo_s] {
+        run_ddl_in(&mut h, ddl, "dbo", "r63_copy", &tables);
+    }
+    assert_eq!(catalog_indexes(&mut h, "r63_copy", &tables), before);
+    drop(h);
+    drop_database(&mut dba, "r63_mem");
+}
+
 /// Waits for a session's connect to fail.
 fn connect_error(params: ConnectParams) -> pythia_db::DbError {
     let (tx, wake) = mpsc::channel();

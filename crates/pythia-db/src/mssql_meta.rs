@@ -485,7 +485,8 @@ fn ddl(
     })
 }
 
-/// `CREATE TABLE` with its columns and constraints, then its other indexes.
+/// `CREATE TABLE` with its columns and constraints, then its other indexes;
+/// a memory-optimized table declares its indexes in it.
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -515,6 +516,17 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
+    // A memory-optimized table's durability (#302). CREATE INDEX can't make
+    // its indexes: they are declared in CREATE TABLE.
+    let durability = ms
+        .rows(
+            "select lower(durability_desc collate database_default) from sys.tables \
+              where object_id = object_id(@P1) and is_memory_optimized = 1",
+            &[object],
+        )?
+        .into_iter()
+        .find_map(first);
+    let options = index_options(ms, object)?;
     // A key's columns, a foreign key's and the ones it references, and the
     // columns of the indexes, quoted, as lists (see Lists).
     let lists = Lists::read(
@@ -542,13 +554,14 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         object,
     )?;
     // Each constraint as (name, its line up to the columns, what follows
-    // them: a foreign key's REFERENCES and its actions).
+    // them: a foreign key's REFERENCES and its actions, a key's index).
     let constraints = ms.rows(
-        "select name, line, refs, actions from ( \
+        "select name, line, refs, actions, ix from ( \
            select k.name, 'constraint ' + quotename(k.name) \
                   + case k.type when 'PK' then ' primary key ' else ' unique ' end \
                   + lower(i.type_desc collate database_default) as line, \
-                  null as refs, '' as actions, case k.type when 'PK' then 1 else 2 end as ord \
+                  null as refs, '' as actions, i.name as ix, \
+                  case k.type when 'PK' then 1 else 2 end as ord \
              from sys.key_constraints k \
              join sys.indexes i on i.object_id = k.parent_object_id and i.index_id = k.unique_index_id \
             where k.parent_object_id = object_id(@P1) \
@@ -561,10 +574,11 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                        else '' end \
                   + case f.update_referential_action when 1 then ' on update cascade' \
                          when 2 then ' on update set null' when 3 then ' on update set default' \
-                         else '' end, 3 \
+                         else '' end, null, 3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
            union all \
-           select c.name, 'constraint ' + quotename(c.name) + ' check ' + c.definition, null, '', 4 \
+           select c.name, 'constraint ' + quotename(c.name) + ' check ' + c.definition, null, '', \
+                  null, 4 \
              from sys.check_constraints c where c.parent_object_id = object_id(@P1) \
          ) x order by ord, name",
         &[object],
@@ -572,19 +586,23 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let constraints = constraints.into_iter().filter_map(|row| {
         let mut values = row.into_iter();
         let mut next = || values.next().flatten();
-        let (name, line, refs, actions) = (next()?, next()?, next(), next().unwrap_or_default());
+        let (name, line, refs) = (next()?, next()?, next());
+        let (actions, index) = (next().unwrap_or_default(), next());
         let columns = lists.clause(" ", &name, "columns");
         let references = refs
             .map(|refs| format!("{refs}{}", lists.clause(" ", &name, "references")))
             .unwrap_or_default();
-        Some(format!("{line}{columns}{references}{actions}"))
+        let with = index
+            .and_then(|index| options.get(&index))
+            .map_or("", String::as_str);
+        Some(format!("{line}{columns}{references}{actions}{with}"))
     });
-    let lines: Vec<String> = columns
+    let mut lines: Vec<String> = columns
         .into_iter()
         .filter_map(first)
         .chain(constraints)
         .collect();
-    let mut ddl = format!("create table {object} (\n    {}\n);", lines.join(",\n    "));
+    let mut indexes = Vec::new();
     // Rowstore (types 1 and 2) and columnstore indexes (5 and 6, #252). A
     // nonclustered columnstore index names its columns, which count as
     // included; a clustered one holds all of them and names none. XML (3)
@@ -627,13 +645,13 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         ),
         object,
     )?;
-    // Each index as (name, its statement up to the columns, a secondary XML
-    // index's USING, its WHERE) and a spatial index's tessellation.
-    let indexes = ms.rows(
-        "select i.name, 'create ' + case when i.is_unique = 1 then 'unique ' else '' end \
-                + case when x.xml_index_type = 0 then 'primary xml' \
-                       else lower(i.type_desc collate database_default) end \
-                + ' index ' + quotename(i.name) + ' on ' + @P1, \
+    // Each index as (name, quoted, UNIQUE, its kind, a secondary XML
+    // index's USING, its WHERE) and a spatial index's tessellation. Hash
+    // indexes (7) are a memory-optimized table's (#302).
+    let rows = ms.rows(
+        "select i.name, quotename(i.name), case when i.is_unique = 1 then 'unique ' else '' end, \
+                case when x.xml_index_type = 0 then 'primary xml' \
+                     else lower(i.type_desc collate database_default) end, \
                 coalesce(' using xml index ' + quotename(u.name) + ' for ' \
                          + lower(x.secondary_type_desc collate database_default), ''), \
                 coalesce(' where ' + i.filter_definition, ''), \
@@ -651,29 +669,73 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
             and s.index_id = i.index_id \
            left join sys.spatial_index_tessellations t on t.object_id = i.object_id \
             and t.index_id = i.index_id \
-          where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6) \
+          where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6, 7) \
             and i.is_primary_key = 0 and i.is_unique_constraint = 0 \
             and (x.xml_index_type is null or x.xml_index_type in (0, 1)) \
           order by case when x.using_xml_index_id is null then 0 else 1 end, i.name",
         &[object],
     )?;
-    for row in indexes {
+    for row in rows {
         let mut values = row.into_iter();
         let mut next = || values.next().flatten();
-        let (Some(name), Some(index)) = (next(), next()) else {
+        let (Some(name), Some(quoted)) = (next(), next()) else {
             continue;
         };
+        let kind = format!(
+            "{}{}",
+            next().unwrap_or_default(),
+            next().unwrap_or_default()
+        );
         let (using, filter) = (next().unwrap_or_default(), next().unwrap_or_default());
         let spatial: Vec<Cell> = values.collect();
-        ddl.push_str(&format!(
-            "\n\n{index}{}{}{using}{}{filter}{};",
-            lists.clause(" ", &name, "columns"),
+        let columns = lists.clause(" ", &name, "columns");
+        let with = options.get(&name).map_or("", String::as_str);
+        if durability.is_some() {
+            lines.push(format!("index {quoted} {kind}{columns}{with}"));
+            continue;
+        }
+        indexes.push(format!(
+            "create {kind} index {quoted} on {object}{columns}{}{using}{}{filter}{}{with};",
             lists.clause(" include ", &name, "include"),
             lists.clause(" order ", &name, "order"),
             spatial_options(&spatial)
         ));
     }
+    let mut ddl = format!("create table {object} (\n    {}\n)", lines.join(",\n    "));
+    if let Some(durability) = durability {
+        ddl.push_str(&format!(
+            " with (memory_optimized = on, durability = {durability})"
+        ));
+    }
+    ddl.push(';');
+    for index in indexes {
+        ddl.push_str(&format!("\n\n{index}"));
+    }
     Ok(ddl)
+}
+
+/// Each index's options as ` with (…)`, by the index's name: a hash
+/// index's bucket count (#302).
+fn index_options(ms: &mut Ms<'_>, object: &str) -> Result<HashMap<String, String>, DbError> {
+    let rows = ms.rows(
+        "select i.name, cast(h.bucket_count as varchar(20)) \
+           from sys.indexes i \
+           left join sys.hash_indexes h on h.object_id = i.object_id and h.index_id = i.index_id \
+          where i.object_id = object_id(@P1) and i.name is not null",
+        &[object],
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let mut values = row.into_iter();
+            let name = values.next().flatten()?;
+            let mut options = Vec::new();
+            if let Some(buckets) = values.next().flatten() {
+                options.push(format!("bucket_count = {buckets}"));
+            }
+            (!options.is_empty()).then(|| (name, format!(" with ({})", options.join(", "))))
+        })
+        .collect())
 }
 
 /// `USING … WITH (…)` of a spatial index from its tessellation: the scheme,
