@@ -10659,6 +10659,51 @@ fn an_empty_name_shows_as_quotes() {
     assert_eq!(h.query_all_by_label("\"\"").count(), 2, "Favorites, Recent");
 }
 
+/// SQLite tables named `" t"` and `"t "` show quoted, so they don't look
+/// like `t`: in the browser, their tabs and views, Favorites and Recent.
+#[test]
+fn names_with_spaces_around_them_show_quoted() {
+    use pythia_db::ObjectType;
+    let connection = "r64-spaces.db";
+    let (mut h, _file) = sqlite_file(connection);
+    run_script(
+        &mut h,
+        connection,
+        "create table \" t\" (a);\ncreate table \"t \" (a, b);\ncreate table t (a)",
+    );
+    h.state_mut().test_expand_browser(&[ObjectType::Table]);
+    wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+    h.run_steps(3);
+    for shown in ["\" t\"", "\"t \"", "t"] {
+        assert_eq!(h.query_all_by_label(shown).count(), 1, "{shown}");
+    }
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: "t ".into(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut().test_open(OpenRequest::Object {
+        connection: connection.into(),
+        object: object.clone(),
+    });
+    wait_until(&mut h, "its view", |app| !app.test_focused_busy());
+    h.run_steps(2);
+    assert_eq!(h.state().test_focused_title().as_deref(), Some("\"t \""));
+    assert_eq!(h.state().test_object_view().loaded_for_test().1, 2);
+    assert!(
+        h.query_by_label("main.\"t \"").is_some(),
+        "the view's heading"
+    );
+    h.state_mut().test_close_focused();
+    h.state_mut().test_browser().test_marks(object);
+    h.run_steps(3);
+    assert_eq!(
+        h.query_all_by_label("\"t \"").count(),
+        2,
+        "Favorites, Recent"
+    );
+}
+
 /// Oracle's names keep the case that tells them apart outside the browser
 /// too, as #272 shows them there: `R64_CASE` reads `r64_case`, `"R64_Case"`
 /// reads `"R64_Case"`, in the maintenance scan and an index's maintenance,

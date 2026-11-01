@@ -680,6 +680,10 @@ All notable changes to Pythia are documented here. The format follows
   database. The program window offers the file *Export schema to folder*
   writes for the unit (`f^oo.pks` for `"Foo"`), not `foo.pks` for both.
   A foreign key on a column such as `"P_Id"` marks it in the browser.
+- A name with a space at its start or end shows quoted (#298), `" t"`
+  and `"t "`, in the object browser, *Favorites*, *Recent*, the tabs and
+  the view's heading (`main."t "`). It read like `t`, so on SQLite or
+  PostgreSQL `" t"`, `"t "` and `t` looked the same.
 
 ## [0.10.0] - 2026-10-30
 

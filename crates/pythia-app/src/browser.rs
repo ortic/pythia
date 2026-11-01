@@ -2491,10 +2491,12 @@ impl Template {
 /// that names told apart by case read apart. Oracle's names in its default
 /// uppercase read in lowercase, which reads better, and the others as its
 /// SQL writes them (`"Foo"`), so that they don't read like those. A name
-/// that is empty or only spaces reads quoted too.
+/// that is empty or only spaces reads quoted too, and so does one with
+/// spaces around it.
 pub fn shown_name(dialect: Dialect, name: &str) -> String {
-    if name.trim().is_empty() {
-        // There would be nothing to see or click (#281).
+    if quoted_to_show(name) {
+        // There would be nothing to see or click (#281), or spaces that
+        // don't show: `" t"` read like `t` (#298).
         dialect.quote_ident(name)
     } else if dialect != Dialect::ORACLE {
         name.to_owned()
@@ -2503,6 +2505,12 @@ pub fn shown_name(dialect: Dialect, name: &str) -> String {
     } else {
         name.to_lowercase()
     }
+}
+
+/// The name reads quoted wherever it is shown: it is empty, or has white
+/// space at its start or end, which wouldn't show.
+pub fn quoted_to_show(name: &str) -> bool {
+    name.is_empty() || name.trim() != name
 }
 
 /// `owner.name`, each [`shown_name`], or the name alone without an owner.
@@ -2960,6 +2968,14 @@ mod tests {
             (Dialect::SQLITE, "  ", "\"  \""),
             (Dialect::MYSQL, "", "``"),
             (Dialect::SQLSERVER, " ", "[ ]"),
+            (Dialect::SQLITE, " t", "\" t\""),
+            (Dialect::SQLITE, "t ", "\"t \""),
+            (Dialect::SQLITE, "a b", "a b"),
+            (Dialect::POSTGRES, "\tt", "\"\tt\""),
+            (Dialect::MYSQL, " t", "` t`"),
+            (Dialect::SQLSERVER, "t ", "[t ]"),
+            (Dialect::ORACLE, " T", "\" T\""),
+            (Dialect::ORACLE, "A B", "a b"),
         ] {
             assert_eq!(shown_name(dialect, name), shown, "{dialect:?} {name}");
         }
