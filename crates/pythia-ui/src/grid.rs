@@ -779,7 +779,10 @@ impl GridState {
         let Some((r, c, text)) = self.edit.as_mut().and_then(|e| e.active.take()) else {
             return;
         };
-        if commit {
+        // A NULL cell's editor opens empty: left so, the cell stays NULL
+        // rather than becoming '', which a date or a number refuses (#262).
+        let unchanged = text.is_empty() && self.value(rows, r, c).is_none();
+        if commit && !unchanged {
             self.set_value(rows, r, c, Some(text));
         }
     }
@@ -3567,6 +3570,66 @@ mod tests {
         assert_eq!(state.cursor, Some((1, 1)));
         frame(&ctx, &c, &r, &mut state, vec![key(Key::ArrowDown)]);
         assert_eq!(state.cursor, Some((2, 1)));
+    }
+
+    /// A NULL cell's editor opens empty; left so, the cell stays NULL
+    /// (#262). It became `''`, which a date or number column refuses on
+    /// Apply ("Incorrect datetime value: ''") and a text column took as a
+    /// change: a new row's TIMESTAMP opened and left lost its default.
+    #[test]
+    fn null_cells_left_empty_stay_null() {
+        let (c, r) = (cols(), rows());
+        let ctx = egui::Context::default();
+        let mut state = GridState::default();
+        state.set_editable(None);
+        // Row 2's A, the first NULL shown.
+        click(&ctx, &c, &r, &mut state, "NULL", 2);
+        assert_eq!(
+            state.edit.as_ref().unwrap().active,
+            Some((1, 0, String::new()))
+        );
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        assert!(state.edit.as_ref().unwrap().active.is_none());
+        assert!(state.changes().unwrap().is_empty(), "{:?}", state.changes());
+        // Typed and taken back, too.
+        state.start_edit(&r, (2, 1), Some("a".into()));
+        state
+            .edit
+            .as_mut()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .2
+            .clear();
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        assert!(state.changes().unwrap().is_empty(), "{:?}", state.changes());
+
+        // A new row's cells.
+        state.add_row(&r, 2);
+        state.start_edit(&r, (3, 1), None);
+        frame(&ctx, &c, &r, &mut state, vec![]);
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        assert_eq!(state.changes().unwrap().inserts, [vec![None, None]]);
+
+        // A value typed is kept, and an empty text where there was one.
+        state.start_edit(&r, (0, 1), None);
+        state
+            .edit
+            .as_mut()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .2
+            .clear();
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        state.start_edit(&r, (3, 1), Some("b".into()));
+        frame(&ctx, &c, &r, &mut state, vec![key(Key::Enter)]);
+        let changes = state.changes().unwrap();
+        assert_eq!(changes.updates[&0][&1].as_deref(), Some(""));
+        assert_eq!(changes.inserts, [vec![None, Some("b".into())]]);
     }
 
     /// The record view shows the pending edits and the inserted rows, and

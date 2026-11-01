@@ -460,6 +460,13 @@ All notable changes to Pythia are documented here. The format follows
   no default, `DEFAULT 'NULL'` as NULL, `'CURRENT_TIMESTAMP'` as the
   function, and an ENUM's `'a'` as `a`. Numbers, bits and expressions
   such as `CURRENT_TIMESTAMP` or `uuid()` read as before.
+- A NULL cell of a result being edited stays NULL when its editor is
+  opened and closed without typing (#262). It became an empty text: a
+  new row's TIMESTAMP opened so failed on *Apply* with "Incorrect
+  datetime value: ''" instead of taking its default, a date or number
+  of a fetched row failed the same way, and a text column's NULL was
+  replaced by `''`. *Set NULL* and the value editor's *Apply* work as
+  before.
 
 ## [0.10.0] - 2026-10-30
 
