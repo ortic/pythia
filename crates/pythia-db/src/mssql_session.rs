@@ -49,6 +49,10 @@ pub(crate) type Tds = tiberius::Client<Compat<TcpStream>>;
 
 const DEFAULT_PORT: u16 = 1433;
 
+/// How long Break waits for the server to acknowledge the attention signal
+/// (the driver's command timeout before #199).
+const ATTENTION_WAIT: Duration = Duration::from_secs(30);
+
 /// Session options of SQL Server Management Studio, which scripts expect.
 const SESSION_OPTIONS: &str = "set ansi_nulls on; set ansi_padding on; set ansi_warnings on; \
                                set arithabort on; set concat_null_yields_null on; \
@@ -698,12 +702,19 @@ fn report_messages(stream: &mut QueryStream<'_>, events: &Events) {
 /// Break: the attention signal stops the batch on the server. The server
 /// first ends its reply to the batch, then acknowledges in a reply of its
 /// own, which tiberius doesn't read; then the connection needs opening
-/// again.
+/// again. Statements have no time limit (#199), the wait for that reply
+/// has: without a network it would never end.
 fn cancel_running(rt: &Runtime, client: &mut Tds, message: &'static str) -> Failure {
-    let reopen = match rt.block_on(client.cancel_query()) {
-        Ok(()) => false,
-        Err(e) => {
+    let acknowledged =
+        rt.block_on(async { tokio::time::timeout(ATTENTION_WAIT, client.cancel_query()).await });
+    let reopen = match acknowledged {
+        Ok(Ok(())) => false,
+        Ok(Err(e)) => {
             debug!("after the attention: {e}");
+            true
+        }
+        Err(_) => {
+            debug!("no reply to the attention within {ATTENTION_WAIT:?}");
             true
         }
     };
@@ -873,7 +884,29 @@ pub(crate) fn config(params: &ConnectParams) -> Result<tiberius::Config, DbError
         config.authentication(AuthMethod::sql_server(&params.username, &params.password));
     }
     config.application_name("Pythia");
+    // A statement runs until it ends or Break stops it, a lock wait too:
+    // the driver's default gave up after 30 s without a word from the
+    // server, and the connection with its transaction was lost (#199).
+    config.command_timeout(if ado { command_timeout(text)? } else { None });
     Ok(config)
+}
+
+/// The ADO.NET string's `Command Timeout` in seconds (0 for none), which
+/// tiberius doesn't read.
+fn command_timeout(text: &str) -> Result<Option<Duration>, DbError> {
+    let Some(value) = text.split(';').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        let key = key.trim().to_ascii_lowercase();
+        matches!(key.as_str(), "command timeout" | "commandtimeout").then_some(value.trim())
+    }) else {
+        return Ok(None);
+    };
+    let seconds: u64 = value.parse().map_err(|_| {
+        DbError::new(format!(
+            "Command Timeout is a number of seconds (0 for none), not {value}"
+        ))
+    })?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 /// Whether the address names an instance (`host\instance`, or the ADO.NET
@@ -1189,6 +1222,32 @@ mod tests {
         assert_eq!((t.host.as_str(), t.port), ("::1", Some(1500)));
         assert!(parse_target("h:port").is_err());
         assert!(parse_target("h?compress").is_err());
+    }
+
+    /// Statements have no time limit unless the connection string sets
+    /// one (#199).
+    #[test]
+    fn command_timeouts() {
+        let config = |connect_string: &str| {
+            config(&ConnectParams {
+                kind: pythia_config::DbKind::SqlServer,
+                username: "u".into(),
+                password: "p".into(),
+                connect_string: connect_string.into(),
+                privilege: Default::default(),
+                init_sql: Vec::new(),
+                ssh: None,
+            })
+        };
+        let timeout = |connect_string: &str| config(connect_string).unwrap().get_command_timeout();
+        assert_eq!(timeout("localhost:1433/db?trust"), None);
+        assert_eq!(timeout("Server=tcp:localhost,1433;Database=db"), None);
+        assert_eq!(
+            timeout("Server=localhost;Command Timeout=45"),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(timeout("server=localhost;commandtimeout = 0"), None);
+        assert!(config("Server=localhost;Command Timeout=soon").is_err());
     }
 
     #[test]

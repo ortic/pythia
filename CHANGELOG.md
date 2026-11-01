@@ -112,6 +112,13 @@ All notable changes to Pythia are documented here. The format follows
   what changed. The open windows are the first Pythia's; one started
   while it runs keeps its own as long as it runs. Two saves at the same
   moment no longer share a temporary file, where one of them failed.
+- SQL Server: a statement that took longer than 30 seconds failed with
+  "Lost connection to SQL Server: the server did not send the next part
+  of the command result within 30s", and the window's changes that
+  weren't committed were rolled back (#199). Waiting longer for a lock
+  held by another window ended the same way. Statements now run until
+  they end or Break stops them; an ADO.NET connection string can still
+  set `Command Timeout=n` (seconds).
 
 ## [0.10.0] - 2026-10-30
 
