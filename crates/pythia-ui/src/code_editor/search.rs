@@ -142,6 +142,11 @@ mod tests {
         }
     }
 
+    /// One match, from `start` to `end`.
+    fn one(start: usize, end: usize) -> Vec<Range<usize>> {
+        vec![Range { start, end }]
+    }
+
     /// In a selection, the text around it still counts for `^`, `$` and
     /// word boundaries, and a match must lie in it: `$1` always expands.
     #[test]
@@ -150,13 +155,13 @@ mod tests {
         // The selection ends inside `name`: only `a`.
         let hay = "a name x";
         let found = m.find_all(hay, Some(0..4));
-        assert_eq!(found, [0..1]);
+        assert_eq!(found, one(0, 1));
         assert_eq!(m.replacement(hay, &found[0], "\"$1\""), "\"a\"");
         // Starting mid-line, `^` is no line start there.
         let m = Matcher::new(&rq(r"^(\s+)(\S)")).unwrap().unwrap();
         let hay = "  x\n  y";
         let found = m.find_all(hay, Some(2..7));
-        assert_eq!(found, [4..7]);
+        assert_eq!(found, one(4, 7));
         assert_eq!(m.replacement(hay, &found[0], "$2"), "y");
         // Ending mid-line, `$` is no line end there.
         let m = Matcher::new(&rq(r"(\w)$")).unwrap().unwrap();
@@ -164,10 +169,10 @@ mod tests {
         // A scope past the text or inside a character is clamped.
         let m = Matcher::new(&q("a")).unwrap().unwrap();
         assert_eq!(m.find_all("t.\nü", Some(0..4)), Vec::<Range<usize>>::new());
-        assert_eq!(m.find_all("aü", Some(0..99)), [0..1]);
+        assert_eq!(m.find_all("aü", Some(0..99)), one(0, 1));
         // Empty matches are stepped over by a character.
         let m = Matcher::new(&rq("x*")).unwrap().unwrap();
-        assert_eq!(m.find_all("üxü", None), [2..3]);
+        assert_eq!(m.find_all("üxü", None), one(2, 3));
     }
 
     #[test]

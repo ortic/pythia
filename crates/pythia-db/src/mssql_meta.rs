@@ -550,7 +550,7 @@ fn trigger_order(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
            from sys.trigger_events te \
           where te.object_id = object_id(@P1) and (te.is_first = 1 or te.is_last = 1) \
           order by te.type",
-        &[&object],
+        &[object],
     )?;
     let name = object.replace('\'', "''");
     let calls: String = rows

@@ -343,7 +343,7 @@ fn number(v: f64) -> String {
         v.to_string()
     } else if v.fract() == 0.0 && a < 1e15 {
         format!("{}", v as i64)
-    } else if a < 1e-4 || a >= 1e15 {
+    } else if !(1e-4..1e15).contains(&a) {
         let s = format!("{v:.3e}");
         let (mantissa, exponent) = s.split_once('e').unwrap_or((&s, "0"));
         format!("{}e{exponent}", trim(mantissa))
