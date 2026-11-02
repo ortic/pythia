@@ -406,6 +406,8 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL: sessions use the server's utf8mb4 collation, not the driver's
   `utf8mb4_general_ci`, which a column's didn't mix with (1267), and
   *Edit* makes a routine or trigger again under its own collation (#452).
+- MySQL: `WITH … UPDATE` and `WITH … DELETE` wait for Commit, as UPDATE
+  and DELETE do: they were committed at once (#453).
 
 ## [0.11.0] - 2026-11-02
 

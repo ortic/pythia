@@ -1561,6 +1561,25 @@ fn trigger_ddl(h: &mut Harness, schema: &str, name: &str) -> String {
     ddl
 }
 
+/// `WITH … UPDATE` waits for Commit, as an UPDATE does (#453): it ran
+/// outside a transaction, and Rollback undid nothing.
+#[test]
+fn with_update_waits_for_commit() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r101_cte");
+    h.ok("create table r101_cte (id int primary key, n int)");
+    h.ok("insert into r101_cte values (1, 1)");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+    assert!(h.ok("with d as (select 1 as id) update r101_cte join d using (id) set n = 2"));
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    assert_eq!(h.scalar("select n from r101_cte").as_deref(), Some("1"));
+    h.ok("drop table r101_cte");
+}
+
 /// A session has the server's utf8mb4 collation, as its own client does
 /// (#452): the driver's utf8mb4_general_ci didn't mix with a column's
 /// (1267). A routine made under another collation keeps it in its DDL,
