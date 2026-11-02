@@ -1172,6 +1172,49 @@ All notable changes to Pythia are documented here. The format follows
   the object browser and completion showed an empty database, and
   another window had none of a window's tables. `cache=private` keeps
   one for each.
+- SQL Server: a table's DDL keeps its columns' dynamic data masks
+  (#348). `masked with (function = …)` was left out, so a copy, an
+  *Edit* or a script made from the DDL masked nothing: a user without
+  UNMASK read there the e-mail addresses, numbers and dates the masks
+  hide in the original.
+- SQL Server: a table's DDL keeps a typed XML column's schema
+  collection (#349), as `xml(document [schema].[collection])` or
+  `xml(content …)`. The column was plain `xml`: a copy took any XML the
+  original rejects. The collection itself isn't made by the table's
+  DDL, as a foreign key's table isn't.
+- SQL Server: a table's DDL keeps ROWGUIDCOL, a persisted computed
+  column's NOT NULL, and NOT FOR REPLICATION of identities, foreign keys
+  and checks (#355). A copy had no `$rowguid`, took NULLs its computed
+  column rejects, and its foreign keys and checks, added `with nocheck`
+  as SQL Server never trusts one not for replication, checked the rows
+  replication puts in.
+- SQL Server: a table's DDL makes its statistics (#357): those made
+  with `create statistics` follow its indexes, with their `where` and
+  `norecompute`, `incremental = on` and `auto_drop = on`. A copy had
+  none of them, and SQL Server makes no statistics on several columns
+  or with a filter by itself.
+- SQL Server: a graph table's DDL makes a node or edge table (#360),
+  `create table … (…) as node` or `as edge`, with its edge constraints.
+  It made a plain table with the columns SQL Server adds to a graph
+  table written out (`graph_id_…`, `$node_id_…`) and the unique index on
+  them, which took no rows without them and no `$node_id`; indexes and
+  statistics on `$node_id`, `$from_id` and `$to_id` now name those.
+- SQL Server: a ledger table's DDL makes a ledger table (#366), `with
+  (system_versioning = on, ledger = on)` or `ledger = on (append_only =
+  on)`, its ledger columns `generated always as transaction_id start
+  hidden` and so on, and its history table, ledger view and the view's
+  columns named where SQL Server didn't name them. It made a plain
+  table, which kept no ledger and took no rows without values for the
+  ledger columns.
+- SQL Server: a table's DDL keeps its Always Encrypted columns
+  encrypted (#367), `encrypted with (column_encryption_key = …,
+  encryption_type = …, algorithm = …)`. A copy's columns were plain
+  ones, which took the values a client sends them in plain text and
+  kept them so.
+- SQL Server: a table's *Indexes* has a *STATUS* column (#368),
+  `ENABLED`, `DISABLED` or `HYPOTHETICAL`. Disabled and hypothetical
+  indexes read like the others, which the *DDL* disables (#326) or
+  leaves out (#327).
 
 ## [0.10.0] - 2026-10-30
 

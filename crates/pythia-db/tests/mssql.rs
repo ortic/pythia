@@ -169,6 +169,22 @@ impl Harness {
         rows[0][0].clone()
     }
 
+    /// A query's first row, NULLs as ''.
+    fn first_row(&mut self, sql: &str) -> Vec<String> {
+        let event = self.run(0, sql);
+        let DbEvent::QueryStarted { .. } = event else {
+            panic!("{sql}: expected a query, got {event:?}")
+        };
+        let DbEvent::Rows { mut rows, .. } = self.next_result() else {
+            panic!("{sql}: expected rows")
+        };
+        self.settle();
+        rows.remove(0)
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect()
+    }
+
     /// Reads up to the transaction state that ends a statement's events.
     fn settle(&mut self) -> bool {
         loop {
@@ -1084,7 +1100,8 @@ fn indexes_of_every_kind() {
                 "UNIQUENESS",
                 "COLUMNS",
                 "INCLUDE",
-                "WHERE"
+                "WHERE",
+                "STATUS"
             ]
         );
         rows.into_iter()
@@ -1099,15 +1116,16 @@ fn indexes_of_every_kind() {
     assert_eq!(
         ix,
         [
-            ["r43_ix_pk", "CLUSTERED", "PRIMARY", "id", "", ""],
-            ["r43_ix_c", "NONCLUSTERED", "UNIQUE", "c", "", ""],
+            ["r43_ix_pk", "CLUSTERED", "PRIMARY", "id", "", "", "ENABLED"],
+            ["r43_ix_c", "NONCLUSTERED", "UNIQUE", "c", "", "", "ENABLED"],
             [
                 "r43_ix_cover",
                 "NONCLUSTERED",
                 "NONUNIQUE",
                 "a DESC",
                 "c, b",
-                ""
+                "",
+                "ENABLED"
             ],
             [
                 "r43_ix_some",
@@ -1115,7 +1133,8 @@ fn indexes_of_every_kind() {
                 "NONUNIQUE",
                 "b",
                 "",
-                "([b] IS NOT NULL)"
+                "([b] IS NOT NULL)",
+                "ENABLED"
             ],
             [
                 "r43_ix_store",
@@ -1123,7 +1142,8 @@ fn indexes_of_every_kind() {
                 "NONUNIQUE",
                 "b, a",
                 "",
-                ""
+                "",
+                "ENABLED"
             ],
         ]
     );
@@ -1131,14 +1151,23 @@ fn indexes_of_every_kind() {
     assert_eq!(
         cs,
         [
-            ["r43_cs_b", "NONCLUSTERED", "NONUNIQUE", "b", "", ""],
+            [
+                "r43_cs_b",
+                "NONCLUSTERED",
+                "NONUNIQUE",
+                "b",
+                "",
+                "",
+                "ENABLED"
+            ],
             [
                 "r43_cs_store",
                 "CLUSTERED COLUMNSTORE",
                 "NONUNIQUE",
                 "a, b",
                 "",
-                ""
+                "",
+                "ENABLED"
             ],
         ]
     );
@@ -1417,9 +1446,9 @@ fn dictionary_at_compatibility_level_100() {
     };
     // As string_agg made them.
     let expected = [
-        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
-        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  | ",
-        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  | ",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  |  | ENABLED",
+        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  |  | ENABLED",
         "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
         "r63_dept_pk | Primary key | deptno | ",
         "r63_dept_site | Unique | site, deptno | ",
@@ -1432,11 +1461,11 @@ fn dictionary_at_compatibility_level_100() {
         "    constraint [r63_dept_site] unique nonclustered ([site] desc, [deptno])",
         ");",
         "GO",
-        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
-        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  | ",
-        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL)",
-        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  | ",
-        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  | ",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  |  | ENABLED",
+        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL) | ENABLED",
+        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  |  | ENABLED",
+        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  |  | ENABLED",
         "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
         "r63_emp_pk | Primary key | empno | ",
         "r63_emp_fk | Foreign key | site, deptno | dbo.r63_dept",
@@ -2540,6 +2569,876 @@ fn clustered_first_without_hypothetical_indexes() {
     drop_tables(&mut h, "r74_copy_h", "r74_h");
     h.ok("drop schema r74_copy_h");
     drop_tables(&mut h, &schema, "r74_h");
+}
+
+/// A table's DDL keeps its columns' dynamic data masks (#348): run
+/// elsewhere, a user without UNMASK reads the copy's columns masked, as
+/// the original's.
+#[test]
+fn masked_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_m", "r82_m");
+    h.ok("drop schema if exists r82_copy_m");
+    drop_tables(&mut h, &schema, "r82_m");
+    h.ok("drop user if exists r82_m_reader");
+    h.ok(
+        "create table r82_m (id int, e varchar(100) masked with (function = 'email()') not null, \
+         p varchar(20) collate Latin1_General_CS_AS \
+           masked with (function = 'partial(1, \"X''X\", 2)'), \
+         d date masked with (function = 'default()') constraint r82_m_d default '2020-01-01', \
+         n int masked with (function = 'random(5, 5)'))",
+    );
+    let ddl = table_ddl(&mut h, &schema, "r82_m");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_m] (\n    \
+               [id] int null,\n    \
+               [e] varchar(100) masked with (function = 'email()') not null,\n    \
+               [p] varchar(20) collate Latin1_General_CS_AS \
+                 masked with (function = 'partial(1, \"X''X\", 2)') null,\n    \
+               [d] date masked with (function = 'default()') null \
+                 constraint [r82_m_d] default ('2020-01-01'),\n    \
+               [n] int masked with (function = 'random(5, 5)') null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.is_masked, m.masking_function) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.masked_columns m on m.object_id = c.object_id \
+                and m.column_id = c.column_id \
+              where c.object_id = object_id('[{owner}].[r82_m]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_m");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_m", &["r82_m"]);
+    assert_eq!(catalog(&mut h, "r82_copy_m"), before);
+    // A user without UNMASK reads both masked.
+    h.ok("create user r82_m_reader without login");
+    for owner in [schema.as_str(), "r82_copy_m"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r82_m] values (1, 'alice@example.com', '0791234567', \
+             '2021-05-06', 7)"
+        ));
+        h.ok(&format!(
+            "grant select on [{owner}].[r82_m] to r82_m_reader"
+        ));
+        h.ok("execute as user = 'r82_m_reader'");
+        let read = h.first_row(&format!("select e, p, d, n from [{owner}].[r82_m]"));
+        h.ok("revert");
+        assert_eq!(
+            read,
+            ["aXXX@XXXX.com", "0X'X67", "1900-01-01", "5"],
+            "{owner}"
+        );
+    }
+    h.ok("drop user r82_m_reader");
+    drop_tables(&mut h, "r82_copy_m", "r82_m");
+    h.ok("drop schema r82_copy_m");
+    drop_tables(&mut h, &schema, "r82_m");
+}
+
+/// A table's DDL types its XML columns with their schema collections, as
+/// content or document (#349): run elsewhere, the copy's columns take only
+/// the XML the collection allows, as the original's.
+#[test]
+fn typed_xml_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_x", "r82_x");
+    h.ok("drop schema if exists r82_copy_x");
+    drop_tables(&mut h, &schema, "r82_x");
+    h.ok(
+        "if exists (select 1 from sys.xml_schema_collections where name = 'r82_xs') \
+         drop xml schema collection r82_xs",
+    );
+    h.ok("create xml schema collection r82_xs as \
+         N'<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\
+           <xs:element name=\"a\" type=\"xs:int\"/></xs:schema>'");
+    h.ok(
+        "create table r82_x (id int, d xml(document r82_xs) not null, c xml(content r82_xs), \
+         p xml(r82_xs), u xml)",
+    );
+    let ddl = table_ddl(&mut h, &schema, "r82_x");
+    let xs = format!("[{schema}].[r82_xs]");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_x] (\n    \
+               [id] int null,\n    \
+               [d] xml(document {xs}) not null,\n    \
+               [c] xml(content {xs}) null,\n    \
+               [p] xml(content {xs}) null,\n    \
+               [u] xml null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, x.name, c.is_xml_document) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.xml_schema_collections x on x.xml_collection_id = c.xml_collection_id \
+                and c.xml_collection_id > 0 \
+              where c.object_id = object_id('[{owner}].[r82_x]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_x");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_x", &["r82_x"]);
+    assert_eq!(catalog(&mut h, "r82_copy_x"), before);
+    // The copy validates its XML as the original does.
+    for owner in [schema.as_str(), "r82_copy_x"] {
+        let t = format!("[{owner}].[r82_x]");
+        h.ok(&format!(
+            "insert into {t} (id, d, c) values (1, '<a>1</a>', '<a>2</a><a>3</a>')"
+        ));
+        h.fails(&format!("insert into {t} (id, d) values (2, '<b/>')"));
+        h.fails(&format!(
+            "insert into {t} (id, d) values (3, '<a>1</a><a>2</a>')"
+        ));
+    }
+    drop_tables(&mut h, "r82_copy_x", "r82_x");
+    h.ok("drop schema r82_copy_x");
+    drop_tables(&mut h, &schema, "r82_x");
+    h.ok("drop xml schema collection r82_xs");
+}
+
+/// A table's DDL keeps ROWGUIDCOL, a persisted computed column's NOT NULL,
+/// and NOT FOR REPLICATION of identities, foreign keys and checks (#355),
+/// which SQL Server never trusts: run elsewhere, the copy's columns and
+/// constraints are the original's.
+#[test]
+fn rowguidcol_not_null_and_not_for_replication() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_r", "r82_r");
+    h.ok("drop schema if exists r82_copy_r");
+    drop_tables(&mut h, &schema, "r82_r");
+    for sql in [
+        "create table r82_rp (id int identity(1, 1) not for replication \
+           constraint r82_rp_pk primary key, \
+         g uniqueidentifier rowguidcol not null constraint r82_rp_g default newid(), \
+         a int, c as (a * 2) persisted not null, v as (a + 1) persisted)",
+        "create table r82_rc (id int identity(5, 2), pid int, \
+         constraint r82_rc_fk foreign key (pid) references r82_rp (id) on delete cascade \
+           not for replication, \
+         constraint r82_rc_ck check not for replication (id > 0))",
+        "alter table r82_rc add constraint r82_rc_off check not for replication (pid <> 0)",
+        "alter table r82_rc nocheck constraint r82_rc_off",
+    ] {
+        h.ok(sql);
+    }
+    let rp = table_ddl(&mut h, &schema, "r82_rp");
+    let t = format!("[{schema}].[r82_rp]");
+    assert_eq!(
+        rp,
+        format!(
+            "create table {t} (\n    \
+               [id] int identity(1, 1) not for replication not null,\n    \
+               [g] uniqueidentifier not null rowguidcol constraint [r82_rp_g] default (newid()),\n    \
+               [a] int null,\n    \
+               [c] as ([a]*(2)) persisted not null,\n    \
+               [v] as ([a]+(1)) persisted,\n    \
+               constraint [r82_rp_pk] primary key clustered ([id])\n\
+             );\nGO\n"
+        )
+    );
+    let rc = table_ddl(&mut h, &schema, "r82_rc");
+    let p = t;
+    let t = format!("[{schema}].[r82_rc]");
+    assert_eq!(
+        rc,
+        format!(
+            "create table {t} (\n    \
+               [id] int identity(5, 2) not null,\n    \
+               [pid] int null,\n    \
+               constraint [r82_rc_fk] foreign key ([pid]) references {p} ([id]) \
+                 on delete cascade not for replication,\n    \
+               constraint [r82_rc_ck] check not for replication ([id]>(0))\n\
+             );\n\n\
+             alter table {t} with nocheck add constraint [r82_rc_off] \
+               check not for replication ([pid]<>(0));\n\n\
+             alter table {t} nocheck constraint [r82_rc_off];\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let tables = format!(
+            "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+                and name like 'r82_r%'"
+        );
+        [
+            format!(
+                "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                             c.is_rowguidcol, c.is_nullable, cc.is_persisted, \
+                                             i.is_not_for_replication) \
+                                   collate database_default, '; ') \
+                          within group (order by object_name(c.object_id), c.column_id) \
+                   from sys.columns c \
+                   left join sys.computed_columns cc on cc.object_id = c.object_id \
+                    and cc.column_id = c.column_id \
+                   left join sys.identity_columns i on i.object_id = c.object_id \
+                    and i.column_id = c.column_id \
+                  where c.object_id in ({tables})"
+            ),
+            format!(
+                "select string_agg(x.line collate database_default, '; ') \
+                          within group (order by x.line) \
+                   from (select concat_ws(' ', name, is_not_for_replication, is_disabled, \
+                                          is_not_trusted, delete_referential_action) as line \
+                           from sys.foreign_keys where parent_object_id in ({tables}) \
+                         union all \
+                         select concat_ws(' ', name, is_not_for_replication, is_disabled, \
+                                          is_not_trusted, definition) \
+                           from sys.check_constraints where parent_object_id in ({tables})) x"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_r");
+    for ddl in [&rp, &rc] {
+        run_ddl_in(&mut h, ddl, &schema, "r82_copy_r", &["r82_rp", "r82_rc"]);
+    }
+    assert_eq!(catalog(&mut h, "r82_copy_r"), before);
+    // The copy takes no NULL for the computed column, and has a $rowguid.
+    for owner in [schema.as_str(), "r82_copy_r"] {
+        h.ok(&format!("insert into [{owner}].[r82_rp] (a) values (1)"));
+        h.fails(&format!("insert into [{owner}].[r82_rp] (a) values (null)"));
+        assert_eq!(
+            h.scalar(&format!("select count($rowguid) from [{owner}].[r82_rp]"))
+                .as_deref(),
+            Some("1"),
+            "{owner}"
+        );
+    }
+    drop_tables(&mut h, "r82_copy_r", "r82_r");
+    h.ok("drop schema r82_copy_r");
+    drop_tables(&mut h, &schema, "r82_r");
+}
+
+/// A table's DDL makes the statistics made on it, with their filters and
+/// options (#357); those of its indexes and the ones SQL Server makes
+/// itself are left out. Run elsewhere, the copy has the same statistics.
+/// In a database of its own: SQL Server lists the objects of incremental
+/// statistics in sys.all_objects with names that aren't UTF-16, which fail
+/// other tests' queries of it.
+#[test]
+fn user_statistics() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(&mut dba, "r82_stats", &[]);
+    let schema = "dbo";
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // AUTO_DROP came with SQL Server 2022.
+    let auto_drop = major >= 16;
+    for sql in [
+        "create partition function r82_st_pf (int) as range right for values (100)",
+        "create partition scheme r82_st_ps as partition r82_st_pf all to ([primary])",
+        "create table r82_st (id int constraint r82_st_pk primary key, a int, b varchar(10), \
+         c int)",
+        "create index r82_st_b on r82_st (b)",
+        "create statistics r82_st_ab on r82_st (a, b)",
+        "create statistics r82_st_f on r82_st (c) where c > 10 with norecompute",
+        "create table r82_stp (id int not null, v int) on r82_st_ps (id)",
+        "create statistics r82_stp_v on r82_stp (v, id) with incremental = on, norecompute",
+    ] {
+        h.ok(sql);
+    }
+    if auto_drop {
+        h.ok("create statistics r82_st_ad on r82_st (a) with auto_drop = on");
+    }
+    let st = table_ddl(&mut h, schema, "r82_st");
+    let t = format!("[{schema}].[r82_st]");
+    let ad = if auto_drop {
+        format!("create statistics [r82_st_ad] on {t} ([a]) with auto_drop = on;\n\n")
+    } else {
+        String::new()
+    };
+    assert!(
+        st.ends_with(&format!(
+            ");\n\n\
+             create nonclustered index [r82_st_b] on {t} ([b]);\n\n\
+             create statistics [r82_st_ab] on {t} ([a], [b]);\n\n\
+             {ad}\
+             create statistics [r82_st_f] on {t} ([c]) where ([c]>(10)) with norecompute;\nGO\n"
+        )),
+        "{st}"
+    );
+    let stp = table_ddl(&mut h, schema, "r82_stp");
+    let t = format!("[{schema}].[r82_stp]");
+    assert!(
+        stp.ends_with(&format!(
+            ") on [r82_st_ps] ([id]);\n\n\
+             create statistics [r82_stp_v] on {t} ([v], [id]) \
+               with norecompute, incremental = on;\nGO\n"
+        )),
+        "{stp}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(s.object_id), s.name, s.user_created, \
+                                         s.has_filter, s.filter_definition, s.no_recompute, \
+                                         s.is_incremental, c.names) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(s.object_id), s.name) \
+               from sys.stats s \
+              outer apply (select string_agg(col_name(sc.object_id, sc.column_id), ',') \
+                                    within group (order by sc.stats_column_id) as names \
+                             from sys.stats_columns sc \
+                            where sc.object_id = s.object_id and sc.stats_id = s.stats_id) c \
+              where s.object_id in (select object_id from sys.tables \
+                                     where schema_id = schema_id('{owner}') \
+                                       and name like 'r82_st%') \
+                and s.name not like '[_]WA[_]Sys[_]%' \
+                and s.name not like 'PK[_][_]%'"
+        ))
+    };
+    let before = catalog(&mut h, schema);
+    h.ok("create schema r82_copy_st");
+    for ddl in [&st, &stp] {
+        run_ddl_in(&mut h, ddl, schema, "r82_copy_st", &["r82_st", "r82_stp"]);
+    }
+    assert_eq!(catalog(&mut h, "r82_copy_st"), before);
+    if auto_drop {
+        assert_eq!(
+            h.scalar(
+                "select auto_drop from sys.stats \
+                  where object_id = object_id('r82_copy_st.r82_st') and name = 'r82_st_ad'"
+            )
+            .as_deref(),
+            Some("1")
+        );
+    }
+    drop(h);
+    drop_database(&mut dba, "r82_stats");
+}
+
+/// The graph tables of `owner` whose names start with `prefix`, as the
+/// catalog has them: node or edge, their columns, graph ones by their
+/// kind, their indexes, a node table's own unique index without its
+/// number, and their edge constraints.
+fn catalog_graph(h: &mut Harness, owner: &str, prefix: &str) -> Vec<Option<String>> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%'"
+    );
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.is_node, t.is_edge) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), \
+                                         coalesce(c.graph_type_desc, c.name), \
+                                         type_name(c.user_type_id), c.is_nullable, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(i.object_id), \
+                                         case when i.name like 'GRAPH[_]UNIQUE[_]INDEX[_]%' \
+                                              then 'GRAPH_UNIQUE_INDEX' else i.name end, \
+                                         i.type_desc, i.is_unique, i.is_primary_key, cols.names) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(i.object_id), i.name) \
+               from sys.indexes i \
+              outer apply (select string_agg((coalesce(c.graph_type_desc, c.name) \
+                                              + case when ic.is_descending_key = 1 \
+                                                     then ' desc' else '' end) \
+                                             collate database_default, ',') \
+                                    within group (order by ic.key_ordinal) as names \
+                             from sys.index_columns ic \
+                             join sys.columns c on c.object_id = ic.object_id \
+                              and c.column_id = ic.column_id \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id) cols \
+              where i.object_id in ({tables}) and i.type > 0"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(e.parent_object_id), e.name, \
+                                         e.delete_referential_action, e.is_disabled, \
+                                         e.is_not_trusted, cl.clauses) \
+                               collate database_default, '; ') within group (order by e.name) \
+               from sys.edge_constraints e \
+              outer apply (select string_agg(object_name(c.from_object_id) + '>' \
+                                             + object_name(c.to_object_id), ',') \
+                                    within group (order by c.clause_number) as clauses \
+                             from sys.edge_constraint_clauses c \
+                            where c.object_id = e.object_id) cl \
+              where e.parent_object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A graph table's DDL makes a node or edge table (#360), without the
+/// columns SQL Server adds to it and a node table's own unique index, with
+/// indexes and statistics on `$node_id`, `$from_id` and `$to_id`, and an
+/// edge table's edge constraints: run elsewhere, the copy is the same kind
+/// of table, which MATCH reads.
+#[test]
+fn graph_tables() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // Graph tables came with SQL Server 2017, edge constraints with 2019.
+    if major < 15 {
+        return;
+    }
+    let drop = |h: &mut Harness, owner: &str| {
+        h.ok(&format!(
+            "drop table if exists [{owner}].[r82_ge], [{owner}].[r82_gk]"
+        ));
+        drop_tables(h, owner, "r82_g");
+    };
+    drop(&mut h, "r82_copy_g");
+    h.ok("drop schema if exists r82_copy_g");
+    drop(&mut h, &schema);
+    for sql in [
+        "create table r82_gp (id int constraint r82_gp_pk primary key, name varchar(20)) as node",
+        "create table r82_gn (x int, constraint r82_gn_pk primary key nonclustered ($node_id)) \
+         as node",
+        "create index r82_gn_x on r82_gn ($node_id desc, x)",
+        "create table r82_ge (rating int, \
+         constraint r82_ge_ec connection (r82_gp to r82_gp, r82_gp to r82_gn) on delete cascade) \
+         as edge",
+        "create index r82_ge_ft on r82_ge ($from_id, $to_id desc)",
+        "create statistics r82_ge_s on r82_ge ($to_id, rating)",
+        "create table r82_gk as edge",
+        "alter table r82_gk add constraint r82_gk_ec connection (r82_gn to r82_gn)",
+        "alter table r82_gk nocheck constraint r82_gk_ec",
+    ] {
+        h.ok(sql);
+    }
+    let (gp, gn, ge, gk) = (
+        format!("[{schema}].[r82_gp]"),
+        format!("[{schema}].[r82_gn]"),
+        format!("[{schema}].[r82_ge]"),
+        format!("[{schema}].[r82_gk]"),
+    );
+    let ddls: Vec<String> = ["r82_gp", "r82_gn", "r82_ge", "r82_gk"]
+        .iter()
+        .map(|table| table_ddl(&mut h, &schema, table))
+        .collect();
+    assert_eq!(
+        ddls,
+        [
+            format!(
+                "create table {gp} (\n    \
+                   [id] int not null,\n    \
+                   [name] varchar(20) null,\n    \
+                   constraint [r82_gp_pk] primary key clustered ([id])\n\
+                 ) as node;\nGO\n"
+            ),
+            format!(
+                "create table {gn} (\n    \
+                   [x] int null,\n    \
+                   constraint [r82_gn_pk] primary key nonclustered ($node_id)\n\
+                 ) as node;\n\n\
+                 create nonclustered index [r82_gn_x] on {gn} ($node_id desc, [x]);\nGO\n"
+            ),
+            format!(
+                "create table {ge} (\n    \
+                   [rating] int null,\n    \
+                   constraint [r82_ge_ec] connection ({gp} to {gp}, {gp} to {gn}) \
+                     on delete cascade\n\
+                 ) as edge;\n\n\
+                 create nonclustered index [r82_ge_ft] on {ge} ($from_id, $to_id desc);\n\n\
+                 create statistics [r82_ge_s] on {ge} ($to_id, [rating]);\nGO\n"
+            ),
+            format!(
+                "create table {gk} as edge;\n\n\
+                 alter table {gk} with nocheck add constraint [r82_gk_ec] \
+                   connection ({gn} to {gn});\n\n\
+                 alter table {gk} nocheck constraint [r82_gk_ec];\nGO\n"
+            ),
+        ]
+    );
+    let before = catalog_graph(&mut h, &schema, "r82_g");
+    assert_eq!(before.len(), 4, "{before:?}");
+    h.ok("create schema r82_copy_g");
+    let tables = ["r82_gp", "r82_gn", "r82_ge", "r82_gk"];
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, &schema, "r82_copy_g", &tables);
+    }
+    assert_eq!(catalog_graph(&mut h, "r82_copy_g", "r82_g"), before);
+    // The copy's nodes and edges make a graph.
+    h.ok("insert into r82_copy_g.r82_gp values (1, 'a'), (2, 'b')");
+    h.ok("insert into r82_copy_g.r82_ge ($from_id, $to_id, rating) \
+         select a.$node_id, b.$node_id, 5 from r82_copy_g.r82_gp a, r82_copy_g.r82_gp b \
+          where a.id = 1 and b.id = 2");
+    assert_eq!(
+        h.scalar(
+            "select b.name from r82_copy_g.r82_gp a, r82_copy_g.r82_ge e, r82_copy_g.r82_gp b \
+              where match(a-(e)->b) and a.id = 1"
+        )
+        .as_deref(),
+        Some("b")
+    );
+    drop(&mut h, "r82_copy_g");
+    h.ok("drop schema r82_copy_g");
+    drop(&mut h, &schema);
+}
+
+/// The ledger tables of `owner`, as the catalog has them: updatable or
+/// append-only, their history table (one SQL Server named read with `N`
+/// for the table's object_id) and ledger view, their generated always
+/// columns and the view's ledger columns.
+fn catalog_ledger(h: &mut Harness, owner: &str) -> Vec<Option<String>> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and ledger_type in (2, 3)"
+    );
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.ledger_type, \
+                                         replace(object_name(t.history_table_id), \
+                                                 cast(t.object_id as varchar(20)), 'N'), \
+                                         object_name(t.ledger_view_id), \
+                                         case when object_schema_name(t.history_table_id) \
+                                                   = schema_name(t.schema_id) then 'own' end, \
+                                         case when object_schema_name(t.ledger_view_id) \
+                                                   = schema_name(t.schema_id) then 'own' end) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         c.generated_always_type, c.is_hidden, c.is_nullable) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         c.ledger_view_column_type) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c \
+              where c.object_id in (select ledger_view_id from sys.tables \
+                                     where object_id in ({tables})) \
+                and c.ledger_view_column_type > 0"
+        ),
+    ]
+    .iter()
+    .map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A ledger table's DDL makes one (#366), updatable or append-only, with its
+/// generated always columns, and the names of its history table, ledger
+/// view and the view's columns where SQL Server didn't give them: run
+/// elsewhere, the copy keeps its ledger. In a database of its own, as a
+/// ledger table that is dropped stays, renamed (SQL Server 2022).
+#[test]
+fn ledger_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let major = dba
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    if major < 16 {
+        return;
+    }
+    let mut h = own_database(&mut dba, "r82_ledger", &[]);
+    for sql in [
+        "create table r82_lu (id int constraint r82_lu_pk primary key, v varchar(10)) \
+         with (system_versioning = on, ledger = on)",
+        "create table r82_la (id int, v varchar(10)) with (ledger = on (append_only = on))",
+        "create table r82_ln (id int constraint r82_ln_pk primary key, v varchar(10), \
+           ts bigint generated always as transaction_id start hidden not null, \
+           te bigint generated always as transaction_id end hidden null, \
+           ss bigint generated always as sequence_number start hidden not null, \
+           se bigint generated always as sequence_number end hidden null) \
+         with (system_versioning = on (history_table = dbo.r82_ln_hist), \
+           ledger = on (ledger_view = dbo.r82_ln_view (transaction_id_column_name = tx, \
+             sequence_number_column_name = sq, operation_type_column_name = op, \
+             operation_type_desc_column_name = opd)))",
+        "create table r82_lv (id int) with (system_versioning = on, \
+           ledger = on (ledger_view = dbo.r82_lv_Ledger (operation_type_desc_column_name = what)))",
+    ] {
+        h.ok(sql);
+    }
+    // The columns SQL Server adds to a ledger table.
+    let start_tx =
+        "[ledger_start_transaction_id] bigint generated always as transaction_id start hidden";
+    let end_tx = "[ledger_end_transaction_id] bigint generated always as transaction_id end hidden";
+    let start_seq =
+        "[ledger_start_sequence_number] bigint generated always as sequence_number start hidden";
+    let end_seq =
+        "[ledger_end_sequence_number] bigint generated always as sequence_number end hidden";
+    let ddls: Vec<String> = ["r82_lu", "r82_la", "r82_ln", "r82_lv"]
+        .iter()
+        .map(|table| table_ddl(&mut h, "dbo", table))
+        .collect();
+    assert_eq!(
+        ddls,
+        [
+            format!(
+                "create table [dbo].[r82_lu] (\n    \
+                   [id] int not null,\n    \
+                   [v] varchar(10) null,\n    \
+                   {start_tx} not null,\n    \
+                   {end_tx} null,\n    \
+                   {start_seq} not null,\n    \
+                   {end_seq} null,\n    \
+                   constraint [r82_lu_pk] primary key clustered ([id])\n\
+                 ) with (system_versioning = on, ledger = on);\nGO\n"
+            ),
+            format!(
+                "create table [dbo].[r82_la] (\n    \
+                   [id] int null,\n    \
+                   [v] varchar(10) null,\n    \
+                   {start_tx} not null,\n    \
+                   {start_seq} not null\n\
+                 ) with (ledger = on (append_only = on));\nGO\n"
+            ),
+            "create table [dbo].[r82_ln] (\n    \
+               [id] int not null,\n    \
+               [v] varchar(10) null,\n    \
+               [ts] bigint generated always as transaction_id start hidden not null,\n    \
+               [te] bigint generated always as transaction_id end hidden null,\n    \
+               [ss] bigint generated always as sequence_number start hidden not null,\n    \
+               [se] bigint generated always as sequence_number end hidden null,\n    \
+               constraint [r82_ln_pk] primary key clustered ([id])\n\
+             ) with (system_versioning = on (history_table = [dbo].[r82_ln_hist]), \
+               ledger = on (ledger_view = [dbo].[r82_ln_view] (transaction_id_column_name = [tx], \
+                 sequence_number_column_name = [sq], operation_type_column_name = [op], \
+                 operation_type_desc_column_name = [opd])));\nGO\n"
+                .to_owned(),
+            format!(
+                "create table [dbo].[r82_lv] (\n    \
+                   [id] int null,\n    \
+                   {start_tx} not null,\n    \
+                   {end_tx} null,\n    \
+                   {start_seq} not null,\n    \
+                   {end_seq} null\n\
+                 ) with (system_versioning = on, \
+                   ledger = on (ledger_view = [dbo].[r82_lv_Ledger] \
+                     (operation_type_desc_column_name = [what])));\nGO\n"
+            ),
+        ]
+    );
+    let before = catalog_ledger(&mut h, "dbo");
+    assert_eq!(before.len(), 3, "{before:?}");
+    h.ok("create schema r82_copy_l");
+    let tables = [
+        "r82_lu",
+        "r82_la",
+        "r82_ln",
+        "r82_ln_hist",
+        "r82_ln_view",
+        "r82_lv",
+        "r82_lv_Ledger",
+    ];
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, "dbo", "r82_copy_l", &tables);
+    }
+    assert_eq!(catalog_ledger(&mut h, "r82_copy_l"), before);
+    // The copy keeps its ledger: an update is in the ledger view, an
+    // append-only table takes none.
+    h.ok("insert into r82_copy_l.r82_lu (id, v) values (1, 'a')");
+    h.ok("update r82_copy_l.r82_lu set v = 'b'");
+    assert_eq!(
+        h.scalar("select count(*) from r82_copy_l.r82_lu_Ledger")
+            .as_deref(),
+        Some("3")
+    );
+    h.ok("insert into r82_copy_l.r82_la (id, v) values (1, 'a')");
+    h.fails("update r82_copy_l.r82_la set v = 'b'");
+    drop(h);
+    drop_database(&mut dba, "r82_ledger");
+}
+
+/// A table's DDL keeps its Always Encrypted columns encrypted (#367), with
+/// their column encryption key, encryption type and algorithm: run
+/// elsewhere, the copy takes no plain values into them, as the original
+/// doesn't. The keys are the database's metadata only: SQL Server keeps
+/// the column master key's path and the column encryption key's value
+/// encrypted with it, which it never reads, so a made-up value does.
+#[test]
+fn always_encrypted_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let drop_keys = |h: &mut Harness| {
+        h.ok(
+            "if exists (select 1 from sys.column_encryption_keys where name = 'r82_cek') \
+               drop column encryption key r82_cek; \
+             if exists (select 1 from sys.column_master_keys where name = 'r82_cmk') \
+               drop column master key r82_cmk",
+        );
+    };
+    drop_tables(&mut h, "r82_copy_ae", "r82_ae");
+    h.ok("drop schema if exists r82_copy_ae");
+    drop_tables(&mut h, &schema, "r82_ae");
+    drop_keys(&mut h);
+    let value = format!("0x01{}", "ab".repeat(100));
+    for sql in [
+        "create column master key r82_cmk with (key_store_provider_name = \
+         'MSSQL_CERTIFICATE_STORE', key_path = 'CurrentUser/My/0123456789ABCDEF')"
+            .to_owned(),
+        format!(
+            "create column encryption key r82_cek with values (column_master_key = r82_cmk, \
+             algorithm = 'RSA_OAEP', encrypted_value = {value})"
+        ),
+        "create table r82_ae (id int, \
+         d varchar(20) collate Latin1_General_BIN2 encrypted with (column_encryption_key = \
+           r82_cek, encryption_type = deterministic, \
+           algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256') not null, \
+         r int encrypted with (column_encryption_key = r82_cek, encryption_type = randomized, \
+           algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256'))"
+            .to_owned(),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = table_ddl(&mut h, &schema, "r82_ae");
+    let with = |kind: &str| {
+        format!(
+            "encrypted with (column_encryption_key = [r82_cek], encryption_type = {kind}, \
+             algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256')"
+        )
+    };
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_ae] (\n    \
+               [id] int null,\n    \
+               [d] varchar(20) collate Latin1_General_BIN2 {} not null,\n    \
+               [r] int {} null\n\
+             );\nGO\n",
+            with("deterministic"),
+            with("randomized")
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.collation_name, c.encryption_type_desc, \
+                                         c.encryption_algorithm_name, k.name) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.column_encryption_keys k \
+                 on k.column_encryption_key_id = c.column_encryption_key_id \
+              where c.object_id = object_id('[{owner}].[r82_ae]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_ae");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_ae", &["r82_ae"]);
+    assert_eq!(catalog(&mut h, "r82_copy_ae"), before);
+    // Plain values go into neither.
+    for owner in [schema.as_str(), "r82_copy_ae"] {
+        h.fails(&format!(
+            "insert into [{owner}].[r82_ae] (id, d) values (1, 'secret')"
+        ));
+    }
+    drop_tables(&mut h, "r82_copy_ae", "r82_ae");
+    h.ok("drop schema r82_copy_ae");
+    drop_tables(&mut h, &schema, "r82_ae");
+    drop_keys(&mut h);
+}
+
+/// Indexes reads which indexes are disabled and which hypothetical (#368),
+/// as the DDL makes the ones disabled and leaves the others out (#326,
+/// #327).
+#[test]
+fn indexes_say_disabled_and_hypothetical() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, &schema, "r82_ix");
+    for sql in [
+        "create table r82_ix (id int constraint r82_ix_pk primary key, a int, b int)",
+        "create index r82_ix_a on r82_ix (a)",
+        "create index r82_ix_b on r82_ix (b)",
+        "alter index r82_ix_b on r82_ix disable",
+        "create index r82_ix_hypo on r82_ix (a, b) with statistics_only = -1",
+        "create table r82_ixc (id int, a int)",
+        "create clustered index r82_ixc_c on r82_ixc (id)",
+        "create index r82_ixc_a on r82_ixc (a)",
+        "alter index r82_ixc_c on r82_ixc disable",
+    ] {
+        h.ok(sql);
+    }
+    let indexes = |h: &mut Harness, table: &str| -> Vec<String> {
+        let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+            owner: schema.clone(),
+            name: table.into(),
+            detail: Detail::Indexes,
+        }) else {
+            panic!("expected a table")
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        let mut lines = vec![names.join(" | ")];
+        for row in rows {
+            let values: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+            lines.push(values.join(" | "));
+        }
+        lines
+    };
+    assert_eq!(
+        indexes(&mut h, "r82_ix"),
+        [
+            "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+            "r82_ix_pk | CLUSTERED | PRIMARY | id |  |  | ENABLED",
+            "r82_ix_a | NONCLUSTERED | NONUNIQUE | a |  |  | ENABLED",
+            "r82_ix_b | NONCLUSTERED | NONUNIQUE | b |  |  | DISABLED",
+            "r82_ix_hypo | NONCLUSTERED | NONUNIQUE | a, b |  |  | HYPOTHETICAL",
+        ]
+    );
+    // A disabled clustered index disables the others.
+    assert_eq!(
+        indexes(&mut h, "r82_ixc"),
+        [
+            "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+            "r82_ixc_a | NONCLUSTERED | NONUNIQUE | a |  |  | DISABLED",
+            "r82_ixc_c | CLUSTERED | NONUNIQUE | id |  |  | DISABLED",
+        ]
+    );
+    drop_tables(&mut h, &schema, "r82_ix");
 }
 
 /// Object filters and Find find names without case, non-ASCII letters too,
