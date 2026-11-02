@@ -274,8 +274,9 @@ fn vectors_read_as_oracle_writes_them() {
             "[6,[0,5],[2.5,1e-30]]",
             "[1,-2]",
             "[255,1]",
-            r#"{"a":1e300,"b":2.5}"#,
-            "1e30"
+            // In their extended objects (#370).
+            r#"{"a":{"$numberDouble":1e300},"b":2.5}"#,
+            r#"{"$numberFloat":1e30}"#
         ]
     );
 }

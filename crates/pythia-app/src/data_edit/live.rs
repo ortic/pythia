@@ -1712,3 +1712,171 @@ fn oracle_long_json_and_vectors_can_be_changed() {
     );
     conn.execute("drop table r76_long_json purge", &[]).unwrap();
 }
+
+/// Oracle JSON's scalars of types JSON text has none of show as Oracle's
+/// extended objects and keep their types (#370): dates, timestamps,
+/// intervals, binary values and binary numbers showed as JSON strings and
+/// numbers, so that the check of each value fetched found no row (a
+/// conflict), and what was written had strings and numbers. A fetched
+/// value set to itself or with a member changed keeps every other scalar
+/// as it was, also where the driver reads a DATE, a TIMESTAMP and a
+/// TIMESTAMP WITH TIME ZONE in UTC alike; a new row takes the extended
+/// objects typed; objects MongoDB writes so (`{"$oid":…}`) stay objects.
+#[test]
+fn oracle_json_extended_scalars() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r84_json purge", &[]);
+    for sql in [
+        "create table r84_json (id number primary key, j json)",
+        "insert into r84_json values (1, json{'a': date '2020-01-01', 'b': 1.5d, 'c': 1.5f, \
+         'd': hextoraw('ABCD'), 'e': interval '1 02:03:04.5' day to second, \
+         'f': interval '-1-2' year to month, 'g': 'x', 'h': 1, 'n': binary_double_nan, \
+         's': timestamp '2020-01-01 10:00:00', 't': timestamp '2020-01-01 10:00:00.123456789', \
+         'u': to_timestamp_tz('2020-01-01 10:00:00.5 +00:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), \
+         'z': to_timestamp_tz('2020-01-01 10:00:00 +02:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), \
+         'l': json_array(date '1999-12-31', -binary_float_infinity, 'y' returning json)})",
+        "insert into r84_json values (2, json_scalar(1e300d))",
+        r#"insert into r84_json values (3, json_transform(json('{"_id":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"},"&":{"$numberDouble":"1.5"}}'), set '$.d' = date '2020-01-01'))"#,
+        "insert into r84_json values (4, json('{\"plain\":[1,\"two\"]}'))",
+        "commit",
+    ] {
+        conn.execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        fetched
+    };
+    // As Oracle has them, every type to be seen.
+    let stored = || {
+        fetch("select json_serialize(j extended) from r84_json order by id")
+            .1
+            .into_iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let before = stored();
+    let edit = Editable {
+        table: "r84_json".into(),
+        source: "select * from r84_json order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let shown: Vec<&str> = rows.iter().map(|row| row[1].as_deref().unwrap()).collect();
+    assert_eq!(
+        shown,
+        [
+            concat!(
+                r#"{"a":{"$oracleDate":"2020-01-01T00:00:00"},"b":{"$numberDouble":1.5},"#,
+                r#""c":{"$numberFloat":1.5},"d":{"$rawhex":"ABCD"},"#,
+                r#""e":{"$intervalDaySecond":"P1DT2H3M4.5S"},"f":{"$intervalYearMonth":"-P1Y2M"},"#,
+                r#""g":"x","h":1,"#,
+                r#""l":[{"$oracleDate":"1999-12-31T00:00:00"},{"$numberFloat":"-Inf"},"y"],"#,
+                r#""n":{"$numberDouble":"Nan"},"s":{"$oracleDate":"2020-01-01T10:00:00"},"#,
+                r#""t":{"$oracleTimestamp":"2020-01-01T10:00:00.123456789"},"#,
+                r#""u":{"$oracleTimestamp":"2020-01-01T10:00:00.5"},"#,
+                r#""z":{"$oracleTimestampTZ":"2020-01-01T10:00:00+02:00"}}"#
+            ),
+            r#"{"$numberDouble":1e300}"#,
+            r#"{"&":{"$numberDouble":"1.5"},"_id":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"},"d":{"$oracleDate":"2020-01-01T00:00:00"}}"#,
+            r#"{"plain":[1,"two"]}"#,
+        ]
+    );
+
+    // The check of each value finds its row, and not another's.
+    for (r, row) in rows.iter().enumerate() {
+        let rowid = row[2].as_deref().unwrap();
+        for (other, value) in rows.iter().map(|row| row[1].as_deref()).enumerate() {
+            let check = same(Dialect::ORACLE, "J", &columns[1], value).unwrap();
+            let sql = format!("select count(*) from r84_json where rowid = '{rowid}' and {check}");
+            let count = fetch(&sql).1[0][0].clone().unwrap();
+            assert_eq!(count, if other == r { "1" } else { "0" }, "{sql}");
+        }
+    }
+
+    // Each set to itself, as the window runs it: every scalar as it was.
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let mut apply = |changes: &Changes| {
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, changes) {
+            let ran = db.apply(&statement);
+            assert!(
+                matches!(ran, Ok(Ran::Done(Some(1)))),
+                "{ran:?}\n{}",
+                statement.sql
+            );
+        }
+    };
+    for (r, row) in rows.iter().enumerate() {
+        apply(&Changes {
+            updates: BTreeMap::from([(r, BTreeMap::from([(1, row[1].clone())]))]),
+            ..Changes::default()
+        });
+    }
+    assert_eq!(stored(), before);
+
+    // A member changed, one added: the others as they were.
+    let changed = shown[0].replace(r#""g":"x""#, r#""g":"changed""#).replace(
+        r#""a":{"$oracleDate":"2020-01-01T00:00:00"}"#,
+        r#""a":{"$oracleDate":"2020-01-02T00:00:00"},"added":{"$intervalYearMonth":"P3Y"}"#,
+    );
+    apply(&Changes {
+        updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(changed))]))]),
+        ..Changes::default()
+    });
+    let expected = before[0].replace(r#""g":"x""#, r#""g":"changed""#).replace(
+        r#""a":{"$oracleDate":"2020-01-01T00:00:00"}"#,
+        r#""a":{"$oracleDate":"2020-01-02T00:00:00"}"#,
+    );
+    let after = stored();
+    assert_eq!(
+        after[0],
+        format!(
+            "{},{}}}",
+            &expected[..expected.len() - 1],
+            r#""added":{"$intervalYearMonth":"P3Y"}"#
+        )
+    );
+
+    // New rows take the extended objects typed, MongoDB's stay objects.
+    apply(&Changes {
+        inserts: vec![
+            vec![Some("11".into()), Some(shown[0].into()), None],
+            vec![Some("12".into()), Some(shown[2].into()), None],
+            vec![
+                Some("13".into()),
+                Some(r#"{"$oracleTimestampTZ":"2021-02-03T04:05:06.7-05:30"}"#.into()),
+                None,
+            ],
+        ],
+        ..Changes::default()
+    });
+    let after = stored();
+    // The driver can't tell s, a TIMESTAMP, and u, in UTC, from a DATE
+    // and a TIMESTAMP.
+    assert_eq!(
+        after[4],
+        before[0]
+            .replace(
+                r#""s":{"$oracleTimestamp":"2020-01-01T10:00:00"}"#,
+                r#""s":{"$oracleDate":"2020-01-01T10:00:00"}"#
+            )
+            .replace(
+                r#""u":{"$oracleTimestampTZ":"2020-01-01T10:00:00.500000Z"}"#,
+                r#""u":{"$oracleTimestamp":"2020-01-01T10:00:00.500000"}"#
+            )
+    );
+    assert_eq!(after[5], before[2]);
+    assert_eq!(
+        after[6],
+        r#"{"$oracleTimestampTZ":"2021-02-03T04:05:06.700000-05:30"}"#
+    );
+    conn.execute("drop table r84_json purge", &[]).unwrap();
+}

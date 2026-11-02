@@ -778,11 +778,13 @@ pub struct Dml {
 /// What an UPDATE or INSERT writes into `col`: a value loaded from a file
 /// as the next of `binds`, which the statement names as returned (#293),
 /// as is a value Oracle takes no literal of ([`oracle_bind`]); any other
-/// as a literal. A literal of megabytes would be impractical anywhere.
+/// as a literal, in an UPDATE of a value that `held` the one fetched. A
+/// literal of megabytes would be impractical anywhere.
 fn written(
     dialect: Dialect,
     col: &Column,
     value: Option<&str>,
+    held: Option<&str>,
     file: Option<&Loaded>,
     binds: &mut Vec<(String, Bind)>,
 ) -> String {
@@ -792,6 +794,11 @@ fn written(
         _ => None,
     };
     let Some(bind) = bind else {
+        // An Oracle JSON keeps the scalars it holds where they stay (#370).
+        if let (DbKind::Oracle, Some(v), Some(held)) = (dialect.kind(), value, held) {
+            let name = dialect.quote_ident(&col.name);
+            return pythia_data::sql_literal_replacing(col, v, &name, held);
+        }
         return literal(dialect, col, value);
     };
     let name = format!("pythia_value{}", binds.len() + 1);
@@ -1307,7 +1314,8 @@ pub fn dml(
             .iter()
             .map(|(c, v)| {
                 let col = &columns[**c];
-                let value = written(dialect, col, v.as_deref(), file(**c), &mut binds);
+                let held = row.get(**c).and_then(|v| v.as_deref());
+                let value = written(dialect, col, v.as_deref(), held, file(**c), &mut binds);
                 format!("{} = {value}", dialect.quote_ident(&col.name))
             })
             .collect();
@@ -1355,7 +1363,7 @@ pub fn dml(
         let mut binds = Vec::new();
         let values: Vec<String> = cells
             .iter()
-            .map(|(c, v)| written(dialect, &columns[*c], *v, file(*c), &mut binds))
+            .map(|(c, v)| written(dialect, &columns[*c], *v, None, file(*c), &mut binds))
             .collect();
         out.push(Dml {
             sql: format!(

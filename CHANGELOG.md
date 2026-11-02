@@ -248,6 +248,21 @@ All notable changes to Pythia are documented here. The format follows
   only a number it holds, a date only a day Oracle reads (1500-02-29
   is one, by the Julian calendar); a CLOB is compared with
   `dbms_lob.compare`.
+- Oracle: a JSON's dates, timestamps, intervals, binary values, IDs and
+  binary numbers show as Oracle's extended objects and keep their types
+  (#370): `{"$oracleDate":"2020-01-01T00:00:00"}`,
+  `{"$oracleTimestampTZ":"2020-01-01T10:00:00+02:00"}`,
+  `{"$intervalDaySecond":"P1DT2H"}`, `{"$numberDouble":1.5}`, a binary
+  value in hex as `{"$rawhex":"ABCD"}`. They showed as JSON strings and
+  numbers, without a time zone, NaN as `NaN`: changing such a JSON
+  reported a change by another session, and its INSERT statements wrote
+  the strings and numbers. Written, each such object is the scalar it
+  stands for, typed into a new row too; other objects, as MongoDB's
+  `{"$oid":…}`, stay objects. A changed JSON keeps the scalars it had
+  where they are as they were, also where the type shown is a guess: the
+  pure-Rust driver reads a DATE, a TIMESTAMP and a TIMESTAMP WITH TIME
+  ZONE in UTC in a JSON alike, so one without a fraction of a second
+  shows as `$oracleDate`, one with as `$oracleTimestamp`.
 - SQL Server: a ledger table's history table's DDL says that its ledger
   table's DDL makes it (#381). It was a plain table's, which, run before
   the ledger table's DDL, made that fail with Msg 37355, and run alone

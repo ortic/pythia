@@ -1629,19 +1629,56 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// JSON text; object keys sorted (the driver keeps them in a HashMap).
+/// A scalar of a type JSON text has none of is Oracle's extended object
+/// for it (#370), as `json_serialize(… extended)` writes it, which Pythia
+/// writes back as that scalar (see `pythia_data::sql_literal`):
+/// `{"$oracleDate":"2020-01-01T00:00:00"}`, `{"$numberDouble":1e300}`,
+/// a binary value in hex, as the grid shows them: `{"$rawhex":"ABCD"}`.
 fn json(v: &JsonValue, out: &mut String) {
     match v {
         JsonValue::Null => out.push_str("null"),
         JsonValue::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
         JsonValue::Number(n) => out.push_str(&n.to_string()),
         // With an exponent where they are long, as a VECTOR's (#341).
-        JsonValue::BinaryDouble(f) => out.push_str(&crate::float_text(*f)),
-        JsonValue::BinaryFloat(f) => out.push_str(&crate::float_text(*f)),
+        JsonValue::BinaryDouble(f) => {
+            let number = binary_number(*f, crate::float_text(*f));
+            extended("$numberDouble", &number, out);
+        }
+        JsonValue::BinaryFloat(f) => {
+            let number = binary_number(f64::from(*f), crate::float_text(*f));
+            extended("$numberFloat", &number, out);
+        }
         JsonValue::String(s) => json_string(s, out),
-        JsonValue::Raw(b) | JsonValue::JsonId(b) => json_string(&hex(b), out),
-        JsonValue::Timestamp(ts) => json_string(&timestamp(ts, TsKind::Plain, 9), out),
-        JsonValue::IntervalDS(i) => json_string(&interval_ds(i, 2, 6), out),
-        JsonValue::IntervalYM(i) => json_string(&interval_ym(i, 2), out),
+        JsonValue::Raw(b) => extended_string("$rawhex", &hex(b), out),
+        JsonValue::JsonId(b) => extended_string("$rawid", &hex(b).to_ascii_lowercase(), out),
+        JsonValue::Timestamp(ts) => json_timestamp(ts, out),
+        JsonValue::IntervalDS(v) => {
+            let negative = v.days() < 0
+                || v.hours() < 0
+                || v.minutes() < 0
+                || v.seconds() < 0
+                || v.nanoseconds() < 0;
+            let duration = format!(
+                "{}P{}DT{}H{}M{}{}S",
+                if negative { "-" } else { "" },
+                v.days().abs(),
+                v.hours().abs(),
+                v.minutes().abs(),
+                v.seconds().abs(),
+                fraction(v.nanoseconds().unsigned_abs())
+            );
+            extended_string("$intervalDaySecond", &duration, out);
+        }
+        JsonValue::IntervalYM(v) => {
+            let negative = v.years() < 0 || v.months() < 0;
+            let duration = format!(
+                "{}P{}Y{}M",
+                if negative { "-" } else { "" },
+                v.years().abs(),
+                v.months().abs()
+            );
+            extended_string("$intervalYearMonth", &duration, out);
+        }
         JsonValue::Vector(v) => out.push_str(&vector(v)),
         JsonValue::JsonArray(items) => {
             out.push('[');
@@ -1668,6 +1705,82 @@ fn json(v: &JsonValue, out: &mut String) {
             out.push('}');
         }
     }
+}
+
+/// Oracle's extended object `{"key":value}`, `value` JSON text (#370).
+fn extended(key: &str, value: &str, out: &mut String) {
+    out.push_str("{\"");
+    out.push_str(key);
+    out.push_str("\":");
+    out.push_str(value);
+    out.push('}');
+}
+
+fn extended_string(key: &str, value: &str, out: &mut String) {
+    let mut text = String::new();
+    json_string(value, &mut text);
+    extended(key, &text, out);
+}
+
+/// A binary double's or float's value in its extended object: a number,
+/// or as Oracle writes what JSON has no number for, `"Nan"`, `"Inf"` and
+/// `"-Inf"`.
+fn binary_number(value: f64, text: String) -> String {
+    match value {
+        v if v.is_nan() => "\"Nan\"".to_owned(),
+        f64::INFINITY => "\"Inf\"".to_owned(),
+        f64::NEG_INFINITY => "\"-Inf\"".to_owned(),
+        _ => text,
+    }
+}
+
+/// `.5` for 500,000,000 nanoseconds, nothing for none.
+fn fraction(nanoseconds: u32) -> String {
+    if nanoseconds == 0 {
+        return String::new();
+    }
+    let digits = format!("{nanoseconds:09}");
+    format!(".{}", digits.trim_end_matches('0'))
+}
+
+/// A JSON's timestamp as Oracle's extended object, its text ISO 8601's as
+/// Oracle writes it (#370). The driver reads a DATE, a TIMESTAMP and a
+/// TIMESTAMP WITH TIME ZONE alike: one with an offset is the last, one
+/// with a fraction of a second a TIMESTAMP, others a DATE.
+fn json_timestamp(ts: &OracleTimestamp, out: &mut String) {
+    let (hours, minutes) = (ts.tz_hour_offset(), ts.tz_minute_offset());
+    let zone = hours != 0 || minutes != 0 || ts.tz_region().is_some();
+    let key = if zone {
+        "$oracleTimestampTZ"
+    } else if ts.nanoseconds() > 0 {
+        "$oracleTimestamp"
+    } else {
+        "$oracleDate"
+    };
+    let year = ts.year();
+    let mut text = format!(
+        "{}{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+        if year < 0 { "-" } else { "" },
+        year.unsigned_abs(),
+        ts.month(),
+        ts.day(),
+        ts.hour(),
+        ts.minute(),
+        ts.second(),
+        fraction(ts.nanoseconds())
+    );
+    if let Some(region) = ts.tz_region() {
+        text.push(' ');
+        text.push_str(region);
+    } else if zone {
+        let sign = if hours < 0 || minutes < 0 { '-' } else { '+' };
+        text.push_str(&format!(
+            "{sign}{:02}:{:02}",
+            hours.unsigned_abs(),
+            minutes.unsigned_abs()
+        ));
+    }
+    extended_string(key, &text, out);
 }
 
 fn json_string(s: &str, out: &mut String) {

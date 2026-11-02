@@ -711,19 +711,180 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             Some(hex) => format!("hextoraw('{hex}')"),
             None => format!("hextoraw({quoted})"),
         },
-        // A literal holds 4000 bytes: a CLOB's longer text is a CLOB of
-        // parts (#317), each a CLOB of its own: Oracle joins the plain
-        // literals after a CLOB into one VARCHAR2 first, which with many
-        // `&`, each a literal apart, failed with ORA-01489 (#342). Oracle
-        // parses many parts slowly: INSERT statements append them in a
-        // PL/SQL block instead (see `oracle_block`).
-        Kind::Text if long_text(col, v) => text_parts(v)
-            .into_iter()
-            .map(|part| format!("to_clob({})", text_literal(part)))
-            .collect::<Vec<_>>()
-            .join(" || "),
-        Kind::Text => text_literal(v),
+        Kind::Text => {
+            let text = text_value(col, v);
+            oracle_json(col, &text, v, None).unwrap_or(text)
+        }
     }
+}
+
+/// [`sql_literal`] of `value` for column `col`, `name` (quoted), which
+/// held `held`: a JSON's scalars that are where they were and as they
+/// were are taken from the column, with their types (see [`oracle_json`]).
+pub fn sql_literal_replacing(col: &Column, value: &str, name: &str, held: &str) -> String {
+    if kind(col) != Kind::Text || binary_float(col, value).is_some() || is_number(col, value) {
+        return sql_literal(col, Some(value));
+    }
+    let text = text_value(col, value);
+    oracle_json(col, &text, value, Some((name, held))).unwrap_or(text)
+}
+
+/// A text's literal. One holds 4000 bytes: a CLOB's longer text is a CLOB
+/// of parts (#317), each a CLOB of its own: Oracle joins the plain
+/// literals after a CLOB into one VARCHAR2 first, which with many `&`,
+/// each a literal apart, failed with ORA-01489 (#342). Oracle parses many
+/// parts slowly: INSERT statements append them in a PL/SQL block instead
+/// (see `oracle_block`).
+fn text_value(col: &Column, v: &str) -> String {
+    if !long_text(col, v) {
+        return text_literal(v);
+    }
+    text_parts(v)
+        .into_iter()
+        .map(|part| format!("to_clob({})", text_literal(part)))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// The keys of the extended objects that Oracle JSON's scalars of types
+/// JSON text has none of show as (#370), as Oracle writes them but a
+/// binary value's, in hex as the grid shows binary values. Other keys
+/// Oracle reads so, as MongoDB's `$oid` and `$date`, are an object's.
+const JSON_EXTENDED: &[&str] = &[
+    "$oracleDate",
+    "$oracleTimestamp",
+    "$oracleTimestampTZ",
+    "$intervalDaySecond",
+    "$intervalYearMonth",
+    "$numberDouble",
+    "$numberFloat",
+    "$rawhex",
+    "$rawid",
+];
+
+/// Whether `value` is one of those objects: one of their keys with text,
+/// a binary number's with a number too. MongoDB writes `{"$numberDouble":
+/// "1.5"}`.
+fn json_extended(value: &serde_json::Value) -> bool {
+    let Some(map) = value.as_object().filter(|map| map.len() == 1) else {
+        return false;
+    };
+    map.iter().all(|(key, v)| match key.as_str() {
+        "$numberDouble" | "$numberFloat" => {
+            v.is_number() || matches!(v.as_str(), Some("Nan" | "Inf" | "-Inf"))
+        }
+        key => JSON_EXTENDED.contains(&key) && v.is_string(),
+    })
+}
+
+/// A step of a path in a JSON value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// The extended objects in `value` (see [`json_extended`]), by their paths.
+fn extended_objects<'a>(
+    value: &'a serde_json::Value,
+    path: &mut Vec<Step<'a>>,
+    out: &mut Vec<(Vec<Step<'a>>, &'a serde_json::Value)>,
+) {
+    if json_extended(value) {
+        out.push((path.clone(), value));
+        return;
+    }
+    let steps: Vec<(Step, &serde_json::Value)> = match value {
+        serde_json::Value::Object(map) => map.iter().map(|(k, v)| (Step::Key(k), v)).collect(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Step::Index(i), v))
+            .collect(),
+        _ => return,
+    };
+    for (step, v) in steps {
+        path.push(step);
+        extended_objects(v, path, out);
+        path.pop();
+    }
+}
+
+/// The value at `path` in `value`.
+fn json_at<'v>(value: &'v serde_json::Value, path: &[Step]) -> Option<&'v serde_json::Value> {
+    path.iter().try_fold(value, |v, step| match step {
+        Step::Key(key) => v.get(*key),
+        Step::Index(i) => v.get(*i),
+    })
+}
+
+/// `path` as a literal of Oracle's JSON path: `'$."a"[2]'`, a `&` as
+/// `\u0026`, which a script doesn't read as a substitution variable (#159).
+fn json_path(path: &[Step]) -> String {
+    let mut out = String::from("'$");
+    for step in path {
+        match step {
+            Step::Index(i) => out.push_str(&format!("[{i}]")),
+            Step::Key(key) => {
+                out.push_str(".\"");
+                for c in key.chars() {
+                    match c {
+                        '"' | '\\' => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        '\'' => out.push_str("''"),
+                        c if c == '&' || c < ' ' => out.push_str(&format!("\\u{:04x}", c as u32)),
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The literal of `v` for Oracle JSON column `col`, `text` its literal as
+/// text, with its extended objects (see [`JSON_EXTENDED`]) the scalars they
+/// stand for (#370): `json_transform(json('…'), set '$."a"' =
+/// json('{"$oracleDate":"…"}' extended))`, or `json('…' extended)` where
+/// `v` is one. Only those: `json('…' extended)` of all of `v` would read
+/// MongoDB's `{"$oid":…}` as an ID too. Where `held` names the column and
+/// the value it holds, a scalar there as it is at its place in `v` is taken
+/// from the column, keeping its type: the driver reads a DATE, a TIMESTAMP
+/// and a TIMESTAMP WITH TIME ZONE in a JSON alike. `None` for a JSON
+/// without them, and for other columns.
+fn oracle_json(col: &Column, text: &str, v: &str, held: Option<(&str, &str)>) -> Option<String> {
+    if col.type_name != "JSON" || !v.contains("\"$") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(v).ok()?;
+    let mut objects = Vec::new();
+    extended_objects(&value, &mut Vec::new(), &mut objects);
+    if objects.is_empty() {
+        return None;
+    }
+    let held = held.and_then(|(name, held)| {
+        Some((name, serde_json::from_str::<serde_json::Value>(held).ok()?))
+    });
+    let scalar = |path: &[Step], object: &serde_json::Value| match &held {
+        Some((name, held)) if json_at(held, path) == Some(object) => {
+            format!("json_query({name}, {} returning json)", json_path(path))
+        }
+        _ => format!("json({} extended)", text_literal(&object.to_string())),
+    };
+    if let [(path, object)] = objects.as_slice()
+        && path.is_empty()
+    {
+        return Some(scalar(path, object));
+    }
+    let sets: Vec<String> = objects
+        .iter()
+        .map(|(path, object)| format!("set {} = {}", json_path(path), scalar(path, object)))
+        .collect();
+    Some(format!("json_transform(json({text}), {})", sets.join(", ")))
 }
 
 /// Text as an Oracle literal, each `&` apart (see [`apart_from_ampersands`]).
@@ -1184,6 +1345,9 @@ fn oracle_block(head: &str, columns: &[Column], row: &[Cell]) -> Option<String> 
                     text_literal(part)
                 ));
             }
+            // A JSON with its extended objects' scalars (#370).
+            values.push(oracle_json(col, &var, text, None).unwrap_or(var));
+            continue;
         } else {
             values.push(sql_literal(col, value));
             continue;
@@ -2193,6 +2357,113 @@ mod tests {
         );
         assert!(
             text.ends_with("  insert into t (j, v) values (pythia$1, pythia$2);\nend;\n/\n"),
+            "{text}"
+        );
+    }
+
+    /// A JSON's extended objects as Pythia shows its scalars of types JSON
+    /// text has none of are those scalars (#370), each set at its path;
+    /// others, as MongoDB's, stay objects. In an UPDATE, a scalar where and
+    /// as it was is taken from the column.
+    #[test]
+    fn oracle_json_extended_scalars() {
+        let json = Column {
+            name: "J".into(),
+            type_name: "JSON".into(),
+            numeric: false,
+        };
+        let lit = |v: &str| sql_literal(&json, Some(v));
+        assert_eq!(
+            lit(r#"{"$oracleDate":"2020-01-01T00:00:00"}"#),
+            r#"json('{"$oracleDate":"2020-01-01T00:00:00"}' extended)"#
+        );
+        assert_eq!(
+            lit(r#"{"a":[1,{"$numberDouble":"Nan"}],"it's \"&\\":{"$rawhex":"AB"}}"#),
+            concat!(
+                r#"json_transform(json('{"a":[1,{"$numberDouble":"Nan"}],"it''s \"' || chr(38) || '\\":{"$rawhex":"AB"}}'), "#,
+                r#"set '$."a"[1]' = json('{"$numberDouble":"Nan"}' extended), "#,
+                r#"set '$."it''s \"\u0026\\"' = json('{"$rawhex":"AB"}' extended))"#
+            )
+        );
+        // MongoDB's objects, Oracle's own `$binary` and objects of more
+        // keys stay objects; text that isn't JSON is left to Oracle.
+        for plain in [
+            r#"{"_id":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"}}"#,
+            r#"{"n":{"$numberDouble":"1.5"},"b":{"$binary":"q80="}}"#,
+            r#"{"d":{"$oracleDate":"2020-01-01T00:00:00","x":1}}"#,
+            r#"{"d":{"$oracleDate":1}}"#,
+            r#"{"$oracleDate":"2020-01-01T00:00:00""#,
+            r#""$oracleDate""#,
+        ] {
+            assert_eq!(lit(plain), text_literal(plain), "{plain}");
+        }
+        // Other columns.
+        let clob = Column {
+            type_name: "CLOB".into(),
+            ..json.clone()
+        };
+        let date = r#"{"$oracleDate":"2020-01-01T00:00:00"}"#;
+        assert_eq!(sql_literal(&clob, Some(date)), format!("'{date}'"));
+        // A long one is JSON of CLOB parts.
+        let long = format!(r#"{{"d":{date},"s":"{}"}}"#, "x".repeat(4000));
+        let literal = lit(&long);
+        assert!(
+            literal.starts_with(r#"json_transform(json(to_clob('{"d":"#),
+            "{literal}"
+        );
+        assert!(literal.ends_with(&format!(r#"')), set '$."d"' = json('{date}' extended))"#)));
+
+        // An UPDATE takes the scalars where and as they were from the column.
+        let held =
+            r#"{"a":{"$oracleDate":"2020-01-01T00:00:00"},"b":[{"$numberFloat":1.5}],"c":1}"#;
+        let new = r#"{"a":{"$oracleDate":"2020-01-01T00:00:00"},"b":[{"$numberFloat":2.5}],"c":2}"#;
+        assert_eq!(
+            sql_literal_replacing(&json, new, "J", held),
+            format!(
+                "json_transform(json('{new}'), \
+                 set '$.\"a\"' = json_query(J, '$.\"a\"' returning json), \
+                 set '$.\"b\"[0]' = json('{{\"$numberFloat\":2.5}}' extended))"
+            )
+        );
+        assert_eq!(
+            sql_literal_replacing(&json, date, "J", date),
+            "json_query(J, '$' returning json)"
+        );
+        assert_eq!(sql_literal_replacing(&json, "[1]", "J", held), "'[1]'");
+        let number = Column {
+            type_name: "NUMBER".into(),
+            numeric: true,
+            ..json.clone()
+        };
+        assert_eq!(sql_literal_replacing(&number, "1.5", "N", "1"), "1.5");
+
+        // INSERT statements, a long one in a block.
+        let rows = vec![
+            vec![Some(
+                r#"{"t":{"$oracleTimestamp":"2020-01-01T10:00:00.5"}}"#.into(),
+            )],
+            vec![Some(long.clone())],
+        ];
+        let options = Options {
+            table: "t".into(),
+            ..Options::default()
+        };
+        let text = String::from_utf8(
+            export_to_vec(Format::Insert, std::slice::from_ref(&json), &rows, &options).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            text.starts_with(concat!(
+                r#"insert into t (j) values (json_transform(json('{"t":{"$oracleTimestamp":"2020-01-01T10:00:00.5"}}'), "#,
+                r#"set '$."t"' = json('{"$oracleTimestamp":"2020-01-01T10:00:00.5"}' extended)));"#,
+                "\ndeclare\n  pythia$1 clob;\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!(
+                "  insert into t (j) values (json_transform(json(pythia$1), set '$.\"d\"' = json('{date}' extended)));\nend;\n/\n"
+            )),
             "{text}"
         );
     }
