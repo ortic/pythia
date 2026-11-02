@@ -146,14 +146,28 @@ pub(super) fn load(
     let no_backslash_escapes = texts(client, "select @@session.sql_mode", &[])?
         .first()
         .is_some_and(|mode| mode.to_uppercase().contains("NO_BACKSLASH_ESCAPES"));
-    let mut global: Vec<String> = client
+    // Privilege, Context, Comment.
+    let privileges: Vec<(String, String)> = client
         .query("show privileges", &[])?
         .iter()
-        .map(|row| text(row, 0).to_uppercase())
-        .filter(|p| !matches!(p.as_str(), "USAGE" | "PROXY" | GRANT_OPTION))
+        .map(|row| (text(row, 0).to_uppercase(), text(row, 1)))
+        .filter(|(p, _)| !matches!(p.as_str(), "USAGE" | "PROXY" | GRANT_OPTION))
         .collect();
+    let mut global: Vec<String> = privileges.iter().map(|(p, _)| p.clone()).collect();
     global.push(GRANT_OPTION.to_owned());
     global.sort();
+    // The lists above, and what else the server says is for tables (or
+    // databases), such as MariaDB's DELETE HISTORY.
+    let scoped = |known: &[&str], contexts: &[&str]| {
+        let mut list: BTreeSet<String> = known.iter().map(|p| (*p).to_owned()).collect();
+        list.extend(
+            privileges
+                .iter()
+                .filter(|(_, context)| context.split(',').any(|c| contexts.contains(&c.trim())))
+                .map(|(p, _)| p.clone()),
+        );
+        list.into_iter().collect::<Vec<_>>()
+    };
     let mut roles = accounts(client, ObjectType::Role)?;
     if !role && let Some(name) = name {
         roles.retain(|r| r != name);
@@ -164,12 +178,9 @@ pub(super) fn load(
             (ScopeKind::Global, global),
             (
                 ScopeKind::Database,
-                DATABASE.iter().map(|p| (*p).to_owned()).collect(),
+                scoped(DATABASE, &["Databases", "Tables"]),
             ),
-            (
-                ScopeKind::Object,
-                TABLE.iter().map(|p| (*p).to_owned()).collect(),
-            ),
+            (ScopeKind::Object, scoped(TABLE, &["Tables"])),
         ]),
         databases: texts(client, "show databases", &[])?,
         ..Choices::default()

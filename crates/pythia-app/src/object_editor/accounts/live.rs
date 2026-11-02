@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pythia_db::{Client, ConnectParams, DbError, DbEvent, DbKind, DbRequest, ObjectType, Session};
 
-use super::{Grant, Login, RoleGrant, Scope, UserDef};
+use super::{Grant, Login, RoleGrant, Scope, ScopeKind, UserDef};
 use crate::documents::{Effects, ObjectRef};
 use crate::object_editor::{EditTarget, ObjectEditor};
 
@@ -269,6 +269,30 @@ fn mysql_passwords_keep_their_backslashes() {
     let typed = logs_in(env, DbKind::MySql, name, r"c\d");
     live.try_exec(&format!("drop user if exists '{name}'@'%'"));
     assert!(typed, "the password isn't the one typed");
+}
+
+/// What can be granted on a database or a table is what the server says,
+/// MariaDB's DELETE HISTORY too, not only the privileges MySQL has.
+#[test]
+fn mysql_privileges_of_each_scope() {
+    let Some(mut live) = Live::connect("PYTHIA_TEST_MYSQL_DBA", DbKind::MySql) else {
+        return;
+    };
+    let mariadb = live.mariadb;
+    let (_, _, choices) = live.run(|c| super::mysql::load(c, None, false)).unwrap();
+    for scope in [ScopeKind::Database, ScopeKind::Object] {
+        let list = &choices.privileges[&scope];
+        assert!(list.iter().any(|p| p == "SELECT"), "{scope:?}: {list:?}");
+        assert_eq!(
+            list.iter().any(|p| p == "DELETE HISTORY"),
+            mariadb,
+            "{scope:?}: {list:?}"
+        );
+    }
+    let database = &choices.privileges[&ScopeKind::Database];
+    assert!(database.iter().any(|p| p == "LOCK TABLES"), "{database:?}");
+    let table = &choices.privileges[&ScopeKind::Object];
+    assert!(!table.iter().any(|p| p == "LOCK TABLES"), "{table:?}");
 }
 
 #[test]

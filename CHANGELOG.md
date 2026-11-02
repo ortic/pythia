@@ -78,6 +78,9 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL: the user form sets the password typed when it has a `\` and
   the session's `sql_mode` has `NO_BACKSLASH_ESCAPES` (#402); the
   backslash was doubled, which that mode keeps.
+- MariaDB: the user and role forms can grant `DELETE HISTORY` on a
+  database or a table (#403): those scopes' privileges add what the
+  server lists for tables.
 
 ## [0.11.0] - 2026-11-02
 
