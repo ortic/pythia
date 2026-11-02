@@ -287,6 +287,12 @@ All notable changes to Pythia are documented here. The format follows
 - SQL Server: a result of a query with `OUTER APPLY`, `PIVOT` or
   `UNPIVOT` can't be edited (#416); a value typed into a column they
   bring in was written to the table of the query.
+- *Edit* no longer finds a row by a floating-point key (#417), whose
+  rounded text matched its neighbours: deleting the MySQL `FLOAT` row
+  shown as `1` deleted 1.000001 and 1.000005 too. Float columns (and
+  SQLite columns of REAL or BLOB affinity) aren't keys now; another
+  unique key or SQLite's rowid finds the row, or the result is
+  read-only. *Save to file…* refuses a key that finds several rows.
 
 ## [0.11.0] - 2026-11-02
 

@@ -525,6 +525,21 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         Err(e) if e.code.is_some() => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    // A float's text is rounded: the row is found with a tolerance, which
+    // finds its neighbours too (#417). Field, Type, …
+    let approximate: std::collections::BTreeSet<String> = client
+        .query(&format!("show columns from {table}"), &[])
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| {
+            value(row, 1).is_some_and(|t| {
+                let t = t.to_ascii_lowercase();
+                ["float", "double", "real"].iter().any(|a| t.starts_with(a))
+            })
+        })
+        .filter_map(|row| value(row, 0))
+        .map(|c| c.to_lowercase())
+        .collect();
     // Table, Non_unique, Key_name, Seq_in_index, Column_name, Collation,
     // Cardinality, Sub_part, Packed, Null: unique ones, the primary key
     // first.
@@ -533,9 +548,11 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         .filter(|row| value(row, 1).as_deref() == Some("0"))
         .map(|row| {
             let seq = value(row, 3).and_then(|s| s.parse().ok()).unwrap_or(0);
-            // Functional key parts have no column; nullable ones don't
-            // identify a row.
-            let column = value(row, 4).filter(|_| value(row, 9).as_deref() != Some("YES"));
+            // Functional key parts have no column; nullable ones and
+            // floats don't identify a row.
+            let column = value(row, 4)
+                .filter(|_| value(row, 9).as_deref() != Some("YES"))
+                .filter(|c| !approximate.contains(&c.to_lowercase()));
             (value(row, 2).unwrap_or_default(), seq, column)
         })
         .collect();
@@ -551,7 +568,7 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
 /// cover every row (not partial); INCLUDE columns aren't part of the key.
 fn postgres_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
     let rows = client.query(
-        "select c.relname, a.attname, a.attnotnull \
+        "select c.relname, a.attname, a.attnotnull and a.atttypid not in (700, 701) \
            from pg_index i \
            join pg_class t on t.oid = i.indrelid \
            join pg_class c on c.oid = i.indexrelid \
@@ -649,10 +666,22 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         .filter_map(|c| value(c, 0))
         .map(|n| n.to_lowercase())
         .collect();
+    // A column of REAL affinity holds rounded floats, one of BLOB affinity
+    // (or none) a 7 and a '7' alike: a lookup finds several rows (#417).
+    let loose: std::collections::BTreeSet<String> = columns
+        .iter()
+        .filter(|c| loose_affinity(&value(c, 3).unwrap_or_default()))
+        .filter_map(|c| value(c, 0))
+        .map(|n| n.to_lowercase())
+        .collect();
     let mut parts: Vec<(String, Option<String>)> = pk
         .into_iter()
         .map(|(_, column, not_null, _)| {
-            let usable = not_null || rowid_alias || !rowid_table;
+            let usable = (not_null || rowid_alias || !rowid_table)
+                && (rowid_alias
+                    || column
+                        .as_ref()
+                        .is_some_and(|c| !loose.contains(&c.to_lowercase())));
             ("primary key".to_owned(), column.filter(|_| usable))
         })
         .collect();
@@ -665,7 +694,8 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
     )?;
     parts.extend(unique.iter().map(|row| {
         // An expression has no column; a nullable one doesn't find a row.
-        let column = value(row, 1).filter(|c| not_null.contains(&c.to_lowercase()));
+        let column = value(row, 1)
+            .filter(|c| not_null.contains(&c.to_lowercase()) && !loose.contains(&c.to_lowercase()));
         (value(row, 0).unwrap_or_default(), column)
     }));
     // Its names, unless a column has taken them.
@@ -681,6 +711,20 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         parts.push(("rowid".to_owned(), Some(rowid.to_owned())));
     }
     Ok(keys(parts))
+}
+
+/// Whether a SQLite column of declared `type` has REAL or BLOB affinity,
+/// by SQLite's rules (INT, then CHAR/CLOB/TEXT, then BLOB or none, then
+/// REAL/FLOA/DOUB).
+fn loose_affinity(declared: &str) -> bool {
+    let t = declared.to_ascii_uppercase();
+    if t.contains("INT") || ["CHAR", "CLOB", "TEXT"].iter().any(|a| t.contains(a)) {
+        return false;
+    }
+    t.is_empty()
+        || ["BLOB", "REAL", "FLOA", "DOUB"]
+            .iter()
+            .any(|a| t.contains(a))
 }
 
 /// SQL Server: `object_id` finds the table the way the query did, by the
@@ -720,11 +764,13 @@ fn sqlserver_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError>
             and ic.key_ordinal > 0 \
           order by i.is_primary_key desc, i.name, ic.key_ordinal"
     );
-    const SQL_VARIANT: &str = "98";
+    // Nor can a real or a float, read rounded (#417).
+    const UNCOMPARABLE: [&str; 3] = ["98", "59", "62"];
     let rows = client.query(&sql, &[table])?;
     Ok(keys(rows.iter().map(|row| {
         let column = value(row, 1).filter(|_| {
-            value(row, 2).as_deref() == Some("0") && value(row, 3).as_deref() != Some(SQL_VARIANT)
+            value(row, 2).as_deref() == Some("0")
+                && !value(row, 3).is_some_and(|t| UNCOMPARABLE.contains(&t.as_str()))
         });
         (value(row, 0).unwrap_or_default(), column)
     })))

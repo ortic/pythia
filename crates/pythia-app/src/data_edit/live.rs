@@ -320,7 +320,12 @@ fn mysql_keys() {
         "create temporary table pythia_live_t (t int not null, u varchar(5) not null, \
            unique key (u), primary key (t))",
         "create temporary table pythia_live_tn (x int)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k float primary key, d double not null unique, \
+           u int not null unique)",
     ]);
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
     // A functional key part (MySQL 8.0.13; MariaDB has none).
     if !db.count("select version()").contains("MariaDB") {
         db.ok("alter table pythia_live_u add unique key pythia_live_u_b ((lower(e)))");
@@ -349,7 +354,7 @@ fn mysql_keys() {
     db.script(&[
         "drop temporary table pythia_live_t, pythia_live_tn",
         "drop view pythia_live_v",
-        "drop table pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t",
+        "drop table pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t, pythia_live_f",
     ]);
 }
 
@@ -374,7 +379,13 @@ fn postgres_keys() {
         "create unique index pythia_live_u_c on pythia_live_u (i) where i > 0",
         "create unique index pythia_live_u_d on pythia_live_u (x) include (n)",
         "create table pythia_live_n (x int)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k real primary key, d double precision not null unique, \
+           u int not null unique)",
     ]);
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
+    db.ok("drop table pythia_live_f");
     // The primary key comes first; unquoted names fold to lowercase.
     assert_eq!(db.key("pythia_live_k"), ["id"]);
     assert_eq!(db.key("PYTHIA_LIVE_K"), ["id"]);
@@ -483,6 +494,9 @@ fn sqlserver_keys() {
         "create unique index pythia_live_u_d on pythia_live_u (x) include (n)",
         "create table pythia_live_n (x int)",
         "create table #pythia_live_t (t int not null primary key, u int not null unique)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k real primary key, d float not null unique, \
+           u int not null unique)",
         "create table ##pythia_live_g (g int not null unique)",
     ]);
     // A temporary table, local or global, is found in tempdb.
@@ -490,7 +504,9 @@ fn sqlserver_keys() {
     assert_eq!(db.key("[#pythia_live_t]"), ["t"]);
     assert_eq!(db.key("##pythia_live_g"), ["g"]);
     assert!(db.key("#pythia_live_missing").is_empty());
-    db.ok("drop table #pythia_live_t, ##pythia_live_g");
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
+    db.ok("drop table #pythia_live_t, ##pythia_live_g, pythia_live_f");
     // The primary key comes first; the default schema and the collation
     // find the table as the query did.
     assert_eq!(db.key("pythia_live_k"), ["id"]);
@@ -590,7 +606,12 @@ fn sqlite_keys() {
         "create table temp_first (m text primary key not null)",
         &format!("attach database '{}' as other", attached.display()),
         "create table other.k (other_id integer primary key)",
+        "create table floats (f real not null primary key, b blob not null unique, \
+           u not null unique, n numeric not null unique)",
     ]);
+    // Neither a float nor a column of BLOB affinity (or none), where a 7
+    // and a '7' are two keys: a unique numeric, else the rowid.
+    assert_eq!(db.key("floats"), ["n"]);
     assert_eq!(db.key("k"), ["id"]);
     assert_eq!(db.key("K"), ["id"]);
     // The rowid itself, quoted names.
