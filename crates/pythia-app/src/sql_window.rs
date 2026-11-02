@@ -1652,11 +1652,11 @@ impl SqlWindow {
                 SqlPlus::Done
             }
             "DESC" | "DESCRIBE" => {
-                let name = rest.trim_end_matches(';').to_owned();
-                let (owner, object) = match name.split_once('.') {
-                    Some((o, n)) => (Some(o.to_owned()), n.to_owned()),
-                    None => (None, name),
-                };
+                // As Oracle reads it: "Mixed" as written, emp as EMP, the
+                // dots in quotes part of the name (#369).
+                let mut parts = pythia_db::Dialect::ORACLE.typed_parts(rest.trim_end_matches(';'));
+                let object = parts.pop().unwrap_or_default();
+                let owner = parts.pop();
                 SqlPlus::Query(
                     DESCRIBE_SQL.into(),
                     vec![("name".into(), Some(object)), ("owner".into(), owner)],
@@ -3443,8 +3443,8 @@ const DESCRIBE_SQL: &str = "select column_name as \"Name\", \
             then '(' || data_precision || nvl2(nullif(data_scale, 0), ',' || data_scale, '') || ')' \
         end as \"Type\" \
    from all_tab_columns \
-  where table_name = upper(:name) \
-    and owner = nvl(upper(:owner), sys_context('USERENV', 'CURRENT_SCHEMA')) \
+  where table_name = :name \
+    and owner = nvl(:owner, sys_context('USERENV', 'CURRENT_SCHEMA')) \
   order by column_id";
 
 enum EditAction {

@@ -3991,6 +3991,64 @@ fn import_keeps_quoted_names() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// Imports into new tables named with a dot in their quotes, as Oracle
+/// reads them: `"R83.Dot"` and `pythia."R83.Dot2"` are tables of the
+/// session's schema and of PYTHIA (#369).
+#[test]
+fn import_reads_the_table_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pythia-import-r83-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r83.csv");
+    std::fs::write(&path, "Id;Name\n1;x\n2;y\n").unwrap();
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83.Dot\"", "\"R83.Dot2\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut imported = Vec::new();
+    for table in ["\"R83.Dot\"", "pythia.\"R83.Dot2\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        imported.push(h.state().test_import_message());
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables where table_name like 'R83.Dot%' \
+              order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let rows = |table: &str| {
+        conn.query_row_as::<i64>(&format!("select count(*) from {table}"), &[])
+            .ok()
+    };
+    let counts: Vec<Option<i64>> = tables.iter().map(|t| rows(t)).collect();
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    for message in &imported {
+        assert!(
+            matches!(message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{imported:?}"
+        );
+    }
+    assert_eq!(made, ["R83.Dot", "R83.Dot2"]);
+    assert_eq!(counts, [Some(2), Some(2)]);
+}
+
 /// Debugs a block calling `demo_pkg.raise_salary` with a breakpoint in the
 /// package body: stops at the line, shows variables, steps and finishes.
 /// A debug run whose session can't connect to the debugger (no network ACL
@@ -9153,6 +9211,60 @@ fn memory_databases_are_the_connections() {
         h.state_mut().test_close_focused();
         h.run_steps(2);
     }
+}
+
+/// DESCRIBE takes a name as Oracle reads it: `"R83_Desc"` as written,
+/// `r83_desc` in uppercase, `pythia."R83.Desc"` with the dot in its quotes
+/// (#369).
+#[test]
+fn describe_takes_names_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83_Desc\"", "r83_desc", "\"R83.Desc\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    for ddl in [
+        "create table \"R83_Desc\" (id number(4) not null, \"Mixed\" varchar2(5))",
+        "create table r83_desc (plain date)",
+        "create table \"R83.Desc\" (described number)",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut described = Vec::new();
+    for name in [
+        "\"R83_Desc\"",
+        "r83_desc",
+        "pythia.\"R83.Desc\"",
+        "\"R83.Desc\"",
+    ] {
+        let (_, rows, _) = grid_rows(&mut h, "pythia@FREEPDB1", &format!("desc {name}"));
+        let columns: Vec<String> = rows
+            .iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect();
+        described.push((name, columns.join(", ")));
+    }
+    for t in tables {
+        conn.execute(&format!("drop table {t} purge"), &[]).unwrap();
+    }
+    assert_eq!(
+        described,
+        [
+            ("\"R83_Desc\"", "ID, Mixed".to_owned()),
+            ("r83_desc", "PLAIN".to_owned()),
+            ("pythia.\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("\"R83.Desc\"", "DESCRIBED".to_owned()),
+        ]
+    );
 }
 
 /// A lone `;` is no statement (#313): `select 1;;` sent `;` to the

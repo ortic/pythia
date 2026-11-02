@@ -48,7 +48,8 @@ impl DataSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataOptions {
-    /// Key columns (upper case). Empty: use the source table's primary key.
+    /// Key columns, as the dictionary names them. Empty: use the source
+    /// table's primary key.
     pub key_columns: Vec<String>,
     /// Optional filter applied on both sides (`WHERE` without the keyword).
     pub filter: String,
@@ -718,12 +719,7 @@ pub fn resolve_keys(
     options: &DataOptions,
 ) -> Result<Vec<String>, Error> {
     if !options.key_columns.is_empty() {
-        return Ok(options
-            .key_columns
-            .iter()
-            .map(|k| k.trim().to_uppercase())
-            .filter(|k| !k.is_empty())
-            .collect());
+        return Ok(options.key_columns.clone());
     }
     match source {
         DataSource::Table { schema, table } => {

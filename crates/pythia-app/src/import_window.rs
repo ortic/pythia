@@ -849,33 +849,26 @@ fn table_ident(name: &str) -> String {
     table_name(name, quote_ident)
 }
 
-/// `owner.table` or `table` with the parts typed in quotes as they are,
-/// the others uppercased and written by `write`.
+/// `owner.table` or `table` with each part as Oracle reads it, written by
+/// `write`.
 fn table_name(name: &str, write: impl Fn(&str) -> String) -> String {
-    name.split('.')
-        .map(|p| {
-            if p.starts_with('"') {
-                p.to_owned()
-            } else {
-                write(&p.trim().to_uppercase())
-            }
-        })
+    Dialect::ORACLE
+        .typed_parts(name)
+        .iter()
+        .map(|p| write(p))
         .collect::<Vec<_>>()
         .join(".")
 }
 
+/// The owner and table typed, as Oracle reads them: the parts in quotes as
+/// written, dots and all, others in uppercase (#369).
 fn split_name(name: &str, current_schema: Option<&str>) -> (String, String) {
-    let clean = |p: &str| {
-        if p.starts_with('"') {
-            p.trim_matches('"').to_owned()
-        } else {
-            p.trim().to_uppercase()
-        }
-    };
-    match name.split_once('.') {
-        Some((owner, table)) => (clean(owner), clean(table)),
-        None => (current_schema.unwrap_or_default().to_owned(), clean(name)),
-    }
+    let mut parts = Dialect::ORACLE.typed_parts(name);
+    let table = parts.pop().unwrap_or_default();
+    let owner = parts
+        .pop()
+        .unwrap_or_else(|| current_schema.unwrap_or_default().to_owned());
+    (owner, table)
 }
 
 fn is_workbook(path: &Path) -> bool {
@@ -891,6 +884,20 @@ fn is_workbook(path: &Path) -> bool {
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    /// A table typed as Oracle reads it: quoted parts as written, with
+    /// their dots, others in uppercase (#369).
+    #[test]
+    fn tables_read_as_typed() {
+        let split = |name| split_name(name, Some("HR"));
+        assert_eq!(split("\"R83.Dot\""), ("HR".into(), "R83.Dot".into()));
+        assert_eq!(split("app.\"My.T\""), ("APP".into(), "My.T".into()));
+        assert_eq!(split(" emp "), ("HR".into(), "EMP".into()));
+        assert_eq!(split("\"a\"\"b\""), ("HR".into(), "a\"b".into()));
+        assert_eq!(table_ident("app.\"My.T\""), "APP.\"My.T\"");
+        assert_eq!(table_ident("\"R83.Dot\""), "\"R83.Dot\"");
+        assert_eq!(table_ident("emp"), "EMP");
+    }
 
     #[test]
     fn expressions_wrap_the_value() {
