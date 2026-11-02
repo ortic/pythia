@@ -69,6 +69,8 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL and PostgreSQL: a `:name` in a string with `\'` (or `E'…'`) is
   no longer replaced by a bind variable's value (#399), which broke the
   statement; binds are put in as the database reads its strings.
+- MySQL: Explain plan of a statement with bind variables says it takes
+  none (#400), instead of a syntax error from the server.
 
 ## [0.11.0] - 2026-11-02
 

@@ -931,6 +931,13 @@ impl SqlWindow {
             self.info("Explain plan works for SQL statements only");
             return effects;
         }
+        // MySQL's EXPLAIN takes no parameters, and a value in their place
+        // would change the plan (NULL makes it "no matching row").
+        if syntax == Syntax::MySql && !find_binds(&stmt.sql, syntax).is_empty() {
+            self.warn("Explain plan doesn't take bind variables on MySQL; use literals");
+            self.state.bottom = BottomTab::Messages;
+            return effects;
+        }
         // Their sessions read one result at a time: the plan's query ends
         // the one with rows left, whose FetchMore would then find none.
         if self.state.syntax != Syntax::Oracle
@@ -4309,6 +4316,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// MySQL's EXPLAIN takes no bind variables: it says so rather than
+    /// sending `:id`, a syntax error. Other databases explain them.
+    #[test]
+    fn explain_with_binds_on_mysql() {
+        let mut w = SqlWindow::new("t".into(), "select * from t where id = :id".into());
+        assert_eq!(explained(&w.explain()), ["select * from t where id = :id"]);
+        w.state.syntax = Syntax::MySql;
+        assert!(explained(&w.explain()).is_empty());
+        assert!(
+            w.state
+                .messages
+                .last()
+                .is_some_and(|m| m.text.contains("doesn't take bind variables on MySQL")),
+        );
+        // A `:` in a string is none.
+        w.editor.set_text("select ':id' from t");
+        assert_eq!(explained(&w.explain()), ["select ':id' from t"]);
     }
 
     /// Explain plan runs in the window's own session (#269), so not while
