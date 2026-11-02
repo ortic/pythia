@@ -3303,12 +3303,13 @@ impl PythiaApp {
             && !std::mem::take(&mut self.production_confirmed)
             && let Some(DocKind::Sql(w)) = self.docs.get(&id).map(|d| &d.kind)
         {
+            let syntax = w.state.syntax;
             let changing = w
                 .statements(current_only)
                 .iter()
                 .filter(|s| {
                     s.kind != pythia_plsql::StatementKind::SqlPlus
-                        && !crate::sql_window::is_query(&s.sql)
+                        && !crate::sql_window::is_query(&s.sql, syntax)
                 })
                 .count();
             if changing > 0 {

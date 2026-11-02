@@ -1140,7 +1140,7 @@ impl SqlWindow {
             && !command
             && self.state.script.is_some()
             && self.state.ahead.len() < AHEAD
-            && (!cx.read_only || is_query(&stmt.sql))
+            && (!cx.read_only || is_query(&stmt.sql, self.state.syntax))
             && !self.needs_values(&stmt.sql)
     }
 
@@ -1313,7 +1313,7 @@ impl SqlWindow {
         effects: &mut Effects,
     ) {
         // Every statement of a run comes here, not only the first (#115).
-        if cx.read_only && !is_query(&sql) {
+        if cx.read_only && !is_query(&sql, self.state.syntax) {
             self.refuse_read_only();
             return;
         }
@@ -3448,17 +3448,45 @@ fn statistics_ui(
 /// Why *Edit* and *Apply* do nothing on a read-only connection.
 const READ_ONLY_EDIT: &str = "Connection is read-only: results can't be edited";
 
-/// Read-only connections only accept queries.
-pub(crate) fn is_query(sql: &str) -> bool {
-    let first = pythia_plsql::tokenize(sql)
+/// Read-only connections only accept queries, and production connections
+/// confirm the rest: statements that start as one and have no word that
+/// changes or locks anything, outside strings and comments, as `syntax`
+/// reads them (#455). `WITH … DELETE`, `SELECT … INTO new_table`, a T-SQL
+/// batch with a DELETE after its SELECT and MySQL's `/*!DELETE …*/` ran so.
+pub(crate) fn is_query(sql: &str, syntax: Syntax) -> bool {
+    let first = pythia_plsql::tokenize_in(sql, syntax)
         .into_iter()
         .find(|t| !t.kind.is_trivia());
-    first.is_some_and(|t| {
-        let word = &sql[t.span];
-        ["SELECT", "WITH"]
-            .iter()
-            .any(|k| word.eq_ignore_ascii_case(k))
+    let starts = first.is_some_and(|t| {
+        let word = &sql[t.span.clone()];
+        t.kind.is_word()
+            && ["SELECT", "WITH"]
+                .iter()
+                .any(|k| word.eq_ignore_ascii_case(k))
             || word == "("
+    });
+    starts && !writes(sql, syntax)
+}
+
+/// Whether `sql` has a word that changes or locks anything, outside
+/// strings and comments; MySQL's `/*!…*/` is code, which the server runs.
+fn writes(sql: &str, syntax: Syntax) -> bool {
+    const WRITES: &[&str] = &[
+        "INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "TRUNCATE", "INTO", "CREATE", "ALTER",
+        "DROP", "GRANT", "REVOKE", "EXEC", "EXECUTE", "CALL", "LOCK",
+    ];
+    pythia_plsql::tokenize_in(sql, syntax).into_iter().any(|t| {
+        let text = &sql[t.span.clone()];
+        match text.strip_prefix("/*!") {
+            Some(code) if syntax.is_mysql() && t.kind == pythia_plsql::TokenKind::Hint => {
+                let code = code.strip_suffix("*/").unwrap_or(code);
+                writes(
+                    code.trim_start_matches(|c: char| c.is_ascii_digit()),
+                    syntax,
+                )
+            }
+            _ => t.kind.is_word() && WRITES.iter().any(|w| text.eq_ignore_ascii_case(w)),
+        }
     })
 }
 
@@ -3944,13 +3972,37 @@ mod tests {
 
     #[test]
     fn queries_on_read_only_connections() {
-        assert!(is_query("/* x */ select 1"));
-        assert!(is_query("with a as (select 1) select * from a"));
-        assert!(!is_query("update t set a = 1"));
+        let oracle = |sql| is_query(sql, Syntax::Oracle);
+        assert!(oracle("/* x */ select 1"));
+        assert!(oracle("with a as (select 1) select * from a"));
+        assert!(oracle("select 'delete' as \"update\" from t -- drop"));
+        assert!(!oracle("update t set a = 1"));
         // A `/*!NNNNN …*/` the server's version doesn't run leaves what
         // follows it: it never makes a query (#219).
-        assert!(!is_query("/*!99999 SELECT 1, */ DELETE FROM t"));
-        assert!(!is_query("/*!40101 SET NAMES utf8mb4 */"));
+        let mysql = |sql| is_query(sql, Syntax::MySql);
+        assert!(!mysql("/*!99999 SELECT 1, */ DELETE FROM t"));
+        assert!(!mysql("/*!40101 SET NAMES utf8mb4 */"));
+        assert!(!mysql("select 1 /*!, (delete from t) */"));
+        assert!(mysql("select `update` from t # delete"));
+        assert!(mysql("select /*!40001 SQL_NO_CACHE */ * from t"));
+        // Statements that start as queries and change or lock (#455).
+        for (sql, syntax) in [
+            ("with d as (select 1) delete from t", Syntax::Postgres),
+            (
+                "with d as (delete from t returning *) select * from d",
+                Syntax::Postgres,
+            ),
+            ("select * into t_copy from t", Syntax::TSql),
+            ("select * from t\ndelete from t", Syntax::TSql),
+            (
+                "with d as (select id from t) update t join d using (id) set n = 0",
+                Syntax::MySql,
+            ),
+            ("select * from t for update", Syntax::Oracle),
+        ] {
+            assert!(!is_query(sql, syntax), "{sql}");
+        }
+        assert!(is_query("select $$delete$$ from t", Syntax::Postgres));
     }
 
     #[test]

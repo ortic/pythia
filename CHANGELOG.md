@@ -410,6 +410,10 @@ All notable changes to Pythia are documented here. The format follows
   and DELETE do: they were committed at once (#453).
 - SQL Server: a batch that starts with a SELECT, PRINT or USE and changes
   rows further on waits for Commit: it was committed at once (#454).
+- A read-only connection refuses, and a production connection confirms,
+  statements that start like a query but change or lock: `WITH … DELETE`,
+  `SELECT … INTO`, a T-SQL batch with a DELETE after its SELECT,
+  `SELECT … FOR UPDATE` (#455).
 
 ## [0.11.0] - 2026-11-02
 
