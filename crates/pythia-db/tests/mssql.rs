@@ -479,8 +479,11 @@ fn queries_see_commits_and_lock_nothing() {
     a.ok("drop table fresh_t");
 }
 
+/// The next statement closes a result with rows left, and runs once the
+/// driver has read the rest off the wire: SQL Server isn't stopped, as
+/// MySQL's server is by KILL QUERY.
 #[test]
-fn closing_an_open_result_stops_the_server() {
+fn closing_an_open_result_reads_the_rest_off_the_wire() {
     let Some(mut h) = Harness::connect() else {
         return;
     };
