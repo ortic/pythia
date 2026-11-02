@@ -6927,6 +6927,7 @@ end;
             unique: false,
             columns: vec!["customer_id".into()],
             generated: false,
+            kind: Default::default(),
         });
     });
     h.run_steps(3);

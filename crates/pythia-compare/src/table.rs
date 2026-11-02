@@ -117,6 +117,19 @@ pub struct IndexDef {
     /// Column names or expressions, in index order (with `DESC` if needed).
     pub columns: Vec<String>,
     pub generated: bool,
+    /// What it is beyond its columns (#467).
+    pub kind: IndexKind,
+}
+
+/// What an index is beyond its columns (#467): a bitmap index was made a
+/// B-tree, a reverse, compressed, invisible or local one a plain one, and
+/// the differences weren't seen.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexKind {
+    pub bitmap: bool,
+    /// `compress 1`, `reverse`, `invisible`, `local`, as CREATE INDEX
+    /// writes them.
+    pub attributes: Vec<String>,
 }
 
 impl ConstraintDef {
@@ -186,7 +199,35 @@ fn normalize_condition(c: &str) -> String {
 
 impl IndexDef {
     fn signature(&self) -> String {
-        format!("{}|{}", self.unique, self.columns.join(","))
+        format!(
+            "{}|{}|{}|{}",
+            self.unique,
+            self.kind.bitmap,
+            self.kind.attributes.join(" "),
+            self.columns.join(",")
+        )
+    }
+
+    /// `create [unique|bitmap] index … on table (…) [attributes] [local]`.
+    fn create(&self, name: &str, table: &str) -> String {
+        let kind = if self.unique {
+            "unique "
+        } else if self.kind.bitmap {
+            "bitmap "
+        } else {
+            ""
+        };
+        let mut sql = format!(
+            "create {kind}index {name} on {table} ({})",
+            self.columns.join(", ")
+        );
+        for attribute in self.kind.attributes.iter().filter(|a| *a != "local") {
+            sql.push_str(&format!(" {attribute}"));
+        }
+        if self.kind.attributes.iter().any(|a| a == "local") {
+            sql.push_str(" local");
+        }
+        sql
     }
 }
 
@@ -720,7 +761,6 @@ pub fn diff(source: &TableDef, target: &TableDef, drops: bool) -> TableDiff {
         let present =
             find_index(&target.indexes, i).is_some_and(|o| o.signature() == i.signature());
         if !present {
-            let unique = if i.unique { "unique " } else { "" };
             let name = if i.generated {
                 format!("{}_ix", source.name.to_lowercase())
             } else {
@@ -728,10 +768,7 @@ pub fn diff(source: &TableDef, target: &TableDef, drops: bool) -> TableDiff {
             };
             out.statements.push(SyncStatement {
                 phase: Phase::Indexes,
-                sql: format!(
-                    "create {unique}index {name} on {t} ({})",
-                    i.columns.join(", ")
-                ),
+                sql: i.create(&name, &t),
                 plsql: false,
                 warning: None,
                 enabled: true,
@@ -939,35 +976,118 @@ pub fn load(
         }
     }
 
+    // A function-based or descending index's expressions are LONGs, read
+    // on their own (#467).
+    let mut expressions: BTreeMap<(String, u32), String> = BTreeMap::new();
     for row in conn.query(
-        "select i.table_name, i.index_name, i.uniqueness, i.generated, \
-                listagg(nvl2(e.column_expression, null, '\"' || c.column_name || '\"') \
-                        || decode(c.descend, 'DESC', ' desc', ''), ', ') \
-                  within group (order by c.column_position), \
-                max(case when e.column_expression is not null then 1 else 0 end) \
-           from all_indexes i \
-           join all_ind_columns c on c.index_owner = i.owner and c.index_name = i.index_name \
-           left join all_ind_expressions e \
-             on e.index_owner = c.index_owner and e.index_name = c.index_name and e.column_position = c.column_position \
-          where i.table_owner = :1 and i.table_name like :2 and i.index_type in ('NORMAL', 'NORMAL/REV', 'BITMAP') \
-            and i.table_name not like 'BIN$%' \
-          group by i.table_name, i.index_name, i.uniqueness, i.generated \
-          order by i.table_name, i.index_name",
+        "select e.index_name, e.column_position, e.column_expression from all_ind_expressions e \
+          where e.index_owner = :1 and e.table_name like :2",
         &[&owner, &name],
     )? {
-        let (table, index, uniqueness, generated, columns, has_expression): (String, String, String, String, String, u32) =
-            row?.get_as()?;
-        if backing_indexes.iter().any(|(t, i)| *t == table && *i == index) || has_expression > 0 {
-            // Function-based indexes are compared via their DDL text instead.
+        let (index, position, expression): (String, u32, Option<String>) = row?.get_as()?;
+        expressions.insert(
+            (index, position),
+            expression.unwrap_or_default().trim().to_owned(),
+        );
+    }
+    // Domain indexes, and globally partitioned ones, whose partitions the
+    // model has no place for, aren't compared.
+    let mut current: Option<(String, IndexDef)> = None;
+    let mut found: Vec<(String, IndexDef)> = Vec::new();
+    for row in conn.query(
+        "select i.table_name, i.index_name, i.uniqueness, i.generated, i.index_type, \
+                i.compression, i.prefix_length, i.visibility, \
+                (select p.locality from all_part_indexes p \
+                  where p.owner = i.owner and p.index_name = i.index_name), \
+                c.column_position, c.column_name, c.descend \
+           from all_indexes i \
+           join all_ind_columns c on c.index_owner = i.owner and c.index_name = i.index_name \
+          where i.table_owner = :1 and i.table_name like :2 \
+            and i.index_type in ('NORMAL', 'NORMAL/REV', 'BITMAP', 'FUNCTION-BASED NORMAL', \
+                                 'FUNCTION-BASED NORMAL/REV', 'FUNCTION-BASED BITMAP') \
+            and i.table_name not like 'BIN$%' \
+          order by i.table_name, i.index_name, c.column_position",
+        &[&owner, &name],
+    )? {
+        let row = row?;
+        #[allow(clippy::type_complexity)]
+        let (table, index, uniqueness, generated, index_type, compression, prefix, visibility): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        ) = row.get_as()?;
+        let locality: Option<String> = row.get(8)?;
+        let position: u32 = row.get(9)?;
+        let column: String = row.get(10)?;
+        let descend: String = row.get(11)?;
+        if backing_indexes
+            .iter()
+            .any(|(t, i)| *t == table && *i == index)
+            || locality.as_deref() == Some("GLOBAL")
+        {
             continue;
         }
+        let expression = match expressions.get(&(index.clone(), position)) {
+            Some(e) => e.clone(),
+            None => format!("\"{column}\""),
+        };
+        let expression = if descend == "DESC" {
+            format!("{expression} desc")
+        } else {
+            expression
+        };
+        if current
+            .as_ref()
+            .is_none_or(|(t, i)| *t != table || i.name != index)
+        {
+            found.extend(current.take());
+            let mut attributes = Vec::new();
+            match compression.as_deref() {
+                Some("ENABLED") => attributes.push(match prefix {
+                    Some(n) => format!("compress {n}"),
+                    None => "compress".to_owned(),
+                }),
+                Some(advanced @ ("ADVANCED LOW" | "ADVANCED HIGH")) => {
+                    attributes.push(format!("compress {}", advanced.to_lowercase()));
+                }
+                _ => {}
+            }
+            if index_type.ends_with("/REV") {
+                attributes.push("reverse".to_owned());
+            }
+            if visibility.as_deref() == Some("INVISIBLE") {
+                attributes.push("invisible".to_owned());
+            }
+            if locality.as_deref() == Some("LOCAL") {
+                attributes.push("local".to_owned());
+            }
+            current = Some((
+                table.clone(),
+                IndexDef {
+                    name: index,
+                    unique: uniqueness == "UNIQUE",
+                    columns: Vec::new(),
+                    generated: generated == "Y",
+                    kind: IndexKind {
+                        bitmap: index_type.contains("BITMAP"),
+                        attributes,
+                    },
+                },
+            ));
+        }
+        if let Some((_, def)) = current.as_mut() {
+            def.columns.push(expression);
+        }
+    }
+    found.extend(current);
+    for (table, index) in found {
         if let Some(t) = tables.get_mut(&table) {
-            t.indexes.push(IndexDef {
-                name: index,
-                unique: uniqueness == "UNIQUE",
-                columns: columns.split(", ").map(str::to_owned).collect(),
-                generated: generated == "Y",
-            });
+            t.indexes.push(index);
         }
     }
     Ok(tables)
@@ -1107,6 +1227,7 @@ mod tests {
             unique: false,
             columns: vec!["\"NAME\"".into()],
             generated: false,
+            kind: Default::default(),
         });
         let mut target = base();
         target.constraints[0] = pk("SYS_C999", &["ID"], true);
@@ -1115,6 +1236,7 @@ mod tests {
             unique: true,
             columns: vec!["\"ID\"".into()],
             generated: false,
+            kind: Default::default(),
         });
         let d = diff(&source, &target, true);
         assert_eq!(
@@ -1195,6 +1317,7 @@ mod tests {
             unique: false,
             columns: vec!["DEPT_ID".into()],
             generated: false,
+            kind: Default::default(),
         });
         let statements = create(
             &def,

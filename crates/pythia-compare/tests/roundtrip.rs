@@ -327,3 +327,70 @@ fn generated_and_national_columns_sync() {
         std::panic::resume_unwind(e);
     }
 }
+
+/// A table's bitmap, reverse, compressed, invisible, local,
+/// function-based and descending indexes are made again as they are by
+/// the sync statements, and equal ones differ in nothing (#467): a bitmap
+/// index was made a B-tree, the others plain or not compared at all.
+#[test]
+fn index_kinds_sync() {
+    use pythia_compare::table;
+    let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (user, password) = credentials.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, password, connect_string).unwrap();
+    let tables = ["FD_IX_S", "FD_IX_T"];
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    for t in tables {
+        run(
+            &conn,
+            &format!(
+                "create table {t} (a number, b number, name varchar2(20)) partition by range (a) \
+                   (partition p1 values less than (10), partition p2 values less than (maxvalue))"
+            ),
+        );
+    }
+    run(
+        &conn,
+        "create bitmap index fd_ix_s_bm on fd_ix_s (b) local;
+         create index fd_ix_s_rev on fd_ix_s (a, b) compress 1 reverse invisible;
+         create index fd_ix_s_fn on fd_ix_s (upper(name));
+         create index fd_ix_s_desc on fd_ix_s (b desc, a);",
+    );
+    let owner = user.to_ascii_uppercase();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source = table::load(&conn, &owner, Some("FD_IX_S")).unwrap()["FD_IX_S"].clone();
+        assert_eq!(source.indexes.len(), 4, "{:?}", source.indexes);
+        let target = table::load(&conn, &owner, Some("FD_IX_T")).unwrap()["FD_IX_T"].clone();
+        let mut renamed = source.clone();
+        renamed.name = "FD_IX_T".into();
+        for index in &mut renamed.indexes {
+            index.name = index.name.replace("FD_IX_S", "FD_IX_T");
+        }
+        for statement in table::diff(&renamed, &target, false).statements {
+            if statement.enabled {
+                run(&conn, &statement.sql);
+            }
+        }
+        let made = table::load(&conn, &owner, Some("FD_IX_T")).unwrap()["FD_IX_T"].clone();
+        let kinds = |def: &table::TableDef| -> Vec<(bool, Vec<String>, Vec<String>)> {
+            def.indexes
+                .iter()
+                .map(|i| (i.kind.bitmap, i.kind.attributes.clone(), i.columns.clone()))
+                .collect()
+        };
+        assert_eq!(kinds(&made), kinds(&source));
+        let again = table::diff(&renamed, &made, false);
+        assert!(again.statements.is_empty(), "{:?}", again.statements);
+    }));
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

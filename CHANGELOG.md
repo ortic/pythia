@@ -444,6 +444,10 @@ All notable changes to Pythia are documented here. The format follows
   table's owner, compression, REVERSE, INVISIBLE and LOCAL partitioning,
   which it lost, and doesn't make domain or globally partitioned indexes
   again (#466).
+- Oracle: Schema Compare and the table editor keep an index's kind
+  (bitmap), compression, REVERSE, visibility and LOCAL partitioning, and
+  compare function-based and descending indexes, which they made plain
+  or left out (#467).
 
 ## [0.11.0] - 2026-11-02
 
