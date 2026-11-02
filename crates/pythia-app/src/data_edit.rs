@@ -401,6 +401,12 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
         "INTERSECT",
         "MINUS",
         "EXCEPT",
+        // SQL Server's OUTER APPLY (CROSS APPLY has CROSS) and PIVOT: a
+        // column of what they bring in was written to the table (#416).
+        "OUTER",
+        "APPLY",
+        "PIVOT",
+        "UNPIVOT",
     ];
     // From the table on: a join word that isn't a keyword looks like an alias.
     let multi = tokens.get(next).is_some_and(|t| t.kind == TokenKind::Comma)
@@ -1540,6 +1546,15 @@ mod tests {
             single_table(Dialect::SQLSERVER, "select * from [it's \"odd\"] -- [x]"),
             Some("[it's \"odd\"]".into())
         );
+        // What APPLY or PIVOT brings in isn't the table's.
+        for sql in [
+            "select * from o outer apply (select top 1 n.note from n where n.oid = o.id) x",
+            "select * from o cross apply f(o.id) x",
+            "select * from s pivot (sum(v) for k in ([a], [b])) p",
+            "select * from s unpivot (v for k in (a, b)) u",
+        ] {
+            assert_eq!(single_table(Dialect::SQLSERVER, sql), None, "{sql}");
+        }
         // A temporary table.
         assert_eq!(
             single_table(Dialect::SQLSERVER, "select * from #orders o"),

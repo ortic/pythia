@@ -284,6 +284,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: a child table's DDL inherits from its parents, with only
   its own columns and constraints (#376); a copy was a table of its own,
   which a query on its parent's copy didn't read. (Foreign tables: #409.)
+- SQL Server: a result of a query with `OUTER APPLY`, `PIVOT` or
+  `UNPIVOT` can't be edited (#416); a value typed into a column they
+  bring in was written to the table of the query.
 
 ## [0.11.0] - 2026-11-02
 
