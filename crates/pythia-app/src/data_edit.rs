@@ -418,8 +418,8 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
     ];
     let mut depth = 0i32;
     let mut comma = false;
-    for j in next..tokens.len() {
-        match tokens[j].kind {
+    for (j, token) in tokens.iter().enumerate().skip(next) {
+        match token.kind {
             TokenKind::LParen => depth += 1,
             TokenKind::RParen => depth -= 1,
             TokenKind::Comma if depth == 0 => {

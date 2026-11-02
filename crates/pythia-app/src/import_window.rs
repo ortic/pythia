@@ -944,7 +944,7 @@ mod transform_tests {
         };
         let infos = import::infer(&sheet);
         let phone = Some(&infos[0]);
-        assert!(matches!(phone.unwrap().kind, import::Kind::Number { .. }));
+        assert!(matches!(infos[0].kind, import::Kind::Number { .. }));
         let day = Some(&infos[1]);
         let t = Transform::default();
         for target in ["VARCHAR2(20 CHAR)", "nvarchar2(20)", "CLOB", "CHAR(16)"] {
