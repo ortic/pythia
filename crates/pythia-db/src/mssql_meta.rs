@@ -497,9 +497,44 @@ fn ddl(
         }
     };
     Ok(if runnable {
-        format!("{text}\nGO\n")
+        let order = if object_type == ObjectType::Trigger {
+            trigger_order(ms, &object)?
+        } else {
+            String::new()
+        };
+        format!("{text}\nGO\n{order}")
     } else {
         text
+    })
+}
+
+/// A trigger's place among its table's triggers of an event, where it is
+/// the first or the last: `sp_settriggerorder` calls that set it, in a
+/// batch of their own, or nothing. `ALTER TRIGGER` drops it, and the
+/// trigger made again from its DDL fired in no order (#440).
+fn trigger_order(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
+    let rows = ms.rows(
+        "select te.type_desc, case when te.is_first = 1 then 'First' else 'Last' end \
+           from sys.trigger_events te \
+          where te.object_id = object_id(@P1) and (te.is_first = 1 or te.is_last = 1) \
+          order by te.type",
+        &[&object],
+    )?;
+    let name = object.replace('\'', "''");
+    let calls: String = rows
+        .into_iter()
+        .filter_map(|row| match row.as_slice() {
+            [Some(event), Some(order)] => Some(format!(
+                "exec sp_settriggerorder @triggername = N'{name}', @order = N'{order}', \
+                 @stmttype = N'{event}';\n"
+            )),
+            _ => None,
+        })
+        .collect();
+    Ok(if calls.is_empty() {
+        calls
+    } else {
+        format!("{calls}GO\n")
     })
 }
 

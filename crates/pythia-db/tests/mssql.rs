@@ -4061,3 +4061,68 @@ fn values_bound_whole() {
     h.ok("rollback");
     h.ok("drop table if exists lob_bound");
 }
+
+/// A trigger's DDL keeps its place among its table's triggers of an event
+/// (#440): first or last, which `ALTER TRIGGER` drops, as *Edit* runs it.
+/// Its script, run as it is, keeps the order.
+#[test]
+fn trigger_ddl_keeps_its_order() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.scalar("select schema_name()").unwrap();
+    h.ok("drop table if exists r100_ord");
+    h.ok("create table r100_ord (s varchar(10))");
+    for name in ["a", "b", "c"] {
+        h.ok(&format!(
+            "create trigger r100_ord_{name} on r100_ord after insert, update as set nocount on"
+        ));
+    }
+    h.ok("exec sp_settriggerorder N'r100_ord_c', N'First', N'INSERT'");
+    h.ok("exec sp_settriggerorder N'r100_ord_c', N'Last', N'UPDATE'");
+    h.ok("exec sp_settriggerorder N'r100_ord_a', N'Last', N'INSERT'");
+    let ddl = |h: &mut Harness, name: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: name.into(),
+            object_type: ObjectType::Trigger,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let c = ddl(&mut h, "r100_ord_c");
+    let calls = format!(
+        "GO\nexec sp_settriggerorder @triggername = N'[{schema}].[r100_ord_c]', @order = N'First', \
+         @stmttype = N'INSERT';\n\
+         exec sp_settriggerorder @triggername = N'[{schema}].[r100_ord_c]', @order = N'Last', \
+         @stmttype = N'UPDATE';\nGO\n"
+    );
+    assert!(c.ends_with(&calls), "{c}");
+    assert!(ddl(&mut h, "r100_ord_b").ends_with("set nocount on\nGO\n"));
+    let order = |h: &mut Harness| {
+        h.first_row(
+            "select string_agg(object_name(te.object_id) + ' ' + te.type_desc + ' ' \
+                     + iif(te.is_first = 1, 'first', 'last'), ', ') \
+                     within group (order by object_name(te.object_id), te.type_desc) \
+               from sys.trigger_events te \
+              where object_name(te.object_id) like 'r100%' and (te.is_first = 1 or te.is_last = 1)",
+        )
+    };
+    let before = order(&mut h);
+    assert_eq!(
+        before,
+        ["r100_ord_a INSERT last, r100_ord_c INSERT first, r100_ord_c UPDATE last"]
+    );
+    // As Edit makes it again: altered, then its order set.
+    for batch in c
+        .replace("create trigger", "create or alter trigger")
+        .split("\nGO\n")
+    {
+        if !batch.trim().is_empty() {
+            h.ok(batch);
+        }
+    }
+    assert_eq!(order(&mut h), before);
+    h.ok("drop table r100_ord");
+}

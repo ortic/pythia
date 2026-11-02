@@ -355,6 +355,8 @@ All notable changes to Pythia are documented here. The format follows
   (#438).
 - A chart's tooltip shows a value below 0.0001 with its exponent, not as
   0 (#439).
+- SQL Server: a trigger's DDL keeps its first or last place among its
+  table's triggers, which *Edit* dropped (#440).
 
 ## [0.11.0] - 2026-11-02
 
