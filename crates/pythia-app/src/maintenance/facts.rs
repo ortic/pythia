@@ -617,6 +617,10 @@ fn postgres(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
 
 fn mysql(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
     let mut f = Facts::default();
+    // MySQL 8 caches a table's sizes and last change for a day: after an
+    // OPTIMIZE, or rows written, they were the old ones (#441). MariaDB
+    // has no such cache (and no variable).
+    let _ = c.execute("set session information_schema_stats_expiry = 0");
     let row = first_row(
         c.query(
             "select engine, table_rows, data_length, index_length, data_free, \
@@ -757,6 +761,41 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MySQL's facts are the table's as it is, not as it was cached when
+    /// they were first read (#441): its last change, after rows written.
+    #[test]
+    fn mysql_facts_are_current() {
+        crate::test_db::run_on("PYTHIA_TEST_MYSQL", DbKind::MySql, |c| {
+            let schema = c.query("select database()", &[]).unwrap()[0][0]
+                .clone()
+                .unwrap();
+            c.execute("drop table if exists fd_facts").unwrap();
+            c.execute("create table fd_facts (n int primary key)")
+                .unwrap();
+            let table = ObjectRef {
+                owner: schema,
+                name: "fd_facts".into(),
+                object_type: ObjectType::Table,
+            };
+            let changed = |c: &mut dyn Client| {
+                other(c, &table)
+                    .unwrap()
+                    .state
+                    .iter()
+                    .any(|f| f.label == "Last change")
+            };
+            // Read once, as the facts of a new table are.
+            // MariaDB has no cache.
+            let _ = c.execute("set session information_schema_stats_expiry = 86400");
+            assert!(!changed(c));
+            c.execute("insert into fd_facts values (1)").unwrap();
+            // MariaDB has no cache.
+            let _ = c.execute("set session information_schema_stats_expiry = 86400");
+            assert!(changed(c));
+            c.execute("drop table fd_facts").unwrap();
+        });
+    }
 
     #[test]
     fn groups_digits() {

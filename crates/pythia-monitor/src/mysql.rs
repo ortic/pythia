@@ -615,6 +615,9 @@ fn mariadb_replica(r: &[Cell]) -> Replica {
 const SYSTEM_SCHEMAS: &str = "('mysql', 'information_schema', 'performance_schema', 'sys')";
 
 fn storage_stats(c: &mut dyn Client, s: &mut MySqlSnapshot) -> Result<(), DbError> {
+    // MySQL 8 caches the tables' sizes for a day, read again here every
+    // few minutes (#441); MariaDB has no such cache (and no variable).
+    let _ = c.execute("set session information_schema_stats_expiry = 0");
     let schemas = c.query(
         &format!(
             "select table_schema, count(*), sum(data_length), sum(index_length), \
