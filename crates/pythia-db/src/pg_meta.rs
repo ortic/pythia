@@ -876,10 +876,11 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
 /// comments, its grants and the sequences' comments (#354) and grants. A
 /// serial column's sequence goes with the table, as `pg_dump` writes it:
 /// run elsewhere, the DDL makes the copy a sequence of its own (#263),
-/// which roles use as they use the table's (#331). The table is unlogged where it is, with its access
-/// method, storage parameters and tablespace where they aren't the
-/// defaults, as a materialized view (#352). Its [`OWNER`] comes after the
-/// sequences are its columns', so that they go to it with the table (#353).
+/// which roles use as they use the table's (#331). The table is unlogged
+/// where it is, with its access method, storage parameters and tablespace
+/// where they aren't the defaults, as a materialized view (#352). Its
+/// [`OWNER`] comes after the sequences are its columns', so that they go to
+/// it with the table (#353). Its [`row_security`] follows its comments.
 fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let (owner, name) = stored(pg, owner, name)?;
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
@@ -887,7 +888,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .first(
             &format!(
                 "select c.oid, c.relkind, pg_get_partkeydef(c.oid), \
-                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {}, {OWNER} \
+                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {}, {OWNER}, \
+                        c.relrowsecurity, c.relforcerowsecurity \
                    from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                    join pg_roles r on r.oid = c.relowner \
                    left join pg_am a on a.oid = c.relam \
@@ -907,6 +909,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let unlogged = table.next().flatten().as_deref() == Some("t");
     let options = table.next().flatten().unwrap_or_default();
     let role = table.next().flatten();
+    let secure = table.next().flatten().as_deref() == Some("t");
+    let forced = table.next().flatten().as_deref() == Some("t");
     let mut lines: Vec<String> = pg
         .rows(
             &format!(
@@ -1010,6 +1014,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     for constraint in late {
         ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
     }
+    row_security(pg, &mut ddl, &oid, &qualified, secure, forced)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
@@ -1043,6 +1048,67 @@ fn foreign_server(pg: &Pg<'_>, oid: &str) -> Result<Option<String>, DbError> {
         &[],
     )?;
     Ok(row.and_then(first))
+}
+
+/// A table's row level security, enabled and forced where it is, then its
+/// policies as `CREATE POLICY` takes them, appended to `ddl`: restrictive
+/// where they aren't permissive, for a command where they aren't for all,
+/// to their roles where they aren't `public`, with their USING and WITH
+/// CHECK. Without them, a copy showed every row to every role that could
+/// read it (#373). Read on the table's empty search path, their expressions
+/// name every table and function with its schema.
+fn row_security(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+    secure: bool,
+    forced: bool,
+) -> Result<(), DbError> {
+    if secure {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} enable row level security;"
+        ));
+    }
+    if forced {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} force row level security;"
+        ));
+    }
+    let policies = pg.rows(
+        &format!(
+            "select quote_ident(p.polname), \
+                    case when p.polpermissive then '' else ' as restrictive' end \
+                    || case p.polcmd when 'r' then ' for select' when 'a' then ' for insert' \
+                                     when 'w' then ' for update' when 'd' then ' for delete' \
+                                     else '' end, \
+                    case when p.polroles <> array[0::oid] then \
+                         (select string_agg(coalesce(quote_ident(o.rolname), 'public'), ', ' \
+                                            order by x.n) \
+                            from unnest(p.polroles) with ordinality x(role, n) \
+                            left join pg_roles o on o.oid = x.role) end, \
+                    pg_get_expr(p.polqual, p.polrelid, true), \
+                    pg_get_expr(p.polwithcheck, p.polrelid, true) \
+               from pg_policy p where p.polrelid = {oid} order by p.polname"
+        ),
+        &[],
+    )?;
+    for row in policies {
+        if let [Some(name), Some(kind), roles, using, check] = row.as_slice() {
+            ddl.push_str(&format!("\n\ncreate policy {name} on {qualified}{kind}"));
+            if let Some(roles) = roles {
+                ddl.push_str(&format!("\n  to {roles}"));
+            }
+            if let Some(using) = using {
+                ddl.push_str(&format!("\n  using ({using})"));
+            }
+            if let Some(check) = check {
+                ddl.push_str(&format!("\n  with check ({check})"));
+            }
+            ddl.push(';');
+        }
+    }
+    Ok(())
 }
 
 /// The relation's indexes that no constraint makes, then the comments on

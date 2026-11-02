@@ -2204,6 +2204,93 @@ fn the_ddl_has_the_comments() {
     h.ok("drop schema r81_cm, r81_cm_copy cascade");
 }
 
+/// A table's DDL enables and forces its row level security where it does,
+/// and creates its policies, with their command, roles, USING and WITH
+/// CHECK, restrictive or permissive, and every name with its schema. Run
+/// in another schema, the copy has the same (#373).
+#[test]
+fn a_tables_ddl_keeps_its_row_level_security() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r81_rls, r81_rls_copy cascade");
+    h.ok("drop function if exists r81_rls_ok(int)");
+    h.ok("create schema r81_rls");
+    h.ok("create schema r81_rls_copy");
+    h.ok(&format!(
+        "create function {schema}.r81_rls_ok(x int) returns bool language sql \
+         as 'select x > 0'"
+    ));
+    for sql in [
+        "create table r81_rls.r81_log (id int)",
+        "create table r81_rls.r81_t (id int primary key, who text, n int)",
+        "alter table r81_rls.r81_t enable row level security",
+        "alter table r81_rls.r81_t force row level security",
+        "create policy r81_own on r81_rls.r81_t using (who = current_user)",
+        "create policy \"R81 Insert\" on r81_rls.r81_t as restrictive for insert \
+         to pg_monitor, pg_read_all_stats with check (r81_rls_ok(n))",
+        "create policy r81_upd on r81_rls.r81_t for update \
+         using (n in (select id from r81_rls.r81_log)) with check (n < 100)",
+        "create table r81_rls.r81_on (n int)",
+        "alter table r81_rls.r81_on enable row level security",
+    ] {
+        h.ok(sql);
+    }
+    let t = ddl_of(&mut h, "r81_rls", "r81_t", ObjectType::Table);
+    for part in [
+        "\n\nalter table r81_rls.r81_t enable row level security;\n\n\
+         alter table r81_rls.r81_t force row level security;\n\n"
+            .to_owned(),
+        "\n\ncreate policy r81_own on r81_rls.r81_t\n  using (who = CURRENT_USER);".to_owned(),
+        format!(
+            "\n\ncreate policy \"R81 Insert\" on r81_rls.r81_t as restrictive for insert\n  \
+             to pg_monitor, pg_read_all_stats\n  with check ({schema}.r81_rls_ok(n));"
+        ),
+        "\n\ncreate policy r81_upd on r81_rls.r81_t for update\n  using (".to_owned(),
+        "FROM r81_rls.r81_log)))\n  with check (n < 100);".to_owned(),
+    ] {
+        assert!(t.contains(&part), "{t}");
+    }
+    let on = ddl_of(&mut h, "r81_rls", "r81_on", ObjectType::Table);
+    assert!(
+        on.ends_with("\n\nalter table r81_rls.r81_on enable row level security;"),
+        "{on}"
+    );
+    let log = ddl_of(&mut h, "r81_rls", "r81_log", ObjectType::Table);
+    assert!(!log.contains("row level security"), "{log}");
+    for ddl in [&log, &t, &on] {
+        run_ddl(&mut h, ddl, "r81_rls.", "r81_rls_copy.");
+    }
+    // Each table's row level security and policies.
+    let security = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relrowsecurity, c.relforcerowsecurity, \
+                      (select string_agg(concat_ws(' ', p.polname, p.polcmd, p.polpermissive, \
+                                                   p.polroles::regrole[]::text, \
+                                                   pg_get_expr(p.polqual, p.polrelid), \
+                                                   pg_get_expr(p.polwithcheck, p.polrelid)), \
+                                         '; ' order by p.polname) \
+                         from pg_policy p where p.polrelid = c.oid)), \
+                               ' | ' order by c.relname) \
+               from pg_class c \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind = 'r'"
+        ))
+        .map(|s| s.replace(&format!("{schema}."), ""))
+    };
+    let was = security(&mut h, "r81_rls");
+    assert!(
+        was.as_deref().is_some_and(|w| w.contains(
+            "R81 Insert a f {pg_monitor,pg_read_all_stats} r81_rls_ok(n); r81_own * t {-}"
+        )),
+        "{was:?}"
+    );
+    assert_eq!(security(&mut h, "r81_rls_copy"), was, "{t}");
+    h.ok("drop schema r81_rls, r81_rls_copy cascade");
+    h.ok(&format!("drop function {schema}.r81_rls_ok(int)"));
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another

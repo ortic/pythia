@@ -111,6 +111,12 @@ All notable changes to Pythia are documented here. The format follows
   was closed) is read again when Pythia starts, unless the window has
   changes of its own; saving over such a file asks first (#411). The
   window restored its old text, and Save wrote it over the change.
+- PostgreSQL: a table's DDL keeps its row level security (#373): `alter
+  table … enable row level security` and `force row level security`
+  where they are on, and a `create policy` for each policy, with its
+  command, roles, `using` and `with check`, restrictive or not. Run
+  elsewhere, the copy had neither, so every role that could read it read
+  every row, and rows no policy let through could be written to it.
 
 ## [0.11.0] - 2026-11-02
 
