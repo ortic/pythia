@@ -9202,8 +9202,10 @@ fn completed(h: &mut Ui, text: &str) -> Vec<String> {
 /// A window whose session couldn't connect opens a new one for its next
 /// statement (#424): the failed one was kept, its worker gone, and the
 /// window ran for ever. SQLite's file, renamed away and back, stands for a
-/// server that was down.
+/// server that was down. Not on Windows, which renames no file another
+/// session holds open.
 #[test]
+#[cfg(unix)]
 fn a_failed_window_session_is_opened_again() {
     let dir = std::env::temp_dir().join(format!("pythia-r99-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
