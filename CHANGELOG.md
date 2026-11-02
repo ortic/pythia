@@ -414,6 +414,9 @@ All notable changes to Pythia are documented here. The format follows
   statements that start like a query but change or lock: `WITH … DELETE`,
   `SELECT … INTO`, a T-SQL batch with a DELETE after its SELECT,
   `SELECT … FOR UPDATE` (#455).
+- Import into an existing table's text columns takes the file's values
+  as they are: a phone number, `1.10` or a date in text were converted as
+  numbers and dates (#456).
 
 ## [0.11.0] - 2026-11-02
 

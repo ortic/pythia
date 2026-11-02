@@ -97,6 +97,24 @@ impl Transform {
     }
 }
 
+/// How a file's column, whose values look like `info`, is converted into
+/// a column of type `target`: a text column takes the value as it is (#456).
+/// A phone number `+41 44 123 45 67` was stored as `41441234567`, `1.10` as
+/// `1.1` and `01.02.2024` as a date's text, in VARCHAR2 columns.
+fn conversion<'a>(
+    info: Option<&'a import::ColumnInfo>,
+    target: Option<&str>,
+) -> Option<&'a import::ColumnInfo> {
+    const TEXT: &[&str] = &[
+        "CHAR", "NCHAR", "VARCHAR", "NVARCHAR", "CLOB", "NCLOB", "LONG",
+    ];
+    let text = target.is_some_and(|t| {
+        let t = t.trim_start().to_ascii_uppercase();
+        TEXT.iter().any(|k| t.starts_with(k)) && !t.starts_with("LONG RAW")
+    });
+    if text { None } else { info }
+}
+
 /// Replaces `:value` (any case, as a whole word) in an expression.
 fn replace_value(expression: &str, with: &str) -> String {
     let lower = expression.to_ascii_lowercase();
@@ -661,10 +679,23 @@ impl ImportWindow {
         let names: Vec<String> = pairs.iter().map(|(_, n)| quote_ident(n)).collect();
         let default = Transform::default();
         let transform = |i: usize| s.transforms.get(i).unwrap_or(&default);
+        // Each source column's conversion, for the type of its target
+        // column in an existing table.
+        let target_type = |name: &str| match (&s.target, &s.existing) {
+            (TargetTable::Existing, Some(Ok(columns))) => columns
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.data_type.as_str()),
+            _ => None,
+        };
+        let infos: Vec<Option<&import::ColumnInfo>> = pairs
+            .iter()
+            .map(|(i, name)| conversion(data.info.get(*i), target_type(name)))
+            .collect();
         let binds: Vec<String> = pairs
             .iter()
             .enumerate()
-            .map(|(n, (i, _))| transform(*i).bind_expr(n + 1, data.info.get(*i)))
+            .map(|(n, (i, _))| transform(*i).bind_expr(n + 1, infos[n]))
             .collect();
         let insert = format!(
             "insert into {} ({}) values ({})",
@@ -679,9 +710,9 @@ impl ImportWindow {
             .map(|row| {
                 pairs
                     .iter()
-                    .map(|(i, _)| {
-                        transform(*i)
-                            .value(row.get(*i).and_then(|v| v.as_deref()), data.info.get(*i))
+                    .enumerate()
+                    .map(|(n, (i, _))| {
+                        transform(*i).value(row.get(*i).and_then(|v| v.as_deref()), infos[n])
                     })
                     .collect()
             })
@@ -897,6 +928,44 @@ mod transform_tests {
         assert_eq!(table_ident("app.\"My.T\""), "APP.\"My.T\"");
         assert_eq!(table_ident("\"R83.Dot\""), "\"R83.Dot\"");
         assert_eq!(table_ident("emp"), "EMP");
+    }
+
+    /// A text column of an existing table takes the file's values as they
+    /// are, whatever they look like (#456); a number or date column has them
+    /// converted.
+    #[test]
+    fn text_columns_take_values_as_they_are() {
+        let sheet = import::Sheet {
+            headers: vec!["PHONE".into(), "DAY".into()],
+            rows: vec![
+                vec![Some("+41 44 123 45 67".into()), Some("01.02.2024".into())],
+                vec![Some("1.10".into()), Some("31.12.2024".into())],
+            ],
+        };
+        let infos = import::infer(&sheet);
+        let phone = Some(&infos[0]);
+        assert!(matches!(phone.unwrap().kind, import::Kind::Number { .. }));
+        let day = Some(&infos[1]);
+        let t = Transform::default();
+        for target in ["VARCHAR2(20 CHAR)", "nvarchar2(20)", "CLOB", "CHAR(16)"] {
+            let info = conversion(phone, Some(target));
+            assert_eq!(t.bind_expr(1, info), ":1", "{target}");
+            assert_eq!(
+                t.value(Some("+41 44 123 45 67"), info).as_deref(),
+                Some("+41 44 123 45 67")
+            );
+            assert_eq!(t.bind_expr(2, conversion(day, Some(target))), ":2");
+        }
+        assert_eq!(
+            t.bind_expr(1, conversion(phone, Some("NUMBER(12)"))),
+            "to_number(:1)"
+        );
+        assert!(
+            t.bind_expr(2, conversion(day, Some("DATE")))
+                .starts_with("to_date(:2")
+        );
+        // A new table's columns are the file's.
+        assert_eq!(t.bind_expr(1, conversion(phone, None)), "to_number(:1)");
     }
 
     #[test]
