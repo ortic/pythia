@@ -507,16 +507,17 @@ fn ddl(
 /// which is made apart, as a foreign key's table is (#349). ROWGUIDCOL, a
 /// persisted computed column's NOT NULL and NOT FOR REPLICATION are kept
 /// (#355). A graph's node or edge table is made one, without the columns
-/// SQL Server adds to it, and with its edge constraints (#360). What CREATE
-/// TABLE can't give follows the table: its lock escalation, foreign keys
-/// and checks that aren't trusted, disabled ones disabled, and disabled
-/// indexes (#326).
+/// SQL Server adds to it, and with its edge constraints (#360), a ledger
+/// table a ledger table, its ledger columns generated always (#366). What
+/// CREATE TABLE can't give follows the table: its lock escalation, foreign
+/// keys and checks that aren't trusted, disabled ones disabled, and
+/// disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // Catalog columns of later versions: a columnstore index's ORDER
     // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022), a
     // temporal table's HISTORY_RETENTION_PERIOD (2017), the AUTO_DROP of
-    // statistics (2022), graph tables (2017) and their edge constraints
-    // (2019).
+    // statistics (2022), graph tables (2017), their edge constraints (2019)
+    // and ledger tables (2022).
     let later = ms
         .rows(
             "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
@@ -525,7 +526,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                     col_length('sys.tables', 'history_retention_period'), \
                     col_length('sys.stats', 'auto_drop'), \
                     col_length('sys.tables', 'is_node'), \
-                    col_length('sys.edge_constraints', 'object_id')",
+                    col_length('sys.edge_constraints', 'object_id'), \
+                    col_length('sys.tables', 'ledger_type')",
             &[],
         )?
         .into_iter()
@@ -566,10 +568,14 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                       + case when ic.is_not_for_replication = 1 \
                                              then ' not for replication' else '' end \
                                  else '' end \
-                             + case when c.generated_always_type in (1, 2) \
-                                 then ' generated always as row ' \
-                                      + case c.generated_always_type when 1 then 'start' \
-                                             else 'end' end \
+                             + case when c.generated_always_type in (1, 2, 7, 8, 9, 10) \
+                                 then ' generated always as ' \
+                                      + case c.generated_always_type when 1 then 'row start' \
+                                             when 2 then 'row end' \
+                                             when 7 then 'transaction_id start' \
+                                             when 8 then 'transaction_id end' \
+                                             when 9 then 'sequence_number start' \
+                                             else 'sequence_number end' end \
                                       + case when c.is_hidden = 1 then ' hidden' else '' end \
                                  else '' end \
                              + case when c.is_nullable = 1 then ' null' else ' not null' end \
@@ -601,6 +607,18 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     } else {
         "null"
     };
+    // A ledger table's kind, updatable (2) or append-only (3), its ledger
+    // view and whether that isn't the table's name and _Ledger in its
+    // schema (#366).
+    let ledger = if has(7) {
+        "t.ledger_type, \
+         quotename(object_schema_name(t.ledger_view_id)) + '.' \
+           + quotename(object_name(t.ledger_view_id)), \
+         case when object_schema_name(t.ledger_view_id) <> schema_name(t.schema_id) \
+                or object_name(t.ledger_view_id) <> t.name + '_Ledger' then 1 end"
+    } else {
+        "null, null, null"
+    };
     let retention = if has(3) {
         "case when t.history_retention_period > 0 \
               then cast(t.history_retention_period as varchar(10)) + ' ' \
@@ -618,7 +636,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // table's object_id in its schema, so that a copy gets its own, and the
     // history's retention where it isn't infinite (#324). Its lock
     // escalation where it isn't TABLE (#326). Whether it is a graph's node
-    // or edge table (#360).
+    // or edge table (#360). A ledger table's history is named so too, with
+    // MSSQL_LedgerHistoryFor_ (#366).
     let table = ms
         .rows(
             &format!(
@@ -632,14 +651,16 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                           + quotename(col_name(p.object_id, p.end_column_id)) + ')', \
                         t.temporal_type, \
                         case when h.schema_id <> t.schema_id \
-                               or h.name <> 'MSSQL_TemporalHistoryFor_' \
+                               or h.name <> case when t.temporal_type = 2 \
+                                                 then 'MSSQL_TemporalHistoryFor_' \
+                                                 else 'MSSQL_LedgerHistoryFor_' end \
                                             + cast(t.object_id as varchar(20)) \
                              then quotename(schema_name(h.schema_id)) + '.' + quotename(h.name) \
                         end, \
                         {retention}, \
                         case when t.lock_escalation <> 0 and t.is_memory_optimized = 0 \
                              then lower(t.lock_escalation_desc collate database_default) end, \
-                        {node_or_edge} \
+                        {node_or_edge}, {ledger} \
                    from sys.tables t \
                    join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
                    left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
@@ -658,6 +679,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let (period, versioned) = (next(), next().as_deref() == Some("2"));
     let (history, retention, escalation) = (next(), next(), next());
     let node_or_edge = next();
+    let (ledger, ledger_view, view_named) = (next(), next(), next().is_some());
+    let ledger = ledger.filter(|kind| kind == "2" || kind == "3");
     let storage = index_storage(ms, object, has(1), has(2))?;
     let no_storage = Storage::default();
     let storage_of = |index: &str| storage.get(index).unwrap_or(&no_storage);
@@ -977,7 +1000,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if rows_in == "0" {
         options.extend(table_storage.options.iter().cloned());
     }
-    if versioned {
+    // An updatable ledger table is system-versioned, without a period
+    // (#366).
+    if versioned || ledger.as_deref() == Some("2") {
         let history: Vec<String> = [
             history.map(|history| format!("history_table = {history}")),
             retention.map(|retention| format!("history_retention_period = {retention}")),
@@ -990,6 +1015,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         } else {
             format!("system_versioning = on ({})", history.join(", "))
         });
+    }
+    if let Some(ledger) = ledger {
+        options.push(ledger_option(ms, object, &ledger, ledger_view, view_named)?);
     }
     if !options.is_empty() {
         ddl.push_str(&format!(" with ({})", options.join(", ")));
@@ -1026,6 +1054,56 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         ddl.push_str(&format!("\n\n{statement}"));
     }
     Ok(ddl)
+}
+
+/// `ledger = on` of a ledger table of `kind`, updatable (2) or append-only
+/// (3), with its ledger `view` where it is `named` other than the default,
+/// or where the view's columns are, as they then follow it (#366).
+fn ledger_option(
+    ms: &mut Ms<'_>,
+    object: &str,
+    kind: &str,
+    view: Option<String>,
+    named: bool,
+) -> Result<String, DbError> {
+    let columns: Vec<String> = ms
+        .rows(
+            "select case c.ledger_view_column_type \
+                      when 1 then 'transaction_id_column_name' \
+                      when 2 then 'sequence_number_column_name' \
+                      when 3 then 'operation_type_column_name' \
+                      else 'operation_type_desc_column_name' end \
+                    + ' = ' + quotename(c.name) \
+               from sys.tables t join sys.columns c on c.object_id = t.ledger_view_id \
+              where t.object_id = object_id(@P1) and c.ledger_view_column_type in (1, 2, 3, 4) \
+                and c.name <> case c.ledger_view_column_type \
+                                when 1 then 'ledger_transaction_id' \
+                                when 2 then 'ledger_sequence_number' \
+                                when 3 then 'ledger_operation_type' \
+                                else 'ledger_operation_type_desc' end \
+              order by c.ledger_view_column_type",
+            &[object],
+        )?
+        .into_iter()
+        .filter_map(first)
+        .collect();
+    let mut options = Vec::new();
+    if let Some(view) = view.filter(|_| named || !columns.is_empty()) {
+        let columns = if columns.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", columns.join(", "))
+        };
+        options.push(format!("ledger_view = {view}{columns}"));
+    }
+    if kind == "3" {
+        options.push("append_only = on".to_owned());
+    }
+    Ok(if options.is_empty() {
+        "ledger = on".to_owned()
+    } else {
+        format!("ledger = on ({})", options.join(", "))
+    })
 }
 
 /// The statistics made on the table, after its indexes, with their filters

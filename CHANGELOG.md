@@ -1139,6 +1139,13 @@ All notable changes to Pythia are documented here. The format follows
   table written out (`graph_id_…`, `$node_id_…`) and the unique index on
   them, which took no rows without them and no `$node_id`; indexes and
   statistics on `$node_id`, `$from_id` and `$to_id` now name those.
+- SQL Server: a ledger table's DDL makes a ledger table (#366), `with
+  (system_versioning = on, ledger = on)` or `ledger = on (append_only =
+  on)`, its ledger columns `generated always as transaction_id start
+  hidden` and so on, and its history table, ledger view and the view's
+  columns named where SQL Server didn't name them. It made a plain
+  table, which kept no ledger and took no rows without values for the
+  ledger columns.
 
 ## [0.10.0] - 2026-10-30
 

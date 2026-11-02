@@ -3094,6 +3094,180 @@ fn graph_tables() {
     drop(&mut h, &schema);
 }
 
+/// The ledger tables of `owner`, as the catalog has them: updatable or
+/// append-only, their history table (one SQL Server named read with `N`
+/// for the table's object_id) and ledger view, their generated always
+/// columns and the view's ledger columns.
+fn catalog_ledger(h: &mut Harness, owner: &str) -> Vec<Option<String>> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and ledger_type in (2, 3)"
+    );
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.ledger_type, \
+                                         replace(object_name(t.history_table_id), \
+                                                 cast(t.object_id as varchar(20)), 'N'), \
+                                         object_name(t.ledger_view_id), \
+                                         case when object_schema_name(t.history_table_id) \
+                                                   = schema_name(t.schema_id) then 'own' end, \
+                                         case when object_schema_name(t.ledger_view_id) \
+                                                   = schema_name(t.schema_id) then 'own' end) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         c.generated_always_type, c.is_hidden, c.is_nullable) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                         c.ledger_view_column_type) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c \
+              where c.object_id in (select ledger_view_id from sys.tables \
+                                     where object_id in ({tables})) \
+                and c.ledger_view_column_type > 0"
+        ),
+    ]
+    .iter()
+    .map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A ledger table's DDL makes one (#366), updatable or append-only, with its
+/// generated always columns, and the names of its history table, ledger
+/// view and the view's columns where SQL Server didn't give them: run
+/// elsewhere, the copy keeps its ledger. In a database of its own, as a
+/// ledger table that is dropped stays, renamed (SQL Server 2022).
+#[test]
+fn ledger_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let major = dba
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    if major < 16 {
+        return;
+    }
+    let mut h = own_database(&mut dba, "r82_ledger", &[]);
+    for sql in [
+        "create table r82_lu (id int constraint r82_lu_pk primary key, v varchar(10)) \
+         with (system_versioning = on, ledger = on)",
+        "create table r82_la (id int, v varchar(10)) with (ledger = on (append_only = on))",
+        "create table r82_ln (id int constraint r82_ln_pk primary key, v varchar(10), \
+           ts bigint generated always as transaction_id start hidden not null, \
+           te bigint generated always as transaction_id end hidden null, \
+           ss bigint generated always as sequence_number start hidden not null, \
+           se bigint generated always as sequence_number end hidden null) \
+         with (system_versioning = on (history_table = dbo.r82_ln_hist), \
+           ledger = on (ledger_view = dbo.r82_ln_view (transaction_id_column_name = tx, \
+             sequence_number_column_name = sq, operation_type_column_name = op, \
+             operation_type_desc_column_name = opd)))",
+        "create table r82_lv (id int) with (system_versioning = on, \
+           ledger = on (ledger_view = dbo.r82_lv_Ledger (operation_type_desc_column_name = what)))",
+    ] {
+        h.ok(sql);
+    }
+    // The columns SQL Server adds to a ledger table.
+    let start_tx =
+        "[ledger_start_transaction_id] bigint generated always as transaction_id start hidden";
+    let end_tx = "[ledger_end_transaction_id] bigint generated always as transaction_id end hidden";
+    let start_seq =
+        "[ledger_start_sequence_number] bigint generated always as sequence_number start hidden";
+    let end_seq =
+        "[ledger_end_sequence_number] bigint generated always as sequence_number end hidden";
+    let ddls: Vec<String> = ["r82_lu", "r82_la", "r82_ln", "r82_lv"]
+        .iter()
+        .map(|table| table_ddl(&mut h, "dbo", table))
+        .collect();
+    assert_eq!(
+        ddls,
+        [
+            format!(
+                "create table [dbo].[r82_lu] (\n    \
+                   [id] int not null,\n    \
+                   [v] varchar(10) null,\n    \
+                   {start_tx} not null,\n    \
+                   {end_tx} null,\n    \
+                   {start_seq} not null,\n    \
+                   {end_seq} null,\n    \
+                   constraint [r82_lu_pk] primary key clustered ([id])\n\
+                 ) with (system_versioning = on, ledger = on);\nGO\n"
+            ),
+            format!(
+                "create table [dbo].[r82_la] (\n    \
+                   [id] int null,\n    \
+                   [v] varchar(10) null,\n    \
+                   {start_tx} not null,\n    \
+                   {start_seq} not null\n\
+                 ) with (ledger = on (append_only = on));\nGO\n"
+            ),
+            "create table [dbo].[r82_ln] (\n    \
+               [id] int not null,\n    \
+               [v] varchar(10) null,\n    \
+               [ts] bigint generated always as transaction_id start hidden not null,\n    \
+               [te] bigint generated always as transaction_id end hidden null,\n    \
+               [ss] bigint generated always as sequence_number start hidden not null,\n    \
+               [se] bigint generated always as sequence_number end hidden null,\n    \
+               constraint [r82_ln_pk] primary key clustered ([id])\n\
+             ) with (system_versioning = on (history_table = [dbo].[r82_ln_hist]), \
+               ledger = on (ledger_view = [dbo].[r82_ln_view] (transaction_id_column_name = [tx], \
+                 sequence_number_column_name = [sq], operation_type_column_name = [op], \
+                 operation_type_desc_column_name = [opd])));\nGO\n"
+                .to_owned(),
+            format!(
+                "create table [dbo].[r82_lv] (\n    \
+                   [id] int null,\n    \
+                   {start_tx} not null,\n    \
+                   {end_tx} null,\n    \
+                   {start_seq} not null,\n    \
+                   {end_seq} null\n\
+                 ) with (system_versioning = on, \
+                   ledger = on (ledger_view = [dbo].[r82_lv_Ledger] \
+                     (operation_type_desc_column_name = [what])));\nGO\n"
+            ),
+        ]
+    );
+    let before = catalog_ledger(&mut h, "dbo");
+    assert_eq!(before.len(), 3, "{before:?}");
+    h.ok("create schema r82_copy_l");
+    let tables = [
+        "r82_lu",
+        "r82_la",
+        "r82_ln",
+        "r82_ln_hist",
+        "r82_ln_view",
+        "r82_lv",
+        "r82_lv_Ledger",
+    ];
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, "dbo", "r82_copy_l", &tables);
+    }
+    assert_eq!(catalog_ledger(&mut h, "r82_copy_l"), before);
+    // The copy keeps its ledger: an update is in the ledger view, an
+    // append-only table takes none.
+    h.ok("insert into r82_copy_l.r82_lu (id, v) values (1, 'a')");
+    h.ok("update r82_copy_l.r82_lu set v = 'b'");
+    assert_eq!(
+        h.scalar("select count(*) from r82_copy_l.r82_lu_Ledger")
+            .as_deref(),
+        Some("3")
+    );
+    h.ok("insert into r82_copy_l.r82_la (id, v) values (1, 'a')");
+    h.fails("update r82_copy_l.r82_la set v = 'b'");
+    drop(h);
+    drop_database(&mut dba, "r82_ledger");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.
