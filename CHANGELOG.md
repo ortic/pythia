@@ -1146,6 +1146,11 @@ All notable changes to Pythia are documented here. The format follows
   columns named where SQL Server didn't name them. It made a plain
   table, which kept no ledger and took no rows without values for the
   ledger columns.
+- SQL Server: a table's DDL keeps its Always Encrypted columns
+  encrypted (#367), `encrypted with (column_encryption_key = …,
+  encryption_type = …, algorithm = …)`. A copy's columns were plain
+  ones, which took the values a client sends them in plain text and
+  kept them so.
 
 ## [0.10.0] - 2026-10-30
 

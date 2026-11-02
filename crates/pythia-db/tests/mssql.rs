@@ -3268,6 +3268,97 @@ fn ledger_tables() {
     drop_database(&mut dba, "r82_ledger");
 }
 
+/// A table's DDL keeps its Always Encrypted columns encrypted (#367), with
+/// their column encryption key, encryption type and algorithm: run
+/// elsewhere, the copy takes no plain values into them, as the original
+/// doesn't. The keys are the database's metadata only: SQL Server keeps
+/// the column master key's path and the column encryption key's value
+/// encrypted with it, which it never reads, so a made-up value does.
+#[test]
+fn always_encrypted_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let drop_keys = |h: &mut Harness| {
+        h.ok(
+            "if exists (select 1 from sys.column_encryption_keys where name = 'r82_cek') \
+               drop column encryption key r82_cek; \
+             if exists (select 1 from sys.column_master_keys where name = 'r82_cmk') \
+               drop column master key r82_cmk",
+        );
+    };
+    drop_tables(&mut h, "r82_copy_ae", "r82_ae");
+    h.ok("drop schema if exists r82_copy_ae");
+    drop_tables(&mut h, &schema, "r82_ae");
+    drop_keys(&mut h);
+    let value = format!("0x01{}", "ab".repeat(100));
+    for sql in [
+        "create column master key r82_cmk with (key_store_provider_name = \
+         'MSSQL_CERTIFICATE_STORE', key_path = 'CurrentUser/My/0123456789ABCDEF')"
+            .to_owned(),
+        format!(
+            "create column encryption key r82_cek with values (column_master_key = r82_cmk, \
+             algorithm = 'RSA_OAEP', encrypted_value = {value})"
+        ),
+        "create table r82_ae (id int, \
+         d varchar(20) collate Latin1_General_BIN2 encrypted with (column_encryption_key = \
+           r82_cek, encryption_type = deterministic, \
+           algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256') not null, \
+         r int encrypted with (column_encryption_key = r82_cek, encryption_type = randomized, \
+           algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256'))"
+            .to_owned(),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = table_ddl(&mut h, &schema, "r82_ae");
+    let with = |kind: &str| {
+        format!(
+            "encrypted with (column_encryption_key = [r82_cek], encryption_type = {kind}, \
+             algorithm = 'AEAD_AES_256_CBC_HMAC_SHA_256')"
+        )
+    };
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_ae] (\n    \
+               [id] int null,\n    \
+               [d] varchar(20) collate Latin1_General_BIN2 {} not null,\n    \
+               [r] int {} null\n\
+             );\nGO\n",
+            with("deterministic"),
+            with("randomized")
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.collation_name, c.encryption_type_desc, \
+                                         c.encryption_algorithm_name, k.name) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.column_encryption_keys k \
+                 on k.column_encryption_key_id = c.column_encryption_key_id \
+              where c.object_id = object_id('[{owner}].[r82_ae]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_ae");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_ae", &["r82_ae"]);
+    assert_eq!(catalog(&mut h, "r82_copy_ae"), before);
+    // Plain values go into neither.
+    for owner in [schema.as_str(), "r82_copy_ae"] {
+        h.fails(&format!(
+            "insert into [{owner}].[r82_ae] (id, d) values (1, 'secret')"
+        ));
+    }
+    drop_tables(&mut h, "r82_copy_ae", "r82_ae");
+    h.ok("drop schema r82_copy_ae");
+    drop_tables(&mut h, &schema, "r82_ae");
+    drop_keys(&mut h);
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.

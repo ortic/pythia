@@ -508,10 +508,11 @@ fn ddl(
 /// persisted computed column's NOT NULL and NOT FOR REPLICATION are kept
 /// (#355). A graph's node or edge table is made one, without the columns
 /// SQL Server adds to it, and with its edge constraints (#360), a ledger
-/// table a ledger table, its ledger columns generated always (#366). What
-/// CREATE TABLE can't give follows the table: its lock escalation, foreign
-/// keys and checks that aren't trusted, disabled ones disabled, and
-/// disabled indexes (#326).
+/// table a ledger table, its ledger columns generated always (#366). Always
+/// Encrypted columns are encrypted with their key, which is the database's
+/// (#367). What CREATE TABLE can't give follows the table: its lock
+/// escalation, foreign keys and checks that aren't trusted, disabled ones
+/// disabled, and disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // Catalog columns of later versions: a columnstore index's ORDER
     // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022), a
@@ -555,6 +556,12 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                          <> cast(databasepropertyex(db_name(), 'Collation') \
                                                  as sysname) collate database_default \
                                  then ' collate ' + c.collation_name else '' end \
+                             + coalesce(' encrypted with (column_encryption_key = ' \
+                                        + quotename(ek.name) + ', encryption_type = ' \
+                                        + lower(c.encryption_type_desc collate database_default) \
+                                        + ', algorithm = ''' \
+                                        + c.encryption_algorithm_name collate database_default \
+                                        + ''')', '') \
                              + case when c.is_sparse = 1 then ' sparse' \
                                     when c.is_column_set = 1 \
                                       then ' column_set for all_sparse_columns' \
@@ -594,6 +601,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                 and m.column_id = c.column_id and m.is_masked = 1 \
                left join sys.xml_schema_collections xs on xs.xml_collection_id = c.xml_collection_id \
                 and c.xml_collection_id > 0 \
+               left join sys.column_encryption_keys ek \
+                 on ek.column_encryption_key_id = c.column_encryption_key_id \
               where c.object_id = object_id(@P1) \
               order by c.column_id"
         ),
