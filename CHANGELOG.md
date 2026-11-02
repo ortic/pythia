@@ -353,6 +353,8 @@ All notable changes to Pythia are documented here. The format follows
   (#437).
 - Find in Source searches the text as typed, blanks around it too
   (#438).
+- A chart's tooltip shows a value below 0.0001 with its exponent, not as
+  0 (#439).
 
 ## [0.11.0] - 2026-11-02
 
