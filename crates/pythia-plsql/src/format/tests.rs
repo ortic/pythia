@@ -536,6 +536,26 @@ fn kept_as_written_lists_what_could_be_formatted() {
     assert!(!equivalent("select a from t", "select b from t"));
 }
 
+/// A query's PL/SQL declarations are one statement with it (#358), which
+/// isn't laid out as SQL: it is kept as written, the statements after it
+/// are formatted.
+#[test]
+fn queries_with_plsql_are_kept() {
+    let query = "with function f return number is\nbegin\n  return 1;\nend;\nselect f from dual";
+    let src = format!("{query};\nSELECT 2 FROM dual;\n");
+    let o = FormatOptions::default();
+    assert_eq!(
+        format(&src, &o).text,
+        format!("{query};\nselect 2 from dual;\n")
+    );
+    let kept = kept_as_written(&src, &o);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0], 0..query.len());
+    // A common table expression called function is formatted.
+    let src = "WITH function AS (SELECT 1 a FROM dual) SELECT a FROM function";
+    assert!(format(src, &o).text.starts_with("with\n"), "{src}");
+}
+
 #[test]
 fn conditional_compilation_is_kept() {
     // `$IF x $THEN` became `$ if x $ then` (#172), which Oracle doesn't

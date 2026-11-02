@@ -220,6 +220,15 @@ All notable changes to Pythia are documented here. The format follows
   `café` doesn't name, and didn't map it to an existing table's `CAFÉ`;
   a *Schema* or *Default schema* typed `straße` named `STRASSE`, where
   Oracle reads `STRAßE`.
+- Oracle: a query with PL/SQL declarations, `with function f … end;
+  select f from dual`, runs as one statement (#358), also in an INSERT,
+  a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
+  The script ended it at the first `;` inside the function, which failed
+  with ORA-02000, and ran the rest on its own. It ends at the `;` after
+  the query, or at `/` on a line of its own as in SQL*Plus; declarations
+  still open at the end of the script, as while they are typed, end at
+  that first `;` as before, so the statements after them stay apart.
+  Format Code keeps such a query as written.
 
 ## [0.11.0] - 2026-11-02
 

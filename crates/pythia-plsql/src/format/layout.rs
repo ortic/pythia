@@ -888,6 +888,17 @@ impl<'a, 's> Layout<'a, 's> {
     }
 
     fn with_clause(&mut self) -> Doc {
+        // A query's PL/SQL declarations (#358) aren't laid out as SQL: the
+        // statement is kept as written.
+        if (self.word_at(1, "FUNCTION") || self.word_at(1, "PROCEDURE"))
+            && self.sig(2).is_some_and(|t| {
+                (t.kind.is_word() && !t.text.eq_ignore_ascii_case("AS"))
+                    || t.kind == TokenKind::QuotedIdent
+            })
+        {
+            self.bail = true;
+            return self.rest();
+        }
         let kw = self.next();
         let mut items = Vec::new();
         loop {

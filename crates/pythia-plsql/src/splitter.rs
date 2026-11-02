@@ -197,6 +197,24 @@ pub fn terminated(sql: &str, syntax: Syntax) -> String {
     }
 }
 
+/// Where the splitter is in the PL/SQL declarations of an Oracle query,
+/// `WITH FUNCTION f … END; [FUNCTION g … END;] SELECT …`, whose `;` don't
+/// end the statement.
+#[derive(Default)]
+struct Declarations {
+    /// Inside them: from the `WITH` to the `;` after the last one's `END`.
+    open: bool,
+    /// The blocks open: `BEGIN` (true) and `CASE` (false) up to their `END`.
+    blocks: Vec<bool>,
+    /// The functions and procedures outside any block whose body hasn't
+    /// ended: a declaration's, and those of its own declarations.
+    units: usize,
+    /// In a heading, before its `IS` or `AS`.
+    heading: bool,
+    /// The parentheses open, in which a heading's `AS` is a `CAST`'s.
+    parens: usize,
+}
+
 struct Splitter<'a> {
     src: &'a str,
     tokens: Vec<Token>,
@@ -352,6 +370,76 @@ impl<'a> Splitter<'a> {
             return isize::from(block);
         }
         0
+    }
+
+    /// Whether token `idx` starts an Oracle query's PL/SQL declarations,
+    /// `WITH FUNCTION f …` or `WITH PROCEDURE p …`, rather than a common
+    /// table expression of that name (`with function as (…)`).
+    fn starts_declarations(&self, idx: usize) -> bool {
+        let mut words = self.significant_from(idx);
+        words.next().is_some_and(|t| self.word_eq(t, &["WITH"]))
+            && words
+                .next()
+                .is_some_and(|t| self.word_eq(t, &["FUNCTION", "PROCEDURE"]))
+            && words.next().is_some_and(|t| {
+                (t.kind.is_word() || t.kind == TokenKind::QuotedIdent) && !self.word_eq(t, &["AS"])
+            })
+    }
+
+    /// Follows token `idx` through the PL/SQL declarations of a query
+    /// (#358), which `decls` holds while they are open.
+    fn follow_declarations(&self, idx: usize, decls: &mut Declarations) {
+        let t = &self.tokens[idx];
+        if !decls.open {
+            decls.open = self.starts_declarations(idx);
+            return;
+        }
+        match t.kind {
+            TokenKind::LParen => decls.parens += 1,
+            TokenKind::RParen => decls.parens = decls.parens.saturating_sub(1),
+            TokenKind::Semicolon if decls.blocks.is_empty() => {
+                if decls.heading {
+                    // A forward declaration: `function g return number;`.
+                    decls.heading = false;
+                    decls.units = decls.units.saturating_sub(1);
+                } else if decls.units == 0 {
+                    // The end of a declaration: another, or the query.
+                    decls.open = self
+                        .next_word(idx)
+                        .is_some_and(|n| self.word_eq(n, &["FUNCTION", "PROCEDURE"]));
+                }
+            }
+            _ if !t.kind.is_word() => {}
+            _ if self.word_eq(t, &["FUNCTION", "PROCEDURE"]) && decls.blocks.is_empty() => {
+                decls.units += 1;
+                decls.heading = true;
+            }
+            _ if self.word_eq(t, &["IS", "AS"]) && decls.heading && decls.parens == 0 => {
+                decls.heading = false;
+            }
+            _ if self.word_eq(t, &["BEGIN"]) => decls.blocks.push(true),
+            // Not the `CASE` of `END CASE`.
+            _ if self.word_eq(t, &["CASE"])
+                && !self.tokens[..idx]
+                    .iter()
+                    .rfind(|t| !t.kind.is_trivia())
+                    .is_some_and(|p| self.word_eq(p, &["END"])) =>
+            {
+                decls.blocks.push(false)
+            }
+            _ if self.word_eq(t, &["END"]) => {
+                // `END IF` and `END LOOP` close what wasn't counted; the
+                // `END` of a body outside any block, its function's.
+                let closed = match self.next_word(idx) {
+                    Some(n) if self.word_eq(n, &["IF", "LOOP"]) => None,
+                    _ => decls.blocks.pop(),
+                };
+                if closed == Some(true) && decls.blocks.is_empty() {
+                    decls.units = decls.units.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Whether the statement at token `start` is `CREATE [OR REPLACE] RULE`.
@@ -552,13 +640,22 @@ impl<'a> Splitter<'a> {
             let mut parens = 0usize;
             let mut inner: Option<(usize, usize)> = None;
             let mut ended = false;
+            // An Oracle query's PL/SQL declarations keep their `;` (#358):
+            // `with function f … end; select f from dual`, in a subquery too
+            // (`insert /*+ with_plsql */ …`). Where they aren't ended by the
+            // end of the script, it ends at their first `;`, as a rule does.
+            let plsql = self.syntax == Syntax::Oracle && kind == StatementKind::Sql;
+            let mut decls = Declarations::default();
+            if plsql {
+                self.follow_declarations(start, &mut decls);
+            }
             i += 1;
             while i < self.tokens.len() {
                 let t = &self.tokens[i];
                 match kind {
                     StatementKind::SqlPlus if t.kind == TokenKind::Newline => break,
                     StatementKind::Sql if t.kind == TokenKind::Semicolon && depth == 0 => {
-                        if parens == 0 {
+                        if parens == 0 && !decls.open {
                             i += 1;
                             ended = true;
                             break;
@@ -581,11 +678,17 @@ impl<'a> Splitter<'a> {
                     }
                 }
                 if !t.kind.is_trivia() {
+                    if plsql {
+                        self.follow_declarations(i, &mut decls);
+                    }
                     last = i;
                 }
                 i += 1;
             }
-            if !ended && let Some((semicolon, before)) = inner {
+            if !ended
+                && (rule || decls.open)
+                && let Some((semicolon, before)) = inner
+            {
                 i = semicolon + 1;
                 last = before;
             }
@@ -857,6 +960,131 @@ mod tests {
         );
         // Not on the databases without rules.
         assert_eq!(split_in("create rule r (a; b);", Syntax::Sqlite).len(), 2);
+    }
+
+    /// A query's PL/SQL declarations, `WITH FUNCTION` and `WITH PROCEDURE`,
+    /// keep their `;` (#358): the query ends at the `;` after them, or at
+    /// `/`.
+    #[test]
+    fn oracle_with_plsql() {
+        let src = "with function f return number is begin return 1; end;\nselect f from dual;\n\
+                   select 2 from dual;\n\
+                   with function f return number is begin return 1; end;\nselect f from dual\n/\n\
+                   with function f return number is begin return 1; end;\nselect f from dual;\n/\n\
+                   with procedure p is begin null; end;\n\
+                   function f return number is begin p; return 1; end;\n\
+                   c as (select f() x from dual)\nselect x from c;\n\
+                   with function f(n number default cast(1 as number)) return number is\n  \
+                   v number := case when n > 0 then 1 else 0 end;\n  \
+                   function g return number;\n  \
+                   function g return number is begin return 2; end;\n\
+                   begin\n  for i in 1 .. 2 loop\n    if v > 0 then v := v + g; end if;\n  end loop;\n  \
+                   case when v > 1 then null; else v := 0; end case;\n  \
+                   declare w number; begin w := 'end;'; end;\n  return v;\nend f;\n\
+                   select f(1) from dual;\n\
+                   insert /*+ with_plsql */ into t\nwith function f return number is begin return 1; end;\n\
+                   select f from dual;\n\
+                   create or replace view v as with /* c */ function f return number is begin return 1; end;\n\
+                   select f x from dual;\n\
+                   update /*+ with_plsql */ t set x = (with function g return number is begin return 5; end;\n\
+                   select g from dual);\n\
+                   select /*+ with_plsql */ * from (with function h return number is begin return 7; end;\n\
+                   select h from dual) where 1 = 1;\n\
+                   with function as (select 1 a from dual) select a from function;\n\
+                   with procedure (a) as (select 1 from dual) select a from procedure;\n\
+                   with function f return number is begin return 1; end;\nselect f from dual";
+        assert_eq!(
+            split(src),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "with function f return number is begin return 1; end;\nselect f from dual"
+                ),
+                (StatementKind::Sql, "select 2 from dual"),
+                (
+                    StatementKind::Sql,
+                    "with function f return number is begin return 1; end;\nselect f from dual"
+                ),
+                (
+                    StatementKind::Sql,
+                    "with function f return number is begin return 1; end;\nselect f from dual"
+                ),
+                (
+                    StatementKind::Sql,
+                    "with procedure p is begin null; end;\n\
+                     function f return number is begin p; return 1; end;\n\
+                     c as (select f() x from dual)\nselect x from c"
+                ),
+                (
+                    StatementKind::Sql,
+                    "with function f(n number default cast(1 as number)) return number is\n  \
+                     v number := case when n > 0 then 1 else 0 end;\n  \
+                     function g return number;\n  \
+                     function g return number is begin return 2; end;\n\
+                     begin\n  for i in 1 .. 2 loop\n    if v > 0 then v := v + g; end if;\n  end loop;\n  \
+                     case when v > 1 then null; else v := 0; end case;\n  \
+                     declare w number; begin w := 'end;'; end;\n  return v;\nend f;\n\
+                     select f(1) from dual"
+                ),
+                (
+                    StatementKind::Sql,
+                    "insert /*+ with_plsql */ into t\nwith function f return number is begin return 1; end;\n\
+                     select f from dual"
+                ),
+                (
+                    StatementKind::Sql,
+                    "create or replace view v as with /* c */ function f return number is begin return 1; end;\n\
+                     select f x from dual"
+                ),
+                (
+                    StatementKind::Sql,
+                    "update /*+ with_plsql */ t set x = (with function g return number is begin return 5; end;\n\
+                     select g from dual)"
+                ),
+                (
+                    StatementKind::Sql,
+                    "select /*+ with_plsql */ * from (with function h return number is begin return 7; end;\n\
+                     select h from dual) where 1 = 1"
+                ),
+                // Common table expressions called function or procedure.
+                (
+                    StatementKind::Sql,
+                    "with function as (select 1 a from dual) select a from function"
+                ),
+                (
+                    StatementKind::Sql,
+                    "with procedure (a) as (select 1 from dual) select a from procedure"
+                ),
+                (
+                    StatementKind::Sql,
+                    "with function f return number is begin return 1; end;\nselect f from dual"
+                ),
+            ]
+        );
+        // Declarations not ended by the end of the script, as while they are
+        // typed, end at their first `;`, so that the statements after them
+        // stay apart.
+        let src = "with function f return number is begin return 1;\nselect 2 from dual;\nselect 3 from dual;";
+        assert_eq!(
+            split(src),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "with function f return number is begin return 1"
+                ),
+                (StatementKind::Sql, "select 2 from dual"),
+                (StatementKind::Sql, "select 3 from dual"),
+            ]
+        );
+        // Not on the other databases.
+        let src = "with function f return number is begin return 1; end; select f from dual;";
+        for syntax in [Syntax::MySql, Syntax::Postgres] {
+            assert_eq!(
+                split_in(src, syntax)[0].1,
+                "with function f return number is begin return 1",
+                "{syntax:?}"
+            );
+        }
     }
 
     #[test]

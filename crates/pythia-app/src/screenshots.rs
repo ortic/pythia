@@ -8435,6 +8435,62 @@ fn postgres_rules_with_several_actions() {
     run_in_window(&mut h, "rollback;\ndrop table r75_r;\ncommit");
 }
 
+/// Oracle: a query's PL/SQL declarations, `with function … end; select …`,
+/// are one statement with it (#358), also in an INSERT and in an UPDATE's
+/// subquery. The script ended it at the first `;` of the function and sent
+/// `with function f(n number) return number is\n  v number := n`, which
+/// failed with ORA-02000: missing AS keyword, and the rest as statements of
+/// their own.
+#[test]
+fn oracle_queries_with_plsql_declarations() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection,
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let _ = run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r84_w purge'; exception when others then null; end;",
+    );
+    run_in_window(&mut h, "create table r84_w (x number)");
+    run_in_window(
+        &mut h,
+        "with function f(n number) return number is\n  v number := n;\nbegin\n  v := v * 2;\n  return v;\nend;\n\
+         select f(21) a from dual;\n\
+         insert /*+ with_plsql */ into r84_w\nwith function g return number is begin return 5; end;\n\
+         select g from dual;\n\
+         update /*+ with_plsql */ r84_w set x = x + (with function k return number is begin return 1; end;\n\
+         select k from dual);\n\
+         with function h return varchar2 is begin return 'end;'; end;\nselect h() b from dual\n/\n\
+         select x c from r84_w",
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["A = 42", "B = end;", "C = 6"]);
+    run_in_window(&mut h, "rollback");
+    run_in_window(&mut h, "drop table r84_w purge");
+}
+
 /// On SQL Server and PostgreSQL a statement with several results shows
 /// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
 /// DECLAREs, a procedure's result sets, the SELECTs rules add to an
