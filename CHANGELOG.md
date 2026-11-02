@@ -386,6 +386,8 @@ All notable changes to Pythia are documented here. The format follows
 - SQLite: a window with rows left to fetch doesn't keep another from
   committing: it reads the rest ahead, up to 256 MB, which lets its lock
   on the file go (#185).
+- SQLite: text that isn't UTF-8 shows, copies and exports as Windows-1252,
+  not with replacement characters (#413).
 
 ## [0.11.0] - 2026-11-02
 

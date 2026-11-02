@@ -354,6 +354,23 @@ fn rows_left_to_fetch_dont_block_commits() {
     assert_eq!(a.scalar("select count(*) from t").as_deref(), Some("501"));
 }
 
+/// Text that isn't UTF-8 shows as Windows-1252, not with U+FFFD for its
+/// other bytes (#413); compared with that text, as Edit checks a row, it
+/// isn't found: its bytes differ.
+#[test]
+fn text_that_isnt_utf8() {
+    let db = TempDb::new("latin");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table t (s text)");
+    h.ok("insert into t values (cast(X'4DFC6C6C657220803520' as text))");
+    assert_eq!(h.scalar("select s from t").as_deref(), Some("Müller €5 "));
+    assert_eq!(
+        h.scalar("select count(*) from t where s = 'Müller €5 '")
+            .as_deref(),
+        Some("0")
+    );
+}
+
 /// For the grid a blob is cut short with its size; for a file it comes
 /// whole, and a batch ends once it holds 64 MB of text, so rows of large
 /// blobs come a few at a time (#204).

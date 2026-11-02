@@ -26,6 +26,7 @@ mod sql_text;
 mod sqlite_meta;
 mod sqlite_session;
 pub mod ssh;
+pub mod text;
 mod types;
 
 pub use dialect::{DbKind, Dialect, Feature};

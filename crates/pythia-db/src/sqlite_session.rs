@@ -1018,7 +1018,14 @@ pub(crate) fn cell(value: ValueRef<'_>, whole: bool) -> Cell {
         // `{:?}`: shortest round trip, keeps `.0`, exponent for large and
         // tiny values.
         ValueRef::Real(f) => format!("{f:?}"),
-        ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        // Text that isn't UTF-8, as legacy data in Windows-1252 or Latin-1
+        // is, read as Windows-1252, not with U+FFFD for its other bytes
+        // (#413): Copy and exports have its characters. Its Edit check
+        // finds no row with that text, a conflict, as before.
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_owned(),
+            Err(_) => crate::text::windows_1252(bytes),
+        },
         ValueRef::Blob(bytes) => hex(bytes, whole),
     })
 }

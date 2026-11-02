@@ -42,16 +42,18 @@ pub fn decode(bytes: &[u8]) -> (String, Detected) {
     } else {
         match std::str::from_utf8(bytes) {
             Ok(text) => (text.to_owned(), Detected::Utf8),
-            Err(_) => (
-                bytes
-                    .iter()
-                    .map(|&b| match b {
-                        0x80..=0x9f => CP1252_HIGH[usize::from(b - 0x80)],
-                        b => char::from(b),
-                    })
-                    .collect(),
-                Detected::Windows1252,
-            ),
+            Err(_) => (windows_1252(bytes), Detected::Windows1252),
         }
     }
+}
+
+/// `bytes` as Windows-1252, which takes every byte.
+pub fn windows_1252(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| match b {
+            0x80..=0x9f => CP1252_HIGH[usize::from(b - 0x80)],
+            b => char::from(b),
+        })
+        .collect()
 }
