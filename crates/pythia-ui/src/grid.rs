@@ -485,7 +485,7 @@ impl GridState {
             }
             (None, None) => SaveSource::Held(held.to_owned()),
         };
-        self.file_request = Some(FileRequest::Save(SaveValue {
+        self.ask_owner(FileRequest::Save(SaveValue {
             row,
             col,
             binary,
@@ -506,7 +506,15 @@ impl GridState {
         self.last_load += 1;
         let load = self.last_load;
         self.loads.insert(load, (self.row_ref(view_row), col));
-        self.file_request = Some(FileRequest::Load { load, col, binary });
+        self.ask_owner(FileRequest::Load { load, col, binary });
+    }
+
+    /// Hands `request` to the owner. A load it took the place of, which
+    /// the owner never saw, is forgotten (#361).
+    fn ask_owner(&mut self, request: FileRequest) {
+        if let Some(FileRequest::Load { load, .. }) = self.file_request.replace(request) {
+            self.loads.remove(&load);
+        }
     }
 
     /// Puts the file of `load` into the cell it was chosen for, where its
@@ -531,6 +539,11 @@ impl GridState {
     /// Forgets `load`, whose file wasn't chosen.
     pub fn cancel_load(&mut self, load: u64) {
         self.loads.remove(&load);
+    }
+
+    /// The loads whose files haven't come yet.
+    pub fn loads_in_progress(&self) -> usize {
+        self.loads.len()
     }
 
     /// Makes a file's value the pending change of a cell (#293), a step
@@ -6073,6 +6086,30 @@ mod tests {
     /// What a cell holds of a file's value, as each database shows binary
     /// values: cut short past 4000 bytes, with the size the grid reads
     /// back (#293).
+    /// A load whose request the owner never took, another one asked for
+    /// before it did, is forgotten (#361).
+    #[test]
+    fn a_load_asked_for_again_is_forgotten() {
+        let columns = vec![col_of("ID", "INTEGER"), col_of("IMG", "BLOB")];
+        let rows = vec![vec![Some("1".into()), Some("X'CAFE'".into())]];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            value_files: true,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        state.sync(&rows, &columns);
+        state.request_load(&columns, (0, 1));
+        state.request_load(&columns, (0, 1));
+        assert_eq!(state.loads_in_progress(), 1);
+        state.request_save(&columns, &rows, (0, 1));
+        assert_eq!(state.loads_in_progress(), 0);
+        assert!(matches!(
+            state.take_file_request(),
+            Some(FileRequest::Save(_))
+        ));
+    }
+
     /// A file loaded into a new row goes into that row where it is when the
     /// file comes, or into none where the row went (#344): the row's place
     /// among the new rows changes while the file is chosen and read. It

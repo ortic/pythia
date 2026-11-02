@@ -14564,6 +14564,67 @@ fn a_file_loads_into_its_own_row_or_none() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A load that ends without a file leaves nothing behind in the grid
+/// (#361): one asked for while the dialog of another is open, which is
+/// refused, and one whose file can't be read. Each kept its cell among the
+/// grid's loads in progress for as long as the result was there.
+#[test]
+fn loads_without_a_file_are_forgotten() {
+    let (mut h, _db) = sqlite_file("r85-loads.db");
+    run_script(
+        &mut h,
+        "r85-loads.db",
+        "create table r85_lob (id integer primary key, img blob);\n\
+         insert into r85_lob values (1, X'CAFE'), (2, X'BEEF');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "r85-loads.db".into(),
+        text: "select id, img from r85_lob".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let loads = |h: &mut Harness<'_, PythiaApp>| first_result(h).grid.loads_in_progress();
+    // The dialog for row 1, kept open; row 2's meanwhile.
+    h.state_mut().test_sql_window().state.value_files.held = true;
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (0, 1));
+    }
+    wait_until(&mut h, "the dialog", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.value_files.is_busy())
+    });
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (1, 1));
+    }
+    h.run_steps(3);
+    let refused = loads(&mut h);
+    // Row 1's file can't be read.
+    let missing = std::env::temp_dir().join(format!("pythia-r85-{}-none", std::process::id()));
+    let before = message_count(&mut h);
+    let answer = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .answer
+        .take();
+    answer.expect("the dialog").send(Some(missing)).unwrap();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Load from file failed"), "{said}");
+    assert_eq!(
+        (refused, loads(&mut h)),
+        (1, 0),
+        "after refused, after failed"
+    );
+    h.state_mut().test_close_focused();
+}
+
 /// *Load from file…* (#293), from the context menu and the value editor of
 /// a result being edited, not of one that isn't: the file becomes the
 /// cell's pending change, shown by its size, and Undo takes it back; a

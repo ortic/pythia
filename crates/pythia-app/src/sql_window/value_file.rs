@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use pythia_db::{DbEvent, DbKind, DbRequest};
-use pythia_ui::{FileRequest, Loaded, SaveSource, SaveValue};
+use pythia_ui::{FileRequest, GridState, Loaded, SaveSource, SaveValue};
 
 use super::{BottomTab, Level, Message, SqlWindow};
 use crate::documents::{DocContext, Effects, Target, request_id};
@@ -33,6 +33,12 @@ pub struct ValueFiles {
     /// cancelled).
     #[cfg(test)]
     pub chosen: std::collections::VecDeque<Option<PathBuf>>,
+    /// The next dialog stays open in a test, until it answers through
+    /// `answer`.
+    #[cfg(test)]
+    pub held: bool,
+    #[cfg(test)]
+    pub answer: Option<mpsc::Sender<Option<PathBuf>>>,
     /// The file names the dialogs suggested.
     #[cfg(test)]
     pub suggested: Vec<String>,
@@ -54,15 +60,30 @@ impl ValueFiles {
         self.fetch.as_ref().is_some_and(|f| f.id == id)
     }
 
-    /// Opens the dialog for `request` of result `result`.
-    pub(super) fn ask(&mut self, result: u64, request: FileRequest) {
+    /// Opens the dialog for `request` of result `result`, whose grid is
+    /// `grid`. With a dialog open already, a load is refused and its grid
+    /// forgets it (#361).
+    pub(super) fn ask(&mut self, result: u64, request: FileRequest, grid: &mut GridState) {
         if self.pick.is_some() {
+            if let FileRequest::Load { load, .. } = request {
+                grid.cancel_load(load);
+            }
             return;
         }
         let (tx, path) = mpsc::channel();
         #[cfg(test)]
         if let FileRequest::Save(save) = &request {
             self.suggested.push(save.file_name.clone());
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.held) {
+            self.answer = Some(tx);
+            self.pick = Some(Pick {
+                result,
+                request,
+                path,
+            });
+            return;
         }
         #[cfg(test)]
         if let Some(chosen) = self.chosen.pop_front() {
@@ -125,6 +146,13 @@ enum Done {
         col: usize,
         loaded: Loaded,
         path: PathBuf,
+    },
+    /// The file of a load couldn't be read: the grid forgets the load
+    /// (#361).
+    NotLoaded {
+        result: u64,
+        load: u64,
+        error: String,
     },
     Failed(String),
 }
@@ -239,7 +267,11 @@ impl SqlWindow {
                             loaded,
                             path,
                         },
-                        Err(e) => Done::Failed(format!("Load from file failed: {e}")),
+                        Err(e) => Done::NotLoaded {
+                            result,
+                            load,
+                            error: format!("Load from file failed: {e}"),
+                        },
                     };
                     let _ = tx.send(done);
                 });
@@ -421,6 +453,16 @@ impl SqlWindow {
                         path.display()
                     )),
                 }
+            }
+            Done::NotLoaded {
+                result,
+                load,
+                error,
+            } => {
+                if let Some(r) = self.state.results.iter_mut().find(|r| r.id == result) {
+                    r.grid.cancel_load(load);
+                }
+                self.file_failed(error);
             }
             Done::Failed(text) => self.file_failed(text),
         }

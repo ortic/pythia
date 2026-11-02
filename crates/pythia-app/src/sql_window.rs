@@ -2816,7 +2816,7 @@ impl SqlWindow {
                 .show(ui);
                 state.selection_summary = out.selection_summary;
                 if let Some(request) = result.grid.take_file_request() {
-                    state.value_files.ask(result.id, request);
+                    state.value_files.ask(result.id, request, &mut result.grid);
                 }
                 if let Some(text) = result.grid.take_failed() {
                     state.messages.push(Message {

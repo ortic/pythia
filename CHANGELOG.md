@@ -1120,6 +1120,10 @@ All notable changes to Pythia are documented here. The format follows
   from file…* takes it back. A shorter text scrolls in its field, where
   one of some thousand characters made the dialog taller than the
   screen and put *Apply* out of reach.
+- A *Load from file…* that ends without a file is forgotten (#361): one
+  chosen while another file dialog was open, which does nothing, and one
+  whose file can't be read stayed among the result's loads in progress
+  for as long as it was shown.
 
 ## [0.10.0] - 2026-10-30
 
