@@ -513,56 +513,21 @@ fn ddl(
         ObjectType::View | ObjectType::MaterializedView => {
             on_path(pg, "", || view_ddl(pg, owner, name, object_type, end))?.ok_or_else(missing)
         }
-        // Each overload with its grants (#331).
+        // A routine's and a trigger's too: its argument and return types,
+        // its body's tables and functions, a trigger's table and function
+        // (#350).
         ObjectType::Function | ObjectType::Procedure => {
-            let rows = pg.rows(
-                "select pg_get_functiondef(p.oid), p.oid, \
-                        case p.prokind when 'p' then 'procedure ' else 'function ' end \
-                        || quote_ident(n.nspname) || '.' || quote_ident(p.proname) \
-                        || '(' || pg_get_function_identity_arguments(p.oid) || ')' \
-                   from pg_proc p \
-                   join pg_namespace n on n.oid = p.pronamespace \
-                  where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
-                  order by p.oid",
-                &[owner, name],
-            )?;
-            let mut overloads = Vec::new();
-            for row in rows {
-                if let [Some(definition), Some(oid), Some(on)] = row.as_slice() {
-                    let mut rest = String::new();
-                    grants(pg, &mut rest, Privileges::Routine, oid, on)?;
-                    overloads.push(followed(definition.trim_end(), &rest, end));
-                }
-            }
-            if overloads.is_empty() {
-                return Err(missing());
-            }
-            Ok(overloads.join("\n\n"))
+            on_path(pg, "", || routine_ddl(pg, owner, name, end))?.ok_or_else(missing)
         }
         ObjectType::Trigger => {
-            let rows = pg.rows(
-                "select pg_get_triggerdef(t.oid, true) from pg_trigger t \
-                   join pg_class c on c.oid = t.tgrelid \
-                   join pg_namespace n on n.oid = c.relnamespace \
-                  where n.nspname = $1 and t.tgname = $2 and not t.tgisinternal \
-                  order by c.relname",
-                &[owner, name],
-            )?;
-            let triggers: Vec<String> = rows
-                .into_iter()
-                .filter_map(first)
-                .map(|t| format!("{t}{end}"))
-                .collect();
-            if triggers.is_empty() {
-                return Err(missing());
-            }
-            Ok(triggers.join("\n\n"))
+            on_path(pg, "", || trigger_ddl(pg, owner, name, end))?.ok_or_else(missing)
         }
         ObjectType::Sequence => {
             let (owner, name) = stored(pg, owner, name)?;
-            let (oid, create) = sequence_ddl(pg, &owner, &name, true)?.ok_or_else(missing)?;
+            let (oid, create, note) = sequence_ddl(pg, &owner, &name, true)?.ok_or_else(missing)?;
             let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, &name));
             let mut rest = String::new();
+            comment_on(&mut rest, &on, note.as_deref());
             grants(pg, &mut rest, Privileges::Relation, &oid, &on)?;
             Ok(followed(&create, &rest, end))
         }
@@ -583,10 +548,80 @@ fn followed(ddl: &str, rest: &str, end: &str) -> String {
     }
 }
 
+/// `comment on <on> is …;` appended to `ddl`, where there is a comment.
+/// Each object's DDL has it after its `CREATE` and owner, before its
+/// grants, as tables and materialized views have it (#301, #354).
+fn comment_on(ddl: &mut String, on: &str, comment: Option<&str>) {
+    if let Some(comment) = comment {
+        ddl.push_str(&format!("\n\ncomment on {on} is {};", literal(comment)));
+    }
+}
+
+/// Each overload of a function or procedure with its [`OWNER`] (#353), its
+/// comment and its grants (#331), if there is one.
+fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+    let rows = pg.rows(
+        &format!(
+            "select pg_get_functiondef(p.oid), p.oid, \
+                    case p.prokind when 'p' then 'procedure ' else 'function ' end \
+                    || quote_ident(n.nspname) || '.' || quote_ident(p.proname) \
+                    || '(' || pg_get_function_identity_arguments(p.oid) || ')', \
+                    {OWNER}, obj_description(p.oid, 'pg_proc') \
+               from pg_proc p \
+               join pg_namespace n on n.oid = p.pronamespace \
+               join pg_roles r on r.oid = p.proowner \
+              where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
+              order by p.oid"
+        ),
+        &[owner, name],
+    )?;
+    let mut overloads = Vec::new();
+    for row in rows {
+        if let [Some(definition), Some(oid), Some(on), role, note] = row.as_slice() {
+            let mut rest = String::new();
+            if let Some(role) = role {
+                rest.push_str(&format!("\n\nalter {on} owner to {role};"));
+            }
+            comment_on(&mut rest, on, note.as_deref());
+            grants(pg, &mut rest, Privileges::Routine, oid, on)?;
+            overloads.push(followed(definition.trim_end(), &rest, end));
+        }
+    }
+    Ok((!overloads.is_empty()).then(|| overloads.join("\n\n")))
+}
+
+/// The triggers of the name on the schema's tables, each with its comment
+/// (#354), if there is one.
+fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+    let rows = pg.rows(
+        "select pg_get_triggerdef(t.oid, true), \
+                'trigger ' || quote_ident(t.tgname) || ' on ' \
+                || quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+                obj_description(t.oid, 'pg_trigger') \
+           from pg_trigger t \
+           join pg_class c on c.oid = t.tgrelid \
+           join pg_namespace n on n.oid = c.relnamespace \
+          where n.nspname = $1 and t.tgname = $2 and not t.tgisinternal \
+          order by c.relname",
+        &[owner, name],
+    )?;
+    let mut triggers = Vec::new();
+    for row in rows {
+        if let [Some(definition), Some(on), note] = row.as_slice() {
+            let mut rest = String::new();
+            comment_on(&mut rest, on, note.as_deref());
+            triggers.push(followed(definition, &rest, end));
+        }
+    }
+    Ok((!triggers.is_empty()).then(|| triggers.join("\n\n")))
+}
+
 /// A relation's storage parameters, then its TOAST table's as `toast.…`, as
 /// `with (…)` takes them (`c` is its `pg_class`); null without any. A value
 /// is quoted unless it is a name that needs no quotes, as `pg_get_indexdef`
-/// writes them: `fillfactor='70', autovacuum_enabled=off`.
+/// writes them: `fillfactor='70', autovacuum_enabled=off`. A view's options
+/// are its `security_barrier` and `security_invoker`; its check option has
+/// a clause of its own ([`CHECK_OPTION`]).
 const STORAGE: &str = "(select string_agg(p.name || '=' \
                                           || case when quote_ident(p.value) = p.value then p.value \
                                                   else quote_literal(p.value) end, \
@@ -594,11 +629,52 @@ const STORAGE: &str = "(select string_agg(p.name || '=' \
                           from (select false as toast, o.n, quote_ident(split_part(o.x, '=', 1)) as name, \
                                        substr(o.x, strpos(o.x, '=') + 1) as value \
                                   from unnest(c.reloptions) with ordinality o(x, n) \
+                                 where split_part(o.x, '=', 1) <> 'check_option' \
                                 union all \
                                 select true, o.n, 'toast.' || quote_ident(split_part(o.x, '=', 1)), \
                                        substr(o.x, strpos(o.x, '=') + 1) \
                                   from pg_class s cross join unnest(s.reloptions) with ordinality o(x, n) \
                                  where s.oid = c.reltoastrelid) p)";
+
+/// A view's check option, `local` or `cascaded`, kept with its options
+/// (`c` is its `pg_class`); null without one.
+const CHECK_OPTION: &str = "(select split_part(o.x, '=', 2) from unnest(c.reloptions) o(x) \
+                              where split_part(o.x, '=', 1) = 'check_option')";
+
+/// What the `CREATE` of a table, materialized view or view writes after its
+/// columns or its name where it isn't the default (#330, #352): ` using
+/// <method>` where it isn't the session's `default_table_access_method`,
+/// ` with (…)` with its [`STORAGE`] parameters, ` tablespace <name>` where
+/// it isn't the database's. `c` is its `pg_class`, `a` its `pg_am` and `t`
+/// its `pg_tablespace`, left joined; a view has none but its options.
+fn options() -> String {
+    format!(
+        "concat(case when a.amname <> current_setting('default_table_access_method') \
+                     then ' using ' || quote_ident(a.amname) end, \
+                ' with (' || {STORAGE} || ')', \
+                ' tablespace ' || quote_ident(t.spcname))"
+    )
+}
+
+/// `definition` with `clauses` before `tail`, the clauses it ends with,
+/// where `CREATE INDEX` or a constraint takes them: a tablespace before a
+/// `WHERE`, an index's parameters before `DEFERRABLE`. As it is where it
+/// doesn't end so.
+fn inserted(definition: &str, clauses: &str, tail: &str) -> String {
+    match definition.strip_suffix(tail) {
+        Some(head) if !clauses.is_empty() => format!("{head}{clauses}{tail}"),
+        _ => definition.to_owned(),
+    }
+}
+
+/// An object's owner where it isn't the role reading the DDL, null where
+/// it is (`r` is its `pg_roles`). The DDL of each object with an owner
+/// gives it back with `alter … owner to` after its `CREATE`, before its
+/// indexes, comments and grants, which are then the owner's (#330, #353):
+/// run elsewhere, a copy would belong to the role that ran it. Edit's
+/// CREATE OR REPLACE keeps the owner, and the line then sets the one it
+/// has, which changes and checks nothing.
+const OWNER: &str = "case when r.rolname <> current_user then quote_ident(r.rolname) end";
 
 /// `CREATE` of a view or materialized view as stored, if there is one. A
 /// view is replaced in place, but Edit drops a materialized view and
@@ -607,9 +683,12 @@ const STORAGE: &str = "(select string_agg(p.name || '=' \
 /// it, populated, with the default storage (#330). So a materialized view's
 /// `CREATE` has its access method, storage parameters and tablespace where
 /// they aren't the defaults, and `with no data` where it has none; its
-/// owner follows where it isn't the role reading the DDL. A role that can
-/// drop the view but can't give it back to its owner gets an error, and
-/// Edit's block leaves the view as it was.
+/// [`OWNER`] follows, a view's too (#353), and its comments, a view's too
+/// (#354). A role that can drop the view but can't give it back to its
+/// owner gets an error, and Edit's block leaves the view as it was. A
+/// view's `CREATE` has its options and its check option, which
+/// `pg_get_viewdef` leaves out: CREATE OR REPLACE without them resets
+/// them, a security barrier view's too (#351).
 fn view_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -621,17 +700,13 @@ fn view_ddl(
     let Some(row) = pg.first(
         &format!(
             "select pg_get_viewdef(c.oid, true), c.oid, obj_description(c.oid, 'pg_class'), \
-                    c.relispopulated, \
-                    concat(case when a.amname <> current_setting('default_table_access_method') \
-                                then ' using ' || quote_ident(a.amname) end, \
-                           ' with (' || {STORAGE} || ')', \
-                           ' tablespace ' || quote_ident(t.spcname)), \
-                    case when r.rolname <> current_user then quote_ident(r.rolname) end \
+                    c.relispopulated, {}, {OWNER}, {CHECK_OPTION} \
                from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                join pg_roles r on r.oid = c.relowner \
                left join pg_am a on a.oid = c.relam \
                left join pg_tablespace t on t.oid = c.reltablespace \
-              where n.nspname = $1 and c.relname = $2"
+              where n.nspname = $1 and c.relname = $2",
+            options()
         ),
         &[&owner, &name],
     )?
@@ -648,68 +723,72 @@ fn view_ddl(
     let populated = next().as_deref() != Some("f");
     let storage = next().unwrap_or_default();
     let role = next();
+    let check = next();
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
     let definition = definition.trim_end().trim_end_matches(';');
     let ddl = if object_type == ObjectType::View {
-        format!("create or replace view {qualified} as\n{definition}")
+        let check = check
+            .map(|check| format!("\nwith {check} check option"))
+            .unwrap_or_default();
+        format!("create or replace view {qualified}{storage} as\n{definition}{check}")
     } else {
         let data = if populated { "" } else { "\nwith no data" };
         format!("create materialized view {qualified}{storage} as\n{definition}{data}")
     };
     let mut rest = String::new();
-    if object_type == ObjectType::MaterializedView {
-        if let Some(role) = role {
-            rest.push_str(&format!(
-                "\n\nalter materialized view {qualified} owner to {role};"
-            ));
-        }
-        indexes_and_comments(
-            pg,
-            &mut rest,
-            &oid,
-            "materialized view",
-            &qualified,
-            comment,
-        )?;
+    let kind = object_type.dictionary_name().to_lowercase();
+    if let Some(role) = role {
+        rest.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    // A view's too, for a copy: Edit's CREATE OR REPLACE keeps them anyway
-    // (#331).
+    // A view's comments and grants too, for a copy: Edit's CREATE OR
+    // REPLACE keeps them anyway (#331, #354). A view has no indexes.
+    indexes_and_comments(pg, &mut rest, &oid, &kind, &qualified, comment)?;
     grants(pg, &mut rest, Privileges::Relation, &oid, &qualified)?;
     Ok(Some(followed(&ddl, &rest, end)))
 }
 
-/// `CREATE SEQUENCE` of a sequence as stored, without its `;`, and its oid,
-/// if there is one. `owned` names the column that owns it (`serial`, `OWNED
-/// BY`), so that a copy goes with the copy's column (#307); a table's DDL
-/// makes the column the owner after the table. An identity column's
-/// sequence is made by its table's DDL (#263): its own says so and sets the
-/// identity's options, which next to a copy of the table gives the copy's
-/// identity the same and elsewhere fails, where a `CREATE SEQUENCE` made a
-/// sequence no column uses (#332).
+/// `CREATE SEQUENCE` of a sequence as stored, without its `;`, its oid and
+/// its comment (#354), if there is one. `owned` names the column that owns
+/// it (`serial`, `OWNED BY`), so that a copy goes with the copy's column
+/// (#307), and its [`OWNER`] (#353), which must be the table's: `alter
+/// sequence … owner to`, then `owned by`. A table's DDL makes the column
+/// the owner after the table, and its owner the sequence's with the
+/// table's. An identity column's sequence is made by its table's DDL
+/// (#263): its own says so and sets the identity's options, which next to
+/// a copy of the table gives the copy's identity the same and elsewhere
+/// fails, where a `CREATE SEQUENCE` made a sequence no column uses (#332).
+/// An unlogged sequence, as an unlogged table's `serial` ones are, is made
+/// so (#352).
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
     name: &str,
     owned: bool,
-) -> Result<Option<(String, String)>, DbError> {
+) -> Result<Option<(String, String, Option<String>)>, DbError> {
     let row = pg.first(
-        "select c.oid, d.deptype, format_type(s.seqtypid, null), s.seqincrement, s.seqmin, \
-                s.seqmax, s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
-           from pg_sequence s join pg_class c on c.oid = s.seqrelid \
-           join pg_namespace n on n.oid = c.relnamespace \
-           left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
-                and d.refclassid = 'pg_class'::regclass and d.deptype in ('a', 'i') \
-           left join pg_class t on t.oid = d.refobjid \
-           left join pg_namespace tn on tn.oid = t.relnamespace \
-           left join pg_attribute a on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
-          where n.nspname = $1 and c.relname = $2",
+        &format!(
+            "select c.oid, d.deptype, c.relpersistence = 'u', {OWNER}, \
+                    obj_description(c.oid, 'pg_class'), format_type(s.seqtypid, null), \
+                    s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle, \
+                    tn.nspname, t.relname, a.attname \
+               from pg_sequence s join pg_class c on c.oid = s.seqrelid \
+               join pg_namespace n on n.oid = c.relnamespace \
+               join pg_roles r on r.oid = c.relowner \
+               left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
+                    and d.refclassid = 'pg_class'::regclass and d.deptype in ('a', 'i') \
+               left join pg_class t on t.oid = d.refobjid \
+               left join pg_namespace tn on tn.oid = t.relnamespace \
+               left join pg_attribute a on a.attrelid = d.refobjid and a.attnum = d.refobjsubid \
+              where n.nspname = $1 and c.relname = $2"
+        ),
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let (head, row) = row.split_at(2);
+        let (head, row) = row.split_at(5);
         let (v, column) = row.split_at(7);
         let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
         let oid = head[0].clone().unwrap_or_default();
+        let note = head[4].clone();
         let column = match column {
             [Some(schema), Some(table), Some(column)] => Some((
                 Dialect::POSTGRES.qualified(schema, table),
@@ -732,16 +811,21 @@ fn sequence_ddl(
                 v[5],
                 if v[6] == "t" { "cycle" } else { "no cycle" }
             );
-            return (oid, alter);
+            return (oid, alter, note);
         }
+        let qualified = Dialect::POSTGRES.qualified(owner, name);
         let owned_by = match column {
-            Some((table, column)) if owned => format!("\n  owned by {table}.{column}"),
-            _ => String::new(),
+            Some((table, column)) if owned => Some(format!("owned by {table}.{column}")),
+            _ => None,
         };
-        let create = format!(
-            "create sequence {} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
-             start with {} cache {}{}{owned_by}",
-            Dialect::POSTGRES.qualified(owner, name),
+        let mut create = format!(
+            "create {}sequence {qualified} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
+             start with {} cache {}{}",
+            if head[2].as_deref() == Some("t") {
+                "unlogged "
+            } else {
+                ""
+            },
             v[0],
             v[1],
             v[2],
@@ -750,7 +834,17 @@ fn sequence_ddl(
             v[5],
             if v[6] == "t" { " cycle" } else { "" }
         );
-        (oid, create)
+        match (head[3].as_deref().filter(|_| owned), owned_by) {
+            (Some(role), owned_by) => {
+                create.push_str(&format!(";\n\nalter sequence {qualified} owner to {role}"));
+                if let Some(owned_by) = owned_by {
+                    create.push_str(&format!(";\n\nalter sequence {qualified} {owned_by}"));
+                }
+            }
+            (None, Some(owned_by)) => create.push_str(&format!("\n  {owned_by}")),
+            (None, None) => {}
+        }
+        (oid, create, note)
     }))
 }
 
@@ -779,18 +873,28 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
 
 /// The sequences its columns own, `CREATE TABLE` with its columns and
 /// constraints, the sequences' owners, then its other indexes and
-/// comments, its grants and the sequences'. A serial column's sequence goes
-/// with the table, as `pg_dump` writes it: run elsewhere, the DDL makes the
-/// copy a sequence of its own (#263), which roles use as they use the
-/// table's (#331).
+/// comments, its grants and the sequences' comments (#354) and grants. A
+/// serial column's sequence goes with the table, as `pg_dump` writes it:
+/// run elsewhere, the DDL makes the copy a sequence of its own (#263),
+/// which roles use as they use the table's (#331). The table is unlogged where it is, with its access
+/// method, storage parameters and tablespace where they aren't the
+/// defaults, as a materialized view (#352). Its [`OWNER`] comes after the
+/// sequences are its columns', so that they go to it with the table (#353).
 fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let (owner, name) = stored(pg, owner, name)?;
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
     let table = pg
         .first(
-            "select c.oid, c.relkind, pg_get_partkeydef(c.oid), obj_description(c.oid, 'pg_class') \
-               from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-              where n.nspname = $1 and c.relname = $2",
+            &format!(
+                "select c.oid, c.relkind, pg_get_partkeydef(c.oid), \
+                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {}, {OWNER} \
+                   from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                   join pg_roles r on r.oid = c.relowner \
+                   left join pg_am a on a.oid = c.relam \
+                   left join pg_tablespace t on t.oid = c.reltablespace \
+                  where n.nspname = $1 and c.relname = $2",
+                options()
+            ),
             &[&owner, &name],
         )?
         .ok_or_else(|| DbError::new(format!("No table {owner}.{name}")))?;
@@ -798,6 +902,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let oid = table.next().flatten().unwrap_or_default();
     let partitions = table.nth(1).flatten();
     let comment = table.next().flatten();
+    let unlogged = table.next().flatten().as_deref() == Some("t");
+    let options = table.next().flatten().unwrap_or_default();
+    let role = table.next().flatten();
     let mut lines: Vec<String> = pg
         .rows(
             &format!(
@@ -815,32 +922,48 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .into_iter()
         .filter_map(first)
         .collect();
-    lines.extend(
-        pg.rows(
-            &format!(
-                "select 'constraint ' || quote_ident(conname) || ' ' || pg_get_constraintdef(oid, true) \
-                   from pg_constraint where conrelid = {oid} and contype in ('p', 'u', 'f', 'c', 'x') \
-                  order by position(contype::text in 'pucfx'), conname"
-            ),
-            &[],
-        )?
-        .into_iter()
-        .filter_map(first),
-    );
+    // pg_get_constraintdef leaves out the storage parameters of a key's
+    // index and the tablespace of a key's or exclusion constraint's (#352).
+    let constraints = pg.rows(
+        &format!(
+            "select 'constraint ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid, true), \
+                    concat(case when k.contype in ('p', 'u') then ' WITH (' || {STORAGE} || ')' end, \
+                           ' USING INDEX TABLESPACE ' || quote_ident(t.spcname)), \
+                    concat(' WHERE (' || pg_get_expr(i.indpred, i.indrelid, true) || ')', \
+                           case when k.condeferrable then ' DEFERRABLE' end, \
+                           case when k.condeferred then ' INITIALLY DEFERRED' end) \
+               from pg_constraint k \
+               left join pg_index i on i.indexrelid = k.conindid and k.contype in ('p', 'u', 'x') \
+               left join pg_class c on c.oid = i.indexrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              where k.conrelid = {oid} and k.contype in ('p', 'u', 'f', 'c', 'x') \
+              order by position(k.contype::text in 'pucfx'), k.conname"
+        ),
+        &[],
+    )?;
+    lines.extend(constraints.into_iter().filter_map(|row| {
+        let mut values = row.into_iter().map(Option::unwrap_or_default);
+        let (definition, index, tail) = (values.next()?, values.next()?, values.next()?);
+        Some(inserted(&definition, &index, &tail))
+    }));
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
+    let mut notes = Vec::new();
     for (_, sequence, _) in &sequences {
-        if let Some((_, create)) = sequence_ddl(pg, &owner, sequence, false)? {
+        if let Some((_, create, note)) = sequence_ddl(pg, &owner, sequence, false)? {
             ddl.push_str(&format!("{create};\n\n"));
+            notes.push(note);
         }
     }
     ddl.push_str(&format!(
-        "create table {qualified} (\n    {}\n)",
+        "create {}table {qualified} (\n    {}\n)",
+        if unlogged { "unlogged " } else { "" },
         lines.join(",\n    ")
     ));
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
+    ddl.push_str(&options);
     ddl.push(';');
     for (_, sequence, column) in &sequences {
         ddl.push_str(&format!(
@@ -849,18 +972,24 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             Dialect::POSTGRES.quote_ident(column)
         ));
     }
+    if let Some(role) = role {
+        ddl.push_str(&format!("\n\nalter table {qualified} owner to {role};"));
+    }
     indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
-    for (sequence_oid, sequence, _) in &sequences {
+    for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
+        comment_on(&mut ddl, &on, note.as_deref());
         grants(pg, &mut ddl, Privileges::Relation, sequence_oid, &on)?;
     }
     Ok(ddl)
 }
 
 /// The relation's indexes that no constraint makes, then the comments on
-/// it (a `kind`: `table`, `materialized view`) and on its columns, each
-/// statement with its `;`, appended to `ddl`.
+/// it (a `kind`: `table`, `view`, `materialized view`) and on its columns,
+/// each statement with its `;`, appended to `ddl`. An index in a
+/// tablespace that isn't the database's has it, which `pg_get_indexdef`
+/// leaves out (#352).
 fn indexes_and_comments(
     pg: &Pg<'_>,
     ddl: &mut String,
@@ -871,7 +1000,11 @@ fn indexes_and_comments(
 ) -> Result<(), DbError> {
     let indexes = pg.rows(
         &format!(
-            "select pg_get_indexdef(i.indexrelid) from pg_index i \
+            "select pg_get_indexdef(i.indexrelid), \
+                    coalesce(' TABLESPACE ' || quote_ident(t.spcname), ''), \
+                    coalesce(' WHERE ' || pg_get_expr(i.indpred, i.indrelid), '') \
+               from pg_index i join pg_class c on c.oid = i.indexrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
               where i.indrelid = {oid} \
                 and not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid \
                                    and k.conrelid = i.indrelid) \
@@ -879,15 +1012,12 @@ fn indexes_and_comments(
         ),
         &[],
     )?;
-    for index in indexes.into_iter().filter_map(first) {
-        ddl.push_str(&format!("\n\n{index};"));
+    for row in indexes {
+        if let [Some(index), Some(tablespace), Some(tail)] = row.as_slice() {
+            ddl.push_str(&format!("\n\n{};", inserted(index, tablespace, tail)));
+        }
     }
-    if let Some(comment) = comment {
-        ddl.push_str(&format!(
-            "\n\ncomment on {kind} {qualified} is {};",
-            literal(&comment)
-        ));
-    }
+    comment_on(ddl, &format!("{kind} {qualified}"), comment.as_deref());
     let comments = pg.rows(
         &format!(
             "select quote_ident(attname), col_description(attrelid, attnum) from pg_attribute \

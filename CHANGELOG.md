@@ -1112,6 +1112,42 @@ All notable changes to Pythia are documented here. The format follows
   the statement's, or the fetch's, as one without rows first is. An error
   after a result of a statement with several, which comes the same way
   on MySQL, PostgreSQL and SQL Server, is too.
+- PostgreSQL: the DDL of a trigger, function or procedure names every
+  table, function and type with its schema (#350), as a view's does
+  since #329. It left the schema out where the connection's search path
+  found them, `ON t … EXECUTE FUNCTION tf()` for `public.t`, so that
+  *Edit* in a SQL window whose search path finds another `t` first made
+  the trigger on that table, and a routine whose argument types it finds
+  elsewhere was made again beside the one edited, with those types.
+- PostgreSQL: *Edit* of a view keeps its `security_barrier`,
+  `security_invoker` and check option (#351). The view's DDL left them
+  out, and its `create or replace view` reset them: a security barrier
+  view let the functions of a query see the rows it filters out, a
+  security invoker view read its tables as its owner again, and a view
+  `with check option` took rows it doesn't show. The DDL now has them,
+  `with (security_barrier='true') as … with local check option`.
+- PostgreSQL: a table's DDL makes it as it is (#352), as a materialized
+  view's does since #330: `create unlogged table` where it is unlogged,
+  its `serial` sequences too, with its access method, storage parameters
+  (its TOAST table's too) and tablespace where they aren't the defaults,
+  and each index in its tablespace, a primary key's or unique
+  constraint's with its storage parameters. Run elsewhere, the copy was
+  logged, `heap`, with the default parameters, and it and its indexes
+  were in the database's tablespace. A materialized view's indexes keep
+  their tablespace too.
+- PostgreSQL: the DDL of a table, view, sequence, function or procedure
+  gives it its owner where that isn't you (#353), `alter … owner to …`
+  after the `CREATE`, as a materialized view's does since #330. Run
+  elsewhere, a copy belonged to the role that ran it, and so did a
+  table's `serial` sequences; its grants then revoked what the owner had
+  given up from a role that didn't have it. A sequence owned by a column
+  gets its owner before `owned by`, which needs the table's. *Edit*
+  replaces views and routines in place, keeping their owner, so the line
+  changes nothing there.
+- PostgreSQL: the DDL of a view, sequence, function, procedure or
+  trigger has its comments (#354), a view's columns' too, as a table's
+  and a materialized view's have since #301, and a table's has its
+  `serial` sequences'. Run elsewhere, a copy came without them.
 
 ## [0.10.0] - 2026-10-30
 

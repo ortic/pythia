@@ -1488,6 +1488,527 @@ fn a_views_ddl_names_its_tables_with_their_schemas() {
     h.ok("drop function r73_vp_f(int)");
 }
 
+/// The DDL of a trigger and of a routine names its tables, functions and
+/// types with their schemas, as a view's does (#329): run with another
+/// search path, by Edit in a window that set one, the trigger stays on its
+/// table and calls its function, and each routine is replaced rather than
+/// made again with other argument types (#350).
+#[test]
+fn the_ddl_of_triggers_and_routines_names_their_schemas() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r81_sp, r81_sp_other cascade");
+    h.ok("drop table if exists r81_sp_t");
+    h.ok("drop function if exists r81_sp_tf(), r81_sp_g(int)");
+    h.ok("drop domain if exists r81_sp_d");
+    h.ok("create schema r81_sp");
+    h.ok("create schema r81_sp_other");
+    for (owner, n) in [(schema.as_str(), 1), ("r81_sp_other", 2)] {
+        h.ok(&format!("create table {owner}.r81_sp_t (n int)"));
+        h.ok(&format!("create domain {owner}.r81_sp_d as int"));
+        h.ok(&format!(
+            "create function {owner}.r81_sp_g(x int) returns int language sql \
+             as 'select x * {n}'"
+        ));
+        h.ok(&format!(
+            "create function {owner}.r81_sp_tf() returns trigger language plpgsql \
+             as 'begin return new; end'"
+        ));
+    }
+    // Names the session's path finds.
+    h.ok(
+        "create trigger r81_sp_tr before insert on r81_sp_t for each row \
+          when (r81_sp_g(new.n) > 0) execute function r81_sp_tf()",
+    );
+    h.ok(
+        "create function r81_sp.r81_sp_f(x r81_sp_d) returns r81_sp_d language sql \
+          return r81_sp_g(x)",
+    );
+    h.ok("revoke execute on function r81_sp.r81_sp_f(r81_sp_d) from public");
+    h.ok("create procedure r81_sp.r81_sp_p(x r81_sp_d) language sql \
+          begin atomic insert into r81_sp_t values (r81_sp_g(x)); end");
+    let trigger = ddl_of(&mut h, &schema, "r81_sp_tr", ObjectType::Trigger);
+    assert_eq!(
+        trigger,
+        format!(
+            "CREATE TRIGGER r81_sp_tr BEFORE INSERT ON {schema}.r81_sp_t FOR EACH ROW \
+             WHEN ({schema}.r81_sp_g(new.n) > 0) EXECUTE FUNCTION {schema}.r81_sp_tf();"
+        )
+    );
+    let function = ddl_of(&mut h, "r81_sp", "r81_sp_f", ObjectType::Function);
+    for part in [
+        format!("r81_sp.r81_sp_f(x {schema}.r81_sp_d)\n RETURNS {schema}.r81_sp_d\n"),
+        format!("RETURN {schema}.r81_sp_g("),
+        format!("revoke execute on function r81_sp.r81_sp_f(x {schema}.r81_sp_d) from public;"),
+    ] {
+        assert!(function.contains(&part), "{function}");
+    }
+    let procedure = ddl_of(&mut h, "r81_sp", "r81_sp_p", ObjectType::Procedure);
+    for part in [
+        format!("r81_sp.r81_sp_p(IN x {schema}.r81_sp_d)\n"),
+        format!("INSERT INTO {schema}.r81_sp_t"),
+        format!("{schema}.r81_sp_g("),
+    ] {
+        assert!(procedure.contains(&part), "{procedure}");
+    }
+    // As Edit runs them.
+    h.ok(&format!("set search_path = r81_sp_other, {schema}"));
+    run_ddl(
+        &mut h,
+        &trigger.replacen("CREATE TRIGGER", "CREATE OR REPLACE TRIGGER", 1),
+        "",
+        "",
+    );
+    run_ddl(&mut h, &function, "", "");
+    run_ddl(&mut h, &procedure, "", "");
+    h.ok("reset search_path");
+    assert_eq!(
+        h.scalar(
+            "select string_agg(c.relnamespace::regnamespace || '.' || c.relname || ' ' \
+                               || p.pronamespace::regnamespace || '.' || p.proname, ', ') \
+               from pg_trigger t join pg_class c on c.oid = t.tgrelid \
+               join pg_proc p on p.oid = t.tgfoid \
+              where t.tgname = 'r81_sp_tr'"
+        ),
+        Some(format!("{schema}.r81_sp_t {schema}.r81_sp_tf")),
+        "{trigger}"
+    );
+    assert_eq!(
+        h.scalar(
+            "select string_agg(p.proname || '(' || t.typnamespace::regnamespace || ')', ', ' \
+                               order by p.proname, t.typnamespace::regnamespace::text) \
+               from pg_proc p join pg_type t on t.oid = p.proargtypes[0] \
+              where p.pronamespace = 'r81_sp'::regnamespace"
+        ),
+        Some(format!("r81_sp_f({schema}), r81_sp_p({schema})")),
+        "{function}\n\n{procedure}"
+    );
+    assert_eq!(h.scalar("select r81_sp.r81_sp_f(3)").as_deref(), Some("3"));
+    h.ok("drop schema r81_sp, r81_sp_other cascade");
+    h.ok("drop table r81_sp_t");
+    h.ok("drop function r81_sp_tf(), r81_sp_g(int)");
+    h.ok("drop domain r81_sp_d");
+}
+
+/// A view's DDL keeps its security_barrier, security_invoker and check
+/// option, which pg_get_viewdef leaves out: Edit's CREATE OR REPLACE
+/// without them reset them (#351). Run in place, as Edit runs it, and
+/// in another schema, the views have the options they had.
+#[test]
+fn a_views_ddl_keeps_its_security_and_check_option() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_vo, r81_vo_copy cascade");
+    h.ok("create schema r81_vo");
+    h.ok("create schema r81_vo_copy");
+    for schema in ["r81_vo", "r81_vo_copy"] {
+        h.ok(&format!("create table {schema}.r81_t (n int)"));
+    }
+    h.ok("create view r81_vo.r81_barrier with (security_barrier) as \
+          select n from r81_vo.r81_t where n > 0 with local check option");
+    h.ok(
+        "create view r81_vo.r81_invoker with (security_invoker = true, security_barrier = false) \
+          as select n from r81_vo.r81_barrier with cascaded check option",
+    );
+    h.ok("create view r81_vo.r81_plain as select n from r81_vo.r81_t");
+    let barrier = ddl_of(&mut h, "r81_vo", "r81_barrier", ObjectType::View);
+    assert_eq!(
+        barrier,
+        "create or replace view r81_vo.r81_barrier with (security_barrier='true') as\n \
+         SELECT n\n   FROM r81_vo.r81_t\n  WHERE n > 0\nwith local check option;"
+    );
+    let invoker = ddl_of(&mut h, "r81_vo", "r81_invoker", ObjectType::View);
+    assert!(
+        invoker.starts_with(
+            "create or replace view r81_vo.r81_invoker \
+             with (security_invoker='true', security_barrier='false') as\n"
+        ),
+        "{invoker}"
+    );
+    assert!(
+        invoker.ends_with("\nwith cascaded check option;"),
+        "{invoker}"
+    );
+    let plain = ddl_of(&mut h, "r81_vo", "r81_plain", ObjectType::View);
+    assert_eq!(
+        plain,
+        "create or replace view r81_vo.r81_plain as\n SELECT n\n   FROM r81_vo.r81_t;"
+    );
+    let options = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(relname || ' ' || coalesce(array_to_string(reloptions, ','), '-'), \
+                               '; ' order by relname) \
+               from pg_class where relnamespace = '{schema}'::regnamespace and relkind = 'v'"
+        ))
+    };
+    let was = options(&mut h, "r81_vo");
+    assert_eq!(
+        was.as_deref(),
+        Some(
+            "r81_barrier security_barrier=true,check_option=local; \
+             r81_invoker security_invoker=true,security_barrier=false,check_option=cascaded; \
+             r81_plain -"
+        )
+    );
+    for ddl in [&barrier, &invoker, &plain] {
+        run_ddl(&mut h, ddl, "", "");
+    }
+    assert_eq!(options(&mut h, "r81_vo"), was, "{barrier}\n\n{invoker}");
+    for ddl in [&barrier, &invoker, &plain] {
+        run_ddl(&mut h, ddl, "r81_vo.", "r81_vo_copy.");
+    }
+    assert_eq!(
+        options(&mut h, "r81_vo_copy"),
+        was,
+        "{barrier}\n\n{invoker}"
+    );
+    h.fails("insert into r81_vo_copy.r81_barrier values (-1)");
+    h.ok("drop schema r81_vo, r81_vo_copy cascade");
+}
+
+/// A table's DDL makes it as it is, as a materialized view's does (#330):
+/// unlogged where it is, its serial sequence too, with its access method,
+/// storage parameters (its TOAST table's too) and tablespace where they
+/// aren't the defaults, and each index in its tablespace, a constraint's
+/// with its storage parameters. Run in another schema, the copy is the
+/// same (#352).
+#[test]
+fn a_tables_ddl_keeps_its_storage() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r81_st, r81_st_copy cascade");
+    h.ok("drop tablespace if exists r81_space");
+    h.ok("drop access method if exists r81_heap");
+    h.ok("create schema r81_st");
+    h.ok("create schema r81_st_copy");
+    // A tablespace in the data directory, as tests make them.
+    h.ok("set allow_in_place_tablespaces = on");
+    h.ok("create tablespace r81_space location ''");
+    h.ok("reset allow_in_place_tablespaces");
+    h.ok("create access method r81_heap type table handler heap_tableam_handler");
+    h.ok(
+        "create unlogged table r81_st.r81_t (id serial, n int, s text, \
+         constraint r81_t_pk primary key (id) with (fillfactor = 80) \
+           using index tablespace r81_space, \
+         constraint r81_t_n unique (n) using index tablespace r81_space deferrable, \
+         constraint r81_t_x exclude (s with =) with (fillfactor = 50) \
+           using index tablespace r81_space where (n > 0)) \
+         using r81_heap with (fillfactor = 70, toast.autovacuum_enabled = false) \
+         tablespace r81_space",
+    );
+    h.ok(
+        "create index r81_t_s on r81_st.r81_t (s) with (fillfactor = 60) \
+          tablespace r81_space where n > 0",
+    );
+    h.ok("create index r81_t_ns on r81_st.r81_t (n, s) tablespace r81_space");
+    h.ok("create table r81_st.r81_plain (n int primary key, s text)");
+    h.ok("create index r81_plain_s on r81_st.r81_plain (s)");
+    h.ok(
+        "create table r81_st.r81_parts (n int, primary key (n) with (fillfactor = 90)) \
+          partition by range (n) tablespace r81_space",
+    );
+    let t = ddl_of(&mut h, "r81_st", "r81_t", ObjectType::Table);
+    for part in [
+        "create unlogged sequence r81_st.r81_t_id_seq as integer\n",
+        "create unlogged table r81_st.r81_t (\n",
+        "constraint r81_t_pk PRIMARY KEY (id) WITH (fillfactor='80') \
+         USING INDEX TABLESPACE r81_space,\n",
+        "constraint r81_t_n UNIQUE (n) USING INDEX TABLESPACE r81_space DEFERRABLE,\n",
+        "constraint r81_t_x EXCLUDE USING btree (s WITH =) WITH (fillfactor='50') \
+         USING INDEX TABLESPACE r81_space WHERE (n > 0)\n",
+        "\n) using r81_heap with (fillfactor='70', toast.autovacuum_enabled='false') \
+         tablespace r81_space;",
+        "CREATE INDEX r81_t_s ON r81_st.r81_t USING btree (s) WITH (fillfactor='60') \
+         TABLESPACE r81_space WHERE (n > 0);",
+        "CREATE INDEX r81_t_ns ON r81_st.r81_t USING btree (n, s) TABLESPACE r81_space;",
+    ] {
+        assert!(t.contains(part), "{t}");
+    }
+    let plain = ddl_of(&mut h, "r81_st", "r81_plain", ObjectType::Table);
+    for default in [
+        "unlogged",
+        " using ",
+        " with (",
+        "WITH (",
+        "tablespace",
+        "TABLESPACE",
+    ] {
+        assert!(!plain.contains(default), "{plain}");
+    }
+    let parts = ddl_of(&mut h, "r81_st", "r81_parts", ObjectType::Table);
+    for part in [
+        "constraint r81_parts_pkey PRIMARY KEY (n) WITH (fillfactor='90')\n",
+        "\n) partition by RANGE (n) tablespace r81_space;",
+    ] {
+        assert!(parts.contains(part), "{parts}");
+    }
+    for ddl in [&t, &plain, &parts] {
+        run_ddl(&mut h, ddl, "r81_st.", "r81_st_copy.");
+    }
+    let state = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relkind, c.relpersistence, c.reloptions, \
+                                         s.reloptions, coalesce(t.spcname, '-'), \
+                                         coalesce(a.amname, '-')), \
+                               '; ' order by c.relname) \
+               from pg_class c left join pg_am a on a.oid = c.relam \
+               left join pg_class s on s.oid = c.reltoastrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              where c.relnamespace = '{schema}'::regnamespace"
+        ))
+    };
+    let was = state(&mut h, "r81_st");
+    for relation in [
+        "r81_t r u {fillfactor=70} {autovacuum_enabled=false} r81_space r81_heap",
+        "r81_t_id_seq S u - -",
+        "r81_t_pk i u {fillfactor=80} r81_space btree",
+        "r81_t_s i u {fillfactor=60} r81_space btree",
+        "r81_parts p p r81_space -",
+        "r81_parts_pkey I p {fillfactor=90} - btree",
+    ] {
+        assert!(
+            was.as_deref().is_some_and(|w| w.contains(relation)),
+            "{was:?}"
+        );
+    }
+    assert_eq!(state(&mut h, "r81_st_copy"), was, "{t}\n\n{parts}");
+    h.ok("drop schema r81_st, r81_st_copy cascade");
+    h.ok("drop tablespace r81_space");
+    h.ok("drop access method r81_heap");
+}
+
+/// The DDL of a table, a view, a sequence and a routine gives it its owner
+/// where that isn't the role reading it, as a materialized view's does
+/// (#330): run in another schema, the copies have the same owners, a
+/// table's serial sequence too, and the privileges an owner gave up stay
+/// revoked (#353). Those of the role reading it have none.
+#[test]
+fn the_ddl_keeps_the_owner() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r81_ow, r81_ow_copy cascade");
+    h.ok("drop role if exists \"R81 Owner\"");
+    h.ok("create role \"R81 Owner\"");
+    h.ok("create schema r81_ow");
+    h.ok("create schema r81_ow_copy");
+    for sql in [
+        "create table r81_ow.r81_t (id serial, n int)",
+        "alter table r81_ow.r81_t owner to \"R81 Owner\"",
+        "revoke truncate on r81_ow.r81_t from \"R81 Owner\"",
+        // A sequence a column owns has the table's owner.
+        "create sequence r81_ow.r81_n",
+        "alter sequence r81_ow.r81_n owner to \"R81 Owner\"",
+        "alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n",
+        "create sequence r81_ow.r81_free",
+        "alter sequence r81_ow.r81_free owner to \"R81 Owner\"",
+        "create view r81_ow.r81_v as select n from r81_ow.r81_t",
+        "alter view r81_ow.r81_v owner to \"R81 Owner\"",
+        "create function r81_ow.r81_f(x int) returns int language sql as 'select x'",
+        "alter function r81_ow.r81_f(int) owner to \"R81 Owner\"",
+        "create function r81_ow.r81_f(x text) returns text language sql as 'select x'",
+        "create procedure r81_ow.r81_p() language sql as 'select 1'",
+        "alter procedure r81_ow.r81_p() owner to \"R81 Owner\"",
+        "create view r81_ow.r81_mine as select 1 as one",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r81_ow", "r81_t", ObjectType::Table);
+    let owned = table.find("alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n;");
+    let owner = table.find("\n\nalter table r81_ow.r81_t owner to \"R81 Owner\";\n\n");
+    let revoke = table.find("revoke truncate on r81_ow.r81_t from \"R81 Owner\";");
+    assert!(
+        owned.is_some() && owned < owner && owner < revoke,
+        "{table}"
+    );
+    let function = ddl_of(&mut h, "r81_ow", "r81_f", ObjectType::Function);
+    assert!(
+        function.contains(
+            "$function$;\n\nalter function r81_ow.r81_f(x integer) owner to \"R81 Owner\";"
+        ),
+        "{function}"
+    );
+    assert_eq!(function.matches("owner to").count(), 1, "{function}");
+    let n = ddl_of(&mut h, "r81_ow", "r81_n", ObjectType::Sequence);
+    assert!(
+        n.ends_with(
+            "\n  start with 1 cache 1;\n\n\
+             alter sequence r81_ow.r81_n owner to \"R81 Owner\";\n\n\
+             alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n;"
+        ),
+        "{n}"
+    );
+    let mine = ddl_of(&mut h, "r81_ow", "r81_mine", ObjectType::View);
+    assert!(!mine.contains("owner to"), "{mine}");
+    let mut ddls = vec![table];
+    for (name, object_type) in [
+        ("r81_free", ObjectType::Sequence),
+        ("r81_v", ObjectType::View),
+        ("r81_f", ObjectType::Function),
+        ("r81_p", ObjectType::Procedure),
+        ("r81_mine", ObjectType::View),
+    ] {
+        ddls.push(ddl_of(&mut h, "r81_ow", name, object_type));
+    }
+    for ddl in &ddls {
+        run_ddl(&mut h, ddl, "r81_ow.", "r81_ow_copy.");
+    }
+    // Each object's owner and privileges.
+    let owners = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(name || ' ' || owner || ' ' || coalesce(acl, '-'), '; ' \
+                               order by name) \
+               from (select relname as name, relowner::regrole::text as owner, \
+                            relacl::text as acl \
+                       from pg_class where relnamespace = '{schema}'::regnamespace \
+                     union all \
+                     select oid::regprocedure::text, proowner::regrole::text, proacl::text \
+                       from pg_proc where pronamespace = '{schema}'::regnamespace) o"
+        ))
+        .map(|o| o.replace(&format!("{schema}."), ""))
+    };
+    let me = h
+        .scalar("select current_user::regrole::text")
+        .unwrap_or_default();
+    let was = owners(&mut h, "r81_ow");
+    assert!(
+        was.as_deref().is_some_and(|w| {
+            w.contains("r81_t_id_seq \"R81 Owner\"")
+                && w.contains("r81_f(text) ")
+                && w.contains(&format!("r81_mine {me} -"))
+        }),
+        "{was:?}"
+    );
+    assert_eq!(owners(&mut h, "r81_ow_copy"), was, "{}", ddls[0]);
+    // The sequence a column owns, alone beside its table.
+    h.ok("drop sequence r81_ow_copy.r81_n");
+    run_ddl(&mut h, &n, "r81_ow.", "r81_ow_copy.");
+    assert_eq!(owners(&mut h, "r81_ow_copy"), was, "{n}");
+    h.ok("drop schema r81_ow, r81_ow_copy cascade");
+    h.ok("drop role \"R81 Owner\"");
+}
+
+/// The DDL of a view, a sequence, a routine and a trigger has their
+/// comments, a view's columns' too, as a table's and a materialized view's
+/// has (#301), and a table's has its serial sequences': run in another
+/// schema, the copies have them too (#354).
+#[test]
+fn the_ddl_has_the_comments() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_cm, r81_cm_copy cascade");
+    h.ok("create schema r81_cm");
+    h.ok("create schema r81_cm_copy");
+    for sql in [
+        "create table r81_cm.r81_t (id serial, n int)",
+        "comment on sequence r81_cm.r81_t_id_seq is 'The ids'",
+        "create view r81_cm.r81_v as select n from r81_cm.r81_t",
+        "comment on view r81_cm.r81_v is 'It''s the view'",
+        "comment on column r81_cm.r81_v.n is 'The n'",
+        "create sequence r81_cm.r81_s",
+        "comment on sequence r81_cm.r81_s is 'A sequence'",
+        "create function r81_cm.r81_f(x int) returns int language sql as 'select x'",
+        "comment on function r81_cm.r81_f(int) is 'For ints'",
+        "create function r81_cm.r81_f(x text) returns text language sql as 'select x'",
+        "create procedure r81_cm.r81_p() language sql as 'select 1'",
+        "comment on procedure r81_cm.r81_p() is 'A procedure'",
+        "create function r81_cm.r81_tf() returns trigger language plpgsql \
+         as 'begin return new; end'",
+        "create trigger r81_tr before insert on r81_cm.r81_t for each row \
+         execute function r81_cm.r81_tf()",
+        "comment on trigger r81_tr on r81_cm.r81_t is 'The trigger'",
+    ] {
+        h.ok(sql);
+    }
+    let mut ddls = Vec::new();
+    for (name, object_type, comment) in [
+        (
+            "r81_t",
+            ObjectType::Table,
+            "\n\ncomment on sequence r81_cm.r81_t_id_seq is 'The ids';",
+        ),
+        (
+            "r81_v",
+            ObjectType::View,
+            "\n\ncomment on view r81_cm.r81_v is 'It''s the view';\n\
+             comment on column r81_cm.r81_v.n is 'The n';",
+        ),
+        (
+            "r81_s",
+            ObjectType::Sequence,
+            "\n\ncomment on sequence r81_cm.r81_s is 'A sequence';",
+        ),
+        (
+            "r81_f",
+            ObjectType::Function,
+            "\n\ncomment on function r81_cm.r81_f(x integer) is 'For ints';",
+        ),
+        (
+            "r81_p",
+            ObjectType::Procedure,
+            "\n\ncomment on procedure r81_cm.r81_p() is 'A procedure';",
+        ),
+        ("r81_tf", ObjectType::Function, ""),
+        (
+            "r81_tr",
+            ObjectType::Trigger,
+            "\n\ncomment on trigger r81_tr on r81_cm.r81_t is 'The trigger';",
+        ),
+    ] {
+        let ddl = ddl_of(&mut h, "r81_cm", name, object_type);
+        assert!(ddl.contains(comment), "{ddl}");
+        ddls.push(ddl);
+    }
+    assert_eq!(ddls[3].matches("comment on").count(), 1, "{}", ddls[3]);
+    for ddl in &ddls {
+        run_ddl(&mut h, ddl, "r81_cm.", "r81_cm_copy.");
+    }
+    // The comments on what is in the schema.
+    let comments = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(o.name || ': ' || d.description, '; ' order by o.name) \
+               from pg_description d \
+              cross join lateral (select replace(pg_describe_object(d.classoid, d.objoid, \
+                                                                    d.objsubid), \
+                                                 '{schema}.', '') as name) o \
+              where position('{schema}.' in pg_describe_object(d.classoid, d.objoid, \
+                                                                d.objsubid)) > 0"
+        ))
+    };
+    let was = comments(&mut h, "r81_cm");
+    assert_eq!(
+        was.as_deref(),
+        Some(
+            "column n of view r81_v: The n; function r81_f(integer): For ints; \
+             function r81_p(): A procedure; sequence r81_s: A sequence; \
+             sequence r81_t_id_seq: The ids; trigger r81_tr on table r81_t: The trigger; \
+             view r81_v: It's the view"
+        )
+    );
+    assert_eq!(comments(&mut h, "r81_cm_copy"), was);
+    h.ok("drop schema r81_cm, r81_cm_copy cascade");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another
