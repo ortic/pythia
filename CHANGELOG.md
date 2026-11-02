@@ -39,6 +39,11 @@ All notable changes to Pythia are documented here. The format follows
   with its `… (N bytes)` ending deleted, written as the whole value,
   truncating it. Apply says how many cut values (pasted, say) it leaves
   out.
+- PostgreSQL: `key=value` connect strings are read as libpq reads them
+  (#393): a `?` in a value no longer makes the string a URL, quoted
+  values keep their spaces, and `sslmode = require` with spaces is
+  taken. An `sslmode` that the driver read but Pythia didn't was turned
+  into `prefer`, which falls back to a connection without TLS.
 
 ## [0.11.0] - 2026-11-02
 
