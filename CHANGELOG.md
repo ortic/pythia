@@ -333,6 +333,9 @@ All notable changes to Pythia are documented here. The format follows
 - The workspace is saved while a window's file has a name that isn't
   UTF-8 (Linux) (#430); it wasn't saved at all then, and every window's
   unsaved text was lost with the next restart.
+- A failed statement that took the transaction with it (SQLite after a
+  Break of a change, MySQL after a deadlock) says that the earlier
+  changes are undone (#431); only the status bar showed it.
 
 ## [0.11.0] - 2026-11-02
 

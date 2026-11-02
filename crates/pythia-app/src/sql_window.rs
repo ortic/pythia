@@ -94,6 +94,9 @@ pub struct RunState {
     /// The session had a transaction open after its last statement, as it
     /// said.
     pub in_transaction: bool,
+    /// The last statement failed: a transaction it ended was rolled back
+    /// with it (#431).
+    pub failed_last: bool,
     /// The changes an Apply didn't make, for the result (by request id)
     /// that fetches its rows again (#247).
     pub unapplied: Option<(u64, crate::data_edit::Unapplied)>,
@@ -2253,6 +2256,7 @@ impl SqlWindow {
                 effects.extend(self.run_next(cx));
             }
             DbEvent::Failed { id, error, elapsed } => {
+                self.state.failed_last = true;
                 if self.state.fetching == Some(id) {
                     self.state.fetching = None;
                     self.error(&error);
@@ -2396,7 +2400,16 @@ impl SqlWindow {
                         "The transaction was rolled back with it: the {undone} change(s) \
                          applied before it were undone"
                     ));
+                } else if ended && self.state.failed_last {
+                    // SQLite after a Break of a change or a RAISE(ROLLBACK),
+                    // MySQL after a deadlock: nothing is pending any more,
+                    // which only the status bar showed (#431).
+                    self.warn(
+                        "The transaction was rolled back with the statement that failed: \
+                         the changes made in it before are undone",
+                    );
                 }
+                self.state.failed_last = false;
             }
             DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
@@ -4340,6 +4353,40 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A failed statement that ended the transaction says so: its earlier
+    /// changes are gone (SQLite after a Break of a change, MySQL after a
+    /// deadlock). One that ended none, or a rollback asked for, doesn't.
+    #[test]
+    fn a_failure_that_ends_the_transaction_says_so() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "update t set n = 1".into());
+        let warned = |w: &SqlWindow| {
+            w.state.messages.iter().any(|m| {
+                m.text
+                    .starts_with("The transaction was rolled back with the statement")
+            })
+        };
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        let failed = || DbEvent::Failed {
+            id: 1,
+            error: pythia_db::DbError::new("interrupted"),
+            elapsed: Duration::ZERO,
+        };
+        w.on_event(failed(), &cx);
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        assert!(!warned(&w));
+        w.on_event(failed(), &cx);
+        w.on_event(DbEvent::Transaction { pending: false }, &cx);
+        assert!(warned(&w));
+        // A rollback of the user's ends it without a word.
+        w.state.messages.clear();
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        w.on_event(DbEvent::Notice("Rolled back".into()), &cx);
+        w.on_event(DbEvent::Transaction { pending: false }, &cx);
+        assert!(!warned(&w));
     }
 
     /// A file changed on disk since the window read it is told apart:
