@@ -101,6 +101,11 @@ pub struct GridState {
     /// The time zone MySQL showed the rows' TIMESTAMP values in: INSERT
     /// statements set it (#213).
     pub time_zone: Option<String>,
+    /// The table's columns the database computes, and its identity columns
+    /// that take a value only when told to: INSERT statements leave the
+    /// first out and tell for the others (#457).
+    pub generated: Vec<String>,
+    pub identity: Vec<String>,
     /// Why a copy failed, for the owner to show (a value held cut short).
     failed: Option<String>,
     /// The owner saves values to files and loads files into cells: the
@@ -413,6 +418,8 @@ impl GridState {
             dialect: self.dialect,
             table: self.table.clone().unwrap_or(defaults.table.clone()),
             time_zone: self.time_zone.clone(),
+            generated: self.generated.clone(),
+            identity: self.identity.clone(),
             ..defaults
         }
     }

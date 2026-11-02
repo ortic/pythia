@@ -87,6 +87,14 @@ pub struct Options {
     /// statements in MySQL's SQL set it while they run, as mysqldump does
     /// (#213).
     pub time_zone: Option<String>,
+    /// The table's columns the database computes (generated and computed
+    /// columns, SQL Server's rowversion): INSERT statements leave them out,
+    /// as no database takes a value for them (#457).
+    pub generated: Vec<String>,
+    /// Its identity columns that take a value only when told to:
+    /// PostgreSQL's GENERATED ALWAYS (`OVERRIDING SYSTEM VALUE`) and SQL
+    /// Server's (`SET IDENTITY_INSERT`) (#457).
+    pub identity: Vec<String>,
 }
 
 impl Default for Options {
@@ -99,6 +107,8 @@ impl Default for Options {
             delimiter: None,
             null_text: String::new(),
             time_zone: None,
+            generated: Vec::new(),
+            identity: Vec::new(),
         }
     }
 }
@@ -1282,6 +1292,12 @@ fn inserts(
     out: &mut dyn Write,
 ) -> Result<()> {
     let dialect = options.dialect;
+    let named = |list: &[String], c: &Column| list.iter().any(|n| n.eq_ignore_ascii_case(&c.name));
+    // The columns a value can be written into (#457).
+    let kept: Vec<usize> = (0..columns.len())
+        .filter(|&i| !named(&options.generated, &columns[i]))
+        .collect();
+    let columns: Vec<Column> = kept.iter().map(|&i| columns[i].clone()).collect();
     let names: Vec<String> = columns
         .iter()
         .map(|c| match dialect.kind() {
@@ -1294,20 +1310,39 @@ fn inserts(
     } else {
         options.table.trim()
     };
-    let head = format!("insert into {target} ({}) values (", names.join(", "));
+    let identity = !rows.is_empty() && columns.iter().any(|c| named(&options.identity, c));
+    let overriding = match dialect.kind() {
+        DbKind::Postgres if identity => " overriding system value",
+        _ => "",
+    };
+    let identity_insert = identity && dialect.kind() == DbKind::SqlServer;
+    if identity_insert {
+        writeln!(out, "set identity_insert {target} on;")?;
+    }
+    let head = format!(
+        "insert into {target} ({}){overriding} values (",
+        names.join(", ")
+    );
     for row in rows {
+        let row: Vec<Cell> = kept
+            .iter()
+            .map(|&i| row.get(i).cloned().flatten())
+            .collect();
         if dialect.kind() == DbKind::Oracle
-            && let Some(block) = oracle_block(&head, columns, row)
+            && let Some(block) = oracle_block(&head, &columns, &row)
         {
             write!(out, "{block}")?;
             continue;
         }
         let values: Vec<String> = columns
             .iter()
-            .zip(row)
+            .zip(&row)
             .map(|(c, v)| literal(dialect, c, v.as_deref()))
             .collect();
         writeln!(out, "{head}{});", values.join(", "))?;
+    }
+    if identity_insert {
+        writeln!(out, "set identity_insert {target} off;")?;
     }
     Ok(())
 }
@@ -1489,6 +1524,42 @@ mod tests {
     use std::cell::Cell as Counter;
 
     use super::*;
+
+    /// INSERTs leave out the columns the database computes and tell it to
+    /// take an identity's values (#457).
+    #[test]
+    fn inserts_leave_computed_columns_alone() {
+        let col = |name: &str, numeric| Column {
+            name: name.into(),
+            type_name: if numeric { "int" } else { "text" }.into(),
+            numeric,
+        };
+        let columns = [col("id", true), col("n", true), col("twice", true)];
+        let rows = vec![vec![Some("1".into()), Some("2".into()), Some("4".into())]];
+        let insert = |dialect: Dialect| {
+            let options = Options {
+                dialect,
+                table: "t".into(),
+                generated: vec!["TWICE".into()],
+                identity: vec!["id".into()],
+                ..Options::default()
+            };
+            String::from_utf8(export_to_vec(Format::Insert, &columns, &rows, &options).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            insert(Dialect::POSTGRES),
+            "insert into t (id, n) overriding system value values (1, 2);\n"
+        );
+        assert_eq!(
+            insert(Dialect::SQLSERVER),
+            "set identity_insert t on;\ninsert into t (id, n) values (1, 2);\nset identity_insert t off;\n"
+        );
+        assert_eq!(
+            insert(Dialect::MYSQL),
+            "insert into t (id, n) values (1, 2);\n"
+        );
+    }
 
     /// PostgreSQL's money as `lc_monetary` writes it, as a plain decimal.
     #[test]

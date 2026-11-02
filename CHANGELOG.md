@@ -417,6 +417,11 @@ All notable changes to Pythia are documented here. The format follows
 - Import into an existing table's text columns takes the file's values
   as they are: a phone number, `1.10` or a date in text were converted as
   numbers and dates (#456).
+- A result's INSERT statements leave out the columns its table computes
+  (generated and computed columns, rowversion) and say when an identity
+  takes the values written (`OVERRIDING SYSTEM VALUE`, `SET
+  IDENTITY_INSERT`); Edit keeps those columns read-only: every database
+  refused the values (#457).
 
 ## [0.11.0] - 2026-11-02
 

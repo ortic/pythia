@@ -87,6 +87,9 @@ pub struct RunState {
     pub results: Vec<QueryResult>,
     /// Foreign key lookups in flight: task id → result id.
     pub relation_requests: BTreeMap<u64, u64>,
+    /// Lookups of the columns a result's table writes itself, by request
+    /// id: the result's id (#457).
+    pub written_requests: BTreeMap<u64, u64>,
     /// Task id of the key lookup an edit waits for.
     pub key_lookup: Option<u64>,
     /// The Apply under way.
@@ -2040,6 +2043,24 @@ impl SqlWindow {
                     ));
                     self.state.bottom = BottomTab::Messages;
                 }
+                // The columns its table writes itself, which INSERT
+                // statements of its rows and Edit leave alone (#457).
+                if let Some(table) =
+                    crate::data_edit::single_table(cx.dialect, &self.state.results[index].sql)
+                {
+                    let task_id = request_id();
+                    self.state.written_requests.insert(task_id, id);
+                    effects.request(
+                        Target::Main,
+                        DbRequest::Run {
+                            id: task_id,
+                            task: Box::new(move |client| {
+                                let written = crate::data_edit::database_written(client, &table);
+                                Ok(Box::new(written) as Box<dyn std::any::Any + Send>)
+                            }),
+                        },
+                    );
+                }
                 if cx.dialect.supports(Feature::FollowKeys)
                     && let Some(table) =
                         crate::data_edit::single_table(cx.dialect, &self.state.results[index].sql)
@@ -2133,6 +2154,28 @@ impl SqlWindow {
                         self.state.queue.clear();
                         self.error(&e);
                     }
+                }
+            }
+            DbEvent::TaskDone { id, result } if self.state.written_requests.contains_key(&id) => {
+                let result_id = self.state.written_requests.remove(&id).unwrap_or_default();
+                let written = result
+                    .ok()
+                    .and_then(|any| any.downcast::<crate::data_edit::Written>().ok())
+                    .map(|w| *w)
+                    .unwrap_or_default();
+                if let Some(result) = self.state.results.iter_mut().find(|r| r.id == result_id) {
+                    let locked: Vec<usize> = written
+                        .locked()
+                        .filter_map(|name| {
+                            result
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
+                        })
+                        .collect();
+                    result.grid.lock_columns(locked);
+                    result.grid.generated = written.generated;
+                    result.grid.identity = written.identity;
                 }
             }
             DbEvent::TaskDone { id, result } if self.state.relation_requests.contains_key(&id) => {
