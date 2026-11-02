@@ -158,6 +158,10 @@ struct ValueEditor {
     /// A text over [`VIEWER_CHARS`], which isn't edited in a text field: a
     /// letter typed laid it out whole again, seconds for megabytes (#356).
     long: Option<LongText>,
+    /// The size of a binary value the grid holds cut short: its first
+    /// bytes aren't the value, and an edit of them would be written as it,
+    /// or not at all.
+    cut: Option<u64>,
 }
 
 /// A text the value editor shows in rows, as the viewer shows it.
@@ -173,11 +177,13 @@ impl ValueEditor {
             chars: text.chars().count(),
             rows: text_rows(&text),
         });
+        let cut = pythia_db::cut_size(&text);
         Self {
             view_row,
             col,
             text,
             long,
+            cut,
         }
     }
 }
@@ -3170,6 +3176,19 @@ fn value_editor(
                 ui.weak(note);
                 ui.separator();
             }
+            if let Some(size) = ed.cut {
+                let mut note = format!(
+                    "The grid holds the first {} bytes of {size}: shown here, not edited",
+                    pythia_db::SHOWN_BYTES
+                );
+                if files {
+                    note.push_str(
+                        ". Save to file… writes the whole value, Load from file… replaces it",
+                    );
+                }
+                ui.weak(note);
+                ui.separator();
+            }
             let height = if date {
                 ui.text_style_height(&egui::TextStyle::Monospace) + 10.0
             } else {
@@ -3186,22 +3205,33 @@ fn value_editor(
                 egui::ScrollArea::vertical()
                     .max_height(height)
                     .show(ui, |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), height],
-                            egui::TextEdit::multiline(&mut ed.text)
-                                .font(egui::TextStyle::Monospace)
-                                .lock_focus(true),
-                        );
+                        if ed.cut.is_some() {
+                            ui.add_sized(
+                                [ui.available_width(), height],
+                                egui::TextEdit::multiline(&mut ed.text.as_str())
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        } else {
+                            ui.add_sized(
+                                [ui.available_width(), height],
+                                egui::TextEdit::multiline(&mut ed.text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .lock_focus(true),
+                            );
+                        }
                     });
             }
             ui.horizontal(|ui| {
-                if ed.long.is_none() && ui.button("Apply").clicked() {
+                if ed.long.is_none() && ed.cut.is_none() && ui.button("Apply").clicked() {
                     result = Some(Some(ed.text.clone()));
                 }
                 if ui.button("Set NULL").clicked() {
                     result = Some(None);
                 }
-                if files && ed.long.is_some() && ui.button("Save to file…").clicked() {
+                if files
+                    && (ed.long.is_some() || ed.cut.is_some())
+                    && ui.button("Save to file…").clicked()
+                {
                     save = true;
                 }
                 if files
@@ -5568,6 +5598,50 @@ mod tests {
     /// scroll through, not to edit: Save to file… and Load from file… take
     /// it to a file and back. One of 100,000 still edits, in a field that
     /// scrolls: the dialog grew with its text, Apply off the screen.
+    /// A binary value the grid holds cut short shows read-only in the
+    /// value editor: its first bytes, edited, were written as the whole
+    /// value (or, with the size left at the end, not at all).
+    #[test]
+    fn cut_values_are_not_edited_in_the_value_editor() {
+        let columns = vec![Column {
+            name: "B".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let cut = format!("{}… (10240 bytes)", "AB".repeat(pythia_db::SHOWN_BYTES));
+        assert_eq!(pythia_db::cut_size(&cut), Some(10240));
+        let rows = vec![vec![Some(cut.clone())]];
+        let ctx = egui::Context::default();
+        let mut state = GridState {
+            dialect: Dialect::MYSQL,
+            value_files: true,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.open_value_editor(&rows, (0, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let shown = texts(&drawn);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.starts_with("The grid holds the first 4000 bytes of 10240")),
+            "{shown:?}"
+        );
+        assert!(!shown.contains(&"Apply"), "{shown:?}");
+        for button in ["Save to file…", "Load from file…", "Set NULL"] {
+            assert!(shown.contains(&button), "{button}: {shown:?}");
+        }
+        // A short value still edits.
+        let rows = vec![vec![Some("ABCD".to_owned())]];
+        state.close_value_editor();
+        state.open_value_editor(&rows, (0, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert!(texts(&drawn).contains(&"Apply"));
+    }
+
     #[test]
     fn the_value_editor_of_a_huge_value_keeps_up() {
         let columns = vec![Column {

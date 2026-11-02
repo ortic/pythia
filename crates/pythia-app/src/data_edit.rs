@@ -1194,6 +1194,30 @@ fn cut(value: &Cell) -> bool {
     value.as_deref().and_then(pythia_db::cut_size).is_some()
 }
 
+/// How many changed or new values [`dml`] leaves out because they are a
+/// binary value cut short, as the grid holds it (pasted from another
+/// cell, say): its first bytes aren't the value, so it isn't written.
+pub fn cut_changes(edit: &Editable, columns: &[Column], changes: &Changes) -> usize {
+    let key_start = columns.len().saturating_sub(edit.key.width());
+    let skipped = |at: RowRef, c: usize, v: &Cell| {
+        c < key_start && cut(v) && !changes.loaded.contains_key(&(at, c))
+    };
+    let updates = changes
+        .updates
+        .iter()
+        .filter(|(r, _)| !changes.deletes.contains(r))
+        .flat_map(|(&r, cells)| cells.iter().map(move |(&c, v)| (RowRef::Existing(r), c, v)));
+    let inserts = changes.inserts.iter().enumerate().flat_map(|(i, row)| {
+        row.iter()
+            .enumerate()
+            .map(move |(c, v)| (RowRef::New(i), c, v))
+    });
+    updates
+        .chain(inserts)
+        .filter(|&(at, c, v)| skipped(at, c, v))
+        .count()
+}
+
 /// Where a fetched `row` of `edit`'s result is the row of its table, by
 /// the key in its last columns; `None` without its key (the key
 /// [`row_key`] picks can always be compared).
@@ -2260,6 +2284,25 @@ mod tests {
             let rows = vec![row.clone()];
             let inserts = dml(dialect, &edit, &columns, &rows, &changes);
             assert!(!inserts[0].sql.contains(" bytes)"), "{}", inserts[0].sql);
+            // Left out, and counted for the window to say so.
+            assert_eq!(cut_changes(&edit, &columns, &changes), 1);
+            let changes = Changes {
+                updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(value.clone()))]))]),
+                inserts: vec![vec![Some("2".into()), Some(new.into()), None]],
+                ..Changes::default()
+            };
+            assert_eq!(cut_changes(&edit, &columns, &changes), 1);
+            assert!(
+                dml(dialect, &edit, &columns, &rows, &changes)
+                    .iter()
+                    .all(|d| d.sql.starts_with("insert"))
+            );
+            // From a file, it is written whole.
+            let mut loaded = changes.clone();
+            loaded
+                .loaded
+                .insert((RowRef::Existing(0), 1), Loaded::Bytes(vec![1, 2].into()));
+            assert_eq!(cut_changes(&edit, &columns, &loaded), 0);
         }
     }
 

@@ -1488,6 +1488,16 @@ impl SqlWindow {
         });
         self.state.messages.clear();
         self.state.message_rows = TextRows::default();
+        let cut = result.grid.changes().map_or(0, |changes| {
+            crate::data_edit::cut_changes(&edit, &result.columns, changes)
+        });
+        if cut > 0 {
+            self.warn(format!(
+                "{cut} value{} not written: a binary value the grid holds cut short isn't the \
+                 value (Load from file… sets one whole)",
+                if cut == 1 { "" } else { "s" }
+            ));
+        }
         for dml in statements {
             self.state.queue.push_back(PendingStatement {
                 origin: None,

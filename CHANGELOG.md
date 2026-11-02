@@ -33,6 +33,12 @@ All notable changes to Pythia are documented here. The format follows
   them (#391). In `/* off /* step 2 */ delete from t; */`, Pythia ended
   the comment at the first `*/` and ran the `delete`, which the server
   would have left commented out. The editor highlights it as comment too.
+- The value editor shows a binary value the grid holds cut short (its
+  first 4000 bytes) read-only (#392), with *Save to file…* and *Load
+  from file…*. Editing that text was either dropped without a word or,
+  with its `… (N bytes)` ending deleted, written as the whole value,
+  truncating it. Apply says how many cut values (pasted, say) it leaves
+  out.
 
 ## [0.11.0] - 2026-11-02
 
