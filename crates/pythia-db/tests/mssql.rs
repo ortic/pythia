@@ -169,6 +169,22 @@ impl Harness {
         rows[0][0].clone()
     }
 
+    /// A query's first row, NULLs as ''.
+    fn first_row(&mut self, sql: &str) -> Vec<String> {
+        let event = self.run(0, sql);
+        let DbEvent::QueryStarted { .. } = event else {
+            panic!("{sql}: expected a query, got {event:?}")
+        };
+        let DbEvent::Rows { mut rows, .. } = self.next_result() else {
+            panic!("{sql}: expected rows")
+        };
+        self.settle();
+        rows.remove(0)
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect()
+    }
+
     /// Reads up to the transaction state that ends a statement's events.
     fn settle(&mut self) -> bool {
         loop {
@@ -2533,6 +2549,82 @@ fn clustered_first_without_hypothetical_indexes() {
     drop_tables(&mut h, "r74_copy_h", "r74_h");
     h.ok("drop schema r74_copy_h");
     drop_tables(&mut h, &schema, "r74_h");
+}
+
+/// A table's DDL keeps its columns' dynamic data masks (#348): run
+/// elsewhere, a user without UNMASK reads the copy's columns masked, as
+/// the original's.
+#[test]
+fn masked_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_m", "r82_m");
+    h.ok("drop schema if exists r82_copy_m");
+    drop_tables(&mut h, &schema, "r82_m");
+    h.ok("drop user if exists r82_m_reader");
+    h.ok(
+        "create table r82_m (id int, e varchar(100) masked with (function = 'email()') not null, \
+         p varchar(20) collate Latin1_General_CS_AS \
+           masked with (function = 'partial(1, \"X''X\", 2)'), \
+         d date masked with (function = 'default()') constraint r82_m_d default '2020-01-01', \
+         n int masked with (function = 'random(5, 5)'))",
+    );
+    let ddl = table_ddl(&mut h, &schema, "r82_m");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_m] (\n    \
+               [id] int null,\n    \
+               [e] varchar(100) masked with (function = 'email()') not null,\n    \
+               [p] varchar(20) collate Latin1_General_CS_AS \
+                 masked with (function = 'partial(1, \"X''X\", 2)') null,\n    \
+               [d] date masked with (function = 'default()') null \
+                 constraint [r82_m_d] default ('2020-01-01'),\n    \
+               [n] int masked with (function = 'random(5, 5)') null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, c.is_masked, m.masking_function) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.masked_columns m on m.object_id = c.object_id \
+                and m.column_id = c.column_id \
+              where c.object_id = object_id('[{owner}].[r82_m]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_m");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_m", &["r82_m"]);
+    assert_eq!(catalog(&mut h, "r82_copy_m"), before);
+    // A user without UNMASK reads both masked.
+    h.ok("create user r82_m_reader without login");
+    for owner in [schema.as_str(), "r82_copy_m"] {
+        h.ok(&format!(
+            "insert into [{owner}].[r82_m] values (1, 'alice@example.com', '0791234567', \
+             '2021-05-06', 7)"
+        ));
+        h.ok(&format!(
+            "grant select on [{owner}].[r82_m] to r82_m_reader"
+        ));
+        h.ok("execute as user = 'r82_m_reader'");
+        let read = h.first_row(&format!("select e, p, d, n from [{owner}].[r82_m]"));
+        h.ok("revert");
+        assert_eq!(
+            read,
+            ["aXXX@XXXX.com", "0X'X67", "1900-01-01", "5"],
+            "{owner}"
+        );
+    }
+    h.ok("drop user r82_m_reader");
+    drop_tables(&mut h, "r82_copy_m", "r82_m");
+    h.ok("drop schema r82_copy_m");
+    drop_tables(&mut h, &schema, "r82_m");
 }
 
 /// Object filters and Find find names without case, non-ASCII letters too,

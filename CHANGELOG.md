@@ -1112,6 +1112,11 @@ All notable changes to Pythia are documented here. The format follows
   the statement's, or the fetch's, as one without rows first is. An error
   after a result of a statement with several, which comes the same way
   on MySQL, PostgreSQL and SQL Server, is too.
+- SQL Server: a table's DDL keeps its columns' dynamic data masks
+  (#348). `masked with (function = …)` was left out, so a copy, an
+  *Edit* or a script made from the DDL masked nothing: a user without
+  UNMASK read there the e-mail addresses, numbers and dates the masks
+  hide in the original.
 
 ## [0.10.0] - 2026-10-30
 

@@ -501,7 +501,9 @@ fn ddl(
 /// elsewhere the others take that database's, as they were made. A
 /// temporal table's period columns are `generated always`, hidden or not,
 /// and its period comes last (#324). Sparse columns and a column set are
-/// declared so (#325). What CREATE TABLE can't give follows the table: its
+/// declared so (#325), masked columns with their masks (#348): their
+/// functions keep their quotes doubled in the catalog, as they go between
+/// quotes. What CREATE TABLE can't give follows the table: its
 /// lock escalation, foreign keys and checks that aren't trusted, disabled
 /// ones disabled, and disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
@@ -520,6 +522,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                     when c.is_column_set = 1 \
                                       then ' column_set for all_sparse_columns' \
                                     else '' end \
+                             + coalesce(' masked with (function = ''' \
+                                        + m.masking_function collate database_default \
+                                        + ''')', '') \
                              + case when ic.object_id is not null \
                                  then ' identity(' + cast(ic.seed_value as varchar(40)) + ', ' \
                                       + cast(ic.increment_value as varchar(40)) + ')' else '' end \
@@ -539,6 +544,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                 and ic.column_id = c.column_id \
                left join sys.default_constraints dc on dc.parent_object_id = c.object_id \
                 and dc.parent_column_id = c.column_id \
+               left join sys.masked_columns m on m.object_id = c.object_id \
+                and m.column_id = c.column_id and m.is_masked = 1 \
               where c.object_id = object_id(@P1) \
               order by c.column_id"
         ),
