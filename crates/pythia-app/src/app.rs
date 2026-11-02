@@ -324,6 +324,20 @@ impl PythiaApp {
             app.reset_layout();
         }
         app.focused = app.docs.keys().next().copied();
+        // A file changed on disk while Pythia was closed (a `git pull`) is
+        // read again, unless its window has changes of its own; saving
+        // those asks first.
+        let mut reloaded = Vec::new();
+        for doc in app.docs.values_mut() {
+            if let DocKind::Sql(w) = &mut doc.kind
+                && w.reload_if_clean()
+            {
+                reloaded.extend(w.path.clone());
+            }
+        }
+        for path in reloaded {
+            app.log(format!("Read {} again: it changed on disk", path.display()));
+        }
 
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         theme::install(&cc.egui_ctx);
@@ -2862,16 +2876,23 @@ impl PythiaApp {
                 match self.docs.get_mut(&id).map(|d| &mut d.kind) {
                     Some(DocKind::Sql(w)) => match (&w.path, command) {
                         (Some(path), Command::SaveFile) => {
-                            let path = path.clone();
-                            if self.settings.format_auto.on_save {
-                                w.editor.format_all(&self.settings.format);
+                            // Not over what something else wrote meanwhile
+                            // without asking.
+                            if w.changed_on_disk().is_some() {
+                                self.confirm = Some(Confirm {
+                                    action: ConfirmAction::Overwrite(id),
+                                    title: "File changed on disk".into(),
+                                    text: format!(
+                                        "{} changed on disk since this window read or saved \
+                                         it. Save this window's text over it?",
+                                        path.display()
+                                    ),
+                                    yes: "Overwrite",
+                                    other: None,
+                                });
+                                return;
                             }
-                            match w.save_to(path.clone()) {
-                                Ok(()) => self.log(format!("Saved {}", path.display())),
-                                Err(e) => {
-                                    self.log(format!("Could not save {}: {e}", path.display()))
-                                }
-                            }
+                            self.save_sql_file(id);
                         }
                         _ => {
                             let name = w.path.as_ref().and_then(|p| p.file_name()).map_or_else(
@@ -4684,6 +4705,22 @@ impl PythiaApp {
         }
     }
 
+    /// Saves SQL window `id` to its file, formatted first if the settings
+    /// say so.
+    fn save_sql_file(&mut self, id: DocId) {
+        let Some(DocKind::Sql(w)) = self.docs.get_mut(&id).map(|d| &mut d.kind) else {
+            return;
+        };
+        let Some(path) = w.path.clone() else { return };
+        if self.settings.format_auto.on_save {
+            w.editor.format_all(&self.settings.format);
+        }
+        match w.save_to(path.clone()) {
+            Ok(()) => self.log(format!("Saved {}", path.display())),
+            Err(e) => self.log(format!("Could not save {}: {e}", path.display())),
+        }
+    }
+
     /// Saves the focused SQL window's file in `encoding`, which it keeps;
     /// the one it had if that fails (a character Windows-1252 can't hold).
     fn save_in(&mut self, encoding: Encoding) {
@@ -5031,6 +5068,7 @@ impl PythiaApp {
                             self.remove_window(id);
                         }
                     }
+                    ConfirmAction::Overwrite(id) => self.save_sql_file(id),
                     ConfirmAction::CloseWindows(_) | ConfirmAction::Activate(_) => {}
                 }
             }

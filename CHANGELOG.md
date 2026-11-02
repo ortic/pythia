@@ -100,6 +100,10 @@ All notable changes to Pythia are documented here. The format follows
   with its and its columns' options (#409); it was a plain CREATE TABLE.
 - SQL Server: a table's DDL keeps the descriptions (`MS_Description`) of
   the table and its columns (#410), as `sp_addextendedproperty` calls.
+- A SQL window's file that changed on disk (a `git pull` while Pythia
+  was closed) is read again when Pythia starts, unless the window has
+  changes of its own; saving over such a file asks first (#411). The
+  window restored its old text, and Save wrote it over the change.
 
 ## [0.11.0] - 2026-11-02
 

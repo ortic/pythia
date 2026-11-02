@@ -468,6 +468,30 @@ impl SqlWindow {
         self.path.is_some() && self.editor.text() != self.saved_text
     }
 
+    /// The file as it is on disk where its text isn't what the window read
+    /// or saved last: something else changed it since (a `git pull`, an
+    /// editor). `None` if it is the same or can't be read.
+    pub fn changed_on_disk(&self) -> Option<crate::text_file::TextFile> {
+        let file = crate::text_file::read(self.path.as_ref()?).ok()?;
+        (file.text != self.saved_text).then_some(file)
+    }
+
+    /// Reads the file again where it changed on disk and the window has
+    /// no changes of its own; whether it did.
+    pub fn reload_if_clean(&mut self) -> bool {
+        if self.is_dirty() {
+            return false;
+        }
+        let Some(file) = self.changed_on_disk() else {
+            return false;
+        };
+        self.editor.set_text(file.text.clone());
+        self.saved_text = file.text;
+        self.encoding = file.encoding;
+        self.line_ending = file.line_ending;
+        true
+    }
+
     /// Writes the text to `path` and makes it the window's file.
     pub fn save_to(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
         crate::text_file::write(&path, self.editor.text(), self.encoding, self.line_ending)?;
@@ -4316,6 +4340,31 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A file changed on disk since the window read it is told apart:
+    /// read again where the window has no changes of its own, and saving
+    /// over it is asked first (the app does).
+    #[test]
+    fn files_changed_on_disk() {
+        let dir = std::env::temp_dir().join(format!("pythia-changed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.sql");
+        std::fs::write(&path, "select 1 from dual;\n").unwrap();
+        let file = crate::text_file::read(&path).unwrap();
+        let mut w = SqlWindow::from_file(path.clone(), file);
+        assert!(w.changed_on_disk().is_none());
+        std::fs::write(&path, "select 2 from dual;\r\n").unwrap();
+        assert!(w.changed_on_disk().is_some());
+        // With changes of its own, it isn't read again.
+        w.editor.set_text("select 3 from dual;\n");
+        assert!(!w.reload_if_clean());
+        w.editor.set_text("select 1 from dual;\n");
+        assert!(w.reload_if_clean());
+        assert_eq!(w.editor.text(), "select 2 from dual;\n");
+        assert_eq!(w.line_ending, crate::text_file::LineEnding::CrLf);
+        assert!(w.changed_on_disk().is_none() && !w.is_dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// MySQL's EXPLAIN takes no bind variables: it says so rather than
