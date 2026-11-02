@@ -1493,6 +1493,78 @@ fn index_key_parts_as_defined() {
     h.ok("drop table r53_ix");
 }
 
+fn trigger_ddl(h: &mut Harness, schema: &str, name: &str) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.into(),
+        name: name.into(),
+        object_type: ObjectType::Trigger,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// A trigger's DDL keeps its place among its table's triggers of the same
+/// timing and event (`PRECEDES` the next one) and the sql_mode it was
+/// made under, where the session's isn't it: dropped and made again from
+/// it, it fired last, and `||` was no concatenation.
+#[test]
+fn trigger_ddl_keeps_order_and_sql_mode() {
+    // Making triggers with binary logging on takes SUPER (or
+    // log_bin_trust_function_creators): as the DBA.
+    let Some(params) = std::env::var("PYTHIA_TEST_MYSQL_DBA")
+        .ok()
+        .and_then(|spec| mysql_params(&spec))
+    else {
+        return;
+    };
+    let mut h = Harness::with(params);
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r99_ord");
+    h.ok("create table r99_ord (s varchar(10))");
+    for name in ["a", "b", "c"] {
+        h.ok(&format!(
+            "create trigger r99_ord_{name} before insert on r99_ord for each row \
+             set new.s = concat(new.s, '{name}')"
+        ));
+    }
+    let a = trigger_ddl(&mut h, &schema, "r99_ord_a");
+    assert!(
+        a.to_uppercase()
+            .contains("FOR EACH ROW PRECEDES R99_ORD_B "),
+        "{a}"
+    );
+    let c = trigger_ddl(&mut h, &schema, "r99_ord_c");
+    assert!(!c.contains("PRECEDES"), "{c}");
+    // Made again from its DDL, it fires first again.
+    h.ok("drop trigger r99_ord_a");
+    h.ok(&a);
+    h.ok("insert into r99_ord values ('')");
+    assert_eq!(h.scalar("select s from r99_ord").as_deref(), Some("abc"));
+
+    // Made under PIPES_AS_CONCAT: the DDL sets it.
+    h.ok("set @before = @@session.sql_mode");
+    h.ok("set session sql_mode = concat(@@session.sql_mode, ',PIPES_AS_CONCAT')");
+    h.ok("create trigger r99_ord_p before update on r99_ord for each row set new.s = 'p' || new.s");
+    h.ok("set session sql_mode = @before");
+    let p = trigger_ddl(&mut h, &schema, "r99_ord_p");
+    let (mode, create) = p.split_once("\n\n").expect(&p);
+    assert!(
+        mode.starts_with("set session sql_mode = '") && mode.contains("PIPES_AS_CONCAT"),
+        "{p}"
+    );
+    h.ok("drop trigger r99_ord_p");
+    h.ok(mode);
+    h.ok(create);
+    h.ok("set session sql_mode = @before");
+    h.ok("update r99_ord set s = 'x'");
+    assert_eq!(h.scalar("select s from r99_ord").as_deref(), Some("px"));
+    // In the session's own mode, the DDL doesn't set it.
+    let a = trigger_ddl(&mut h, &schema, "r99_ord_a");
+    assert!(!a.starts_with("set session"), "{a}");
+    h.ok("drop table r99_ord");
+}
+
 /// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE
 /// TABLE writes it (#260): MySQL gives a literal's value as it is, so
 /// `DEFAULT ''` read as no default, `'NULL'` as NULL and

@@ -305,6 +305,10 @@ All notable changes to Pythia are documented here. The format follows
 - MariaDB: *Edit* of a trigger created with `IF NOT EXISTS` opens a
   script that runs (#420); it failed with "Incorrect usage of OR REPLACE
   and IF NOT EXISTS".
+- MySQL and MariaDB: a trigger's DDL keeps its place among its table's
+  triggers (`PRECEDES`, #421), and a trigger's or routine's the
+  `sql_mode` it was made under (#422). *Edit* made it fire last, and
+  under the window's mode, where `||` may mean OR.
 
 ## [0.11.0] - 2026-11-02
 

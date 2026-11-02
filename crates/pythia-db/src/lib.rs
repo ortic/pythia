@@ -33,6 +33,7 @@ pub use meta::{
     CompileError, DbObject, Detail, Member, MetaQuery, MetaResult, ObjectType, TableColumn,
     cursor_plan, display_cursor, like_pattern, object_ddl, object_source,
 };
+pub use mysql_meta::SQL_MODE_PREFIX as MYSQL_SQL_MODE_PREFIX;
 pub use session::{Script, Session, open_connection, stream_query};
 pub use sql_text::{SHOWN_BYTES, cut_size, float_text};
 pub use sqlite_session::sqlite_without_create;

@@ -2110,6 +2110,19 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
         (pythia_db::DbKind::MySql, ObjectType::View) => {
             format!("{database}{}\n", create_or(ddl, "or replace", ""))
         }
+        // An object made under a sql_mode of its own is made again under it
+        // (#422); the window's mode is set back after it.
+        (pythia_db::DbKind::MySql, _)
+            if ddl.starts_with(pythia_db::MYSQL_SQL_MODE_PREFIX)
+                && let Some((mode, rest)) = ddl.split_once("\n\n") =>
+        {
+            let inner = replace_script(dialect, o, rest, mariadb);
+            let inner = inner.strip_prefix(&database).unwrap_or(&inner);
+            format!(
+                "{database}set @pythia_sql_mode = @@session.sql_mode;\n{mode}\n\n{inner}\
+                 set session sql_mode = @pythia_sql_mode;\n"
+            )
+        }
         (pythia_db::DbKind::MySql, _) if mariadb => {
             format!("{database}{}\n/\n", create_or(ddl, "or replace", ""))
         }
@@ -3251,6 +3264,22 @@ mod tests {
         assert!(
             replace_script(Dialect::MYSQL, &trigger, ddl, true)
                 .starts_with("use shop;\n\nCREATE or replace DEFINER=`app`@`%` TRIGGER t ")
+        );
+        // Made under a sql_mode of its own: set for it, the window's after.
+        let moded = "set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
+                     CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s";
+        assert_eq!(
+            replace_script(Dialect::MYSQL, &trigger, moded, true),
+            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode;\n\
+             set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
+             CREATE or replace TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s\n/\n\
+             set session sql_mode = @pythia_sql_mode;\n"
+        );
+        let script = replace_script(Dialect::MYSQL, &trigger, moded, false);
+        assert!(
+            script.contains("set session sql_mode = 'PIPES_AS_CONCAT';\n\n-- MySQL can't")
+                && script.ends_with("/\nset session sql_mode = @pythia_sql_mode;\n"),
+            "{script}"
         );
         // MariaDB keeps IF NOT EXISTS, which OR REPLACE can't go with.
         let kept = "CREATE DEFINER=`app`@`%` trigger if not exists t before insert on o \
