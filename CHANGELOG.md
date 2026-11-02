@@ -274,6 +274,9 @@ All notable changes to Pythia are documented here. The format follows
   committed failed at once with "database table is locked", and while a
   window had uncommitted DDL, the object browser and completion came up
   empty. Lookups answer as they did last while the schema is locked.
+- PostgreSQL: a trigger's DDL keeps it disabled, or enabled for replicas
+  or always, where it is so (#415), and *Edit* keeps that state:
+  replaced or made again, it fired as an ordinary trigger.
 
 ## [0.11.0] - 2026-11-02
 

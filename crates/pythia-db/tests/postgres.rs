@@ -1688,6 +1688,55 @@ fn a_views_ddl_names_its_tables_with_their_schemas() {
 /// search path, by Edit in a window that set one, the trigger stays on its
 /// table and calls its function, and each routine is replaced rather than
 /// made again with other argument types (#350).
+/// A trigger's DDL keeps a trigger that isn't enabled as created so:
+/// disabled, replica or always. Created again, it fired on every insert.
+#[test]
+fn a_triggers_ddl_keeps_its_state() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r98_tr cascade");
+    h.ok("create schema r98_tr");
+    for sql in [
+        "create table r98_tr.orders (n int)",
+        "create table r98_tr.items (n int)",
+        "create table r98_tr.lines (n int)",
+        "create function r98_tr.audit() returns trigger language plpgsql \
+           as 'begin new.n = -1; return new; end'",
+        "create trigger audit before insert on r98_tr.orders for each row \
+           execute function r98_tr.audit()",
+        "create trigger audit before insert on r98_tr.items for each row \
+           execute function r98_tr.audit()",
+        "create trigger audit before insert on r98_tr.lines for each row \
+           execute function r98_tr.audit()",
+        "alter table r98_tr.items disable trigger audit",
+        "alter table r98_tr.lines enable always trigger audit",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = ddl_of(&mut h, "r98_tr", "audit", ObjectType::Trigger);
+    assert!(
+        ddl.contains("alter table r98_tr.items disable trigger audit;"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("alter table r98_tr.lines enable always trigger audit;"),
+        "{ddl}"
+    );
+    assert!(!ddl.contains("r98_tr.orders disable"), "{ddl}");
+    // Run again as Edit runs it, each trigger replaced: the states stay.
+    let script = ddl.replace("CREATE TRIGGER", "CREATE OR REPLACE TRIGGER");
+    run_ddl(&mut h, &script, "", "");
+    let states = h.scalar(
+        "select string_agg(c.relname || '=' || t.tgenabled::text, ',' order by c.relname) \
+           from pg_trigger t join pg_class c on c.oid = t.tgrelid \
+          where t.tgname = 'audit' and c.relnamespace = 'r98_tr'::regnamespace",
+    );
+    assert_eq!(states.as_deref(), Some("items=D,lines=A,orders=O"));
+    h.ok("drop schema r98_tr cascade");
+}
+
 #[test]
 fn the_ddl_of_triggers_and_routines_names_their_schemas() {
     let Some(mut h) = Harness::connect() else {

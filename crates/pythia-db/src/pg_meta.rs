@@ -597,7 +597,11 @@ fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
         "select pg_get_triggerdef(t.oid, true), \
                 'trigger ' || quote_ident(t.tgname) || ' on ' \
                 || quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
-                obj_description(t.oid, 'pg_trigger') \
+                obj_description(t.oid, 'pg_trigger'), \
+                case t.tgenabled when 'D' then 'disable' when 'R' then 'enable replica' \
+                                 when 'A' then 'enable always' end \
+                || ' trigger ' || quote_ident(t.tgname), \
+                quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
            from pg_trigger t \
            join pg_class c on c.oid = t.tgrelid \
            join pg_namespace n on n.oid = c.relnamespace \
@@ -607,8 +611,14 @@ fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
     )?;
     let mut triggers = Vec::new();
     for row in rows {
-        if let [Some(definition), Some(on), note] = row.as_slice() {
-            let mut rest = String::new();
+        if let [Some(definition), Some(on), note, state, Some(table)] = row.as_slice() {
+            // A trigger that isn't enabled as created stays so: CREATE
+            // makes it fire on every insert, as CREATE OR REPLACE does to
+            // one disabled (#415).
+            let mut rest = state
+                .as_ref()
+                .map(|state| format!("\n\nalter table {table} {state};"))
+                .unwrap_or_default();
             comment_on(&mut rest, on, note.as_deref());
             triggers.push(followed(definition, &rest, end));
         }
