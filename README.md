@@ -365,12 +365,11 @@ for Linux, Windows and macOS.
   REPLACE` (PostgreSQL) or `CREATE OR ALTER` (SQL Server). A PostgreSQL
   materialized view is dropped and created again, with its indexes,
   comments and grants, in one block that a failing create undoes.
-- On SQL Server a batch shows its first result set; `PRINT` output and
-  informational messages show as messages, in order with it. After Break,
-  the connection is opened again: the driver can't go on after a cancel,
-  so changes that weren't committed are rolled back. The driver is our
-  fork of [tiberius](https://github.com/ortic/tiberius) (branch `pythia`),
-  which passes those messages on.
+- On SQL Server every result set of a batch shows; `PRINT` output and
+  informational messages show as messages, in order with them. Break
+  stops the batch and keeps the transaction. The driver is our fork of
+  [tiberius](https://github.com/ortic/tiberius) (branch `pythia`), which
+  passes those messages on and reads the server's answer to a Break.
 
 **SQLite (experimental)**
 - *Type: SQLite* with the database file's path (*…* picks one, *New…*

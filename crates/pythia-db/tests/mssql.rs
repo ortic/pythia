@@ -572,28 +572,26 @@ fn cancel_interrupts_a_running_statement() {
     };
     assert_eq!(error.message, "Cancelled");
     assert!(started.elapsed() < Duration::from_secs(5));
-    // The driver needs a new connection after a cancel; the insert is gone.
+    // The connection goes on, with the insert pending (#384): it was
+    // opened again, which rolled the insert back.
     loop {
         match h.next() {
             DbEvent::Notice(n) => notices.push(n),
             DbEvent::Transaction { pending } => {
-                assert!(!pending);
+                assert!(pending, "the insert is still pending");
                 break;
             }
             _ => {}
         }
     }
-    assert_eq!(
-        notices,
-        [
-            "After a cancel, SQL Server's driver can't go on: the connection was opened again; \
-             changes that weren't committed were rolled back"
-        ]
-    );
+    assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(
         h.scalar("select count(*) from cancel_t").as_deref(),
-        Some("0")
+        Some("1")
     );
+
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
     h.ok("drop table cancel_t");
 
     // A Break while nothing runs doesn't stop the next statement.

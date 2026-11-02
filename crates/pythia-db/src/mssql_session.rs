@@ -6,10 +6,10 @@
 //! other request closes it, and the driver reads the rest of the batch
 //! before the next request.
 //!
-//! Break sends TDS's attention signal, which stops the batch on the server
-//! at once. The server acknowledges it with a reply of its own, which
-//! tiberius (0.13) doesn't read: the connection is out of step afterwards,
-//! so the worker opens it again (see [`Worker::reset`]).
+//! Break sends TDS's attention signal, which stops the batch on the
+//! server at once. The driver reads the server's acknowledgement; without
+//! one the connection is out of step, and the worker opens it again (see
+//! [`Worker::reset`]).
 //!
 //! Transactions behave like Oracle's: queries see what others committed,
 //! and changes wait for Commit unless the session autocommits (a change
@@ -800,26 +800,33 @@ fn report_messages(stream: &mut QueryStream<'_>, events: &Events) {
     }
 }
 
-/// Break: the attention signal stops the batch on the server. The server
-/// first ends its reply to the batch, then acknowledges in a reply of its
-/// own, which tiberius doesn't read; then the connection needs opening
-/// again. Statements have no time limit (#199), the wait for that reply
-/// has: without a network it would never end.
+/// Break: the attention signal stops the batch on the server; the
+/// connection needs opening again when it wasn't acknowledged.
 fn cancel_running(rt: &Runtime, client: &mut Tds, message: &'static str) -> Failure {
-    let acknowledged =
-        rt.block_on(async { tokio::time::timeout(ATTENTION_WAIT, client.cancel_query()).await });
-    let reopen = match acknowledged {
-        Ok(Ok(())) => false,
-        Ok(Err(e)) => {
-            debug!("after the attention: {e}");
-            true
-        }
-        Err(_) => {
-            debug!("no reply to the attention within {ATTENTION_WAIT:?}");
+    let reopen = match attention(rt, client) {
+        Ok(()) => false,
+        Err(why) => {
+            debug!("{why}");
             true
         }
     };
     Failure::Cancelled { message, reopen }
+}
+
+/// Sends the attention signal, which stops the batch on the server, and
+/// reads the reply: the server ends the batch's reply, then acknowledges
+/// in a reply of its own, which the driver reads up to (#384). Statements
+/// have no time limit (#199), the wait for the acknowledgement has: without
+/// a network it would never end. An error says why the connection is out
+/// of step.
+fn attention(rt: &Runtime, client: &mut Tds) -> Result<(), String> {
+    match rt.block_on(async { tokio::time::timeout(ATTENTION_WAIT, client.cancel_query()).await }) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("after the attention: {e}")),
+        Err(_) => Err(format!(
+            "no reply to the attention within {ATTENTION_WAIT:?}"
+        )),
+    }
 }
 
 /// A statement's error, placed at its line in the batch.

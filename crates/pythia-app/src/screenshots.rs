@@ -3002,10 +3002,12 @@ impl Side {
 }
 
 /// An Apply on SQL Server cut off while a statement after the first waits
-/// for a lock: the session killed, a lost connection, or Break, after
-/// which the session opens the connection again (#289). Both roll back
-/// the transaction, and all the changes wait for Apply again. Before, the
-/// changes before Break were taken for applied, and lost.
+/// for a lock. The session killed, a lost connection, rolls back the
+/// transaction, and all the changes wait for Apply again (#289); before,
+/// they were taken for applied, and lost. Break keeps the transaction, as
+/// on the other databases (#384): the update of row 1 stays applied in it,
+/// and the changes of rows 2 and 3 wait for Apply. Before, the session
+/// opened the connection again after Break, which rolled it back too.
 #[test]
 fn an_apply_cut_off_by_a_new_connection() {
     let (Ok(spec), Ok(dba)) = (
@@ -3104,35 +3106,47 @@ fn an_apply_cut_off_by_a_new_connection() {
             .session
             .send(pythia_db::DbRequest::SetAutocommit(true));
         wait_until(&mut h, "apply", |app| !app.test_focused_busy());
-        let stored = admin.run(&format!("select v from {schema}.r52_apply order by id"));
+        // Past the lock of a change the window's transaction keeps.
+        let stored = admin.run(&format!(
+            "select v from {schema}.r52_apply with (nolock) order by id"
+        ));
         let (rows, updates, _, _, messages) = part(&mut h);
         let text = |v: &str| vec![Some(v.to_owned())];
-        assert_eq!(stored, [text("a"), text("b"), text("c")], "{how}");
-        assert_eq!(
-            rows,
-            pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
-            "{how}: {messages:?}"
-        );
-        assert_eq!(
-            updates,
-            pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
-            "{how}: {messages:?}"
-        );
         let said = |start: &str| messages.iter().any(|m| m.starts_with(start));
         if how == "kill" {
+            assert_eq!(stored, [text("a"), text("b"), text("c")], "{how}");
+            assert_eq!(
+                rows,
+                pairs(&[("1", "a"), ("2", "b"), ("3", "c")]),
+                "{how}: {messages:?}"
+            );
+            assert_eq!(
+                updates,
+                pairs(&[("1", "x"), ("2", "y"), ("3", "z")]),
+                "{how}: {messages:?}"
+            );
             assert!(said("Connection lost."), "{messages:?}");
         } else {
-            assert!(
-                said("The transaction was rolled back with it: the 1 change(s) applied"),
-                "{messages:?}"
+            assert_eq!(stored, [text("x"), text("b"), text("c")], "{how}");
+            assert!(h.state().test_pending_tx(), "{messages:?}");
+            assert_eq!(
+                rows,
+                pairs(&[("1", "x"), ("2", "b"), ("3", "c")]),
+                "{how}: {messages:?}"
             );
+            assert_eq!(
+                updates,
+                pairs(&[("2", "y"), ("3", "z")]),
+                "{how}: {messages:?}"
+            );
+            assert!(!said("The transaction was rolled back"), "{messages:?}");
             assert!(
-                said("3 change(s) weren't applied: they wait for Apply"),
+                said("2 change(s) weren't applied: they wait for Apply"),
                 "{messages:?}"
             );
         }
     }
-    // Applied again, all of them go in once.
+    // Applied again, the rest go in once.
     h.state_mut()
         .test_on_sql_window(|w, cx| w.apply_changes(0, cx));
     wait_until(&mut h, "apply", |app| !app.test_focused_busy());

@@ -2318,10 +2318,10 @@ impl SqlWindow {
             DbEvent::Transaction { pending } => {
                 let ended = std::mem::replace(&mut self.state.in_transaction, pending) && !pending;
                 // The transaction ended with the statement of the Apply that
-                // failed, whose report this is: rolled back, as on SQL
-                // Server after Break, where the session opens the
-                // connection again, and after a deadlock. What the Apply
-                // made before is undone (#289).
+                // failed, whose report this is: rolled back, as after a
+                // deadlock, or on SQL Server after a Break the server didn't
+                // answer, where the session opens the connection again. What
+                // the Apply made before is undone (#289).
                 let mut undone = 0;
                 if let Some(apply) = &mut self.state.apply
                     && std::mem::take(&mut apply.failed)

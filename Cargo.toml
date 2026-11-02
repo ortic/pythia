@@ -46,11 +46,12 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 # Our fork of tiberius (branch `pythia`): PRINT and informational messages
-# reach the caller (#98), and rustls runs on ring instead of aws-lc (#99).
+# reach the caller (#98), rustls runs on ring instead of aws-lc (#99), and a
+# cancel reads the server's answer past the end of the stopped batch (#384).
 # SQLite, compiled in (no library to install); the session workers are
 # synchronous like its API.
 rusqlite = { version = "0.41", features = ["bundled", "column_decltype"] }
-tiberius = { git = "https://github.com/ortic/tiberius", rev = "1ec36e8bbbcbb332de19c3bc65e9adaab074841c", default-features = false, features = ["tds80", "rustls-ring", "sql-browser-tokio"] }
+tiberius = { git = "https://github.com/ortic/tiberius", rev = "54a0969477f45974ef8e79d2c9911254ee453628", default-features = false, features = ["tds80", "rustls-ring", "sql-browser-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "1"

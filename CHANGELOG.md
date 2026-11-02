@@ -1215,6 +1215,11 @@ All notable changes to Pythia are documented here. The format follows
   `ENABLED`, `DISABLED` or `HYPOTHETICAL`. Disabled and hypothetical
   indexes read like the others, which the *DDL* disables (#326) or
   leaves out (#327).
+- SQL Server: Break keeps the connection and its transaction (#384), as
+  on Oracle, MySQL and PostgreSQL. It opened the connection again, which
+  rolled back the changes that weren't committed and lost the session's
+  temporary tables and settings: the driver gave up reading the server's
+  answer to the cancel, which comes after the end of the stopped batch.
 
 ## [0.10.0] - 2026-10-30
 
