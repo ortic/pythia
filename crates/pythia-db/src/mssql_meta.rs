@@ -228,13 +228,17 @@ fn details(
     detail: Detail,
 ) -> Result<MetaResult, DbError> {
     let sql = match detail {
+        // Whether an index is disabled or hypothetical, which the DDL makes
+        // disabled or leaves out (#368).
         Detail::Indexes => {
             "select i.name as INDEX_NAME, i.type_desc as INDEX_TYPE, \
                     case when i.is_primary_key = 1 then 'PRIMARY' when i.is_unique = 1 then 'UNIQUE' \
                          else 'NONUNIQUE' end as UNIQUENESS, \
                     cast(null as nvarchar(4000)) as COLUMNS, \
                     cast(null as nvarchar(4000)) as [INCLUDE], \
-                    i.filter_definition as [WHERE] \
+                    i.filter_definition as [WHERE], \
+                    case when i.is_hypothetical = 1 then 'HYPOTHETICAL' \
+                         when i.is_disabled = 1 then 'DISABLED' else 'ENABLED' end as STATUS \
                from sys.indexes i where i.object_id = object_id(@P1) and i.type > 0 \
               order by i.is_primary_key desc, i.name"
         }

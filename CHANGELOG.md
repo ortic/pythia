@@ -1151,6 +1151,10 @@ All notable changes to Pythia are documented here. The format follows
   encryption_type = …, algorithm = …)`. A copy's columns were plain
   ones, which took the values a client sends them in plain text and
   kept them so.
+- SQL Server: a table's *Indexes* has a *STATUS* column (#368),
+  `ENABLED`, `DISABLED` or `HYPOTHETICAL`. Disabled and hypothetical
+  indexes read like the others, which the *DDL* disables (#326) or
+  leaves out (#327).
 
 ## [0.10.0] - 2026-10-30
 

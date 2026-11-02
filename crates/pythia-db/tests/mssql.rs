@@ -1097,7 +1097,8 @@ fn indexes_of_every_kind() {
                 "UNIQUENESS",
                 "COLUMNS",
                 "INCLUDE",
-                "WHERE"
+                "WHERE",
+                "STATUS"
             ]
         );
         rows.into_iter()
@@ -1112,15 +1113,16 @@ fn indexes_of_every_kind() {
     assert_eq!(
         ix,
         [
-            ["r43_ix_pk", "CLUSTERED", "PRIMARY", "id", "", ""],
-            ["r43_ix_c", "NONCLUSTERED", "UNIQUE", "c", "", ""],
+            ["r43_ix_pk", "CLUSTERED", "PRIMARY", "id", "", "", "ENABLED"],
+            ["r43_ix_c", "NONCLUSTERED", "UNIQUE", "c", "", "", "ENABLED"],
             [
                 "r43_ix_cover",
                 "NONCLUSTERED",
                 "NONUNIQUE",
                 "a DESC",
                 "c, b",
-                ""
+                "",
+                "ENABLED"
             ],
             [
                 "r43_ix_some",
@@ -1128,7 +1130,8 @@ fn indexes_of_every_kind() {
                 "NONUNIQUE",
                 "b",
                 "",
-                "([b] IS NOT NULL)"
+                "([b] IS NOT NULL)",
+                "ENABLED"
             ],
             [
                 "r43_ix_store",
@@ -1136,7 +1139,8 @@ fn indexes_of_every_kind() {
                 "NONUNIQUE",
                 "b, a",
                 "",
-                ""
+                "",
+                "ENABLED"
             ],
         ]
     );
@@ -1144,14 +1148,23 @@ fn indexes_of_every_kind() {
     assert_eq!(
         cs,
         [
-            ["r43_cs_b", "NONCLUSTERED", "NONUNIQUE", "b", "", ""],
+            [
+                "r43_cs_b",
+                "NONCLUSTERED",
+                "NONUNIQUE",
+                "b",
+                "",
+                "",
+                "ENABLED"
+            ],
             [
                 "r43_cs_store",
                 "CLUSTERED COLUMNSTORE",
                 "NONUNIQUE",
                 "a, b",
                 "",
-                ""
+                "",
+                "ENABLED"
             ],
         ]
     );
@@ -1428,9 +1441,9 @@ fn dictionary_at_compatibility_level_100() {
     };
     // As string_agg made them.
     let expected = [
-        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
-        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  | ",
-        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  | ",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+        "r63_dept_pk | CLUSTERED | PRIMARY | deptno |  |  | ENABLED",
+        "r63_dept_site | NONCLUSTERED | UNIQUE | site DESC, deptno |  |  | ENABLED",
         "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
         "r63_dept_pk | Primary key | deptno | ",
         "r63_dept_site | Unique | site, deptno | ",
@@ -1443,11 +1456,11 @@ fn dictionary_at_compatibility_level_100() {
         "    constraint [r63_dept_site] unique nonclustered ([site] desc, [deptno])",
         ");",
         "GO",
-        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE",
-        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  | ",
-        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL)",
-        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  | ",
-        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  | ",
+        "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+        "r63_emp_pk | NONCLUSTERED | PRIMARY | empno |  |  | ENABLED",
+        "r63_emp_cover | NONCLUSTERED | NONUNIQUE | deptno | sal, na,me | ([deptno] IS NOT NULL) | ENABLED",
+        "r63_emp_name | CLUSTERED | NONUNIQUE | na,me, empno DESC |  |  | ENABLED",
+        "r63_emp_store | NONCLUSTERED COLUMNSTORE | NONUNIQUE | sal, site |  |  | ENABLED",
         "CONSTRAINT_NAME | TYPE | DEFINITION | REFERENCES",
         "r63_emp_pk | Primary key | empno | ",
         "r63_emp_fk | Foreign key | site, deptno | dbo.r63_dept",
@@ -3357,6 +3370,68 @@ fn always_encrypted_columns() {
     h.ok("drop schema r82_copy_ae");
     drop_tables(&mut h, &schema, "r82_ae");
     drop_keys(&mut h);
+}
+
+/// Indexes reads which indexes are disabled and which hypothetical (#368),
+/// as the DDL makes the ones disabled and leaves the others out (#326,
+/// #327).
+#[test]
+fn indexes_say_disabled_and_hypothetical() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, &schema, "r82_ix");
+    for sql in [
+        "create table r82_ix (id int constraint r82_ix_pk primary key, a int, b int)",
+        "create index r82_ix_a on r82_ix (a)",
+        "create index r82_ix_b on r82_ix (b)",
+        "alter index r82_ix_b on r82_ix disable",
+        "create index r82_ix_hypo on r82_ix (a, b) with statistics_only = -1",
+        "create table r82_ixc (id int, a int)",
+        "create clustered index r82_ixc_c on r82_ixc (id)",
+        "create index r82_ixc_a on r82_ixc (a)",
+        "alter index r82_ixc_c on r82_ixc disable",
+    ] {
+        h.ok(sql);
+    }
+    let indexes = |h: &mut Harness, table: &str| -> Vec<String> {
+        let MetaResult::Table { columns, rows } = h.meta(MetaQuery::Details {
+            owner: schema.clone(),
+            name: table.into(),
+            detail: Detail::Indexes,
+        }) else {
+            panic!("expected a table")
+        };
+        let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        let mut lines = vec![names.join(" | ")];
+        for row in rows {
+            let values: Vec<String> = row.into_iter().map(Option::unwrap_or_default).collect();
+            lines.push(values.join(" | "));
+        }
+        lines
+    };
+    assert_eq!(
+        indexes(&mut h, "r82_ix"),
+        [
+            "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+            "r82_ix_pk | CLUSTERED | PRIMARY | id |  |  | ENABLED",
+            "r82_ix_a | NONCLUSTERED | NONUNIQUE | a |  |  | ENABLED",
+            "r82_ix_b | NONCLUSTERED | NONUNIQUE | b |  |  | DISABLED",
+            "r82_ix_hypo | NONCLUSTERED | NONUNIQUE | a, b |  |  | HYPOTHETICAL",
+        ]
+    );
+    // A disabled clustered index disables the others.
+    assert_eq!(
+        indexes(&mut h, "r82_ixc"),
+        [
+            "INDEX_NAME | INDEX_TYPE | UNIQUENESS | COLUMNS | INCLUDE | WHERE | STATUS",
+            "r82_ixc_a | NONCLUSTERED | NONUNIQUE | a |  |  | DISABLED",
+            "r82_ixc_c | CLUSTERED | NONUNIQUE | id |  |  | DISABLED",
+        ]
+    );
+    drop_tables(&mut h, &schema, "r82_ix");
 }
 
 /// Object filters and Find find names without case, non-ASCII letters too,
