@@ -2928,6 +2928,87 @@ fn typed_xml_columns() {
     h.ok("drop xml schema collection r82_xs");
 }
 
+/// A table's DDL names an alias type with its schema (#372), as Columns
+/// does: by its name alone, a session whose default schema isn't the
+/// type's doesn't find it. The system's types, CLR ones too, keep their
+/// names.
+#[test]
+fn alias_types_with_their_schema() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let drop_types = |h: &mut Harness| {
+        h.ok(
+            "drop type if exists r82_ty.r82_ssn; drop type if exists r82_ty.r82_amount; \
+             drop schema if exists r82_ty",
+        );
+    };
+    drop_tables(&mut h, "r82_copy_ty", "r82_ty");
+    h.ok("drop schema if exists r82_copy_ty");
+    drop_tables(&mut h, &schema, "r82_ty");
+    drop_types(&mut h);
+    for sql in [
+        "create schema r82_ty",
+        "create type r82_ty.r82_ssn from varchar(11) not null",
+        "create type r82_ty.r82_amount from decimal(10, 2)",
+        "create table r82_ty_t (id int, s r82_ty.r82_ssn, a r82_ty.r82_amount, \
+         g geography, h hierarchyid)",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = table_ddl(&mut h, &schema, "r82_ty_t");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_ty_t] (\n    \
+               [id] int null,\n    \
+               [s] [r82_ty].[r82_ssn] not null,\n    \
+               [a] [r82_ty].[r82_amount] null,\n    \
+               [g] geography null,\n    \
+               [h] hierarchyid null\n\
+             );\nGO\n"
+        )
+    );
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema.clone(),
+        table: "r82_ty_t".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    let types: Vec<&str> = columns.iter().map(|c| c.data_type.as_str()).collect();
+    assert_eq!(
+        types,
+        [
+            "int",
+            "[r82_ty].[r82_ssn]",
+            "[r82_ty].[r82_amount]",
+            "geography",
+            "hierarchyid"
+        ]
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, schema_name(t.schema_id), t.name, \
+                                         c.is_nullable) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
+              where c.object_id = object_id('[{owner}].[r82_ty_t]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_ty");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_ty", &["r82_ty_t"]);
+    assert_eq!(catalog(&mut h, "r82_copy_ty"), before);
+    drop_tables(&mut h, "r82_copy_ty", "r82_ty");
+    h.ok("drop schema r82_copy_ty");
+    drop_tables(&mut h, &schema, "r82_ty");
+    drop_types(&mut h);
+}
+
 /// A table's DDL keeps ROWGUIDCOL, a persisted computed column's NOT NULL,
 /// and NOT FOR REPLICATION of identities, foreign keys and checks (#355),
 /// which SQL Server never trusts: run elsewhere, the copy's columns and

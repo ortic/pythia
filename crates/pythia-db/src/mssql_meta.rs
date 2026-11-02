@@ -25,8 +25,12 @@ const TYPE: &str = "case when o.type = 'U' then 'TABLE' when o.type = 'V' then '
 const TYPES: &str = "'U', 'V', 'P', 'PC', 'TR', 'SO', 'SN', 'FN', 'IF', 'TF', 'FS', 'FT'";
 
 /// The column's type as written in DDL (`c` is `sys.columns`, `t`
-/// `sys.types`).
-const COLUMN_TYPE: &str = "case when t.name in ('varchar', 'char', 'varbinary', 'binary') \
+/// `sys.types`). A user-defined type, an alias or a CLR type, is named with
+/// its schema, as it is found by its name only in `sys` and the session's
+/// default schema (#372); an alias has its length.
+const COLUMN_TYPE: &str = "case when t.is_user_defined = 1 \
+                                  then quotename(schema_name(t.schema_id)) + '.' + quotename(t.name) \
+                                when t.name in ('varchar', 'char', 'varbinary', 'binary') \
                                   then t.name + '(' + case when c.max_length = -1 then 'max' \
                                        else cast(c.max_length as varchar(10)) end + ')' \
                                 when t.name in ('nvarchar', 'nchar') \

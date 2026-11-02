@@ -134,6 +134,16 @@ All notable changes to Pythia are documented here. The format follows
   `sys.all_objects`: the result failed with "Protocol error: nvarchar:
   invalid UTF-16 sequence", and the connection was opened again, which
   rolled back the transaction.
+- SQL Server: an `nvarchar`, `nchar` or `ntext` value that isn't valid
+  UTF-16 reads with U+FFFD in its place (#371). SQL Server doesn't check
+  them, as in the names of incremental statistics' objects in
+  `sys.all_objects`: the result failed with "Protocol error: nvarchar:
+  invalid UTF-16 sequence", and the connection was opened again, which
+  rolled back the transaction.
+- SQL Server: a table's DDL and *Columns* name a user-defined type, an
+  alias or a CLR type, with its schema (#372), `[app].[ssn]`. By its name
+  alone, the DDL failed with Msg 2715 where the session's default schema
+  isn't the type's.
 
 ## [0.11.0] - 2026-11-02
 
