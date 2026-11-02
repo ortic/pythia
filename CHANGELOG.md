@@ -336,6 +336,9 @@ All notable changes to Pythia are documented here. The format follows
 - A failed statement that took the transaction with it (SQLite after a
   Break of a change, MySQL after a deadlock) says that the earlier
   changes are undone (#431); only the status bar showed it.
+- MySQL and MariaDB: an event with a `DO BEGIN … END` body and
+  MariaDB's aggregate function are one statement up to `/` (#432); they
+  were cut at their first `;`.
 
 ## [0.11.0] - 2026-11-02
 

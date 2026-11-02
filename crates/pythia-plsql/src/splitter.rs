@@ -525,15 +525,57 @@ impl<'a> Splitter<'a> {
                 return StatementKind::SqlPlus;
             }
         }
+        let mysql = self.syntax == Syntax::MySql;
+        // MySQL's events: `… DO BEGIN … END` is a block, up to `/` or the
+        // DELIMITER, a body without one ends at `;` (#432).
+        let event_block = |mut rest: std::iter::Take<_>| {
+            let mut after_do = false;
+            for t in &mut rest {
+                let t: &Token = t;
+                if t.kind == TokenKind::Semicolon {
+                    return false;
+                }
+                if after_do {
+                    return self.word_eq(t, &["BEGIN"]);
+                }
+                after_do = self.word_eq(t, &["DO"]);
+            }
+            false
+        };
+        if mysql && self.word_eq(first, &["ALTER"]) {
+            let mut rest = words.take(400);
+            for t in rest.by_ref().take(24) {
+                if self.word_eq(t, &["EVENT"]) {
+                    return if event_block(rest) {
+                        StatementKind::PlSql
+                    } else {
+                        StatementKind::Sql
+                    };
+                }
+            }
+            return StatementKind::Sql;
+        }
         if self.word_eq(first, &["CREATE"]) {
             // MySQL's `DEFINER = user@host` (quoted any way) may come first.
             let mut definer = false;
-            for t in words.take(24) {
+            let mut rest = words.take(400);
+            for t in rest.by_ref().take(24) {
                 if self.word_eq(t, PLSQL_UNITS) {
                     return StatementKind::PlSql;
                 }
+                if mysql && self.word_eq(t, &["EVENT"]) {
+                    return if event_block(rest) {
+                        StatementKind::PlSql
+                    } else {
+                        StatementKind::Sql
+                    };
+                }
+                // MariaDB's AGGREGATE FUNCTION (#432).
+                if mysql && self.word_eq(t, &["AGGREGATE"]) {
+                    continue;
+                }
                 if definer {
-                    if self.word_eq(t, &["VIEW", "EVENT", "SQL"]) {
+                    if self.word_eq(t, &["VIEW", "SQL"]) {
                         break;
                     }
                 } else if self.word_eq(t, &["DEFINER"]) {
@@ -1107,6 +1149,41 @@ mod tests {
                 (StatementKind::Sql, "select 7"),
             ]
         );
+    }
+
+    /// MySQL's event with a BEGIN … END body and MariaDB's aggregate
+    /// function are blocks, up to `/`: they were cut at their first `;`.
+    /// An event whose body is one statement ends at its `;`.
+    #[test]
+    fn mysql_events_and_aggregates() {
+        let src = "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM t; \
+                   INSERT INTO u VALUES (1); END\n/\n\
+                   CREATE DEFINER=`root`@`%` EVENT f ON SCHEDULE AT now() DO DELETE FROM t;\n\
+                   ALTER EVENT e DO BEGIN DELETE FROM t; DELETE FROM u; END\n/\n\
+                   ALTER EVENT f DISABLE;\n\
+                   CREATE OR REPLACE AGGREGATE FUNCTION agg(x INT) RETURNS INT BEGIN \
+                   DECLARE s INT DEFAULT 0; LOOP FETCH GROUP NEXT ROW; SET s = s + x; \
+                   END LOOP; END\n/\n\
+                   select 1";
+        let split = split_in(src, Syntax::MySql);
+        let kinds: Vec<StatementKind> = split.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                StatementKind::PlSql,
+                StatementKind::Sql,
+                StatementKind::PlSql,
+                StatementKind::Sql,
+                StatementKind::PlSql,
+                StatementKind::Sql,
+            ],
+            "{split:?}"
+        );
+        assert!(
+            split[0].1.ends_with("INSERT INTO u VALUES (1); END"),
+            "{split:?}"
+        );
+        assert!(split[4].1.ends_with("END LOOP; END"), "{split:?}");
     }
 
     #[test]
