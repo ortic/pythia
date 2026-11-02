@@ -8597,8 +8597,7 @@ fn completion_in_the_windows_context() {
             },
         )
     };
-    let servers = [
-        mysql("PYTHIA_TEST_MYSQL_DBA"),
+    let postgres = |change: &str| {
         (
             "PYTHIA_TEST_POSTGRES",
             DbKind::Postgres,
@@ -8608,7 +8607,7 @@ fn completion_in_the_windows_context() {
                         drop table if exists r75_t;\ncreate table r75_t (id int, in_default int);\n\
                         commit"
                     .into(),
-                change: "set search_path to r75_s".into(),
+                change: change.into(),
                 undo: None,
                 table: "r75_t",
                 temporary: "create temp table r75_tmp (id int, note text)",
@@ -8618,7 +8617,13 @@ fn completion_in_the_windows_context() {
                 cleanup: "drop schema r75_s cascade;\ndrop table r75_t;\ncommit".into(),
                 oracle: false,
             },
-        ),
+        )
+    };
+    let servers = [
+        mysql("PYTHIA_TEST_MYSQL_DBA"),
+        postgres("set search_path to r75_s"),
+        // As SET does (#362).
+        postgres("select set_config('search_path', 'r75_s', false)"),
         (
             "PYTHIA_TEST_MSSQL",
             DbKind::SqlServer,

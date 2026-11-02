@@ -676,6 +676,103 @@ fn connected_reports_the_schema_after_the_login_statements() {
     assert!(notice.starts_with("Login script: "), "{notice}");
 }
 
+/// The search paths a statement reported (#320), up to the transaction
+/// state that ends its events; it must succeed.
+fn paths(h: &mut Harness, sql: &str) -> Vec<Vec<String>> {
+    h.execute(0, sql, 100);
+    let mut paths = Vec::new();
+    loop {
+        match h.next() {
+            DbEvent::Context(context) => paths.push(context.schemas),
+            DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+            DbEvent::Transaction { .. } => return paths,
+            _ => {}
+        }
+    }
+}
+
+/// Every way a statement changes the search path is reported, for
+/// completion to look names up in it (#320): set_config as SET does, for
+/// the path and for the role that "$user" names; a SET LOCAL until its
+/// transaction ends. A function's own SET search_path is undone when it
+/// returns. Before, a set_config reported nothing.
+#[test]
+fn the_search_path_is_reported_as_it_changes() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let s = |names: &[&str]| -> Vec<Vec<String>> {
+        vec![names.iter().map(|n| (*n).to_owned()).collect()]
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r85_s cascade");
+    h.ok("drop schema if exists r85_role cascade");
+    h.ok("drop role if exists r85_role");
+    h.ok("create schema r85_s");
+    h.ok("create role r85_role");
+    h.ok("create schema r85_role authorization r85_role");
+    h.ok("grant r85_role to current_user");
+    h.ok("create function r85_s.r85_own() returns int language sql \
+         set search_path = r85_s as $$ select 1 $$");
+    h.ok("set search_path = public");
+
+    assert_eq!(
+        paths(
+            &mut h,
+            "select set_config('search_path', 'r85_s, public', false)"
+        ),
+        s(&["r85_s", "public"])
+    );
+    assert_eq!(
+        paths(
+            &mut h,
+            "SELECT pg_catalog.SET_CONFIG('search_path', 'public', false)"
+        ),
+        s(&["public"])
+    );
+    // "$user" is the role's schema once the role is set.
+    h.ok("set search_path = \"$user\", public");
+    assert_eq!(
+        paths(&mut h, "select set_config('role', 'r85_role', false)"),
+        s(&["r85_role", "public"])
+    );
+    assert_eq!(paths(&mut h, "reset role"), s(&["public"]));
+    // A function's SET search_path is its own.
+    assert!(paths(&mut h, "select r85_s.r85_own()").is_empty());
+    assert_eq!(
+        h.scalar("select current_schemas(false)::text").as_deref(),
+        Some("{public}")
+    );
+    // A local setting lasts until its transaction ends.
+    h.session.send(DbRequest::SetAutocommit(false));
+    h.ok("begin");
+    assert_eq!(
+        paths(&mut h, "select set_config('search_path', 'r85_s', true)"),
+        s(&["r85_s"])
+    );
+    assert_eq!(paths(&mut h, "commit"), s(&["public"]));
+    h.ok("begin");
+    assert_eq!(
+        paths(&mut h, "set local search_path = r85_s"),
+        s(&["r85_s"])
+    );
+    h.session.send(DbRequest::Rollback);
+    let mut reported = Vec::new();
+    loop {
+        match h.next() {
+            DbEvent::Context(context) => reported.push(context.schemas),
+            DbEvent::Transaction { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reported, s(&["public"]));
+
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema r85_s cascade");
+    h.ok("drop schema r85_role cascade");
+    h.ok("drop role r85_role");
+}
+
 #[test]
 fn notices_become_messages() {
     let Some(mut h) = Harness::connect() else {

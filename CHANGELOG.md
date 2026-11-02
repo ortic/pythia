@@ -1124,6 +1124,12 @@ All notable changes to Pythia are documented here. The format follows
   chosen while another file dialog was open, which does nothing, and one
   whose file can't be read stayed among the result's loads in progress
   for as long as it was shown.
+- PostgreSQL: completion follows a search path set with `set_config`
+  (#362), as it follows one set with `SET` since #320: after `select
+  set_config('search_path', 'sales', false)` it went on offering the
+  names of the path before, and so after a `set_config('role', …)`,
+  which changes the schema `"$user"` names. A function that sets the
+  path in its body, without a `SET` clause, still changes it unseen.
 
 ## [0.10.0] - 2026-10-30
 
