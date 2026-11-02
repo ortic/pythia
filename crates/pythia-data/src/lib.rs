@@ -119,7 +119,15 @@ pub enum Error {
         pythia_db::SHOWN_BYTES
     )]
     Cut { column: String, size: u64 },
+    /// More than an Excel sheet or cell holds (#434): the library's own
+    /// error named neither the column nor the row.
+    #[error("{0}: export as CSV or JSON, which hold any size")]
+    TooLarge(String),
 }
+
+/// Excel's limits: rows of a sheet, characters of a cell.
+const XLSX_ROWS: usize = 1_048_576;
+const XLSX_CELL_CHARS: usize = 32_767;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -502,6 +510,25 @@ fn xlsx(
     // Excel shows milliseconds; the cell holds what its double can (#192).
     let fraction = XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss.000");
     let first_row = u32::from(options.header);
+    if rows.len() + first_row as usize > XLSX_ROWS {
+        return Err(Error::TooLarge(format!(
+            "An Excel sheet holds {XLSX_ROWS} rows; the result has {}",
+            rows.len()
+        )));
+    }
+    if let Some((r, col)) = rows.iter().enumerate().find_map(|(r, row)| {
+        columns.iter().zip(row).find_map(|(col, cell)| {
+            cell.as_deref()
+                .filter(|v| v.chars().nth(XLSX_CELL_CHARS).is_some())
+                .map(|_| (r, col))
+        })
+    }) {
+        return Err(Error::TooLarge(format!(
+            "Row {}'s {} is longer than the {XLSX_CELL_CHARS} characters an Excel cell holds",
+            r + 1,
+            col.name
+        )));
+    }
     if options.header {
         for (c, col) in columns.iter().enumerate() {
             sheet.write_string_with_format(0, c as u16, &col.name, &bold)?;
@@ -2500,6 +2527,14 @@ mod tests {
         let (c, r) = sample();
         let bytes = export_to_vec(Format::Xlsx, &c, &r, &Options::default()).unwrap();
         assert_eq!(&bytes[..2], b"PK");
+        // A text longer than a cell holds names its row and column.
+        let mut long = r.clone();
+        long[1][1] = Some("x".repeat(XLSX_CELL_CHARS + 1));
+        let e = export_to_vec(Format::Xlsx, &c, &long, &Options::default()).unwrap_err();
+        assert!(
+            e.to_string().starts_with(&format!("Row 2's {}", c[1].name)),
+            "{e}"
+        );
     }
 
     /// Every database's dates and timestamps become Excel dates (#193),

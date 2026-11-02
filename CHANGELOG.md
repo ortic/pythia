@@ -342,6 +342,9 @@ All notable changes to Pythia are documented here. The format follows
 - SQLite: a trigger whose body uses columns named `begin` or `end` is
   one statement (#433); it was split at such a name, or swallowed the
   rest of the script.
+- An Excel export that passes Excel's limits (32,767 characters a cell,
+  1,048,576 rows a sheet) says which row and column, and to export as CSV
+  or JSON (#434); it failed with the library's error only.
 
 ## [0.11.0] - 2026-11-02
 
