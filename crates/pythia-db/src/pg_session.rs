@@ -304,6 +304,10 @@ impl Worker {
                 ));
             }
         }
+        failed.extend(
+            self.keep_utf8()
+                .map(|notice| format!("Login script: {notice}")),
+        );
         let row = self
             .pg()
             .first(
@@ -343,6 +347,27 @@ impl Worker {
                 .collect(),
             ..NameContext::default()
         })
+    }
+
+    /// Sets `client_encoding` back to UTF8 where a statement changed it
+    /// (#451): the server sent text in it, which isn't UTF-8, and read what
+    /// Pythia wrote in it, storing `München` as `MĂĽnchen`. Says so.
+    fn keep_utf8(&self) -> Option<String> {
+        let encoding = self
+            .pg()
+            .first("select current_setting('client_encoding')", &[])
+            .ok()??
+            .into_iter()
+            .next()??;
+        if encoding.eq_ignore_ascii_case("UTF8") {
+            return None;
+        }
+        match self.pg().execute("set client_encoding = 'UTF8'") {
+            Ok(()) => Some(KEEP_UTF8.to_owned()),
+            Err(e) => Some(format!(
+                "client_encoding {encoding} can't be set back to UTF8: {e}"
+            )),
+        }
     }
 
     /// Reports the search path when it changed (#320).
@@ -501,6 +526,9 @@ impl Worker {
         }
         if changes_path(&sql) {
             self.report_context();
+            if let Some(notice) = self.keep_utf8() {
+                self.events.send(DbEvent::Notice(notice));
+            }
         }
         self.report_notices();
         self.report_transaction();
@@ -600,7 +628,18 @@ impl Worker {
             while rows.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 match self.rt.block_on(stream.next()) {
                     Some(Ok(SimpleQueryMessage::Row(row))) => {
-                        let cells = cells(&row);
+                        let cells = match cells(&row) {
+                            Ok(cells) => cells,
+                            Err(error) => {
+                                self.events.send(DbEvent::Failed {
+                                    id,
+                                    error,
+                                    elapsed: started.elapsed(),
+                                });
+                                self.abandon(stream);
+                                return true;
+                            }
+                        };
                         if whole {
                             bytes += row_bytes(&cells);
                         }
@@ -885,7 +924,7 @@ impl Pg<'_> {
                 SimpleQueryMessage::RowDescription(columns) if names.is_empty() => {
                     names = columns.iter().map(|c| c.name().to_owned()).collect();
                 }
-                SimpleQueryMessage::Row(row) => rows.push(cells(&row)),
+                SimpleQueryMessage::Row(row) => rows.push(cells(&row)?),
                 _ => {}
             }
         }
@@ -929,11 +968,25 @@ fn untyped(described: &[tokio_postgres::SimpleColumn]) -> Vec<Column> {
     described.iter().map(|c| column(c.name(), None)).collect()
 }
 
-fn cells(row: &SimpleQueryRow) -> Vec<Cell> {
+/// A row's values. One that isn't UTF-8, which a `client_encoding` other
+/// than UTF8 sends, fails it: `get` panicked, and the session's worker
+/// ended, its window running for ever (#451).
+fn cells(row: &SimpleQueryRow) -> Result<Vec<Cell>, DbError> {
     (0..row.len())
-        .map(|i| row.get(i).map(str::to_owned))
+        .map(|i| {
+            row.try_get(i).map(|v| v.map(str::to_owned)).map_err(|e| {
+                DbError::new(format!(
+                    "A value isn't UTF-8, the encoding Pythia reads text in: the session's \
+                     client_encoding isn't UTF8 ({e})"
+                ))
+            })
+        })
         .collect()
 }
+
+/// What makes a session's `client_encoding` UTF8 again, and says so.
+const KEEP_UTF8: &str = "Pythia reads and writes text in UTF-8, which PostgreSQL converts from \
+                         and to the database's encoding: client_encoding is UTF8 again";
 
 /// A string literal PostgreSQL reads back as `value`, whatever
 /// `standard_conforming_strings` says.

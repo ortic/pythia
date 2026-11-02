@@ -1561,6 +1561,83 @@ fn trigger_ddl(h: &mut Harness, schema: &str, name: &str) -> String {
     ddl
 }
 
+/// `WITH … UPDATE` waits for Commit, as an UPDATE does (#453): it ran
+/// outside a transaction, and Rollback undid nothing.
+#[test]
+fn with_update_waits_for_commit() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r101_cte");
+    h.ok("create table r101_cte (id int primary key, n int)");
+    h.ok("insert into r101_cte values (1, 1)");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+    assert!(h.ok("with d as (select 1 as id) update r101_cte join d using (id) set n = 2"));
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    assert_eq!(h.scalar("select n from r101_cte").as_deref(), Some("1"));
+    h.ok("drop table r101_cte");
+}
+
+/// A session has the server's utf8mb4 collation, as its own client does
+/// (#452): the driver's utf8mb4_general_ci didn't mix with a column's
+/// (1267). A routine made under another collation keeps it in its DDL,
+/// which *Edit* makes it again from.
+#[test]
+fn sessions_use_the_servers_collation() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let default = h.scalar(
+        "select collation_name from information_schema.collations \
+          where character_set_name = 'utf8mb4' and is_default = 'Yes'",
+    );
+    let mariadb = h
+        .scalar("select version()")
+        .is_some_and(|v| v.contains("MariaDB"));
+    // MySQL's may be set otherwise (8.0.18).
+    let mysql_default = if mariadb {
+        None
+    } else {
+        h.scalar("select @@global.default_collation_for_utf8mb4")
+    };
+    let session = h.scalar("select @@session.collation_connection");
+    assert!(
+        session == default || session.is_some() && session == mysql_default,
+        "{session:?}, {default:?}"
+    );
+    h.ok("drop table if exists r101_coll");
+    h.ok("drop procedure if exists r101_coll_p");
+    h.ok("create table r101_coll (name varchar(10)) default charset utf8mb4");
+    h.ok("insert into r101_coll values ('abc')");
+    h.ok("set @r101_n = 'abc'");
+    assert_eq!(
+        h.scalar("select count(*) from r101_coll where name = @r101_n")
+            .as_deref(),
+        Some("1")
+    );
+    h.ok("set session collation_connection = 'utf8mb4_bin'");
+    h.ok("create procedure r101_coll_p() select 'a' = 'A' as same");
+    h.ok("set names utf8mb4");
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema,
+        name: "r101_coll_p".into(),
+        object_type: ObjectType::Procedure,
+    }) else {
+        panic!("expected DDL")
+    };
+    let (setting, _) = ddl.split_once("\n\n").expect(&ddl);
+    assert!(
+        setting.starts_with("set session sql_mode = '")
+            && setting.ends_with(", collation_connection = 'utf8mb4_bin';"),
+        "{ddl}"
+    );
+    h.ok("drop procedure r101_coll_p");
+    h.ok("drop table r101_coll");
+}
+
 /// A trigger's DDL keeps its place among its table's triggers of the same
 /// timing and event (`PRECEDES` the next one) and the sql_mode it was
 /// made under, where the session's isn't it: dropped and made again from

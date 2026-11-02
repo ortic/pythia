@@ -173,6 +173,13 @@ impl Worker {
     fn on_connect(&mut self, init_sql: &[String]) -> Result<(ServerInfo, Vec<String>), DbError> {
         // Whatever the server's default: see `Transaction`.
         self.conn.query_drop("set autocommit = 1")?;
+        // The server's utf8mb4 collation, as its own client has: the driver
+        // asks for utf8mb4_general_ci, which a column's collation or a user
+        // variable's didn't mix with (1267), and *Edit* made routines under
+        // it (#452). The login script may set another.
+        if let Err(e) = self.conn.query_drop("set names utf8mb4") {
+            warn!("set names utf8mb4: {e}");
+        }
         let mut failed = Vec::new();
         for sql in init_sql {
             if let Err(e) = self.conn.query_drop(sql) {
@@ -1036,6 +1043,31 @@ enum TxEffect {
     None,
 }
 
+/// Whether the statement after a `WITH` clause changes rows: an UPDATE or
+/// DELETE outside the parentheses of its common table expressions.
+fn changes_after_with(sql: &str) -> bool {
+    let mut depth = 0i32;
+    pythia_plsql::tokenize_in(sql, Syntax::MySql)
+        .into_iter()
+        .any(|t| match t.kind {
+            pythia_plsql::TokenKind::LParen => {
+                depth += 1;
+                false
+            }
+            pythia_plsql::TokenKind::RParen => {
+                depth -= 1;
+                false
+            }
+            kind => {
+                depth == 0
+                    && kind.is_word()
+                    && ["UPDATE", "DELETE"]
+                        .iter()
+                        .any(|w| sql[t.span.clone()].eq_ignore_ascii_case(w))
+            }
+        })
+}
+
 impl TxEffect {
     /// By the first words, the code in `/*!…*/` too (#219): mysqldump's
     /// `/*!40000 ALTER TABLE … DISABLE KEYS */` commits.
@@ -1051,6 +1083,9 @@ impl TxEffect {
             "CREATE" | "ALTER" | "DROP" | "RENAME" | "TRUNCATE" | "GRANT" | "REVOKE" | "LOCK"
             | "UNLOCK" | "ANALYZE" | "OPTIMIZE" | "REPAIR" => TxEffect::Ends,
             "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "LOAD" | "CALL" => TxEffect::Changes,
+            // `WITH … UPDATE` and `WITH … DELETE` change rows (#453): they
+            // ran outside a transaction, committed at once.
+            "WITH" if changes_after_with(sql) => TxEffect::Changes,
             "SELECT" | "WITH" => {
                 let upper = sql.to_ascii_uppercase();
                 if upper.contains("FOR UPDATE")
@@ -1273,6 +1308,23 @@ mod tests {
             ("select 1", TxEffect::None),
             ("/* x */ update t set a = 1", TxEffect::Changes),
             ("select * from t for update", TxEffect::Changes),
+            // After a WITH clause (#453).
+            (
+                "with d as (select id from t where n > 1) update t join d using (id) set n = 0",
+                TxEffect::Changes,
+            ),
+            (
+                "WITH d AS (SELECT id FROM t) DELETE t FROM t JOIN d USING (id)",
+                TxEffect::Changes,
+            ),
+            (
+                "with d as (select 1 as update_count) select * from d",
+                TxEffect::None,
+            ),
+            (
+                "with d as (select * from t for update) select * from d",
+                TxEffect::Changes,
+            ),
             ("call p()", TxEffect::Changes),
             ("savepoint a", TxEffect::None),
             ("rollback to savepoint a", TxEffect::None),

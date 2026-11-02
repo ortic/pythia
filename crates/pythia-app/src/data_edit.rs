@@ -408,9 +408,30 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
         "PIVOT",
         "UNPIVOT",
     ];
+    // A second table after a comma, also past an alias written with AS or
+    // one the lexer takes for a keyword (`key`, `type`), or SQL Server's
+    // `WITH (NOLOCK)`: the cell of another table's column was written to
+    // the first one (#449). The FROM clause ends at the next clause.
+    const CLAUSES: &[&str] = &[
+        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "OPTION", "WINDOW",
+        "QUALIFY",
+    ];
+    let mut depth = 0i32;
+    let mut comma = false;
+    for (j, token) in tokens.iter().enumerate().skip(next) {
+        match token.kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => depth -= 1,
+            TokenKind::Comma if depth == 0 => {
+                comma = true;
+                break;
+            }
+            _ if depth == 0 && CLAUSES.iter().any(|w| is(j, w)) => break,
+            _ => {}
+        }
+    }
     // From the table on: a join word that isn't a keyword looks like an alias.
-    let multi = tokens.get(next).is_some_and(|t| t.kind == TokenKind::Comma)
-        || (i + 1..tokens.len()).any(|j| joins.iter().any(|w| is(j, w)));
+    let multi = comma || (i + 1..tokens.len()).any(|j| joins.iter().any(|w| is(j, w)));
     if multi {
         return None;
     }
@@ -485,6 +506,121 @@ pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbEr
         .into_iter()
         .find_map(|(_, columns)| columns.into_iter().collect::<Option<Vec<_>>>())
         .unwrap_or_default())
+}
+
+/// The columns of a table the database writes itself (#457): no INSERT or
+/// UPDATE may give them a value, or only when told to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Written {
+    /// Computed from the others: generated and computed columns, SQL
+    /// Server's rowversion. INSERT statements leave them out.
+    pub generated: Vec<String>,
+    /// Identity columns that take a value only when told to: PostgreSQL's
+    /// GENERATED ALWAYS (`OVERRIDING SYSTEM VALUE`), SQL Server's
+    /// (`SET IDENTITY_INSERT`).
+    pub identity: Vec<String>,
+    /// Identity columns that take none: Oracle's GENERATED ALWAYS.
+    pub always: Vec<String>,
+}
+
+impl Written {
+    /// The columns Edit can't change.
+    pub fn locked(&self) -> impl Iterator<Item = &String> {
+        self.generated
+            .iter()
+            .chain(&self.identity)
+            .chain(&self.always)
+    }
+}
+
+/// [`Written`] of `table` (as written in a query); none where it isn't a
+/// table, or the dictionary can't tell (older releases).
+pub fn database_written(client: &mut dyn Client, table: &str) -> Written {
+    let found = match client.dialect().kind() {
+        DbKind::Oracle => oracle_written(client, table),
+        DbKind::MySql => {
+            let sql = "select column_name, 'g' from information_schema.columns \
+                        where table_schema = coalesce(?, database()) and table_name = ? \
+                          and coalesce(generation_expression, '') <> ''";
+            match unquote(table).as_slice() {
+                [schema, name] => client.query(sql, &[schema, name]),
+                [name] => client.query(
+                    &sql.replace("coalesce(?, database())", "database()"),
+                    &[name],
+                ),
+                _ => Ok(Vec::new()),
+            }
+        }
+        DbKind::Postgres => client.query(
+            "select a.attname, case when a.attgenerated <> '' then 'g' else 'i' end \
+               from pg_attribute a \
+              where a.attrelid = to_regclass($1) and a.attnum > 0 and not a.attisdropped \
+                and (a.attgenerated <> '' or a.attidentity = 'a')",
+            &[table],
+        ),
+        DbKind::SqlServer => client.query(
+            "select c.name, case when c.is_computed = 1 or c.system_type_id = 189 then 'g' \
+                                 else 'i' end \
+               from sys.columns c \
+              where c.object_id = object_id(@P1) \
+                and (c.is_computed = 1 or c.is_identity = 1 or c.system_type_id = 189)",
+            &[table],
+        ),
+        DbKind::Sqlite => match unquote(table).as_slice() {
+            [schema, name] => client.query(
+                "select name, 'g' from pragma_table_xinfo(?, ?) where hidden in (2, 3)",
+                &[name, schema],
+            ),
+            [name] => client.query(
+                "select name, 'g' from pragma_table_xinfo(?) where hidden in (2, 3)",
+                &[name],
+            ),
+            _ => Ok(Vec::new()),
+        },
+    };
+    let mut written = Written::default();
+    for row in found.unwrap_or_default() {
+        let (Some(name), Some(kind)) = (value(&row, 0), value(&row, 1)) else {
+            continue;
+        };
+        match kind.as_str() {
+            "g" => written.generated.push(name),
+            "i" => written.identity.push(name),
+            _ => written.always.push(name),
+        }
+    }
+    written
+}
+
+/// Oracle: virtual columns, and identity columns GENERATED ALWAYS (12.1).
+fn oracle_written(client: &mut dyn Client, table: &str) -> Result<Vec<Vec<Cell>>, DbError> {
+    // As Oracle reads the name: quoted parts as written, others uppercase.
+    let parts: Vec<String> = tokenize(table)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia() && t.kind != TokenKind::Dot)
+        .map(|t| {
+            let text = &table[t.span];
+            match text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                Some(quoted) => quoted.replace("\"\"", "\""),
+                None => text.to_uppercase(),
+            }
+        })
+        .collect();
+    let (owner, name) = match parts.as_slice() {
+        [owner, name] => (owner.clone(), name.clone()),
+        [name] => (String::new(), name.clone()),
+        _ => return Ok(Vec::new()),
+    };
+    client.query(
+        "select c.column_name, case when c.virtual_column = 'YES' then 'g' else 'a' end \
+           from all_tab_cols c \
+           left join all_tab_identity_cols i on i.owner = c.owner \
+                 and i.table_name = c.table_name and i.column_name = c.column_name \
+          where c.owner = nvl(:1, sys_context('USERENV', 'CURRENT_SCHEMA')) \
+            and c.table_name = :2 and c.user_generated = 'YES' \
+            and (c.virtual_column = 'YES' or i.generation_type = 'ALWAYS')",
+        &[&owner, &name],
+    )
 }
 
 /// A table's unique keys, the one to prefer first, each with its columns
@@ -1289,15 +1425,31 @@ fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -
     match &edit.key {
         RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
         RowKey::Columns(key) => {
-            let checks: Option<Vec<String>> = key
+            let mut checks: Vec<String> = key
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
                     let v = value(row, key_start + i)?;
                     same(dialect, name, &columns[key_start + i], Some(&v))
                 })
-                .collect();
-            checks.map(|c| c.join(" and "))
+                .collect::<Option<_>>()?;
+            // SQLite's rowid, where a table has no INTEGER PRIMARY KEY, is
+            // renumbered by VACUUM: the row must still have the values
+            // fetched, else a stale result's Delete took another row (#465).
+            let rowid =
+                matches!(key.as_slice(), [k] if ["rowid", "_rowid_", "oid"].contains(&k.as_str()));
+            if dialect.kind() == DbKind::Sqlite && rowid {
+                let plain = plain_columns(dialect, &edit.source, key_start);
+                checks.extend((0..key_start).filter(|&c| plain[c]).filter_map(|c| {
+                    same(
+                        dialect,
+                        &columns[c].name,
+                        &columns[c],
+                        row.get(c)?.as_deref(),
+                    )
+                }));
+            }
+            Some(checks.join(" and "))
         }
     }
 }
@@ -1593,6 +1745,34 @@ mod tests {
         assert_eq!(
             single_table(Dialect::SQLSERVER, "select * from [it's \"odd\"] -- [x]"),
             Some("[it's \"odd\"]".into())
+        );
+        // A second table after a comma, past an alias with AS, one that is
+        // a keyword or a table hint (#449).
+        for sql in [
+            "select o.id, c.status from orders as o, customers as c where o.cid = c.id",
+            "select * from orders o with (nolock), customers c with (nolock)",
+            "select * from orders key, customers c",
+            "select * from orders with (index(ix_a, ix_b)) , customers",
+        ] {
+            assert_eq!(single_table(Dialect::SQLSERVER, sql), None, "{sql}");
+        }
+        // Commas of the later clauses are no tables.
+        for sql in [
+            "select * from orders as o where o.id in (1, 2) order by o.id, o.n",
+            "select * from orders with (nolock, index(ix)) where n = 1",
+        ] {
+            assert_eq!(
+                single_table(Dialect::SQLSERVER, sql),
+                Some("orders".into()),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            single_table(
+                Dialect::MYSQL,
+                "select * from t as x group by a, b limit 1, 2"
+            ),
+            Some("t".into())
         );
         // What APPLY or PIVOT brings in isn't the table's.
         for sql in [

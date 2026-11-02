@@ -119,6 +119,102 @@ fn first(row: Vec<Cell>) -> Option<String> {
     row.into_iter().next().flatten()
 }
 
+/// A module's source with the name it has now (#450): `sp_rename` and
+/// `ALTER SCHEMA … TRANSFER` leave `object_definition` as it was written,
+/// and its DDL, and *Edit*, made the object again under its old name, next
+/// to the renamed one (a trigger fired twice) or over another one called
+/// so. A trigger's table, renamed or moved, is named as it is now too. A
+/// name written as it is stays as written.
+fn named_as_now(
+    source: &str,
+    (owner, name): (&str, &str),
+    table: Option<(String, String)>,
+) -> String {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(source, pythia_plsql::Syntax::TSql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let word = |i: usize, words: &[&str]| {
+        tokens.get(i).is_some_and(|t| {
+            t.kind.is_word()
+                && words
+                    .iter()
+                    .any(|w| source[t.span.clone()].eq_ignore_ascii_case(w))
+        })
+    };
+    // The parts of the name at `i`, as SQL Server reads them, and where it
+    // ends (the index after it, and the byte).
+    let parts = |mut i: usize| {
+        let mut parts = Vec::new();
+        let start = tokens.get(i)?.span.start;
+        loop {
+            let t = tokens.get(i)?;
+            if !matches!(
+                t.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword
+            ) {
+                return None;
+            }
+            parts.push(unquoted(&source[t.span.clone()]));
+            if tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Dot) {
+                i += 2;
+            } else {
+                return Some((parts, start..t.span.end, i + 1));
+            }
+        }
+    };
+    // `CREATE [OR ALTER] VIEW|PROC|PROCEDURE|FUNCTION|TRIGGER name`.
+    let mut i = 0;
+    if !word(i, &["CREATE"]) {
+        return source.to_owned();
+    }
+    i += 1;
+    if word(i, &["OR"]) && word(i + 1, &["ALTER"]) {
+        i += 2;
+    }
+    if !word(i, &["VIEW", "PROC", "PROCEDURE", "FUNCTION", "TRIGGER"]) {
+        return source.to_owned();
+    }
+    let Some((written, span, after)) = parts(i + 1) else {
+        return source.to_owned();
+    };
+    // Each name as it is now, where it is written otherwise: the last part
+    // the name, a part before it the schema.
+    let stale = |written: &[String], schema: &str, name: &str| {
+        written.last().map(String::as_str) != Some(name)
+            || written.len() > 1 && written[written.len() - 2] != schema
+    };
+    let mut edits = Vec::new();
+    if stale(&written, owner, name) {
+        edits.push((span, bracketed(owner, name)));
+    }
+    if let Some((schema, table)) = table
+        && let Some(on) = (after..tokens.len()).find(|&j| word(j, &["ON"]))
+        && !word(on + 1, &["DATABASE", "ALL"])
+        && let Some((written, span, _)) = parts(on + 1)
+        && stale(&written, &schema, &table)
+    {
+        edits.push((span, bracketed(&schema, &table)));
+    }
+    let mut out = source.to_owned();
+    for (span, name) in edits.into_iter().rev() {
+        out.replace_range(span, &name);
+    }
+    out
+}
+
+/// A name as written, without its brackets or double quotes.
+fn unquoted(text: &str) -> String {
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        inner.replace("]]", "]")
+    } else if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        inner.replace("\"\"", "\"")
+    } else {
+        text.to_owned()
+    }
+}
+
 /// `[schema].[name]`, for `object_id()`.
 fn bracketed(owner: &str, name: &str) -> String {
     format!(
@@ -230,9 +326,15 @@ fn columns(
     };
     let rows = ms.rows(
         &format!(
-            "select c.name, {COLUMN_TYPE}, c.is_nullable, object_definition(c.default_object_id), \
-                    cast(p.value as nvarchar(4000)), {pk} \
+            "select c.name, {COLUMN_TYPE}, c.is_nullable, \
+                    case when cc.definition is not null \
+                         then 'as ' + cc.definition \
+                              + case when cc.is_persisted = 1 then ' persisted' else '' end \
+                         else object_definition(c.default_object_id) end, \
+                    cast(p.value as nvarchar(4000)), {pk}, c.is_computed \
                from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
+               left join sys.computed_columns cc \
+                 on cc.object_id = c.object_id and cc.column_id = c.column_id \
                left join sys.extended_properties p on p.major_id = c.object_id \
                 and p.minor_id = c.column_id and p.class = 1 and p.name = 'MS_Description' \
               where c.object_id = object_id(@P1) \
@@ -252,6 +354,7 @@ fn columns(
                 default: next(),
                 comment: next(),
                 pk_position: next().and_then(|p| p.parse().ok()),
+                generated: next().as_deref() == Some("1"),
             }
         })
         .collect())
@@ -468,22 +571,46 @@ fn ddl(
     };
     let text = match object_type {
         ObjectType::Table => table_ddl(ms, &object)?,
-        ObjectType::View | ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger => ms
-            .rows("select object_definition(object_id(@P1))", &[&object])?
-            .into_iter()
-            .find_map(first)
-            .ok_or_else(|| {
-                DbError::new(format!(
-                    "No source for {owner}.{name}: it is encrypted, or it takes the VIEW \
-                     DEFINITION permission to see it"
-                ))
-            })?
-            .trim()
-            .to_owned(),
+        ObjectType::View | ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger => {
+            let source = ms
+                .rows("select object_definition(object_id(@P1))", &[&object])?
+                .into_iter()
+                .find_map(first)
+                .ok_or_else(|| {
+                    DbError::new(format!(
+                        "No source for {owner}.{name}: it is encrypted, or it takes the VIEW \
+                         DEFINITION permission to see it"
+                    ))
+                })?;
+            // A trigger's table, which may have been renamed too.
+            let table = if object_type == ObjectType::Trigger {
+                ms.rows(
+                    "select schema_name(p.schema_id), p.name from sys.triggers t \
+                       join sys.objects p on p.object_id = t.parent_id \
+                      where t.object_id = object_id(@P1)",
+                    &[&object],
+                )?
+                .into_iter()
+                .next()
+                .and_then(|row| match row.as_slice() {
+                    [Some(schema), Some(table)] => Some((schema.clone(), table.clone())),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            named_as_now(source.trim(), (owner, name), table)
+        }
         ObjectType::Sequence => {
             let row = ms
                 .rows(
-                    "select type_name(s.user_type_id), cast(s.start_value as varchar(40)), \
+                    // A decimal's or numeric's precision, which its
+                    // minimum and maximum need (Msg 11708) (#461).
+                    "select type_name(s.user_type_id) \
+                              + case when type_name(s.user_type_id) in ('decimal', 'numeric') \
+                                     then '(' + cast(s.precision as varchar(3)) + ')' \
+                                     else '' end, \
+                            cast(s.start_value as varchar(40)), \
                             cast(s.increment as varchar(40)), cast(s.minimum_value as varchar(40)), \
                             cast(s.maximum_value as varchar(40)), s.is_cycling, s.is_cached, \
                             s.cache_size \
@@ -534,7 +661,14 @@ fn ddl(
         } else {
             String::new()
         };
-        format!("{text}\nGO\n{order}")
+        let described = match object_type {
+            ObjectType::View
+            | ObjectType::Procedure
+            | ObjectType::Function
+            | ObjectType::Trigger => module_descriptions(ms, &object, object_type)?,
+            _ => String::new(),
+        };
+        format!("{text}\nGO\n{order}{described}")
     } else {
         text
     })
@@ -1204,6 +1338,97 @@ fn descriptions(ms: &mut Ms<'_>, object: &str) -> Result<Vec<String>, DbError> {
         .collect())
 }
 
+/// The descriptions (`MS_Description`) of a view, routine or trigger and
+/// of a view's columns and a routine's parameters, in a batch of their own
+/// after its DDL (#472): a copy had none. Each is updated where it is
+/// there, as *Edit*'s `CREATE OR ALTER` keeps it, and added where not.
+fn module_descriptions(
+    ms: &mut Ms<'_>,
+    object: &str,
+    object_type: ObjectType,
+) -> Result<String, DbError> {
+    let rows = ms.rows(
+        "select object_schema_name(o.object_id), o.name, object_name(o.parent_object_id), \
+                case p.class when 1 then col_name(o.object_id, nullif(p.minor_id, 0)) \
+                     else (select x.name from sys.parameters x \
+                            where x.object_id = o.object_id and x.parameter_id = p.minor_id) end, \
+                p.class, cast(p.value as nvarchar(max)) \
+           from sys.extended_properties p join sys.objects o on o.object_id = p.major_id \
+          where p.class in (1, 2) and p.major_id = object_id(@P1) and p.name = 'MS_Description' \
+          order by p.class, p.minor_id",
+        &[object],
+    )?;
+    let n = |text: &str| format!("N'{}'", text.replace('\'', "''"));
+    let mut out = String::new();
+    for row in rows {
+        let [
+            Some(schema),
+            Some(name),
+            parent,
+            part,
+            Some(class),
+            Some(value),
+        ] = row.as_slice()
+        else {
+            continue;
+        };
+        // A trigger is described under its table.
+        let mut levels = vec![("SCHEMA", schema.clone())];
+        match (object_type, parent) {
+            (ObjectType::Trigger, Some(table)) => {
+                levels.push(("TABLE", table.clone()));
+                levels.push(("TRIGGER", name.clone()));
+            }
+            (ObjectType::Trigger, None) => continue,
+            _ => {
+                let kind = match object_type {
+                    ObjectType::View => "VIEW",
+                    ObjectType::Procedure => "PROCEDURE",
+                    _ => "FUNCTION",
+                };
+                levels.push((kind, name.clone()));
+                if let Some(part) = part {
+                    levels.push((
+                        if class == "2" { "PARAMETER" } else { "COLUMN" },
+                        part.clone(),
+                    ));
+                }
+            }
+        }
+        let named: Vec<String> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, name))| {
+                format!("@level{i}type = N'{kind}', @level{i}name = {}", n(name))
+            })
+            .collect();
+        let listed: Vec<String> = (0..3)
+            .flat_map(|i| match levels.get(i) {
+                Some((kind, name)) => [format!("N'{kind}'"), n(name)],
+                None => ["null".to_owned(), "null".to_owned()],
+            })
+            .collect();
+        let call = |procedure: &str| {
+            format!(
+                "exec sys.{procedure} @name = N'MS_Description', @value = {}, {}",
+                n(value),
+                named.join(", ")
+            )
+        };
+        out.push_str(&format!(
+            "if exists (select 1 from sys.fn_listextendedproperty(N'MS_Description', {}))\n  {}\n\
+             else\n  {};\n",
+            listed.join(", "),
+            call("sp_updateextendedproperty"),
+            call("sp_addextendedproperty")
+        ));
+    }
+    if !out.is_empty() {
+        out.push_str("GO\n");
+    }
+    Ok(out)
+}
+
 /// `ledger = on` of a ledger table of `kind`, updatable (2) or append-only
 /// (3), with its ledger `view` where it is `named` other than the default,
 /// or where the view's columns are, as they then follow it (#366).
@@ -1744,6 +1969,46 @@ fn object_name(object: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module renamed or moved is made under the name it has now; one
+    /// written as it is stays as written (#450).
+    #[test]
+    fn modules_are_named_as_now() {
+        let now = |source: &str| named_as_now(source, ("dbo", "v_new"), None);
+        assert_eq!(
+            now("create view v_new as select 1 x"),
+            "create view v_new as select 1 x"
+        );
+        assert_eq!(
+            now("CREATE VIEW [dbo].[v_new] AS SELECT 1 x"),
+            "CREATE VIEW [dbo].[v_new] AS SELECT 1 x"
+        );
+        assert_eq!(
+            now("-- note\ncreate or alter view v_old as select 1 x"),
+            "-- note\ncreate or alter view [dbo].[v_new] as select 1 x"
+        );
+        assert_eq!(
+            now("create view old_schema.v_new as select 1 x"),
+            "create view [dbo].[v_new] as select 1 x"
+        );
+        let table = Some(("sales".to_owned(), "orders".to_owned()));
+        assert_eq!(
+            named_as_now(
+                "create trigger tr_old on [dbo].[orders_old] after insert as select 1",
+                ("sales", "tr"),
+                table.clone()
+            ),
+            "create trigger [sales].[tr] on [sales].[orders] after insert as select 1"
+        );
+        assert_eq!(
+            named_as_now(
+                "create trigger tr on orders after insert as select 1",
+                ("sales", "tr"),
+                table
+            ),
+            "create trigger tr on orders after insert as select 1"
+        );
+    }
 
     #[test]
     fn compression_by_partition() {

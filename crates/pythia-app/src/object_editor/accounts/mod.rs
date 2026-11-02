@@ -95,6 +95,10 @@ pub struct UserDef {
     pub privileges: BTreeMap<(Scope, String), Grant>,
     /// Shown, not edited, e.g. MySQL's authentication plugin.
     pub info: Vec<(String, String)>,
+    /// MariaDB: the account's authentication plugins in order, where it
+    /// has others than a password alone (`unix_socket OR
+    /// mysql_native_password`), which a new password keeps (#463).
+    pub plugins: Vec<String>,
     pub unread: Unread,
 }
 

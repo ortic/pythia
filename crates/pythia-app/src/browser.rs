@@ -2119,8 +2119,10 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             let inner = replace_script(dialect, o, rest, mariadb);
             let inner = inner.strip_prefix(&database).unwrap_or(&inner);
             format!(
-                "{database}set @pythia_sql_mode = @@session.sql_mode;\n{mode}\n\n{inner}\
-                 set session sql_mode = @pythia_sql_mode;\n"
+                "{database}set @pythia_sql_mode = @@session.sql_mode, \
+                 @pythia_collation = @@session.collation_connection;\n{mode}\n\n{inner}\
+                 set session sql_mode = @pythia_sql_mode, \
+                 collation_connection = @pythia_collation;\n"
             )
         }
         (pythia_db::DbKind::MySql, _) if mariadb => {
@@ -2694,6 +2696,14 @@ fn bind_names(cols: &[TableColumn]) -> Vec<String> {
 /// Builds the statement for `kind` with binds named after the columns.
 /// Oracle's names are written in lowercase; MySQL's keep their case.
 fn template(dialect: Dialect, kind: Template, object: &ObjectRef, cols: &[TableColumn]) -> String {
+    // An INSERT or UPDATE gives a generated column no value (#471).
+    let written_cols: Vec<TableColumn>;
+    let cols = if matches!(kind, Template::Insert | Template::Update) {
+        written_cols = cols.iter().filter(|c| !c.generated).cloned().collect();
+        &written_cols[..]
+    } else {
+        cols
+    };
     let name = |c: &TableColumn| written(dialect, &c.name);
     let table = written_qualified(dialect, &object.owner, &object.name);
     let names: Vec<String> = cols.iter().map(name).collect();
@@ -3031,6 +3041,7 @@ mod tests {
             default: None,
             comment: None,
             pk_position: pk,
+            generated: false,
         }
     }
 
@@ -3071,6 +3082,114 @@ mod tests {
             template(Dialect::MYSQL, Template::Select, &object, &cols),
             "select o.id,\n       o.Total,\n       o.`key`\n  from shop.`Order` o"
         );
+        // A generated column takes no value (#471).
+        let mut twice = col("twice", None);
+        twice.generated = true;
+        let cols = [col("id", Some(1)), col("n", None), twice];
+        assert_eq!(
+            template(Dialect::MYSQL, Template::Insert, &object, &cols),
+            "insert into shop.`Order`\n  (id, n)\nvalues\n  (:id, :n)"
+        );
+        assert_eq!(
+            template(Dialect::MYSQL, Template::Update, &object, &cols),
+            "update shop.`Order`\n   set n = :n\n where id = :id"
+        );
+        assert!(template(Dialect::MYSQL, Template::Select, &object, &cols).contains("twice"));
+    }
+
+    /// Every database's columns say which are generated, and how where it
+    /// tells (#471).
+    #[test]
+    fn generated_columns_are_marked() {
+        use pythia_db::{MetaQuery, MetaResult};
+        let check = |c: &mut dyn pythia_db::Client, owner: &str, table: &str, how: &str| {
+            let MetaResult::Columns(columns) = c
+                .meta(&MetaQuery::Columns {
+                    owner: owner.into(),
+                    table: table.into(),
+                    keys: false,
+                })
+                .unwrap()
+            else {
+                panic!("columns")
+            };
+            let marked: Vec<(String, bool)> = columns
+                .iter()
+                .map(|c| (c.name.to_lowercase(), c.generated))
+                .collect();
+            assert_eq!(
+                marked,
+                [("n".to_owned(), false), ("twice".to_owned(), true)],
+                "{:?}",
+                c.dialect()
+            );
+            let default = columns[1]
+                .default
+                .clone()
+                .unwrap_or_default()
+                .to_lowercase();
+            assert!(default.contains(how), "{:?}: {default}", c.dialect());
+        };
+        let dir = std::env::temp_dir().join(format!("pythia-gen-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let file = format!("{}?create", dir.display());
+        crate::test_db::run_with(pythia_config::DbKind::Sqlite, "", "", &file, move |c| {
+            c.execute("create table r101_gen (n int, twice int generated always as (n * 2))")
+                .unwrap();
+            check(c, "main", "r101_gen", "");
+        });
+        let _ = std::fs::remove_file(&dir);
+        for (env, kind, create, how) in [
+            (
+                "PYTHIA_TEST_MYSQL",
+                pythia_config::DbKind::MySql,
+                "create table r101_gen (n int, twice int as (n * 2) stored)",
+                "generated always as",
+            ),
+            (
+                "PYTHIA_TEST_POSTGRES",
+                pythia_config::DbKind::Postgres,
+                "create table r101_gen (n int, twice int generated always as (n * 2) stored)",
+                "generated always as",
+            ),
+            (
+                "PYTHIA_TEST_MSSQL",
+                pythia_config::DbKind::SqlServer,
+                "create table r101_gen (n int, twice as (n * 2))",
+                "as (",
+            ),
+            (
+                "PYTHIA_TEST_DB",
+                pythia_config::DbKind::Oracle,
+                "create table r101_gen (n number, twice as (n * 2) virtual)",
+                "generated always as",
+            ),
+        ] {
+            crate::test_db::run_on(env, kind, move |c| {
+                let _ = c.execute("drop table r101_gen");
+                c.execute(create).unwrap();
+                let owner = c
+                    .query(
+                        match kind {
+                            pythia_config::DbKind::MySql => "select database()",
+                            pythia_config::DbKind::Postgres => "select current_schema()",
+                            pythia_config::DbKind::SqlServer => "select schema_name()",
+                            _ => "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual",
+                        },
+                        &[],
+                    )
+                    .unwrap()[0][0]
+                    .clone()
+                    .unwrap();
+                let table = if kind == pythia_config::DbKind::Oracle {
+                    "R101_GEN"
+                } else {
+                    "r101_gen"
+                };
+                check(c, &owner, table, how);
+                c.execute("drop table r101_gen").unwrap();
+            });
+        }
     }
 
     /// Names keep the case that tells them apart; Oracle's uppercase ones
@@ -3270,15 +3389,19 @@ mod tests {
                      CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s";
         assert_eq!(
             replace_script(Dialect::MYSQL, &trigger, moded, true),
-            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode;\n\
+            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode, \
+             @pythia_collation = @@session.collation_connection;\n\
              set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
              CREATE or replace TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s\n/\n\
-             set session sql_mode = @pythia_sql_mode;\n"
+             set session sql_mode = @pythia_sql_mode, collation_connection = @pythia_collation;\n"
         );
         let script = replace_script(Dialect::MYSQL, &trigger, moded, false);
         assert!(
             script.contains("set session sql_mode = 'PIPES_AS_CONCAT';\n\n-- MySQL can't")
-                && script.ends_with("/\nset session sql_mode = @pythia_sql_mode;\n"),
+                && script.ends_with(
+                    "/\nset session sql_mode = @pythia_sql_mode, \
+                     collation_connection = @pythia_collation;\n"
+                ),
             "{script}"
         );
         // MariaDB keeps IF NOT EXISTS, which OR REPLACE can't go with.

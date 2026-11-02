@@ -27,6 +27,15 @@ pub struct IndexDef {
     pub tablespace: String,
     /// Build without blocking DML on the table.
     pub online: bool,
+    /// The table's owner where it isn't the index's: the index was made
+    /// again on the index owner's table of the name (#466).
+    pub table_owner: String,
+    /// What the form doesn't edit and making the index again keeps (#466):
+    /// `compress 1`, `reverse`, `invisible`, `local`.
+    pub kept: Vec<String>,
+    /// Why the index can't be made again from the form, which would lose
+    /// it: a domain index's parameters, a global partitioning.
+    pub not_remade: Option<String>,
 }
 
 impl IndexDef {
@@ -43,10 +52,34 @@ impl IndexDef {
 }
 
 pub fn load(conn: &Connection, owner: &str, name: &str) -> Result<IndexDef, DbError> {
-    let (table, uniqueness, index_type, tablespace) = conn
-        .query_row_as::<(String, String, String, Option<String>)>(
-            "select table_name, uniqueness, index_type, tablespace_name
-               from all_indexes where owner = :1 and index_name = :2",
+    #[allow(clippy::type_complexity)]
+    let (
+        table_owner,
+        table,
+        uniqueness,
+        index_type,
+        tablespace,
+        compression,
+        prefix,
+        visibility,
+        locality,
+    ) = conn
+        .query_row_as::<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+            Option<String>,
+        )>(
+            "select i.table_owner, i.table_name, i.uniqueness, i.index_type, i.tablespace_name,
+                    i.compression, i.prefix_length, i.visibility,
+                    (select p.locality from all_part_indexes p
+                      where p.owner = i.owner and p.index_name = i.index_name)
+               from all_indexes i where i.owner = :1 and i.index_name = :2",
             &[&owner, &name],
         )
         .map_err(|e| match e.db_error().map(|d| d.code()) {
@@ -89,15 +122,51 @@ pub fn load(conn: &Connection, owner: &str, name: &str) -> Result<IndexDef, DbEr
             desc: descend == "DESC",
         });
     }
+    let mut kept = Vec::new();
+    match compression.as_deref() {
+        Some("ENABLED") => kept.push(match prefix {
+            Some(n) => format!("compress {n}"),
+            None => "compress".to_owned(),
+        }),
+        Some(advanced @ ("ADVANCED LOW" | "ADVANCED HIGH")) => {
+            kept.push(format!("compress {}", advanced.to_lowercase()));
+        }
+        _ => {}
+    }
+    if index_type.ends_with("/REV") {
+        kept.push("reverse".to_owned());
+    }
+    if visibility.as_deref() == Some("INVISIBLE") {
+        kept.push("invisible".to_owned());
+    }
+    let not_remade = match (index_type.as_str(), locality.as_deref()) {
+        ("DOMAIN", _) => Some("a domain index, whose parameters only its DDL keeps".to_owned()),
+        (_, Some("GLOBAL")) => {
+            Some("a globally partitioned index, whose partitions only its DDL keeps".to_owned())
+        }
+        (_, Some("LOCAL")) => {
+            kept.push("local".to_owned());
+            None
+        }
+        _ => None,
+    };
     Ok(IndexDef {
         name: quote_ident(name),
         table: quote_ident(&table),
         columns,
         unique: uniqueness == "UNIQUE",
-        bitmap: index_type.starts_with("BITMAP"),
+        // FUNCTION-BASED BITMAP too.
+        bitmap: index_type.contains("BITMAP"),
         // As typed, like the other names: "my_ts" isn't MY_TS (#365).
         tablespace: tablespace.map(|t| quote_ident(&t)).unwrap_or_default(),
         online: false,
+        table_owner: if table_owner == owner {
+            String::new()
+        } else {
+            table_owner
+        },
+        kept,
+        not_remade,
     })
 }
 
@@ -126,10 +195,15 @@ fn create(owner: &str, def: &IndexDef) -> String {
             if c.desc { format!("{expr} desc") } else { expr }
         })
         .collect();
+    let table_owner = if def.table_owner.is_empty() {
+        owner
+    } else {
+        &def.table_owner
+    };
     let mut sql = format!(
         "create {kind}index {}\n  on {} ({})",
         qualified(owner, &def.name),
-        qualified(owner, &def.table),
+        qualified(table_owner, &def.table),
         columns.join(", ")
     );
     if !def.tablespace.trim().is_empty() {
@@ -138,8 +212,16 @@ fn create(owner: &str, def: &IndexDef) -> String {
             quote_ident(&ident(&def.tablespace))
         ));
     }
+    // Index attributes, then ONLINE, then the partitioning, as Oracle
+    // reads them.
+    for clause in def.kept.iter().filter(|c| *c != "local") {
+        sql.push_str(&format!("\n  {clause}"));
+    }
     if def.online {
         sql.push_str("\n  online");
+    }
+    if def.kept.iter().any(|c| c == "local") {
+        sql.push_str("\n  local");
     }
     sql
 }
@@ -170,6 +252,9 @@ pub fn statements(
         return Ok(vec![create(owner, &def)]);
     };
     if def.structure() != original.structure() {
+        if let Some(why) = &original.not_remade {
+            return Err(format!("It is {why}: change it with its DDL"));
+        }
         return Ok(vec![
             format!("drop index {}", qualified(owner, &def.name)),
             create(owner, &def),
@@ -223,6 +308,19 @@ pub fn ui(ui: &mut Ui, def: &mut IndexDef, existing: bool, lists: &mut Lists) {
                 "Keep the table writable while the index builds (Enterprise Edition)",
             );
         });
+        if !def.kept.is_empty() {
+            form_row(ui, "Also", |ui| {
+                ui.weak(def.kept.join(", "))
+                    .on_hover_text("Kept when the index is made again for new columns");
+            });
+        }
+        if let Some(why) = &def.not_remade {
+            form_row(ui, "Note", |ui| {
+                ui.weak(format!(
+                    "It is {why}: its columns and kind change with its DDL"
+                ));
+            });
+        }
     });
     ui.add_space(8.0);
     ui.label(RichText::new("Columns").strong());
@@ -334,6 +432,92 @@ mod tests {
         );
         d.bitmap = true;
         assert!(statements("APP", None, &d).is_err());
+    }
+
+    /// Made again for a new column, an index keeps its table's owner and
+    /// what the form doesn't edit (#466); a domain index isn't made again.
+    #[test]
+    fn remade_indexes_keep_what_the_form_doesnt_edit() {
+        let original = IndexDef {
+            table_owner: "SALES".into(),
+            kept: vec![
+                "compress 1".into(),
+                "reverse".into(),
+                "invisible".into(),
+                "local".into(),
+            ],
+            ..def()
+        };
+        let mut d = original.clone();
+        d.columns.pop();
+        d.online = true;
+        assert_eq!(
+            statements("APP", Some(&original), &d).unwrap(),
+            [
+                "drop index APP.ORDERS_CUSTOMER_IX",
+                "create index APP.ORDERS_CUSTOMER_IX\n  on SALES.ORDERS (CUSTOMER_ID)\n  \
+                 compress 1\n  reverse\n  invisible\n  online\n  local",
+            ]
+        );
+        let domain = IndexDef {
+            not_remade: Some("a domain index".into()),
+            ..def()
+        };
+        let mut d = domain.clone();
+        d.columns.pop();
+        assert!(statements("APP", Some(&domain), &d).is_err());
+    }
+
+    /// On Oracle: an index made again from the form is as it was but for
+    /// its columns (#466).
+    #[test]
+    fn remade_indexes_on_oracle() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let _ = conn.execute("drop table r101_ixp purge", &[]);
+        for sql in [
+            "create table r101_ixp (a number, b number) partition by range (a) \
+               (partition p1 values less than (10), partition p2 values less than (maxvalue))",
+            "create index r101_ixp_i on r101_ixp (a, b) compress 1 reverse invisible local",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        let owner: String = conn
+            .query_row_as(
+                "select sys_context('USERENV', 'CURRENT_SCHEMA') from dual",
+                &[],
+            )
+            .unwrap();
+        let original = load(&conn, &owner, "R101_IXP_I").unwrap();
+        assert_eq!(
+            original.kept,
+            ["compress 1", "reverse", "invisible", "local"]
+        );
+        assert!(original.table_owner.is_empty() && original.not_remade.is_none());
+        let mut d = original.clone();
+        d.columns.pop();
+        for sql in statements(&owner, Some(&original), &d).unwrap() {
+            conn.execute(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let (index_type, compression, visibility, partitioned): (String, String, String, String) =
+            conn.query_row_as(
+                "select index_type, compression, visibility, partitioned from user_indexes \
+                  where index_name = 'R101_IXP_I'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                index_type.as_str(),
+                compression.as_str(),
+                visibility.as_str(),
+                partitioned.as_str()
+            ),
+            ("NORMAL/REV", "ENABLED", "INVISIBLE", "YES")
+        );
+        conn.execute("drop table r101_ixp purge", &[]).unwrap();
     }
 
     #[test]

@@ -237,7 +237,7 @@ fn columns(
     let sql = format!(
         "select c.column_name, c.column_type, c.is_nullable, c.column_default, \
                 nullif(c.column_comment, ''), {pk}, lower(c.data_type), c.extra, \
-                version() like '%MariaDB%' \
+                version() like '%MariaDB%', nullif(c.generation_expression, '') \
            from information_schema.columns c \
           where c.table_schema = ? and c.table_name = ? \
           order by c.ordinal_position"
@@ -252,24 +252,48 @@ fn columns(
         String,
         String,
         bool,
+        Option<String>,
     );
     let rows: Vec<Row> = conn.exec(sql, (owner, &table))?;
     Ok(rows
         .into_iter()
         .map(
-            |(name, data_type, nullable, default, comment, pk, kind, extra, mariadb)| TableColumn {
+            |(
+                name,
+                data_type,
+                nullable,
+                default,
+                comment,
+                pk,
+                kind,
+                extra,
+                mariadb,
+                expression,
+            )| TableColumn {
                 name,
                 data_type,
                 nullable: nullable == "YES",
-                default: default.map(|d| {
-                    if mariadb {
-                        d
-                    } else {
-                        mysql_default(d, &kind, &extra)
-                    }
-                }),
+                // A generated column says so, with its expression (#471).
+                default: match &expression {
+                    Some(expression) => Some(format!(
+                        "generated always as ({expression}) {}",
+                        if extra.to_uppercase().contains("STORED") {
+                            "stored"
+                        } else {
+                            "virtual"
+                        }
+                    )),
+                    None => default.map(|d| {
+                        if mariadb {
+                            d
+                        } else {
+                            mysql_default(d, &kind, &extra)
+                        }
+                    }),
+                },
                 comment,
                 pk_position: pk,
+                generated: expression.is_some(),
             },
         )
         .collect())
@@ -526,19 +550,20 @@ fn show_create(
     let dialect = Dialect::MYSQL;
     let sql = format!("show create {what} {}", dialect.qualified(owner, name));
     let row: Option<mysql::Row> = conn.query_first(sql)?;
-    // A routine's and a trigger's sql_mode, which SHOW CREATE gives beside
-    // the statement (#422).
-    let mode = row
-        .as_ref()
-        .filter(|_| {
-            matches!(
-                object_type,
-                ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger
-            )
-        })
-        .and_then(|row| row.get_opt::<Option<String>, _>(1))
-        .and_then(Result::ok)
-        .flatten();
+    // A routine's and a trigger's sql_mode (#422) and collation_connection
+    // (#452), which SHOW CREATE gives beside the statement.
+    let routine = matches!(
+        object_type,
+        ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger
+    );
+    let setting = |i: usize| {
+        row.as_ref()
+            .filter(|_| routine)
+            .and_then(|row| row.get_opt::<Option<String>, _>(i))
+            .and_then(Result::ok)
+            .flatten()
+    };
+    let (mode, collation) = (setting(1), setting(4));
     let ddl = row
         .and_then(|row| row.get_opt::<Option<String>, _>(column))
         .and_then(Result::ok)
@@ -556,15 +581,20 @@ fn show_create(
     if object_type == ObjectType::Trigger {
         ddl = in_order(conn, owner, name, ddl)?;
     }
-    // Made under another sql_mode than the session's, it is made again
-    // under its own: PIPES_AS_CONCAT makes || a concatenation, ANSI_QUOTES
-    // "x" a name (#422).
-    let session: Option<String> = conn.query_first("select @@session.sql_mode")?;
-    if let Some(mode) = mode.filter(|mode| session.as_ref() != Some(mode)) {
-        ddl = format!(
-            "{SQL_MODE_PREFIX}'{}';\n\n{ddl}",
-            mode.replace('\\', "\\\\").replace('\'', "''")
-        );
+    // Made under another sql_mode or collation than the session's, it is
+    // made again under its own: PIPES_AS_CONCAT makes || a concatenation,
+    // ANSI_QUOTES "x" a name (#422); the collation is its literals' and
+    // variables', which compare with its tables' columns (#452).
+    let session: Option<(String, String)> =
+        conn.query_first("select @@session.sql_mode, @@session.collation_connection")?;
+    let (session_mode, session_collation) = session.unwrap_or_default();
+    let other_collation = collation.filter(|c| *c != session_collation);
+    if let Some(mode) = mode.filter(|mode| *mode != session_mode || other_collation.is_some()) {
+        let quoted = |s: &str| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"));
+        let collation = other_collation
+            .map(|c| format!(", collation_connection = {}", quoted(&c)))
+            .unwrap_or_default();
+        ddl = format!("{SQL_MODE_PREFIX}{}{collation};\n\n{ddl}", quoted(&mode));
     }
     Ok(ddl)
 }

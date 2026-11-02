@@ -1323,7 +1323,25 @@ impl PythiaApp {
             .and_then(|id| self.docs.get(&id))
             .and_then(|d| d.connection.clone());
         let close = effects.close;
+        // A read-only connection takes no changes (#464): what these windows
+        // run on their own session changes the database.
+        let refuses = self.read_only_of(connection.as_deref())
+            && doc.and_then(|id| self.docs.get(&id)).is_some_and(|d| {
+                matches!(
+                    d.kind,
+                    DocKind::ObjectEditor(_)
+                        | DocKind::TableEditor(_)
+                        | DocKind::Import(_)
+                        | DocKind::Maintenance(_)
+                )
+            });
         for (target, request) in effects.requests {
+            if refuses && matches!(target, Target::Own) {
+                if let Some(id) = doc {
+                    self.deliver(id, read_only_refusal(&request));
+                }
+                continue;
+            }
             let target_connection = match &target {
                 Target::Connection(c) => Some(c.clone()),
                 _ => connection.clone(),
@@ -1399,7 +1417,21 @@ impl PythiaApp {
         for (connection, action) in effects.object_actions {
             self.object_action(connection, action);
         }
-        if let (Some(request), Some(id), Some(name)) = (effects.recompile, doc, &connection)
+        let recompile = effects.recompile.filter(|request| {
+            let read_only = self.read_only_of(connection.as_deref());
+            if read_only && let Some(id) = doc {
+                let error = pythia_db::DbError::new(READ_ONLY_REFUSED);
+                self.deliver(
+                    id,
+                    DbEvent::TaskDone {
+                        id: request.id,
+                        result: Err(error),
+                    },
+                );
+            }
+            !read_only
+        });
+        if let (Some(request), Some(id), Some(name)) = (recompile, doc, &connection)
             && let Some(conn) = self.conns.get_mut(name)
         {
             let params = conn.params().clone();
@@ -2621,7 +2653,19 @@ impl PythiaApp {
             self.use_database(name, &database);
         }
         if let Some(name) = connection {
+            let read_only = self.read_only_of(Some(&name));
             for (target, request) in requests {
+                // The browser's actions (drop, compile, enable, …) change the
+                // database, which a read-only connection takes none of (#464).
+                if read_only && matches!(request, DbRequest::Execute { .. }) {
+                    let mut log = Vec::new();
+                    let effects = self.browser.on_event(read_only_refusal(&request), &mut log);
+                    for line in log {
+                        self.log(line);
+                    }
+                    self.apply_browser(effects);
+                    continue;
+                }
                 match (target, request_key(&request), self.conns.get_mut(&name)) {
                     (Target::Meta, Some(id), Some(conn)) => {
                         conn.send_meta(id, request, &self.notify)
@@ -3303,12 +3347,13 @@ impl PythiaApp {
             && !std::mem::take(&mut self.production_confirmed)
             && let Some(DocKind::Sql(w)) = self.docs.get(&id).map(|d| &d.kind)
         {
+            let syntax = w.state.syntax;
             let changing = w
                 .statements(current_only)
                 .iter()
                 .filter(|s| {
                     s.kind != pythia_plsql::StatementKind::SqlPlus
-                        && !crate::sql_window::is_query(&s.sql)
+                        && !crate::sql_window::is_query(&s.sql, syntax)
                 })
                 .count();
             if changing > 0 {
@@ -6669,6 +6714,27 @@ fn bar_menu(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
 }
 
 /// Request id of requests that are answered with an id-carrying event.
+/// Why a read-only connection didn't run a change (#464).
+const READ_ONLY_REFUSED: &str = "Connection is read-only: nothing is changed";
+
+/// What answers `request` on a read-only connection, which runs no change
+/// (#464).
+fn read_only_refusal(request: &DbRequest) -> DbEvent {
+    let error = pythia_db::DbError::new(READ_ONLY_REFUSED);
+    match request {
+        DbRequest::Task { id, .. } | DbRequest::Run { id, .. } => DbEvent::TaskDone {
+            id: *id,
+            result: Err(error),
+        },
+        DbRequest::Execute { id, .. } | DbRequest::ExecuteWhole { id, .. } => DbEvent::Failed {
+            id: *id,
+            error,
+            elapsed: std::time::Duration::ZERO,
+        },
+        _ => DbEvent::Error(error),
+    }
+}
+
 fn request_key(request: &DbRequest) -> Option<u64> {
     match request {
         DbRequest::Execute { id, .. }

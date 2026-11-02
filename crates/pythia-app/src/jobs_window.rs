@@ -409,7 +409,13 @@ impl JobsWindow {
         if let Some(job) = selected {
             ui.separator();
             if let Some(action) = self.details(ui, &job, cx, &mut effects) {
-                effects.extend(self.action(action));
+                // A read-only connection changes no job (#464).
+                if cx.read_only {
+                    self.state.error =
+                        Some("Connection is read-only: jobs are left as they are".into());
+                } else {
+                    effects.extend(self.action(action));
+                }
             }
         }
         effects

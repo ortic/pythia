@@ -6889,6 +6889,7 @@ end;
         default: None,
         comment: None,
         identity: false,
+        generation: Default::default(),
     };
     h.state_mut().test_table_editor().edit_for_test(|t| {
         t.name = "pythia_tbu_orders".into();
@@ -6926,6 +6927,7 @@ end;
             unique: false,
             columns: vec!["customer_id".into()],
             generated: false,
+            kind: Default::default(),
         });
     });
     h.run_steps(3);
@@ -6999,6 +7001,7 @@ fn table_builder_partitions() {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         });
     });
     h.get_by_label("Partitions").hover();
@@ -13637,6 +13640,59 @@ fn object_view_of_a_dropped_table() {
             .is_some(),
         "Refresh says it's gone"
     );
+}
+
+/// A read-only connection drops nothing from the object browser either
+/// (#464): only SQL windows refused changes, and *Drop…* ran.
+#[test]
+fn read_only_connections_drop_nothing() {
+    use crate::browser::ObjectAction;
+    use pythia_db::ObjectType;
+    let file = SqliteFile(std::env::temp_dir().join(format!(
+        "pythia-ui-{}-r101-read-only.db",
+        std::process::id()
+    )));
+    let _ = std::fs::remove_file(&file.0);
+    rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .execute_batch("create table r101_keep (a)")
+        .unwrap();
+    let connection = "r101-read-only";
+    let profile = ConnectionProfile {
+        name: connection.into(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: file.0.display().to_string(),
+        read_only: true,
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let before = h.state().test_log().len();
+    let object = ObjectRef {
+        owner: "main".into(),
+        name: "r101_keep".into(),
+        object_type: ObjectType::Table,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Drop(object));
+    h.run_steps(3);
+    h.get_by_label("Drop").click();
+    wait_until(&mut h, "the refusal", |app| {
+        app.test_log()[before..]
+            .iter()
+            .any(|l| l.contains("read-only"))
+    });
+    drop(h);
+    let tables: i64 = rusqlite::Connection::open(&file.0)
+        .unwrap()
+        .query_row(
+            "select count(*) from sqlite_schema where name = 'r101_keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1);
 }
 
 /// *Drop…* names the table as its database writes it, in the question and

@@ -796,6 +796,7 @@ fn new_table() -> TableDef {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         }],
         comment: None,
         constraints: vec![ConstraintDef {
@@ -1394,6 +1395,7 @@ fn columns_ui(
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         });
     }
 }
@@ -1638,6 +1640,7 @@ fn indexes_ui(ui: &mut Ui, table: &mut TableDef, new: &mut NewIndex) {
                 unique: new.unique,
                 columns: split_columns(&new.columns),
                 generated: false,
+                kind: Default::default(),
             });
             *new = NewIndex::default();
         }
@@ -1659,6 +1662,7 @@ fn indexes_ui(ui: &mut Ui, table: &mut TableDef, new: &mut NewIndex) {
                     unique: false,
                     columns,
                     generated: false,
+                    kind: Default::default(),
                 });
             }
         }
@@ -1710,6 +1714,7 @@ mod tests {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         }
     }
 
@@ -1753,6 +1758,7 @@ mod tests {
                 unique: false,
                 columns: vec!["name".into()],
                 generated: false,
+                kind: Default::default(),
             });
         });
         assert!(editor.is_dirty());
@@ -1801,6 +1807,7 @@ mod tests {
                 unique: false,
                 columns: vec!["\"NAME\" desc".into()],
                 generated: false,
+                kind: Default::default(),
             }],
         };
         let mut editor = TableEditor::new(ObjectRef {
@@ -1920,6 +1927,7 @@ mod tests {
                 unique: false,
                 columns: vec!["\"Mixed\"".into()],
                 generated: false,
+                kind: Default::default(),
             }],
         };
         let copy = copy_of(&original);
@@ -1946,12 +1954,14 @@ mod tests {
             unique: false,
             columns: vec!["ID".into()],
             generated: false,
+            kind: Default::default(),
         });
         def.indexes.push(IndexDef {
             name: String::new(),
             unique: false,
             columns: vec!["ID".into()],
             generated: false,
+            kind: Default::default(),
         });
         let def = named(def, 30);
         assert_eq!(def.constraints[0].name, "A_VERY_LONG_TABLE_NAME_OF_3_PK");
@@ -2059,6 +2069,7 @@ mod tests {
                     unique: false,
                     columns,
                     generated: false,
+                    kind: Default::default(),
                 });
             }
         });

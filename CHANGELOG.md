@@ -392,6 +392,76 @@ All notable changes to Pythia are documented here. The format follows
   server's default, the login script or a `SET`), a SQL window reads a
   `\` in a string as itself: `'C:\'` no longer runs on to the end of the
   script, in splitting, highlighting and binds (#412).
+- Edit leaves a query over tables joined with commas read-only also when
+  an alias is written with `AS` or is a keyword, or a table has SQL
+  Server's `WITH (NOLOCK)`: another table's cells were written to the
+  first table (#449).
+- SQL Server: a renamed or moved view, routine or trigger has DDL under
+  its name of now, and a trigger under its table's: *Edit* made it again
+  under its old name, beside the renamed one (#450).
+- PostgreSQL: a `SET client_encoding` to anything but UTF8 is undone
+  with a notice, and a value that isn't UTF-8 fails its statement: the
+  window hung for ever at the first non-ASCII value, and text written
+  was stored garbled (#451).
+- MySQL: sessions use the server's utf8mb4 collation, not the driver's
+  `utf8mb4_general_ci`, which a column's didn't mix with (1267), and
+  *Edit* makes a routine or trigger again under its own collation (#452).
+- MySQL: `WITH … UPDATE` and `WITH … DELETE` wait for Commit, as UPDATE
+  and DELETE do: they were committed at once (#453).
+- SQL Server: a batch that starts with a SELECT, PRINT or USE and changes
+  rows further on waits for Commit: it was committed at once (#454).
+- A read-only connection refuses, and a production connection confirms,
+  statements that start like a query but change or lock: `WITH … DELETE`,
+  `SELECT … INTO`, a T-SQL batch with a DELETE after its SELECT,
+  `SELECT … FOR UPDATE` (#455).
+- Import into an existing table's text columns takes the file's values
+  as they are: a phone number, `1.10` or a date in text were converted as
+  numbers and dates (#456).
+- A result's INSERT statements leave out the columns its table computes
+  (generated and computed columns, rowversion) and say when an identity
+  takes the values written (`OVERRIDING SYSTEM VALUE`, `SET
+  IDENTITY_INSERT`); Edit keeps those columns read-only: every database
+  refused the values (#457).
+- Oracle: the table editor's copy and Schema Compare make a virtual column
+  as one (#458), an invisible one too, keep `DEFAULT ON NULL` and an
+  identity's `GENERATED ALWAYS` (#459), and write NVARCHAR2 and NCHAR
+  without `CHAR`, which Oracle refused (#460).
+- SQL Server: a numeric or decimal sequence's DDL keeps its precision,
+  without which it failed (Msg 11708) (#461).
+- MySQL: taking a default role's admin option away in the user form
+  keeps it enabled at login, which MySQL's REVOKE ended (#462).
+- MariaDB: a new password in the user form keeps the account's other
+  ways to log in (`unix_socket OR mysql_native_password`), which it
+  replaced with the password alone (#463).
+- A read-only connection refuses changes everywhere, not only in SQL
+  windows: the browser's Drop and other actions, object forms, the table
+  editor, Import, Maintenance, recompiles, job actions and the monitor's
+  kills ran (#464).
+- SQLite: Edit of a table without a primary key checks a row's values
+  beside its rowid, which VACUUM renumbers: a stale result's Delete took
+  another row (#465).
+- Oracle: the index form makes an index again for new columns with its
+  table's owner, compression, REVERSE, INVISIBLE and LOCAL partitioning,
+  which it lost, and doesn't make domain or globally partitioned indexes
+  again (#466).
+- Oracle: Schema Compare and the table editor keep an index's kind
+  (bitmap), compression, REVERSE, visibility and LOCAL partitioning, and
+  compare function-based and descending indexes, which they made plain
+  or left out (#467).
+- PostgreSQL: a dollar quote's tag may have letters past ASCII
+  (`$função$`), where a script was split inside its body (#468).
+- The editor offers PL/SQL snippets (`func`, `proc`, `begin`, …) in
+  Oracle's windows only, not in other databases', which refused them
+  (#469).
+- PostgreSQL: a partitioned table's DDL makes its partitions too, which a
+  copy needed to take any row (#470).
+- Generate INSERT and UPDATE leave a table's generated columns out, which
+  the database refused, and the Columns tab says which are generated, and
+  how, on every database (#471).
+- SQL Server: the DDL of a view, routine or trigger has its descriptions,
+  and its columns' and parameters', which a copy lacked (#472).
+- SQL Server: a lookup chosen as a deadlock's victim (Msg 1205), as the
+  catalog deadlocks with other sessions' DDL, runs again (#473).
 
 ## [0.11.0] - 2026-11-02
 

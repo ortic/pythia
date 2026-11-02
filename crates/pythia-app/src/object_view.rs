@@ -430,7 +430,12 @@ fn columns_table(ui: &mut Ui, cols: &[Col]) {
                     }
                 });
                 row.col(|ui| {
-                    ui.label(RichText::new(c.default.as_deref().unwrap_or("")).monospace());
+                    let default = c
+                        .default
+                        .as_deref()
+                        .or(c.generated.then_some("generated"))
+                        .unwrap_or("");
+                    ui.label(RichText::new(default).monospace());
                 });
                 row.col(|ui| {
                     ui.label(c.comment.as_deref().unwrap_or(""));

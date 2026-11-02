@@ -434,8 +434,9 @@ fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
         return false;
     }
     let rest = lex.remainder();
+    // A tag is a name: letters of any script too, `$função$` (#468).
     let tag_len = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
     let tag = &rest[..tag_len];
     if !rest[tag_len..].starts_with('$') || tag.starts_with(|c: char| c.is_ascii_digit()) {

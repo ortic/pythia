@@ -316,7 +316,7 @@ fn columns(pg: &Pg<'_>, owner: &str, table: &str, keys: bool) -> Result<Vec<Tabl
     let rows = pg.rows(
         &format!(
             "select a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, {DEFAULT}, \
-                    col_description(c.oid, a.attnum), {pk} \
+                    col_description(c.oid, a.attnum), {pk}, a.attgenerated <> '' \
                from pg_attribute a \
                join pg_class c on c.oid = a.attrelid \
                join pg_namespace n on n.oid = c.relnamespace \
@@ -338,6 +338,7 @@ fn columns(pg: &Pg<'_>, owner: &str, table: &str, keys: bool) -> Result<Vec<Tabl
                 default: next(),
                 comment: next(),
                 pk_position: next().and_then(|p| p.parse().ok()),
+                generated: next().as_deref() == Some("t"),
             }
         })
         .collect())
@@ -1057,7 +1058,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     {
         ddl.push_str(&format!(" inherits ({parents})"));
     }
-    if let Some(key) = partitions {
+    if let Some(key) = &partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
     ddl.push_str(&options);
@@ -1068,6 +1069,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             Dialect::POSTGRES.qualified(&owner, sequence),
             Dialect::POSTGRES.quote_ident(column)
         ));
+    }
+    if partitions.is_some() {
+        partitions_of(pg, &mut ddl, &oid)?;
     }
     // ALTER TABLE and COMMENT ON TABLE refuse a foreign table.
     let kind = if foreign { "foreign table" } else { "table" };
@@ -1373,6 +1377,56 @@ fn rules(
         if let Some(state) = state {
             ddl.push_str(&format!("\nalter {kind} {qualified} {state} rule {name};"));
         }
+    }
+    Ok(())
+}
+
+/// A partitioned table's partitions, theirs too, each `partition of` its
+/// parent with its bounds (#470): without them a copy took no row. A foreign
+/// partition is made by its own DDL, with its server.
+fn partitions_of(pg: &Pg<'_>, ddl: &mut String, oid: &str) -> Result<(), DbError> {
+    let rows = pg.rows(
+        &format!(
+            "with recursive tree (oid, parent, depth) as ( \
+               select i.inhrelid, i.inhparent, 1 from pg_inherits i \
+                 join pg_class c on c.oid = i.inhrelid \
+                where i.inhparent = {oid} and c.relispartition \
+               union all \
+               select i.inhrelid, i.inhparent, t.depth + 1 from tree t \
+                 join pg_inherits i on i.inhparent = t.oid \
+                 join pg_class c on c.oid = i.inhrelid \
+                where c.relispartition) \
+             select quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+                    quote_ident(pn.nspname) || '.' || quote_ident(p.relname), \
+                    pg_get_expr(c.relpartbound, c.oid), pg_get_partkeydef(c.oid), \
+                    c.relkind = 'f' \
+               from tree t \
+               join pg_class c on c.oid = t.oid \
+               join pg_namespace n on n.oid = c.relnamespace \
+               join pg_class p on p.oid = t.parent \
+               join pg_namespace pn on pn.oid = p.relnamespace \
+              order by t.depth, c.relname"
+        ),
+        &[],
+    )?;
+    for row in rows {
+        let [Some(partition), Some(parent), Some(bound), key, foreign] = row.as_slice() else {
+            continue;
+        };
+        if foreign.as_deref() == Some("t") {
+            ddl.push_str(&format!(
+                "\n\n-- {partition}, a foreign table, is a partition of {parent} {bound}: \
+                 made by its own DDL."
+            ));
+            continue;
+        }
+        let key = key
+            .as_ref()
+            .map(|k| format!(" partition by {k}"))
+            .unwrap_or_default();
+        ddl.push_str(&format!(
+            "\n\ncreate table {partition} partition of {parent} {bound}{key};"
+        ));
     }
     Ok(())
 }

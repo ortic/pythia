@@ -4166,3 +4166,199 @@ fn trigger_ddl_keeps_its_order() {
     assert_eq!(order(&mut h), before);
     h.ok("drop table r100_ord");
 }
+
+/// A renamed trigger, on a renamed table, and a view moved to another
+/// schema have DDL under the names they have now (#450): their source
+/// kept the old ones, and made again from it, the trigger was a second one
+/// on the table, firing twice, and the view went back to its old schema.
+#[test]
+fn renamed_modules_keep_their_names() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    let cleanup = |h: &mut Harness| {
+        h.ok("drop view if exists r101_other.r101_v");
+        h.ok("drop view if exists dbo.r101_v");
+        h.ok("drop schema if exists r101_other");
+        h.ok("drop table if exists r101_t_new");
+        h.ok("drop table if exists r101_t");
+        h.ok("drop table if exists r101_log");
+    };
+    cleanup(&mut h);
+    for sql in [
+        "create table r101_t (id int)",
+        "create table r101_log (id int)",
+        "create trigger r101_tr_old on r101_t after insert as \
+           insert into r101_log select id from inserted",
+        "exec sp_rename 'r101_tr_old', 'r101_tr_new'",
+        "exec sp_rename 'r101_t', 'r101_t_new'",
+        "create schema r101_other",
+        "create view dbo.r101_v as select 1 as x",
+        "alter schema r101_other transfer dbo.r101_v",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = |h: &mut Harness, owner: &str, name: &str, object_type: ObjectType| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: owner.into(),
+            name: name.into(),
+            object_type,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let trigger = ddl(&mut h, &schema, "r101_tr_new", ObjectType::Trigger);
+    let expected =
+        format!("create trigger [{schema}].[r101_tr_new] on [{schema}].[r101_t_new] after insert");
+    assert!(trigger.starts_with(&expected), "{trigger}");
+    // As Edit makes it again: altered, not a second trigger.
+    let script = trigger.replacen("create trigger", "create or alter trigger", 1);
+    h.ok(script.trim_end().trim_end_matches("GO").trim_end());
+    h.ok("insert into r101_t_new values (1)");
+    assert_eq!(
+        h.scalar("select count(*) from r101_log").as_deref(),
+        Some("1")
+    );
+    let view = ddl(&mut h, "r101_other", "r101_v", ObjectType::View);
+    assert!(
+        view.starts_with("create view [r101_other].[r101_v] as"),
+        "{view}"
+    );
+    cleanup(&mut h);
+}
+
+/// A batch that starts with a SELECT and changes rows further on runs in
+/// the window's transaction (#454): it was committed at once, and Rollback
+/// undid nothing.
+#[test]
+fn a_select_batch_that_changes_waits_for_commit() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r101_batch");
+    h.ok("create table r101_batch (n int)");
+    h.ok("insert into r101_batch values (1)");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+    h.execute(
+        0,
+        "select n from r101_batch\nupdate r101_batch set n = 2",
+        10,
+    );
+    let pending = loop {
+        match h.next() {
+            DbEvent::Transaction { pending } => break pending,
+            DbEvent::Failed { error, .. } => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(pending);
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    assert_eq!(h.scalar("select n from r101_batch").as_deref(), Some("1"));
+    h.ok("drop table r101_batch");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+}
+
+/// A sequence of a numeric type keeps its precision in its DDL (#461):
+/// `as numeric` is numeric(18,0), which a numeric(28,0)'s maximum doesn't
+/// fit (Msg 11708).
+#[test]
+fn numeric_sequences_keep_their_precision() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    h.ok("drop sequence if exists r101_seq");
+    h.ok("create sequence r101_seq as numeric(28, 0) start with 1");
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema,
+        name: "r101_seq".into(),
+        object_type: ObjectType::Sequence,
+    }) else {
+        panic!("expected DDL")
+    };
+    assert!(ddl.contains(" as numeric(28)\n"), "{ddl}");
+    h.ok("drop sequence r101_seq");
+    h.ok(ddl.trim_end().trim_end_matches("GO").trim_end());
+    h.ok("drop sequence r101_seq");
+}
+
+/// A view's, routine's and trigger's descriptions, and a view's columns'
+/// and a routine's parameters', are in their DDL (#472): run elsewhere, the
+/// copy has them; run again (as Edit does), it keeps them.
+#[test]
+fn module_ddl_keeps_descriptions() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    let cleanup = |h: &mut Harness| {
+        h.ok("drop view if exists r101_desc_v");
+        h.ok("drop procedure if exists r101_desc_p");
+        h.ok("drop table if exists r101_desc_t");
+    };
+    cleanup(&mut h);
+    let describe = |what: &str| {
+        format!(
+            "exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'it''s', {what}"
+        )
+    };
+    for sql in [
+        "create table r101_desc_t (n int)".to_owned(),
+        "create view r101_desc_v as select n from r101_desc_t".to_owned(),
+        "create procedure r101_desc_p @x int as select @x".to_owned(),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'VIEW', @level1name = N'r101_desc_v'"
+        )),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'VIEW', @level1name = N'r101_desc_v', @level2type = N'COLUMN', @level2name = N'n'"
+        )),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'PROCEDURE', @level1name = N'r101_desc_p', @level2type = N'PARAMETER', @level2name = N'@x'"
+        )),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = |h: &mut Harness, name: &str, object_type: ObjectType| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: name.into(),
+            object_type,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let view = ddl(&mut h, "r101_desc_v", ObjectType::View);
+    let procedure = ddl(&mut h, "r101_desc_p", ObjectType::Procedure);
+    let count = |h: &mut Harness| {
+        h.scalar(
+            "select count(*) from sys.extended_properties \
+              where major_id in (object_id('r101_desc_v'), object_id('r101_desc_p')) \
+                and name = 'MS_Description' and cast(value as nvarchar(10)) = N'it''s'",
+        )
+    };
+    assert_eq!(count(&mut h).as_deref(), Some("3"));
+    // Made again over themselves, as Edit does, and made anew.
+    for round in 0..2 {
+        if round == 1 {
+            h.ok("drop view r101_desc_v");
+            h.ok("drop procedure r101_desc_p");
+        }
+        for script in [&view, &procedure] {
+            let script = script.replacen("create ", "create or alter ", 1);
+            for batch in script.split("\nGO\n").filter(|b| !b.trim().is_empty()) {
+                h.ok(batch);
+            }
+        }
+        assert_eq!(count(&mut h).as_deref(), Some("3"), "round {round}");
+    }
+    cleanup(&mut h);
+}

@@ -63,6 +63,9 @@ const SESSION_OPTIONS: &str = "set ansi_nulls on; set ansi_padding on; set ansi_
                                set quoted_identifier on; set ansi_null_dflt_on on; \
                                set implicit_transactions off; set xact_abort off";
 
+/// How long a lookup chosen as a deadlock's victim waits to run again.
+const DEADLOCK_RETRY: Duration = Duration::from_millis(50);
+
 pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, shared: CancelSlot) {
     info!(?params, "connecting");
     let connected = runtime()
@@ -143,7 +146,19 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::QueryClosed { id }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
-                let result = crate::mssql_meta::run(&mut worker.ms(), &query);
+                let mut result = crate::mssql_meta::run(&mut worker.ms(), &query);
+                // A lookup chosen as a deadlock's victim runs again, as SQL
+                // Server says to (Msg 1205): it only reads, and the catalog
+                // deadlocks with other sessions' DDL (#473). Not in a
+                // transaction, which the deadlock rolled back.
+                for _ in 0..3 {
+                    let victim = matches!(&result, Err(e) if e.code == Some(1205));
+                    if !victim || worker.pending {
+                        break;
+                    }
+                    std::thread::sleep(DEADLOCK_RETRY);
+                    result = crate::mssql_meta::run(&mut worker.ms(), &query);
+                }
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1010,10 +1025,11 @@ fn changes(sql: &str) -> bool {
         "UPDATE" if second == "STATISTICS" => false,
         _ if CHANGES.contains(&first) => true,
         "BEGIN" if matches!(second, "TRAN" | "TRANSACTION" | "DISTRIBUTED") => false,
-        "SELECT" => has_word(sql, LOCKS),
-        "WITH" | "DECLARE" | "BEGIN" | "IF" | "WHILE" | "SET" => {
-            has_word(sql, CHANGES) || has_word(sql, LOCKS)
-        }
+        // A batch may go on after its first statement without a `;`:
+        // `select …` and an `update …` on the next line changed rows outside
+        // a transaction, committed at once (#454).
+        "WITH" | "DECLARE" | "BEGIN" | "IF" | "WHILE" | "SET" | "SELECT" | "PRINT" | "USE"
+        | "WAITFOR" | "RAISERROR" | "THROW" => has_word(sql, CHANGES) || has_word(sql, LOCKS),
         _ => false,
     }
 }
@@ -1498,6 +1514,11 @@ mod tests {
                 false,
             ),
             ("if exists (select 1 from t) delete from t", true),
+            // Changes later in the batch (#454).
+            ("select * from t\nupdate t set a = 1", true),
+            ("print 'archiving'\ndelete from t where old = 1", true),
+            ("use shop\ninsert into t values (1)", true),
+            ("select 'update' as what from t -- delete", false),
         ] {
             assert_eq!(changes(sql), changes_rows, "{sql}");
         }

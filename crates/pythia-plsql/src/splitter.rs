@@ -985,6 +985,17 @@ mod tests {
         );
     }
 
+    /// A dollar quote's tag may have letters of any script (#468): the
+    /// body was split at its first `;`.
+    #[test]
+    fn postgres_dollar_tags_in_any_script() {
+        let src = "create function f() returns int as $função$ begin return 1; end; $função$ \
+                   language plpgsql;\nselect 1;";
+        let split = split_in(src, Syntax::Postgres);
+        assert_eq!(split.len(), 2, "{split:?}");
+        assert!(split[0].1.ends_with("language plpgsql"), "{split:?}");
+    }
+
     #[test]
     fn postgres_scripts() {
         let src = "set search_path to app, public;\n\

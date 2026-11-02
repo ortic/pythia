@@ -178,6 +178,26 @@ impl Live {
         }
     }
 
+    /// The columns `table` writes itself, as the window's lookup finds them.
+    fn written(&mut self, table: &str) -> crate::data_edit::Written {
+        let table = table.to_owned();
+        self.session.send(DbRequest::Run {
+            id: 3,
+            task: Box::new(move |client: &mut dyn Client| {
+                let written = crate::data_edit::database_written(client, &table);
+                Ok(Box::new(written) as Box<dyn Any + Send>)
+            }),
+        });
+        loop {
+            if let DbEvent::TaskDone { result, .. } = self.next() {
+                let any = result.unwrap_or_else(|e| panic!("{e}"));
+                return *any
+                    .downcast::<crate::data_edit::Written>()
+                    .expect("columns");
+            }
+        }
+    }
+
     /// The result of `table` as *Edit* fetches it, with its key.
     fn editable(&mut self, table: &str, order: &str) -> (Editable, Vec<Column>, Vec<Vec<Cell>>) {
         let key = self.key(table);
@@ -972,6 +992,162 @@ fn mysql_bits() {
     let (_, _, rows) = db.editable("r41_bits", "id");
     assert_eq!(rows[0][1..3], [Some("01".into()), Some("05".into())]);
     db.ok("drop table r41_bits");
+}
+
+/// A table's INSERT statements leave out the columns it computes and
+/// tell it to take its identity's values, and run back into it (#457):
+/// every database refused a value for a generated column, PostgreSQL and
+/// SQL Server one for such an identity. Oracle's identity ALWAYS takes
+/// none at all: it is kept, as Export Tables keeps it (#443).
+fn written_columns(db: &mut Live, create: &[&str], expected: (&[&str], &[&str], &[&str])) {
+    db.script(create);
+    let written = db.written("fd_gen");
+    let lower = |names: &[String]| -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        names.sort();
+        names
+    };
+    let strs = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+    assert_eq!(
+        (
+            lower(&written.generated),
+            lower(&written.identity),
+            lower(&written.always)
+        ),
+        (strs(expected.0), strs(expected.1), strs(expected.2)),
+        "{:?}",
+        db.dialect
+    );
+    let (columns, rows) = db.query("select * from fd_gen order by id");
+    let options = pythia_data::Options {
+        dialect: db.dialect,
+        table: "fd_gen".into(),
+        generated: written.generated.clone(),
+        identity: written.identity.clone(),
+        ..pythia_data::Options::default()
+    };
+    let bytes =
+        pythia_data::export_to_vec(pythia_data::Format::Insert, &columns, &rows, &options).unwrap();
+    let script = String::from_utf8(bytes).unwrap();
+    db.ok("delete from fd_gen");
+    for statement in script.lines().filter(|l| !l.trim().is_empty()) {
+        db.ok(statement.trim_end_matches(';'));
+    }
+    // A rowversion is new, a computed value the same.
+    let kept: Vec<usize> = (0..columns.len())
+        .filter(|&i| {
+            !written
+                .generated
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case(&columns[i].name))
+        })
+        .collect();
+    let values = |rows: &[Vec<Cell>]| -> Vec<Vec<Cell>> {
+        rows.iter()
+            .map(|r| kept.iter().map(|&i| r[i].clone()).collect())
+            .collect()
+    };
+    let (_, again) = db.query("select * from fd_gen order by id");
+    assert_eq!(values(&again), values(&rows), "{:?}\n{script}", db.dialect);
+    db.ok("drop table fd_gen");
+}
+
+#[test]
+fn database_written_columns() {
+    let (mut db, path) = Live::sqlite("written");
+    written_columns(
+        &mut db,
+        &[
+            "create table fd_gen (id integer primary key, n int, \
+               twice int generated always as (n * 2) virtual, \
+               thrice int generated always as (n * 3) stored)",
+            "insert into fd_gen (id, n) values (1, 1), (2, 5)",
+        ],
+        (&["thrice", "twice"], &[], &[]),
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    if let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) {
+        db.ok("drop table if exists fd_gen");
+        written_columns(
+            &mut db,
+            &[
+                "create table fd_gen (id int auto_increment primary key, n int, \
+                   twice int as (n * 2) virtual, thrice int as (n * 3) stored, \
+                   made timestamp default current_timestamp)",
+                "insert into fd_gen (n) values (1), (5)",
+            ],
+            (&["thrice", "twice"], &[], &[]),
+        );
+    }
+    if let Some(mut db) = Live::connect("PYTHIA_TEST_POSTGRES", DbKind::Postgres) {
+        db.ok("drop table if exists fd_gen");
+        written_columns(
+            &mut db,
+            &[
+                "create table fd_gen (id int generated always as identity primary key, \
+                   n int, twice int generated always as (n * 2) stored, \
+                   other int generated by default as identity)",
+                "insert into fd_gen (n) values (1), (5)",
+            ],
+            (&["twice"], &["id"], &[]),
+        );
+    }
+    if let Some(mut db) = Live::connect("PYTHIA_TEST_MSSQL", DbKind::SqlServer) {
+        db.ok("drop table if exists fd_gen");
+        written_columns(
+            &mut db,
+            &[
+                "create table fd_gen (id int identity primary key, n int, twice as (n * 2), \
+                   version rowversion)",
+                "insert into fd_gen (n) values (1), (5)",
+            ],
+            (&["twice", "version"], &["id"], &[]),
+        );
+    }
+    if let Some(mut db) = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle) {
+        let _ = db.run("drop table fd_gen purge");
+        db.script(&[
+            "create table fd_gen (id number generated always as identity primary key, \
+               n number, twice as (n * 2) virtual)",
+        ]);
+        let written = db.written("fd_gen");
+        assert_eq!(
+            (written.generated, written.identity, written.always),
+            (vec!["TWICE".to_owned()], vec![], vec!["ID".to_owned()])
+        );
+        db.ok("drop table fd_gen purge");
+    }
+}
+
+/// A SQLite table without a key is edited by its rowid, which VACUUM
+/// renumbers: a stale result's Delete finds no row, a conflict, rather
+/// than another row (#465).
+#[test]
+fn sqlite_rowids_renumbered_find_no_row() {
+    let (mut db, path) = Live::sqlite("rowids");
+    db.script(&[
+        "create table fd_rowid (name text)",
+        "insert into fd_rowid values ('a'), ('b'), ('c')",
+    ]);
+    let (edit, columns, rows) = db.editable("fd_rowid", "name");
+    assert_eq!(edit.key, RowKey::Columns(vec!["rowid".into()]));
+    // Elsewhere: the first row goes, and VACUUM renumbers the others.
+    db.script(&["delete from fd_rowid where name = 'a'", "vacuum"]);
+    let changes = Changes {
+        deletes: [1].into_iter().collect(),
+        ..Changes::default()
+    };
+    let statements = dml(db.dialect, &edit, &columns, &rows, &changes);
+    let ran = db.run(&statements[0].sql);
+    assert!(
+        matches!(ran, Ok(Ran::Done(Some(0)))),
+        "{ran:?}\n{}",
+        statements[0].sql
+    );
+    assert_eq!(db.count("select group_concat(name) from fd_rowid"), "b,c");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// MySQL's VECTOR values, shown as the hex of their floats (#436) like the
