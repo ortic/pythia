@@ -1425,15 +1425,31 @@ fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -
     match &edit.key {
         RowKey::Rowid => value(row, key_start).map(|rowid| format!("rowid = '{rowid}'")),
         RowKey::Columns(key) => {
-            let checks: Option<Vec<String>> = key
+            let mut checks: Vec<String> = key
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
                     let v = value(row, key_start + i)?;
                     same(dialect, name, &columns[key_start + i], Some(&v))
                 })
-                .collect();
-            checks.map(|c| c.join(" and "))
+                .collect::<Option<_>>()?;
+            // SQLite's rowid, where a table has no INTEGER PRIMARY KEY, is
+            // renumbered by VACUUM: the row must still have the values
+            // fetched, else a stale result's Delete took another row (#465).
+            let rowid =
+                matches!(key.as_slice(), [k] if ["rowid", "_rowid_", "oid"].contains(&k.as_str()));
+            if dialect.kind() == DbKind::Sqlite && rowid {
+                let plain = plain_columns(dialect, &edit.source, key_start);
+                checks.extend((0..key_start).filter(|&c| plain[c]).filter_map(|c| {
+                    same(
+                        dialect,
+                        &columns[c].name,
+                        &columns[c],
+                        row.get(c)?.as_deref(),
+                    )
+                }));
+            }
+            Some(checks.join(" and "))
         }
     }
 }

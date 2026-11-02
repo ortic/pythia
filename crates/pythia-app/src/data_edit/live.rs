@@ -1120,6 +1120,36 @@ fn database_written_columns() {
     }
 }
 
+/// A SQLite table without a key is edited by its rowid, which VACUUM
+/// renumbers: a stale result's Delete finds no row, a conflict, rather
+/// than another row (#465).
+#[test]
+fn sqlite_rowids_renumbered_find_no_row() {
+    let (mut db, path) = Live::sqlite("rowids");
+    db.script(&[
+        "create table fd_rowid (name text)",
+        "insert into fd_rowid values ('a'), ('b'), ('c')",
+    ]);
+    let (edit, columns, rows) = db.editable("fd_rowid", "name");
+    assert_eq!(edit.key, RowKey::Columns(vec!["rowid".into()]));
+    // Elsewhere: the first row goes, and VACUUM renumbers the others.
+    db.script(&["delete from fd_rowid where name = 'a'", "vacuum"]);
+    let changes = Changes {
+        deletes: [1].into_iter().collect(),
+        ..Changes::default()
+    };
+    let statements = dml(db.dialect, &edit, &columns, &rows, &changes);
+    let ran = db.run(&statements[0].sql);
+    assert!(
+        matches!(ran, Ok(Ran::Done(Some(0)))),
+        "{ran:?}\n{}",
+        statements[0].sql
+    );
+    assert_eq!(db.count("select group_concat(name) from fd_rowid"), "b,c");
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// MySQL's VECTOR values, shown as the hex of their floats (#436) like the
 /// other binary values, not as their bytes read as text: typed again they
 /// find their row, and a new one is written as those bytes.

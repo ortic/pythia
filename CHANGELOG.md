@@ -437,6 +437,9 @@ All notable changes to Pythia are documented here. The format follows
   windows: the browser's Drop and other actions, object forms, the table
   editor, Import, Maintenance, recompiles, job actions and the monitor's
   kills ran (#464).
+- SQLite: Edit of a table without a primary key checks a row's values
+  beside its rowid, which VACUUM renumbers: a stale result's Delete took
+  another row (#465).
 
 ## [0.11.0] - 2026-11-02
 
