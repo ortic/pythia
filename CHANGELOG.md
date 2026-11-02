@@ -71,6 +71,10 @@ All notable changes to Pythia are documented here. The format follows
   statement; binds are put in as the database reads its strings.
 - MySQL: Explain plan of a statement with bind variables says it takes
   none (#400), instead of a syntax error from the server.
+- Oracle: *Follow foreign keys* keeps the columns of a key together when
+  tables of the same name in two schemas have keys of the same name
+  (#401); each became one relation per column, whose link found too many
+  rows. A table in another schema is named with it.
 
 ## [0.11.0] - 2026-11-02
 
