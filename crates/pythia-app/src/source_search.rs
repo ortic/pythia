@@ -612,6 +612,8 @@ mod tests {
         let (cred, db) = spec.rsplit_once('@').unwrap();
         let (user, pw) = cred.split_once('/').unwrap();
         let conn = Connection::connect(user, pw, db).unwrap();
+        // Left by a run that failed.
+        let _ = conn.execute("drop view pythia_ss_long", &[]);
         conn.execute(
             "create or replace view pythia_ss_v as\nselect 'needle_xq7' as marker\n  from dual",
             &[],
