@@ -281,6 +281,9 @@ All notable changes to Pythia are documented here. The format follows
   replaces each of them (#377); the script replaced the first and failed
   at the second, "already exists". With a constraint trigger among them,
   the whole script is one block.
+- PostgreSQL: a child table's DDL inherits from its parents, with only
+  its own columns and constraints (#376); a copy was a table of its own,
+  which a query on its parent's copy didn't read. (Foreign tables: #409.)
 
 ## [0.11.0] - 2026-11-02
 

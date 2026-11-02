@@ -1574,6 +1574,49 @@ fn a_key_to_the_tables_own_unique_index_runs_again() {
     h.ok("drop schema r95_tree, r95_tree_copy cascade");
 }
 
+/// A child table's DDL inherits from its parents, with only the columns
+/// and constraints of its own (#376): a copy was a table of its own, which
+/// a query on the parent's copy didn't read.
+#[test]
+fn a_child_tables_ddl_inherits() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r99_inh, r99_inh_copy cascade");
+    h.ok("create schema r99_inh");
+    h.ok("create schema r99_inh_copy");
+    h.ok("create table r99_inh.parent (id int, n int check (n > 0))");
+    h.ok("create table r99_inh.other (o text)");
+    h.ok(
+        "create table r99_inh.child (x int not null, constraint child_x check (x < 9)) \
+           inherits (r99_inh.parent, r99_inh.other)",
+    );
+    let ddl = ddl_of(&mut h, "r99_inh", "child", ObjectType::Table);
+    assert!(
+        ddl.contains(") inherits (r99_inh.parent, r99_inh.other);"),
+        "{ddl}"
+    );
+    assert!(ddl.contains("x integer not null"), "{ddl}");
+    assert!(ddl.contains("child_x"), "{ddl}");
+    assert!(
+        !ddl.contains("id integer") && !ddl.contains("parent_n_check"),
+        "{ddl}"
+    );
+    for table in ["parent", "other"] {
+        let parent = ddl_of(&mut h, "r99_inh", table, ObjectType::Table);
+        run_ddl(&mut h, &parent, "r99_inh.", "r99_inh_copy.");
+    }
+    run_ddl(&mut h, &ddl, "r99_inh.", "r99_inh_copy.");
+    h.ok("insert into r99_inh_copy.child (id, n, o, x) values (1, 2, 'a', 3)");
+    assert_eq!(
+        h.scalar("select count(*) from r99_inh_copy.parent")
+            .as_deref(),
+        Some("1")
+    );
+    h.ok("drop schema r99_inh, r99_inh_copy cascade");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.

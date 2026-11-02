@@ -947,6 +947,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
                    from pg_attribute a \
                    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
                   where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
+                    and a.attislocal \
                   order by a.attnum",
                 fdw_options("a.attfdwoptions")
             ),
@@ -976,6 +977,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
                left join pg_class c on c.oid = i.indexrelid \
                left join pg_tablespace t on t.oid = c.reltablespace \
               where k.conrelid = {oid} and k.contype in ('p', 'u', 'f', 'c', 'x') \
+                and k.conislocal \
               order by position(k.contype::text in 'pucfx'), k.conname"
         ),
         &[],
@@ -1017,6 +1019,25 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     ));
     if foreign && let Some(server) = foreign_server(pg, &oid)? {
         ddl.push_str(&server);
+    }
+    // A child table's parents (#376), whose columns and constraints it
+    // takes from them: only its own are written above, as pg_dump writes
+    // them. A partition's parent isn't one of these (PARTITION OF).
+    if let Some(parents) = pg
+        .first(
+            &format!(
+                "select string_agg(quote_ident(n.nspname) || '.' || quote_ident(p.relname), \
+                                   ', ' order by i.inhseqno) \
+                   from pg_inherits i join pg_class p on p.oid = i.inhparent \
+                   join pg_namespace n on n.oid = p.relnamespace \
+                   join pg_class c on c.oid = i.inhrelid \
+                  where i.inhrelid = {oid} and not c.relispartition"
+            ),
+            &[],
+        )?
+        .and_then(first)
+    {
+        ddl.push_str(&format!(" inherits ({parents})"));
     }
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
