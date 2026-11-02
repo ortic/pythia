@@ -6,6 +6,8 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-02
+
 ### Added
 - SQLite, experimental (#179): *Type: SQLite* with the database file
   (*…* picks one, *New…* makes one), built in, so there's nothing to
@@ -2372,7 +2374,8 @@ First release.
 - Scheduler jobs window: run, stop, enable, disable, drop, run history.
 - Saved user reports with parameters.
 
-[Unreleased]: https://github.com/ortic/pythia/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ortic/pythia/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ortic/pythia/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ortic/pythia/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ortic/pythia/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ortic/pythia/compare/v0.7.0...v0.8.0
