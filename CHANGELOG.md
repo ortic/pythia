@@ -15,6 +15,11 @@ All notable changes to Pythia are documented here. The format follows
   SHOW CREATE TABLE writes it (#387): `default ('it''s')` showed as
   `_utf8mb4\'it\\\'s\'`, escaped once more as `information_schema`
   gives it.
+- MySQL and SQL Server: *Edit* works on a result of a temporary table
+  (#388), which it refused as having no key: the key came from
+  `information_schema` on MySQL, which lists no temporary tables, and on
+  SQL Server from the database instead of `tempdb`. On MySQL, a
+  temporary table that hides a table of its name got that table's key.
 
 ## [0.11.0] - 2026-11-02
 

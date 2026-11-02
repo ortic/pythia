@@ -478,42 +478,40 @@ fn value(row: &[Cell], i: usize) -> Option<String> {
     row.get(i).cloned().flatten()
 }
 
+/// MySQL: SHOW INDEX finds the table as the query did, by the database in
+/// use and the server's rules for the case of names. information_schema
+/// would not: a temporary table isn't in it, and hides a table of its name
+/// that is. A view has no indexes; a table SHOW INDEX can't read (no
+/// privilege) has no key either.
 fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
-    let names = unquote(table);
-    let (schema, name) = match names.as_slice() {
-        [schema, name] => (Some(schema.as_str()), name.as_str()),
-        [name] => (None, name.as_str()),
+    let quoted = |name: &str| format!("`{}`", name.replace('`', "``"));
+    let table = match unquote(table).as_slice() {
+        [schema, name] => format!("{}.{}", quoted(schema), quoted(name)),
+        [name] => quoted(name),
         _ => return Ok(Vec::new()),
     };
-    // The query ran, so the name as written is right; the dictionary may
-    // still have it in another case where names don't depend on it.
-    let (schema_sql, mut params) = match schema {
-        Some(schema) => ("lower(?)", vec![schema]),
-        None => ("lower(database())", Vec::new()),
+    let rows = match client.query(&format!("show index from {table}"), &[]) {
+        Ok(rows) => rows,
+        Err(e) if e.code.is_some() => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    params.extend([name, name]);
-    let sql = format!(
-        "select s.table_name, s.index_name, s.column_name, s.nullable \
-           from information_schema.statistics s \
-          where lower(s.table_schema) = {schema_sql} \
-            and lower(s.table_name) = lower(?) \
-            and s.non_unique = 0 \
-          order by s.table_name <> ?, s.table_name, s.index_name <> 'PRIMARY', \
-                   s.index_name, s.seq_in_index"
-    );
-    let rows = client.query(&sql, &params)?;
-    let Some(table) = rows.first().and_then(|r| value(r, 0)) else {
-        return Ok(Vec::new());
-    };
+    // Table, Non_unique, Key_name, Seq_in_index, Column_name, Collation,
+    // Cardinality, Sub_part, Packed, Null: unique ones, the primary key
+    // first.
+    let mut parts: Vec<(String, u32, Option<String>)> = rows
+        .iter()
+        .filter(|row| value(row, 1).as_deref() == Some("0"))
+        .map(|row| {
+            let seq = value(row, 3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            // Functional key parts have no column; nullable ones don't
+            // identify a row.
+            let column = value(row, 4).filter(|_| value(row, 9).as_deref() != Some("YES"));
+            (value(row, 2).unwrap_or_default(), seq, column)
+        })
+        .collect();
+    parts.sort_by(|a, b| (a.0 != "PRIMARY", &a.0, a.1).cmp(&(b.0 != "PRIMARY", &b.0, b.1)));
     Ok(keys(
-        rows.iter()
-            .filter(|r| value(r, 0).as_ref() == Some(&table))
-            .map(|row| {
-                // Functional key parts have no column; nullable ones don't
-                // identify a row.
-                let column = value(row, 2).filter(|_| value(row, 3).as_deref() != Some("YES"));
-                (value(row, 1).unwrap_or_default(), column)
-            }),
+        parts.into_iter().map(|(index, _, column)| (index, column)),
     ))
 }
 
@@ -662,10 +660,21 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
 /// enabled and not filtered. A `sql_variant` key can't be compared with
 /// what was fetched: a value is compared as its base type's.
 fn sqlserver_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
-    let catalog = match unquote(table).as_slice() {
-        [database, _, _] => format!("{}.", Dialect::SQLSERVER.quote_ident(database)),
-        _ => String::new(),
+    let names = unquote(table);
+    // A temporary table (`#t`, `##t`) is in tempdb, where object_id finds
+    // it only by a name in tempdb.
+    let (catalog, table) = match names.as_slice() {
+        [name] if name.starts_with('#') => (
+            "tempdb.".to_owned(),
+            format!("tempdb..{}", Dialect::SQLSERVER.quote_ident(name)),
+        ),
+        [database, _, _] => (
+            format!("{}.", Dialect::SQLSERVER.quote_ident(database)),
+            table.to_owned(),
+        ),
+        _ => (String::new(), table.to_owned()),
     };
+    let table = table.as_str();
     let sql = format!(
         "select i.name, c.name, c.is_nullable, c.system_type_id \
            from {catalog}sys.indexes i \
@@ -705,13 +714,22 @@ fn unquote(name: &str) -> Vec<String> {
         let body = text[1..].strip_suffix(close).unwrap_or(&text[1..]);
         Some(body.replace(&format!("{close}{close}"), &close.to_string()))
     };
+    // SQL Server's temporary tables start with `#` (`##` global ones),
+    // which isn't part of a word: the `#`s right before a word are its own.
+    let mut hashes: Option<std::ops::Range<usize>> = None;
     tokenize(&lexed)
         .into_iter()
         .filter_map(|t| {
-            let text = &name[t.span];
+            let text = &name[t.span.clone()];
+            let before = hashes.take().filter(|h| h.end == t.span.start);
+            if !text.is_empty() && text.chars().all(|c| c == '#') {
+                hashes = Some(before.map_or(t.span.start, |h| h.start)..t.span.end);
+                return None;
+            }
+            let prefix = before.map_or("", |h| &name[h]);
             match t.kind {
                 TokenKind::QuotedIdent => inner(text),
-                TokenKind::Ident | TokenKind::Keyword => Some(text.to_owned()),
+                TokenKind::Ident | TokenKind::Keyword => Some(format!("{prefix}{text}")),
                 TokenKind::Operator if text == ".." => Some(String::new()),
                 _ => None,
             }
@@ -1593,6 +1611,10 @@ mod tests {
         assert_eq!(unquote("\"a\"\"b\""), ["a\"b"]);
         assert_eq!(unquote("[dbo].[a]]b]"), ["dbo", "a]b"]);
         assert_eq!(unquote("[it's \"x\"]"), ["it's \"x\""]);
+        // SQL Server's temporary tables.
+        assert_eq!(unquote("#t"), ["#t"]);
+        assert_eq!(unquote("##g_1"), ["##g_1"]);
+        assert_eq!(unquote("[#t x]"), ["#t x"]);
         assert_eq!(unquote("shop..orders"), ["shop", "", "orders"]);
         assert_eq!(unquote("shop.[dbo].orders"), ["shop", "dbo", "orders"]);
     }
