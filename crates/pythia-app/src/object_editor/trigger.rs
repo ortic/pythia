@@ -224,7 +224,10 @@ pub fn source(owner: &str, def: &TriggerDef) -> Result<String, String> {
     }
     text.push_str(disable);
     if !def.when.trim().is_empty() {
-        text.push_str(&format!("\n  when ({})", def.when.trim()));
+        // A `--` comment at its end would take the `)` with it.
+        let when = def.when.trim();
+        let end = if when.contains("--") { "\n  " } else { "" };
+        text.push_str(&format!("\n  when ({when}{end})"));
     }
     text.push('\n');
     text.push_str(&body(def, ""));
@@ -360,6 +363,13 @@ mod tests {
             "create or replace trigger hr.orders_biu\n  before insert or update of status, total on hr.orders\n  \
              for each row\n  when (new.status <> old.status)\nbegin\n  if inserting then\n    null;\n  \
              elsif updating then\n    null;\n  end if;\nend;\n"
+        );
+        // A `--` comment doesn't take the `)` with it.
+        def.when = "new.status <> old.status -- changed".into();
+        assert!(
+            source("HR", &def)
+                .unwrap()
+                .contains("\n  when (new.status <> old.status -- changed\n  )\nbegin"),
         );
         def.when.clear();
         def.update = false;

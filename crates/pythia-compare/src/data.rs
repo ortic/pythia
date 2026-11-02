@@ -124,8 +124,10 @@ pub fn fetch_chunk(
         .iter()
         .map(|k| format!("{} is not null", ident(k)))
         .collect();
+    // On lines of their own: a `--` comment at the filter's or the
+    // query's end would take what follows with it.
     if !filter.trim().is_empty() {
-        conditions.push(format!("({})", filter.trim()));
+        conditions.push(format!("(\n{}\n)", filter.trim()));
     }
     let mut binds: Vec<String> = Vec::new();
     if let Some(after) = after {
@@ -144,7 +146,7 @@ pub fn fetch_chunk(
     }
     let sql = pythia_db::compat::first_rows(
         &format!(
-            "select * from ({}) where {} order by {key_list}",
+            "select * from (\n{}\n) where {} order by {key_list}",
             source.base_sql(),
             conditions.join(" and "),
         ),

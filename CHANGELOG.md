@@ -81,6 +81,10 @@ All notable changes to Pythia are documented here. The format follows
 - MariaDB: the user and role forms can grant `DELETE HISTORY` on a
   database or a table (#403): those scopes' privileges add what the
   server lists for tables.
+- A `--` comment at the end of a data compare's filter or query, a
+  trigger form's WHEN or an import column's expression no longer
+  comments out what follows it (#404), which failed with ORA-00907 or
+  the like.
 
 ## [0.11.0] - 2026-11-02
 
