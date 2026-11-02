@@ -579,7 +579,9 @@ fn columns(
     let sql = format!(
         "select c.column_name, \
                 case \
-                  when c.data_type in ('VARCHAR2', 'NVARCHAR2', 'CHAR', 'NCHAR', 'RAW') then \
+                  when c.data_type in ('NVARCHAR2', 'NCHAR') then \
+                    c.data_type || '(' || c.char_length || ')' \
+                  when c.data_type in ('VARCHAR2', 'CHAR', 'RAW') then \
                     c.data_type || '(' || decode(c.char_used, 'C', c.char_length || ' CHAR', c.data_length) || ')' \
                   when c.data_type = 'NUMBER' and c.data_precision is not null then \
                     'NUMBER(' || c.data_precision || nvl2(nullif(c.data_scale, 0), ',' || c.data_scale, '') || ')' \

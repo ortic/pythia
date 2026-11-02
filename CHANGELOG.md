@@ -422,6 +422,10 @@ All notable changes to Pythia are documented here. The format follows
   takes the values written (`OVERRIDING SYSTEM VALUE`, `SET
   IDENTITY_INSERT`); Edit keeps those columns read-only: every database
   refused the values (#457).
+- Oracle: the table editor's copy and Schema Compare make a virtual column
+  as one (#458), an invisible one too, keep `DEFAULT ON NULL` and an
+  identity's `GENERATED ALWAYS` (#459), and write NVARCHAR2 and NCHAR
+  without `CHAR`, which Oracle refused (#460).
 
 ## [0.11.0] - 2026-11-02
 

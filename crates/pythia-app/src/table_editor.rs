@@ -796,6 +796,7 @@ fn new_table() -> TableDef {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         }],
         comment: None,
         constraints: vec![ConstraintDef {
@@ -1394,6 +1395,7 @@ fn columns_ui(
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         });
     }
 }
@@ -1710,6 +1712,7 @@ mod tests {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         }
     }
 

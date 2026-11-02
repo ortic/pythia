@@ -6889,6 +6889,7 @@ end;
         default: None,
         comment: None,
         identity: false,
+        generation: Default::default(),
     };
     h.state_mut().test_table_editor().edit_for_test(|t| {
         t.name = "pythia_tbu_orders".into();
@@ -6999,6 +7000,7 @@ fn table_builder_partitions() {
             default: None,
             comment: None,
             identity: false,
+            generation: Default::default(),
         });
     });
     h.get_by_label("Partitions").hover();
