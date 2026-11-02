@@ -2126,21 +2126,21 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             };
             format!("{database}{warning}drop {kind} if exists {qualified};\n\n{ddl}\n/\n")
         }
-        (pythia_db::DbKind::Postgres, ObjectType::Trigger) => {
-            format!("{}\n", create_or(ddl, "or replace", "TRIGGER"))
-        }
-        (pythia_db::DbKind::Postgres, ObjectType::MaterializedView) => {
-            let ddl = pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Postgres);
-            let mut tag = "$pythia$".to_owned();
-            while ddl.contains(&tag) {
-                tag.insert(tag.len() - 1, '_');
+        // A constraint trigger has no OR REPLACE: dropped (on its table)
+        // and created in one block.
+        (pythia_db::DbKind::Postgres, ObjectType::Trigger) => match constraint_trigger_table(ddl) {
+            Some(table) => {
+                let name = dialect.quote_ident(&o.name);
+                pg_block(
+                    &kind,
+                    &format!("drop trigger if exists {name} on {table}"),
+                    ddl,
+                )
             }
-            // A column named `found` is the view's, not PL/pgSQL's FOUND.
-            format!(
-                "-- One block: if the create fails, the {kind} stays as it was.\n\
-                 do {tag}\n#variable_conflict use_column\nbegin\n\
-                 drop {kind} if exists {qualified};\n\n{ddl}\nend\n{tag};\n"
-            )
+            None => format!("{}\n", create_or(ddl, "or replace", "TRIGGER")),
+        },
+        (pythia_db::DbKind::Postgres, ObjectType::MaterializedView) => {
+            pg_block(&kind, &format!("drop {kind} if exists {qualified}"), ddl)
         }
         (pythia_db::DbKind::Postgres, _) => format!("{ddl}\n"),
         (pythia_db::DbKind::SqlServer, _) => {
@@ -2163,6 +2163,59 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
         }
         _ => format!("drop {kind} if exists {qualified};\n\n{ddl}\n/\n"),
     }
+}
+
+/// PostgreSQL: `drop` and `ddl` in one `DO` block, so that a failing
+/// create leaves the `kind` as it was (#286).
+fn pg_block(kind: &str, drop: &str, ddl: &str) -> String {
+    let ddl = pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Postgres);
+    let mut tag = "$pythia$".to_owned();
+    while ddl.contains(&tag) {
+        tag.insert(tag.len() - 1, '_');
+    }
+    // A column named `found` is the view's, not PL/pgSQL's FOUND.
+    format!(
+        "-- One block: if the create fails, the {kind} stays as it was.\n\
+         do {tag}\n#variable_conflict use_column\nbegin\n\
+         {drop};\n\n{ddl}\nend\n{tag};\n"
+    )
+}
+
+/// The table of PostgreSQL's `CREATE CONSTRAINT TRIGGER … ON table …`, as
+/// written; `None` for another statement.
+fn constraint_trigger_table(ddl: &str) -> Option<String> {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(ddl, pythia_plsql::Syntax::Postgres)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let text = |i: usize| tokens.get(i).map_or("", |t| &ddl[t.span.clone()]);
+    let is = |i: usize, word: &str| text(i).eq_ignore_ascii_case(word);
+    if !(is(0, "CREATE") && is(1, "CONSTRAINT") && is(2, "TRIGGER")) {
+        return None;
+    }
+    let on = (3..tokens.len()).find(|&i| is(i, "ON"))?;
+    let name = |i: usize| {
+        tokens.get(i).is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Ident | TokenKind::Keyword | TokenKind::QuotedIdent
+            )
+        })
+    };
+    // `name` or `schema.name`.
+    let mut end = on + 1;
+    if !name(end) {
+        return None;
+    }
+    while tokens
+        .get(end + 1)
+        .is_some_and(|t| t.kind == TokenKind::Dot)
+        && name(end + 2)
+    {
+        end += 2;
+    }
+    Some(ddl[tokens[on + 1].span.start..tokens[end].span.end].to_owned())
 }
 
 /// `ddl` with `schema` in front of the name it creates, unless it names
@@ -3255,6 +3308,36 @@ mod tests {
         );
         assert!(script.contains("do $pythia_$\n"), "{script}");
         assert!(script.ends_with("AS t;\nend\n$pythia_$;\n"), "{script}");
+        // A constraint trigger has no OR REPLACE: dropped on its table and
+        // created in one block.
+        let constraint = "CREATE CONSTRAINT TRIGGER \"T c\" AFTER INSERT ON app.\"X y\" \
+                          DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.f()";
+        let script = replace_script(
+            Dialect::POSTGRES,
+            &o("T c", ObjectType::Trigger),
+            constraint,
+            false,
+        );
+        assert_eq!(
+            script,
+            format!(
+                "-- One block: if the create fails, the trigger stays as it was.\n\
+                 do $pythia$\n#variable_conflict use_column\nbegin\n\
+                 drop trigger if exists \"T c\" on app.\"X y\";\n\n{constraint};\nend\n$pythia$;\n"
+            )
+        );
+        assert_eq!(
+            constraint_trigger_table(constraint).as_deref(),
+            Some("app.\"X y\"")
+        );
+        assert_eq!(
+            constraint_trigger_table("CREATE CONSTRAINT TRIGGER t AFTER UPDATE ON x FOR EACH ROW"),
+            Some("x".into())
+        );
+        assert_eq!(
+            constraint_trigger_table("CREATE TRIGGER t AFTER UPDATE ON x"),
+            None
+        );
         let drop = drop_sql(Dialect::POSTGRES, &o("t", ObjectType::Trigger));
         assert!(drop.contains("g.tgname = 't'"), "{drop}");
         assert_eq!(

@@ -60,6 +60,9 @@ All notable changes to Pythia are documented here. The format follows
   key references the table's own unique index (#396). PostgreSQL's left
   that index out, and both put the key in the CREATE TABLE, before the
   index it needs; it is added after the indexes now.
+- PostgreSQL: *Edit* of a constraint trigger opens a script that drops
+  and creates it in one block (#397); the plain CREATE it opened failed,
+  the trigger being there, and PostgreSQL has no OR REPLACE for one.
 
 ## [0.11.0] - 2026-11-02
 
