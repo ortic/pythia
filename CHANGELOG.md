@@ -1135,6 +1135,15 @@ All notable changes to Pythia are documented here. The format follows
   logged, `heap`, with the default parameters, and it and its indexes
   were in the database's tablespace. A materialized view's indexes keep
   their tablespace too.
+- PostgreSQL: the DDL of a table, view, sequence, function or procedure
+  gives it its owner where that isn't you (#353), `alter … owner to …`
+  after the `CREATE`, as a materialized view's does since #330. Run
+  elsewhere, a copy belonged to the role that ran it, and so did a
+  table's `serial` sequences; its grants then revoked what the owner had
+  given up from a role that didn't have it. A sequence owned by a column
+  gets its owner before `owned by`, which needs the table's. *Edit*
+  replaces views and routines in place, keeping their owner, so the line
+  changes nothing there.
 
 ## [0.10.0] - 2026-10-30
 

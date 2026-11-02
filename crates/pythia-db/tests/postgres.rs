@@ -1789,6 +1789,123 @@ fn a_tables_ddl_keeps_its_storage() {
     h.ok("drop access method r81_heap");
 }
 
+/// The DDL of a table, a view, a sequence and a routine gives it its owner
+/// where that isn't the role reading it, as a materialized view's does
+/// (#330): run in another schema, the copies have the same owners, a
+/// table's serial sequence too, and the privileges an owner gave up stay
+/// revoked (#353). Those of the role reading it have none.
+#[test]
+fn the_ddl_keeps_the_owner() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r81_ow, r81_ow_copy cascade");
+    h.ok("drop role if exists \"R81 Owner\"");
+    h.ok("create role \"R81 Owner\"");
+    h.ok("create schema r81_ow");
+    h.ok("create schema r81_ow_copy");
+    for sql in [
+        "create table r81_ow.r81_t (id serial, n int)",
+        "alter table r81_ow.r81_t owner to \"R81 Owner\"",
+        "revoke truncate on r81_ow.r81_t from \"R81 Owner\"",
+        // A sequence a column owns has the table's owner.
+        "create sequence r81_ow.r81_n",
+        "alter sequence r81_ow.r81_n owner to \"R81 Owner\"",
+        "alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n",
+        "create sequence r81_ow.r81_free",
+        "alter sequence r81_ow.r81_free owner to \"R81 Owner\"",
+        "create view r81_ow.r81_v as select n from r81_ow.r81_t",
+        "alter view r81_ow.r81_v owner to \"R81 Owner\"",
+        "create function r81_ow.r81_f(x int) returns int language sql as 'select x'",
+        "alter function r81_ow.r81_f(int) owner to \"R81 Owner\"",
+        "create function r81_ow.r81_f(x text) returns text language sql as 'select x'",
+        "create procedure r81_ow.r81_p() language sql as 'select 1'",
+        "alter procedure r81_ow.r81_p() owner to \"R81 Owner\"",
+        "create view r81_ow.r81_mine as select 1 as one",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r81_ow", "r81_t", ObjectType::Table);
+    let owned = table.find("alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n;");
+    let owner = table.find("\n\nalter table r81_ow.r81_t owner to \"R81 Owner\";\n\n");
+    let revoke = table.find("revoke truncate on r81_ow.r81_t from \"R81 Owner\";");
+    assert!(
+        owned.is_some() && owned < owner && owner < revoke,
+        "{table}"
+    );
+    let function = ddl_of(&mut h, "r81_ow", "r81_f", ObjectType::Function);
+    assert!(
+        function.contains(
+            "$function$;\n\nalter function r81_ow.r81_f(x integer) owner to \"R81 Owner\";"
+        ),
+        "{function}"
+    );
+    assert_eq!(function.matches("owner to").count(), 1, "{function}");
+    let n = ddl_of(&mut h, "r81_ow", "r81_n", ObjectType::Sequence);
+    assert!(
+        n.ends_with(
+            "\n  start with 1 cache 1;\n\n\
+             alter sequence r81_ow.r81_n owner to \"R81 Owner\";\n\n\
+             alter sequence r81_ow.r81_n owned by r81_ow.r81_t.n;"
+        ),
+        "{n}"
+    );
+    let mine = ddl_of(&mut h, "r81_ow", "r81_mine", ObjectType::View);
+    assert!(!mine.contains("owner to"), "{mine}");
+    let mut ddls = vec![table];
+    for (name, object_type) in [
+        ("r81_free", ObjectType::Sequence),
+        ("r81_v", ObjectType::View),
+        ("r81_f", ObjectType::Function),
+        ("r81_p", ObjectType::Procedure),
+        ("r81_mine", ObjectType::View),
+    ] {
+        ddls.push(ddl_of(&mut h, "r81_ow", name, object_type));
+    }
+    for ddl in &ddls {
+        run_ddl(&mut h, ddl, "r81_ow.", "r81_ow_copy.");
+    }
+    // Each object's owner and privileges.
+    let owners = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(name || ' ' || owner || ' ' || coalesce(acl, '-'), '; ' \
+                               order by name) \
+               from (select relname as name, relowner::regrole::text as owner, \
+                            relacl::text as acl \
+                       from pg_class where relnamespace = '{schema}'::regnamespace \
+                     union all \
+                     select oid::regprocedure::text, proowner::regrole::text, proacl::text \
+                       from pg_proc where pronamespace = '{schema}'::regnamespace) o"
+        ))
+        .map(|o| o.replace(&format!("{schema}."), ""))
+    };
+    let me = h
+        .scalar("select current_user::regrole::text")
+        .unwrap_or_default();
+    let was = owners(&mut h, "r81_ow");
+    assert!(
+        was.as_deref().is_some_and(|w| {
+            w.contains("r81_t_id_seq \"R81 Owner\"")
+                && w.contains("r81_f(text) ")
+                && w.contains(&format!("r81_mine {me} -"))
+        }),
+        "{was:?}"
+    );
+    assert_eq!(owners(&mut h, "r81_ow_copy"), was, "{}", ddls[0]);
+    // The sequence a column owns, alone beside its table.
+    h.ok("drop sequence r81_ow_copy.r81_n");
+    run_ddl(&mut h, &n, "r81_ow.", "r81_ow_copy.");
+    assert_eq!(owners(&mut h, "r81_ow_copy"), was, "{n}");
+    h.ok("drop schema r81_ow, r81_ow_copy cascade");
+    h.ok("drop role \"R81 Owner\"");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another
