@@ -44,6 +44,12 @@ All notable changes to Pythia are documented here. The format follows
   values keep their spaces, and `sslmode = require` with spaces is
   taken. An `sslmode` that the driver read but Pythia didn't was turned
   into `prefer`, which falls back to a connection without TLS.
+- Script files in UTF-16 (with its byte order mark, as SQL Server
+  Management Studio and Windows PowerShell write them) open as text and
+  are saved as UTF-16 (#394). They were read as Windows-1252, and an
+  edit saved single bytes into them. The encoding in the status bar
+  saves the file in another one, which a Windows-1252 file needs for a
+  character it can't hold.
 
 ## [0.11.0] - 2026-11-02
 

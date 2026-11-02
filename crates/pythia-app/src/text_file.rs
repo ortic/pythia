@@ -1,5 +1,5 @@
 //! Reading and writing script files the way they were: UTF-8 (with or
-//! without BOM) or Windows-1252, LF or CRLF. The editor always works with
+//! without BOM), UTF-16 with its BOM or Windows-1252, LF or CRLF. The editor always works with
 //! `\n` and Unicode text.
 
 use std::path::Path;
@@ -13,14 +13,28 @@ pub enum Encoding {
     Utf8Bom,
     /// Legacy Windows files (what PL/SQL Developer writes by default).
     Windows1252,
+    /// UTF-16 with its byte order mark, as SQL Server Management Studio's
+    /// scripts and Windows PowerShell's `>` write them.
+    Utf16Le,
+    Utf16Be,
 }
 
 impl Encoding {
+    pub const ALL: [Encoding; 5] = [
+        Encoding::Utf8,
+        Encoding::Utf8Bom,
+        Encoding::Utf16Le,
+        Encoding::Utf16Be,
+        Encoding::Windows1252,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Encoding::Utf8 => "UTF-8",
             Encoding::Utf8Bom => "UTF-8 BOM",
             Encoding::Windows1252 => "Windows-1252",
+            Encoding::Utf16Le => "UTF-16 LE",
+            Encoding::Utf16Be => "UTF-16 BE",
         }
     }
 }
@@ -55,7 +69,21 @@ const CP1252_HIGH: [char; 32] = [
 ];
 
 pub fn decode(bytes: &[u8]) -> TextFile {
-    let (text, encoding) = if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        // An odd byte at the end is no character.
+        let units = rest.chunks(2).map(|c| match c {
+            &[a, b] => unit([a, b]),
+            _ => 0xfffd,
+        });
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+    };
+    let (text, encoding) = if let Some(rest) = bytes.strip_prefix(b"\xff\xfe") {
+        (utf16(rest, u16::from_le_bytes), Encoding::Utf16Le)
+    } else if let Some(rest) = bytes.strip_prefix(b"\xfe\xff") {
+        (utf16(rest, u16::from_be_bytes), Encoding::Utf16Be)
+    } else if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
         (
             String::from_utf8_lossy(rest).into_owned(),
             Encoding::Utf8Bom,
@@ -103,6 +131,14 @@ pub fn encode(text: &str, encoding: Encoding, line_ending: LineEnding) -> Result
             out.extend(text.into_bytes());
             Ok(out)
         }
+        Encoding::Utf16Le => Ok([0xff, 0xfe]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect()),
+        Encoding::Utf16Be => Ok([0xfe, 0xff]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect()),
         Encoding::Windows1252 => text
             .chars()
             .map(|c| match u32::from(c) {
@@ -113,7 +149,8 @@ pub fn encode(text: &str, encoding: Encoding, line_ending: LineEnding) -> Result
                     .map(|i| 0x80 + i as u8)
                     .ok_or_else(|| {
                         format!(
-                            "'{c}' can't be saved as Windows-1252; change the encoding to UTF-8"
+                            "'{c}' can't be saved as Windows-1252; save it as UTF-8 (click the \
+                             encoding in the status bar)"
                         )
                     }),
             })
@@ -166,5 +203,42 @@ mod tests {
         );
 
         assert!(encode("日本", Encoding::Windows1252, LineEnding::Lf).is_err());
+    }
+
+    /// UTF-16 with its BOM, as SQL Server Management Studio writes
+    /// scripts: it was read as Windows-1252 (`ÿþs\0e\0l\0…`), and an edit
+    /// saved single bytes into it.
+    #[test]
+    fn utf16_round_trips() {
+        let text = "select N'Grüße 𝄞';\r\ngo\r\n";
+        let le: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let file = decode(&le);
+        assert_eq!(
+            (file.encoding, file.line_ending),
+            (Encoding::Utf16Le, LineEnding::CrLf)
+        );
+        assert_eq!(file.text, "select N'Grüße 𝄞';\ngo\n");
+        assert_eq!(
+            encode(&file.text, file.encoding, file.line_ending).unwrap(),
+            le
+        );
+        let be: Vec<u8> = [0xfe, 0xff]
+            .into_iter()
+            .chain("x\n".encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let file = decode(&be);
+        assert_eq!(
+            (file.encoding, file.text.as_str()),
+            (Encoding::Utf16Be, "x\n")
+        );
+        assert_eq!(
+            encode(&file.text, file.encoding, file.line_ending).unwrap(),
+            be
+        );
+        // An odd byte or a lone surrogate doesn't stop it.
+        assert_eq!(decode(b"\xff\xfex\x00\x00\xd8y").text, "x\u{fffd}\u{fffd}");
     }
 }

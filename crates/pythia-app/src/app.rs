@@ -25,6 +25,7 @@ use crate::history::History;
 use crate::object_view::ObjectView;
 use crate::program_window::ProgramWindow;
 use crate::sql_window::SqlWindow;
+use crate::text_file::Encoding;
 use crate::{secrets, theme};
 use pythia_ui::icons::{Icon, icon_label};
 
@@ -4521,7 +4522,10 @@ impl PythiaApp {
         choice
     }
 
-    fn status_bar(&self, ui: &mut Ui, commands: &mut Vec<Command>) {
+    /// The status bar; returns an encoding picked to save the focused
+    /// file in.
+    fn status_bar(&self, ui: &mut Ui, commands: &mut Vec<Command>) -> Option<Encoding> {
+        let mut save_as = None;
         ui.horizontal(|ui| {
             let focused = self.focused.and_then(|id| self.docs.get(&id).map(|d| (id, d)));
             let connection = self.current_connection();
@@ -4590,8 +4594,23 @@ impl PythiaApp {
                     && let DocKind::Sql(w) = &doc.kind
                     && w.path.is_some()
                 {
-                    ui.weak(format!("{} · {}", w.encoding.label(), w.line_ending.label()))
-                        .on_hover_text("Saved the way the file was read");
+                    let label = format!("{} · {}", w.encoding.label(), w.line_ending.label());
+                    ui.menu_button(RichText::new(label).weak(), |ui| {
+                        for encoding in Encoding::ALL {
+                            if ui
+                                .add_enabled(
+                                    encoding != w.encoding,
+                                    egui::Button::new(format!("Save as {}", encoding.label())),
+                                )
+                                .clicked()
+                            {
+                                save_as = Some(encoding);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Saved the way the file was read; click to save it in another encoding");
                 }
                 if let Some((_, doc)) = focused {
                     let (line_col, status) = doc.status();
@@ -4606,6 +4625,7 @@ impl PythiaApp {
                 }
             });
         });
+        save_as
     }
 
     fn file_dialog(&mut self, action: FileAction, file_name: Option<String>) {
@@ -4661,6 +4681,28 @@ impl PythiaApp {
                     Err(e) => self.log(format!("Could not save {}: {e}", path.display())),
                 }
             }
+        }
+    }
+
+    /// Saves the focused SQL window's file in `encoding`, which it keeps;
+    /// the one it had if that fails (a character Windows-1252 can't hold).
+    fn save_in(&mut self, encoding: Encoding) {
+        let Some(DocKind::Sql(w)) = self
+            .focused
+            .and_then(|id| self.docs.get_mut(&id))
+            .map(|d| &mut d.kind)
+        else {
+            return;
+        };
+        let Some(path) = w.path.clone() else { return };
+        let before = std::mem::replace(&mut w.encoding, encoding);
+        let result = w.save_to(path.clone());
+        if result.is_err() {
+            w.encoding = before;
+        }
+        match result {
+            Ok(()) => self.log(format!("Saved {} as {}", path.display(), encoding.label())),
+            Err(e) => self.log(format!("Could not save {}: {e}", path.display())),
         }
     }
 
@@ -5077,9 +5119,13 @@ impl eframe::App for PythiaApp {
             .frame(theme::toolbar_frame(ui.style()))
             .show(ui, |ui| self.toolbar(ui, &mut commands))
             .inner;
-        egui::Panel::bottom("status")
+        let save_as = egui::Panel::bottom("status")
             .frame(theme::status_frame(ui.style()))
-            .show(ui, |ui| self.status_bar(ui, &mut commands));
+            .show(ui, |ui| self.status_bar(ui, &mut commands))
+            .inner;
+        if let Some(encoding) = save_as {
+            self.save_in(encoding);
+        }
 
         let before = self.focused;
         if let Some((_, Tab::Doc(id))) = self.dock.find_active_focused() {
