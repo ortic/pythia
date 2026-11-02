@@ -90,6 +90,9 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL and SQL Server: an address with `user:password@` in it is
   refused with a message saying where they go (#406); it was taken for
   the host, and the connect error showed the password.
+- PostgreSQL: `money` sorts by its amount, and the selection's summary
+  and charts count it (#407); written as `$1,234.56`, it sorted as text
+  and was left out.
 
 ## [0.11.0] - 2026-11-02
 

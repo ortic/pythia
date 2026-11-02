@@ -2863,18 +2863,25 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
     if cells < 2 {
         return None;
     }
-    let mut numbers = Vec::new();
+    let mut numbers: Vec<std::borrow::Cow<str>> = Vec::new();
     let mut non_null = 0;
     for vr in shown {
         for &ci in &c {
             if let Some(v) = state.value(rows, vr, ci) {
                 non_null += 1;
-                if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
-                    numbers.push(v);
+                if !columns.get(ci).is_some_and(|col| col.numeric) {
+                    continue;
+                }
+                if v.parse::<f64>().is_ok() {
+                    numbers.push(v.into());
+                } else if let Some(amount) = pythia_data::amount(v) {
+                    // PostgreSQL's money, `$1,234.56`.
+                    numbers.push(amount.into());
                 }
             }
         }
     }
+    let numbers: Vec<&str> = numbers.iter().map(|n| n.as_ref()).collect();
     if numbers.is_empty() {
         return Some(format!("{cells} cells · {non_null} not null"));
     }
@@ -2907,6 +2914,10 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
 fn compare_numbers(x: &str, y: &str) -> Option<Ordering> {
     pythia_data::compare_decimals(x, y)
         .or_else(|| x.parse::<f64>().ok()?.partial_cmp(&y.parse::<f64>().ok()?))
+        // PostgreSQL's money, `$1,234.56`.
+        .or_else(|| {
+            pythia_data::compare_decimals(&pythia_data::amount(x)?, &pythia_data::amount(y)?)
+        })
 }
 
 /// The sum and the average (with four more decimals) of plain decimals,
@@ -3926,6 +3937,33 @@ mod tests {
         assert_eq!(
             summary(&c, &r, &s).unwrap(),
             "Count 4 · Sum 19 · Avg 9.5 · Min 9 · Max 10"
+        );
+    }
+
+    /// PostgreSQL's money, as `lc_monetary` writes it, sorts and adds up
+    /// as the amounts it holds: it sorted as text, and the summary left it
+    /// out.
+    #[test]
+    fn money_sorts_and_adds_up() {
+        let c = vec![Column {
+            name: "M".into(),
+            type_name: "money".into(),
+            numeric: true,
+        }];
+        let r: Vec<Vec<Cell>> = ["$1,234.56", "-$5.00", "$999.00", "$1,234,567.89"]
+            .iter()
+            .map(|m| vec![Some((*m).to_owned())])
+            .collect();
+        let mut order: Vec<usize> = (0..r.len()).collect();
+        sort_order(&mut order, &r, 0, true, true);
+        assert_eq!(order, [1, 2, 0, 3]);
+        let mut s = GridState::default();
+        s.sync(&r, &c);
+        s.select((0, 0), false);
+        s.select((3, 0), true);
+        assert_eq!(
+            summary(&c, &r, &s).unwrap(),
+            "Count 4 · Sum 1236796.45 · Avg 309199.1125 · Min -5.00 · Max 1234567.89"
         );
     }
 
