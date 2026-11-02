@@ -1080,9 +1080,17 @@ fn shown_source_name(text: &str) -> String {
         .join(".")
 }
 
+/// A name of the source as Oracle stores it: a quoted one as written,
+/// without its quotes, others in uppercase. So `"MyProc"` is the member
+/// MyProc, `"PLAIN"` is plain, and `"MyProc"` and `"myproc"` are two
+/// subprograms (#359).
+fn stored_name(text: &str) -> String {
+    pythia_plsql::normalize_ident(text.trim()).0
+}
+
 /// A procedure or function of a text (nested ones too).
 struct SubprogramItem {
-    /// Upper-cased.
+    /// As Oracle stores it ([`stored_name`]).
     name: String,
     params: String,
     span: std::ops::Range<usize>,
@@ -1096,7 +1104,7 @@ fn subprogram_items(text: &str) -> Vec<SubprogramItem> {
         for item in items {
             if matches!(item.kind, OutlineKind::Procedure | OutlineKind::Function) {
                 out.push(SubprogramItem {
-                    name: item.name.to_uppercase(),
+                    name: stored_name(&item.name),
                     params: params(item),
                     span: item.span.clone(),
                     name_span: item.name_span.clone(),
@@ -1155,8 +1163,9 @@ fn counterpart(here: &str, offset: usize, there: &str) -> Option<std::ops::Range
         })
 }
 
-/// The name of the declaration `member` (a subprogram, variable, type, …)
-/// in `text`, or of its `parameter`: in the first overload that has it.
+/// The name of the declaration `member` (a subprogram, variable, type, …,
+/// as the dictionary names it) in `text`, or of its `parameter`: in the
+/// first overload that has it.
 fn member_span(
     text: &str,
     member: &str,
@@ -1166,7 +1175,7 @@ fn member_span(
     fn collect(items: &[OutlineItem], member: &str, out: &mut Vec<(usize, usize, usize)>) {
         for item in items {
             let declaration = !matches!(item.kind, OutlineKind::Statement | OutlineKind::Block);
-            if declaration && item.name.eq_ignore_ascii_case(member) {
+            if declaration && stored_name(&item.name) == member {
                 out.push((item.name_span.start, item.name_span.end, item.span.end));
             }
             collect(&item.children, member, out);
@@ -1232,7 +1241,8 @@ fn subprogram_at(
         }
         ObjectType::Package | ObjectType::PackageBody => {
             let item = members(outline).find(named)?;
-            let same = |i: &&OutlineItem| subprogram(i) && i.name.eq_ignore_ascii_case(&item.name);
+            let name = stored_name(&item.name);
+            let same = |i: &&OutlineItem| subprogram(i) && stored_name(&i.name) == name;
             let declared: Vec<&OutlineItem> = members(spec).filter(same).collect();
             let index = if part_type == ObjectType::Package {
                 declared.iter().position(|d| std::ptr::eq(*d, item))
@@ -1253,7 +1263,7 @@ fn subprogram_at(
                 ..object.clone()
             };
             let member = crate::browser::Subprogram {
-                name: item.name.to_uppercase(),
+                name,
                 overload: (declared.len() > 1).then_some(index as u32 + 1),
             };
             Some((package, Some(member)))
@@ -1908,12 +1918,83 @@ mod tests {
         // The overload that has the parameter.
         let amount = body.find("p_amount").unwrap();
         assert_eq!(
-            member_span(body, "raise", Some("P_AMOUNT")),
+            member_span(body, "RAISE", Some("P_AMOUNT")),
             Some(amount..amount + 8)
         );
         let x = body.find("g_x").unwrap();
         assert_eq!(member_span(body, "G_X", None), Some(x..x + 3));
         assert_eq!(member_span(body, "nope", None), None);
+    }
+
+    /// The source's names are read as Oracle stores them: `"MyProc"` is
+    /// the member MyProc, not `"MYPROC"` with its quotes, `"PLAIN"` is
+    /// plain, and `"MyProc"` and `"myproc"` are two subprograms (#359).
+    #[test]
+    fn quoted_subprograms_are_their_members() {
+        let spec = "create or replace package \"Pkg\" as\n  \
+                    procedure \"MyProc\"(p_n number);\n  procedure \"myproc\"(p_n number);\n  \
+                    procedure \"PLAIN\";\nend;";
+        let body = "create or replace package body \"Pkg\" as\n  \
+                    procedure \"myproc\"(p_n number) is begin null; end;\n  \
+                    procedure \"MyProc\"(p_n number) is begin null; end;\n  \
+                    procedure plain is begin null; end;\nend;";
+        let span = |text: &str, word: &str| {
+            let at = text.find(word).unwrap();
+            Some(at..at + word.len())
+        };
+        assert_eq!(member_span(body, "MyProc", None), span(body, "\"MyProc\""));
+        assert_eq!(member_span(body, "myproc", None), span(body, "\"myproc\""));
+        assert_eq!(member_span(body, "MYPROC", None), None);
+        assert_eq!(member_span(body, "PLAIN", None), span(body, "plain"));
+        assert_eq!(member_span(spec, "PLAIN", None), span(spec, "\"PLAIN\""));
+
+        let package = ObjectRef {
+            owner: "HR".into(),
+            name: "Pkg".into(),
+            object_type: ObjectType::Package,
+        };
+        let (spec_outline, body_outline) = (
+            pythia_lsp_core::outline(spec),
+            pythia_lsp_core::outline(body),
+        );
+        let at = |text: &str, word: &str| text.find(word).unwrap() + 2;
+        let member = |part, text: &str, word: &str| {
+            let outline = match part {
+                ObjectType::Package => &spec_outline,
+                _ => &body_outline,
+            };
+            subprogram_at(&package, part, outline, &spec_outline, at(text, word))
+                .and_then(|(_, m)| m)
+                .map(|m| (m.name, m.overload))
+        };
+        let one = |name: &str| Some((name.to_owned(), None));
+        assert_eq!(
+            member(ObjectType::Package, spec, "\"MyProc\""),
+            one("MyProc")
+        );
+        assert_eq!(
+            member(ObjectType::Package, spec, "\"myproc\""),
+            one("myproc")
+        );
+        assert_eq!(member(ObjectType::Package, spec, "\"PLAIN\""), one("PLAIN"));
+        assert_eq!(
+            member(ObjectType::PackageBody, body, "\"MyProc\""),
+            one("MyProc")
+        );
+        assert_eq!(
+            member(ObjectType::PackageBody, body, "\"myproc\""),
+            one("myproc")
+        );
+        assert_eq!(member(ObjectType::PackageBody, body, "plain"), one("PLAIN"));
+
+        // Go to body and back.
+        let there = |here: &str, word: &str, there: &str| counterpart(here, at(here, word), there);
+        assert_eq!(there(spec, "\"MyProc\"", body), span(body, "\"MyProc\""));
+        assert_eq!(there(spec, "\"myproc\"", body), span(body, "\"myproc\""));
+        assert_eq!(there(spec, "\"PLAIN\"", body), span(body, "plain"));
+        assert_eq!(there(body, "plain", spec), span(spec, "\"PLAIN\""));
+        let names: Vec<String> = subprogram_items(body).into_iter().map(|i| i.name).collect();
+        assert_eq!(names, ["myproc", "MyProc", "PLAIN"]);
     }
 
     use super::*;

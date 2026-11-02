@@ -5900,6 +5900,14 @@ impl PythiaApp {
         }
     }
 
+    /// A program window is focused, its source loaded.
+    pub fn test_program_loaded(&self) -> bool {
+        matches!(
+            self.focused.and_then(|id| self.docs.get(&id)).map(|d| &d.kind),
+            Some(DocKind::Program(w)) if !w.is_busy()
+        )
+    }
+
     pub fn test_apply_focused(&mut self, effects: Effects) {
         self.apply(self.focused, effects);
     }

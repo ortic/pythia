@@ -144,6 +144,15 @@ All notable changes to Pythia are documented here. The format follows
   alias or a CLR type, with its schema (#372), `[app].[ssn]`. By its name
   alone, the DDL failed with Msg 2715 where the session's default schema
   isn't the type's.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
 
 ## [0.11.0] - 2026-11-02
 

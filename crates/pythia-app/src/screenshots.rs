@@ -9660,6 +9660,147 @@ fn quoted_subprograms_keep_their_case() {
     conn.execute("drop package \"R71_Pkg\"", &[]).unwrap();
 }
 
+/// A package's quoted subprogram is the one of its source: Edit "R83_MyProc"
+/// from an editor's menu opens the body at it, and Test… and Debug… from
+/// the outline call it with its parameters, not "R83_MYPROC" (#359).
+#[test]
+fn quoted_subprograms_open_test_and_debug() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let host = std::env::var("PYTHIA_DEBUG_HOST").ok();
+    if let Some(host) = &host {
+        debug_setup(&profile.username, host);
+    }
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R83_Pkg\" as\n  \
+                procedure \"r83_myproc\"(p_d date) is begin null; end;\n  \
+                procedure \"R83_MyProc\"(p_n number) is\n    l_n number := p_n;\n  \
+                begin\n    l_n := l_n + 1;\n  end;\nend;";
+    for ddl in [
+        "create or replace package \"R83_Pkg\" as\n  procedure \"R83_MyProc\"(p_n number);\n  \
+         procedure \"r83_myproc\"(p_d date);\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    if let Some(host) = &host {
+        h.state_mut().test_settings_mut().debug_host = host.clone();
+    }
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R83_Pkg\".\"R83_MyProc\"(1);\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R83_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R83_MyProc\"");
+    h.get_by_label("Edit \"R83_MyProc\"").click();
+    h.run_steps(2);
+    wait_until(&mut h, "source", |app| app.test_program_loaded());
+    let program = h.state_mut().test_program();
+    assert_eq!(program.message(), None);
+    let at = body.find("\"R83_MyProc\"").unwrap();
+    assert_eq!(
+        (program.active, program.active_editor().unwrap().selection()),
+        (1, Some(at..at + "\"R83_MyProc\"".len()))
+    );
+
+    shown(&mut h, "\"R83_MyProc\"");
+    h.get_by_label("\"R83_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Test…").click();
+    wait_until(&mut h, "test block", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("R83_Pkg"))
+    });
+    let block = h.state_mut().test_sql_window().editor.text().to_owned();
+    // Its parameter, not "r83_myproc"'s too.
+    assert!(
+        block.contains("pythia.\"R83_Pkg\".\"R83_MyProc\"(")
+            && block.contains("p_n =>")
+            && !block.contains("p_d"),
+        "{block}"
+    );
+    h.state_mut().test_close_focused();
+    h.run_steps(3);
+
+    if host.is_some() {
+        h.state_mut().test_open(OpenRequest::Program {
+            connection: "pythia@FREEPDB1".into(),
+            object: ObjectRef {
+                owner: "PYTHIA".into(),
+                name: "R83_Pkg".into(),
+                object_type: pythia_db::ObjectType::Package,
+            },
+        });
+        h.run_steps(3);
+        wait_until(&mut h, "program window", |app| app.test_program_loaded());
+        h.get_by_label("\"R83_MyProc\"").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Debug…").click();
+        wait_until(&mut h, "values", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.waiting_for_values())
+        });
+        h.state_mut()
+            .test_sql_window()
+            .bind_values
+            .insert("p_n".into(), Some("1".into()));
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "stop on entry or the end", |app| {
+            let debug = app.test_debug();
+            debug.is_suspended() || debug.state == pythia_debugger::ui::State::Finished
+        });
+        let debug = h.state().test_debug();
+        assert!(debug.is_suspended(), "{:?}", debug.log);
+        let unit =
+            pythia_debugger::Unit::new("PYTHIA", "R83_Pkg", pythia_debugger::UnitType::PackageBody);
+        assert_eq!(debug.stack[0].method, "R83_MyProc", "{:?}", debug.stack);
+        assert_eq!(debug.entry, Some((unit, "R83_MyProc".to_owned())));
+        h.state_mut()
+            .test_debug_mut()
+            .command(pythia_debugger::DebugCommand::Resume);
+        wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    }
+    conn.execute("drop package \"R83_Pkg\"", &[]).unwrap();
+}
+
 /// Go to definition, Back/Forward, Switch Spec/Body, Go to Symbol and Find
 /// References in a package's program window, across its spec and body.
 #[test]

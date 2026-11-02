@@ -648,7 +648,8 @@ struct Argument {
 }
 
 /// The subprogram's parameters and result with their types, and its name
-/// as the dictionary has it.
+/// as the dictionary has it. `name` is the dictionary's: `MyProc` isn't
+/// `MYPROC` (#359).
 fn describe(
     conn: &Connection,
     owner: &str,
@@ -673,7 +674,7 @@ fn describe(
                 a.data_type, a.pls_type, a.type_owner, a.type_name, a.type_subname \
            from all_arguments a \
           where a.owner = :1 and nvl(a.package_name, '-') = :2 \
-            and upper(a.object_name) = upper(:3) and a.data_level = 0 \
+            and a.object_name = :3 and a.data_level = 0 \
           order by to_number(a.overload) nulls first, a.position",
         &[&owner, &package.unwrap_or("-"), &name],
     )?;
