@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::io::Write;
 
 pub mod import;
+pub mod text;
 
 use pythia_db::{Cell, Column, DbKind, Dialect};
 use serde_json::value::{RawValue, to_raw_value};

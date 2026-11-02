@@ -367,6 +367,9 @@ All notable changes to Pythia are documented here. The format follows
   INSERTs and UPDATEs, which Oracle refused (#443).
 - MariaDB: the role editor shows a role's privileges on the server
   (`*.*`), which MariaDB's `information_schema` doesn't list (#445).
+- Import reads CSV files in Windows-1252 and UTF-16 (with its byte order
+  mark), as the editor opens them, not as UTF-8 that lost their accented
+  characters (#446).
 
 ## [0.11.0] - 2026-11-02
 

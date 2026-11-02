@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use pythia_data::text::{CP1252_HIGH, Detected};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -62,46 +63,14 @@ pub struct TextFile {
     pub line_ending: LineEnding,
 }
 
-/// Windows-1252 0x80..=0x9F; the rest of the code page equals Latin-1.
-const CP1252_HIGH: [char; 32] = [
-    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
-    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-];
-
 pub fn decode(bytes: &[u8]) -> TextFile {
-    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
-        // An odd byte at the end is no character.
-        let units = rest.chunks(2).map(|c| match c {
-            &[a, b] => unit([a, b]),
-            _ => 0xfffd,
-        });
-        char::decode_utf16(units)
-            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect::<String>()
-    };
-    let (text, encoding) = if let Some(rest) = bytes.strip_prefix(b"\xff\xfe") {
-        (utf16(rest, u16::from_le_bytes), Encoding::Utf16Le)
-    } else if let Some(rest) = bytes.strip_prefix(b"\xfe\xff") {
-        (utf16(rest, u16::from_be_bytes), Encoding::Utf16Be)
-    } else if let Some(rest) = bytes.strip_prefix(b"\xef\xbb\xbf") {
-        (
-            String::from_utf8_lossy(rest).into_owned(),
-            Encoding::Utf8Bom,
-        )
-    } else {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => (text.to_owned(), Encoding::Utf8),
-            Err(_) => (
-                bytes
-                    .iter()
-                    .map(|&b| match b {
-                        0x80..=0x9f => CP1252_HIGH[usize::from(b - 0x80)],
-                        b => char::from(b),
-                    })
-                    .collect(),
-                Encoding::Windows1252,
-            ),
-        }
+    let (text, detected) = pythia_data::text::decode(bytes);
+    let encoding = match detected {
+        Detected::Utf8 => Encoding::Utf8,
+        Detected::Utf8Bom => Encoding::Utf8Bom,
+        Detected::Utf16Le => Encoding::Utf16Le,
+        Detected::Utf16Be => Encoding::Utf16Be,
+        Detected::Windows1252 => Encoding::Windows1252,
     };
     let crlf = text.matches("\r\n").count();
     let lf = text.matches('\n').count();
