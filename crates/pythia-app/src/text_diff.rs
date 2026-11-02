@@ -15,6 +15,7 @@ pub struct TextDiff {
     pub right_name: String,
     pub right: String,
     /// The file on the right, to open it for editing.
+    #[serde(default, with = "crate::serde_path::option")]
     pub file: Option<std::path::PathBuf>,
     #[serde(skip)]
     diff: Option<LineDiff>,

@@ -39,7 +39,7 @@ pub struct SqlWindow {
     #[serde(default = "yes")]
     pub show_variables: bool,
     /// File the window was opened from or saved to.
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_path::option")]
     pub path: Option<std::path::PathBuf>,
     /// Text as last saved to `path`, to detect unsaved changes.
     #[serde(default)]

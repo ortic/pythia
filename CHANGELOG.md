@@ -330,6 +330,9 @@ All notable changes to Pythia are documented here. The format follows
   the date.
 - PostgreSQL: a table's and a function's grants of one name stay apart,
   and a function's DDL leaves out a procedure of its name (#429).
+- The workspace is saved while a window's file has a name that isn't
+  UTF-8 (Linux) (#430); it wasn't saved at all then, and every window's
+  unsaved text was lost with the next restart.
 
 ## [0.11.0] - 2026-11-02
 

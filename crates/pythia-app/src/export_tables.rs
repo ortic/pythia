@@ -19,6 +19,7 @@ use crate::documents::{DocContext, Effects, Target, quote_ident, request_id};
 pub struct ExportTables {
     /// Schema to export from (empty: the current schema).
     pub owner: String,
+    #[serde(default, with = "crate::serde_path::option")]
     pub folder: Option<PathBuf>,
     #[serde(with = "format_name")]
     pub format: Format,

@@ -42,6 +42,7 @@ mod reports;
 #[cfg(test)]
 mod screenshots;
 mod secrets;
+mod serde_path;
 mod settings_dialog;
 mod shared;
 mod source_search;
