@@ -345,12 +345,52 @@ impl<'a> Splitter<'a> {
         self.significant_from(idx + 1).next()
     }
 
+    /// Whether the word at `idx` reads as a name: after `.`, `,`, `(`, an
+    /// operator or a word that a name follows; a BEGIN also before `=`, `.`, `,` or
+    /// `)` (a CASE's END may come before `=`).
+    fn used_as_name(&self, idx: usize) -> bool {
+        let before = self.tokens[..idx]
+            .iter()
+            .rev()
+            .find(|t| !t.kind.is_trivia());
+        let after = self.next_word(idx);
+        let punct = |t: &Token, kinds: &[TokenKind]| kinds.contains(&t.kind);
+        before.is_some_and(|b| {
+            punct(
+                b,
+                &[
+                    TokenKind::Dot,
+                    TokenKind::Comma,
+                    TokenKind::LParen,
+                    TokenKind::Operator,
+                ],
+            ) || self.word_eq(
+                b,
+                &[
+                    "SET", "SELECT", "WHERE", "AND", "OR", "BY", "DISTINCT", "NOT",
+                ],
+            )
+        }) || self.word_eq(&self.tokens[idx], &["BEGIN"])
+            && after.is_some_and(|a| {
+                punct(a, &[TokenKind::Dot, TokenKind::Comma, TokenKind::RParen])
+                    || (a.kind == TokenKind::Operator && self.text(a) == "=")
+            })
+    }
+
     /// How the token changes the nesting of blocks whose `;` don't end the
     /// statement: `BEGIN … END` (T-SQL, a SQLite trigger's body), `BEGIN
     /// ATOMIC … END` (PostgreSQL) and the `CASE … END` inside them.
     fn depth_change(&self, idx: usize, depth: usize) -> isize {
         let t = &self.tokens[idx];
         if self.syntax.sqlplus() || !t.kind.is_word() {
+            return 0;
+        }
+        // SQLite takes BEGIN and END for names too: `set end = new.start`,
+        // `insert into log(begin) …` counted as the body's (#433).
+        if self.syntax == Syntax::Sqlite
+            && self.word_eq(t, &["BEGIN", "END"])
+            && self.used_as_name(idx)
+        {
             return 0;
         }
         if self.word_eq(t, &["CASE"]) {
@@ -1305,6 +1345,21 @@ mod tests {
                 (StatementKind::SqlPlus, "prompt done"),
             ]
         );
+    }
+
+    /// SQLite takes `begin` and `end` for column names too; a trigger's
+    /// body that uses them ends at its own END.
+    #[test]
+    fn sqlite_triggers_with_columns_named_begin_and_end() {
+        let src = "create trigger ev_t after insert on ev begin\n  \
+                   update ev set end = new.start, \"begin\" = 1 where ev.end is null;\n  \
+                   insert into log(begin, end) values (new.start, case when new.n > 0 then 1 end);\n\
+                   end;\n\
+                   select begin, end from ev where end > begin;";
+        let split = split_in(src, Syntax::Sqlite);
+        assert_eq!(split.len(), 2, "{split:?}");
+        assert!(split[0].1.ends_with("then 1 end);\nend"), "{split:?}");
+        assert_eq!(split[1].1, "select begin, end from ev where end > begin");
     }
 
     #[test]

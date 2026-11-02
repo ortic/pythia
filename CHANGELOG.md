@@ -339,6 +339,9 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL and MariaDB: an event with a `DO BEGIN … END` body and
   MariaDB's aggregate function are one statement up to `/` (#432); they
   were cut at their first `;`.
+- SQLite: a trigger whose body uses columns named `begin` or `end` is
+  one statement (#433); it was split at such a name, or swallowed the
+  rest of the script.
 
 ## [0.11.0] - 2026-11-02
 
