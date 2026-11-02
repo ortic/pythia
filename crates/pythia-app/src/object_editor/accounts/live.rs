@@ -314,11 +314,31 @@ fn mysql_users_and_roles() {
         r.name = "pythia_acct_r".into();
         r.privileges
             .insert((Scope::Database(db.clone()), "SELECT".into()), Grant::Plain);
+        r.privileges
+            .insert((Scope::Global, "PROCESS".into()), Grant::Plain);
     });
     assert!(
         role.privileges
             .contains_key(&(Scope::Database(db.clone()), "SELECT".into()))
     );
+    // Also on MariaDB, whose user_privileges has no roles (#445).
+    assert!(
+        role.privileges
+            .contains_key(&(Scope::Global, "PROCESS".into())),
+        "{role:#?}"
+    );
+    live.exec("grant all on *.* to pythia_acct_r with grant option");
+    let mut editor = live.open(existing("pythia_acct_r", ObjectType::Role));
+    let all = form(&mut editor);
+    for privilege in ["SELECT", "SHUTDOWN", "GRANT OPTION"] {
+        assert!(
+            all.privileges
+                .contains_key(&(Scope::Global, privilege.into())),
+            "{privilege}: {all:#?}"
+        );
+    }
+    live.exec("revoke all on *.* from pythia_acct_r");
+    live.exec("revoke grant option on *.* from pythia_acct_r");
 
     let mut meant = None;
     let user = create(&mut live, ObjectType::User, |u| {

@@ -365,6 +365,8 @@ All notable changes to Pythia are documented here. The format follows
 - Oracle: Export Tables and Data Compare read a table's invisible columns
   too (#444), and leave out its virtual columns where they write
   INSERTs and UPDATEs, which Oracle refused (#443).
+- MariaDB: the role editor shows a role's privileges on the server
+  (`*.*`), which MariaDB's `information_schema` doesn't list (#445).
 
 ## [0.11.0] - 2026-11-02
 

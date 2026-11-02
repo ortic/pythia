@@ -156,6 +156,7 @@ pub(super) fn load(
     let mut global: Vec<String> = privileges.iter().map(|(p, _)| p.clone()).collect();
     global.push(GRANT_OPTION.to_owned());
     global.sort();
+    let all = global.clone();
     // The lists above, and what else the server says is for tables (or
     // databases), such as MariaDB's DELETE HISTORY.
     let scoped = |known: &[&str], contexts: &[&str]| {
@@ -175,7 +176,7 @@ pub(super) fn load(
     let choices = Choices {
         roles,
         privileges: BTreeMap::from([
-            (ScopeKind::Global, global),
+            (ScopeKind::Global, all),
             (
                 ScopeKind::Database,
                 scoped(DATABASE, &["Databases", "Tables"]),
@@ -188,7 +189,7 @@ pub(super) fn load(
     let original = match name {
         Some(name) => {
             let (user, host) = split(name, role, mariadb);
-            Some(load_account(client, &user, &host, role, mariadb)?)
+            Some(load_account(client, &user, &host, role, mariadb, &global)?)
         }
         None => None,
     };
@@ -203,12 +204,15 @@ pub(super) fn load(
     Ok((original, start, choices))
 }
 
+/// An account as it is; `global` is what can be granted on the server,
+/// what a role's `ALL PRIVILEGES` stands for.
 fn load_account(
     client: &mut dyn Client,
     user: &str,
     host: &str,
     role: bool,
     mariadb: bool,
+    global: &[String],
 ) -> Result<UserDef, DbError> {
     let mut def = UserDef {
         name: user.to_owned(),
@@ -326,12 +330,32 @@ fn load_account(
         }
         def.privileges.insert((scope, privilege), Grant::Plain);
     };
-    for row in client.query(
-        "select privilege_type, is_grantable from information_schema.user_privileges \
-          where grantee = ?",
-        &[&grantee],
-    )? {
-        add(Scope::Global, text(&row, 0), yes(&row, 1));
+    if mariadb && role {
+        // MariaDB's user_privileges has no roles (#445): a role's global
+        // privileges are SHOW GRANTS's `… ON *.*`.
+        let sql = format!("show grants for {}", Dialect::MYSQL.quote_ident(user));
+        for row in client.query(&sql, &[])? {
+            let Some((privileges, grantable)) = global_grant(&text(&row, 0)) else {
+                continue;
+            };
+            for privilege in privileges {
+                if privilege == "ALL PRIVILEGES" {
+                    for p in global.iter().filter(|p| *p != GRANT_OPTION) {
+                        add(Scope::Global, p.clone(), grantable);
+                    }
+                } else {
+                    add(Scope::Global, privilege, grantable);
+                }
+            }
+        }
+    } else {
+        for row in client.query(
+            "select privilege_type, is_grantable from information_schema.user_privileges \
+              where grantee = ?",
+            &[&grantee],
+        )? {
+            add(Scope::Global, text(&row, 0), yes(&row, 1));
+        }
     }
     for row in client.query(
         "select table_schema, privilege_type, is_grantable \
@@ -352,6 +376,18 @@ fn load_account(
         );
     }
     Ok(def)
+}
+
+/// The privileges of a line of SHOW GRANTS that grants on the server
+/// (`GRANT RELOAD, PROCESS ON *.* TO `r` WITH GRANT OPTION`), and whether
+/// with the grant option.
+fn global_grant(line: &str) -> Option<(Vec<String>, bool)> {
+    let (privileges, to) = line.strip_prefix("GRANT ")?.split_once(" ON *.* TO ")?;
+    let privileges = privileges
+        .split(',')
+        .map(|p| p.trim().to_uppercase())
+        .collect();
+    Some((privileges, to.ends_with(" WITH GRANT OPTION")))
 }
 
 pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Vec<String>, String> {
