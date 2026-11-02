@@ -678,6 +678,13 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
     let text = text.trim();
     let text = text.strip_prefix("mysql://").unwrap_or(text);
     let (address, query) = text.split_once('?').unwrap_or((text, ""));
+    // `user:password@host`: not taken, and not shown back in the error,
+    // which would show the password.
+    if address.contains('@') {
+        return Err(DbError::new(
+            "The address is host[:port][/database]: the user and password go in their own fields",
+        ));
+    }
     let (host_port, database) = match address.split_once('/') {
         Some((host_port, db)) => (host_port, Some(db.trim()).filter(|d| !d.is_empty())),
         None => (address, None),
@@ -1205,6 +1212,8 @@ mod tests {
         );
         assert_eq!(parse_target("h/db?tls").unwrap().tls, Tls::Verify);
         assert!(parse_target("h:port").is_err());
+        let e = parse_target("mysql://app:secret@db:3306/shop").unwrap_err();
+        assert!(!e.message.contains("secret"), "{}", e.message);
         assert!(parse_target("h?compress").is_err());
     }
 

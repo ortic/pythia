@@ -87,6 +87,9 @@ All notable changes to Pythia are documented here. The format follows
   the like.
 - A new row's cell set to NULL (*Set NULL*, Delete) is inserted as NULL
   (#405); it got the column's default, as a cell left alone does.
+- MySQL and SQL Server: an address with `user:password@` in it is
+  refused with a message saying where they go (#406); it was taken for
+  the host, and the connect error showed the password.
 
 ## [0.11.0] - 2026-11-02
 
