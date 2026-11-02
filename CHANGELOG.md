@@ -75,6 +75,9 @@ All notable changes to Pythia are documented here. The format follows
   tables of the same name in two schemas have keys of the same name
   (#401); each became one relation per column, whose link found too many
   rows. A table in another schema is named with it.
+- MySQL: the user form sets the password typed when it has a `\` and
+  the session's `sql_mode` has `NO_BACKSLASH_ESCAPES` (#402); the
+  backslash was doubled, which that mode keeps.
 
 ## [0.11.0] - 2026-11-02
 
