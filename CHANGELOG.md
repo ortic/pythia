@@ -1220,6 +1220,10 @@ All notable changes to Pythia are documented here. The format follows
   rolled back the changes that weren't committed and lost the session's
   temporary tables and settings: the driver gave up reading the server's
   answer to the cancel, which comes after the end of the stopped batch.
+- SQL Server: Break stops a fetch while rows keep arriving (#385). It was
+  taken only once the session had read all it had asked for, so *Fetch
+  all* of a large table couldn't be stopped and read rows into memory
+  until the table ended.
 
 ## [0.10.0] - 2026-10-30
 

@@ -779,14 +779,16 @@ enum Wait {
     Cancel,
 }
 
-/// The stream's next item, or Break. The stream keeps what it has read of
-/// an item when Break comes first.
+/// The stream's next item, or Break. Break comes first when both are
+/// ready: rows that arrive faster than they are read kept it waiting until
+/// the fetch had all it asked for (#385). The stream keeps what it has
+/// read of an item when Break comes first.
 fn wait(rt: &Runtime, cancel: &Notify, stream: &mut QueryStream<'_>) -> Wait {
     rt.block_on(async {
         tokio::select! {
             biased;
-            item = stream.next() => Wait::Item(item),
             () = cancel.notified() => Wait::Cancel,
+            item = stream.next() => Wait::Item(item),
         }
     })
 }

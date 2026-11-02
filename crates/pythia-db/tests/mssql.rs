@@ -550,6 +550,20 @@ fn closing_an_open_result_reads_the_rest_off_the_wire() {
     }
 }
 
+/// A query of `rows` numbers made of VALUES only, `into` before its
+/// SELECT: it takes no locks, as a scan of sys.all_objects does against
+/// the DDL of tests running alongside (deadlocks).
+fn counted(rows: u64, into: &str) -> String {
+    let from: Vec<String> = (0..rows.to_string().len())
+        .map(|i| format!("d d{i}"))
+        .collect();
+    format!(
+        "with d (n) as (select n from (values (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)) \
+         v (n)) {into}select top {rows} d0.n from {}",
+        from.join(", ")
+    )
+}
+
 #[test]
 fn cancel_interrupts_a_running_statement() {
     let Some(mut h) = Harness::connect() else {
@@ -590,6 +604,28 @@ fn cancel_interrupts_a_running_statement() {
         Some("1")
     );
 
+    // A Break while a result's rows are fetched, too.
+    h.execute(2, &counted(100_000_000, ""), 100_000_000);
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 2, .. }
+    ));
+    std::thread::sleep(Duration::from_millis(500));
+    h.session.cancel();
+    let error = loop {
+        match h.next() {
+            DbEvent::Failed { error, .. } => break error,
+            DbEvent::Notice(n) => notices.push(n),
+            _ => {}
+        }
+    };
+    assert_eq!(error.message, "Cancelled while fetching");
+    assert!(h.settle(), "the insert is still pending");
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(
+        h.scalar("select count(*) from cancel_t").as_deref(),
+        Some("1")
+    );
     h.session.send(DbRequest::Rollback);
     assert!(!h.settle());
     h.ok("drop table cancel_t");
