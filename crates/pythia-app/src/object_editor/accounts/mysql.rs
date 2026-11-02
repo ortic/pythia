@@ -465,7 +465,14 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
                 .collect()
         };
         let after = defaults(def);
-        if after != defaults(before) {
+        // MySQL's REVOKE, which takes the admin option away, ends a role's
+        // being enabled at login, and the GRANT after it doesn't give that
+        // back (#462); MariaDB keeps it.
+        let regranted = !def.mariadb
+            && def.roles.iter().any(|(r, g)| {
+                g.default && before.roles.get(r).is_some_and(|was| was.admin && !g.admin)
+            });
+        if after != defaults(before) || regranted {
             let refs: Vec<&String> = after.iter().collect();
             let roles = if after.is_empty() {
                 "none".to_owned()
@@ -626,6 +633,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Taking a default role's admin option away revokes and grants it
+    /// again, and sets the default roles again: MySQL's REVOKE ended its
+    /// being enabled at login (#462).
+    #[test]
+    fn a_default_role_without_admin_stays_default() {
+        let mut loaded = user();
+        loaded.password.clear();
+        loaded.roles.insert(
+            "reader".into(),
+            RoleGrant {
+                admin: true,
+                default: true,
+            },
+        );
+        let mut changed = loaded.clone();
+        changed.roles.get_mut("reader").unwrap().admin = false;
+        assert_eq!(
+            statements(Some(&loaded), &changed).unwrap(),
+            [
+                "revoke 'reader' from 'app'@'%'",
+                "grant 'reader' to 'app'@'%'",
+                "set default role 'reader' to 'app'@'%'",
+            ]
+        );
+        // MariaDB keeps it.
+        loaded.mariadb = true;
+        changed.mariadb = true;
+        assert_eq!(statements(Some(&loaded), &changed).unwrap().len(), 2);
     }
 
     #[test]

@@ -428,6 +428,8 @@ All notable changes to Pythia are documented here. The format follows
   without `CHAR`, which Oracle refused (#460).
 - SQL Server: a numeric or decimal sequence's DDL keeps its precision,
   without which it failed (Msg 11708) (#461).
+- MySQL: taking a default role's admin option away in the user form
+  keeps it enabled at login, which MySQL's REVOKE ended (#462).
 
 ## [0.11.0] - 2026-11-02
 
