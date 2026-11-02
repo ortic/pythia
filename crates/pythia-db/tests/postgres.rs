@@ -1671,6 +1671,124 @@ fn a_views_ddl_keeps_its_security_and_check_option() {
     h.ok("drop schema r81_vo, r81_vo_copy cascade");
 }
 
+/// A table's DDL makes it as it is, as a materialized view's does (#330):
+/// unlogged where it is, its serial sequence too, with its access method,
+/// storage parameters (its TOAST table's too) and tablespace where they
+/// aren't the defaults, and each index in its tablespace, a constraint's
+/// with its storage parameters. Run in another schema, the copy is the
+/// same (#352).
+#[test]
+fn a_tables_ddl_keeps_its_storage() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let superuser = h.scalar("select rolsuper::text from pg_roles where rolname = current_user");
+    if superuser.as_deref() != Some("true") {
+        eprintln!("not a superuser, skipping");
+        return;
+    }
+    h.ok("drop schema if exists r81_st, r81_st_copy cascade");
+    h.ok("drop tablespace if exists r81_space");
+    h.ok("drop access method if exists r81_heap");
+    h.ok("create schema r81_st");
+    h.ok("create schema r81_st_copy");
+    // A tablespace in the data directory, as tests make them.
+    h.ok("set allow_in_place_tablespaces = on");
+    h.ok("create tablespace r81_space location ''");
+    h.ok("reset allow_in_place_tablespaces");
+    h.ok("create access method r81_heap type table handler heap_tableam_handler");
+    h.ok(
+        "create unlogged table r81_st.r81_t (id serial, n int, s text, \
+         constraint r81_t_pk primary key (id) with (fillfactor = 80) \
+           using index tablespace r81_space, \
+         constraint r81_t_n unique (n) using index tablespace r81_space deferrable, \
+         constraint r81_t_x exclude (s with =) with (fillfactor = 50) \
+           using index tablespace r81_space where (n > 0)) \
+         using r81_heap with (fillfactor = 70, toast.autovacuum_enabled = false) \
+         tablespace r81_space",
+    );
+    h.ok(
+        "create index r81_t_s on r81_st.r81_t (s) with (fillfactor = 60) \
+          tablespace r81_space where n > 0",
+    );
+    h.ok("create index r81_t_ns on r81_st.r81_t (n, s) tablespace r81_space");
+    h.ok("create table r81_st.r81_plain (n int primary key, s text)");
+    h.ok("create index r81_plain_s on r81_st.r81_plain (s)");
+    h.ok(
+        "create table r81_st.r81_parts (n int, primary key (n) with (fillfactor = 90)) \
+          partition by range (n) tablespace r81_space",
+    );
+    let t = ddl_of(&mut h, "r81_st", "r81_t", ObjectType::Table);
+    for part in [
+        "create unlogged sequence r81_st.r81_t_id_seq as integer\n",
+        "create unlogged table r81_st.r81_t (\n",
+        "constraint r81_t_pk PRIMARY KEY (id) WITH (fillfactor='80') \
+         USING INDEX TABLESPACE r81_space,\n",
+        "constraint r81_t_n UNIQUE (n) USING INDEX TABLESPACE r81_space DEFERRABLE,\n",
+        "constraint r81_t_x EXCLUDE USING btree (s WITH =) WITH (fillfactor='50') \
+         USING INDEX TABLESPACE r81_space WHERE (n > 0)\n",
+        "\n) using r81_heap with (fillfactor='70', toast.autovacuum_enabled='false') \
+         tablespace r81_space;",
+        "CREATE INDEX r81_t_s ON r81_st.r81_t USING btree (s) WITH (fillfactor='60') \
+         TABLESPACE r81_space WHERE (n > 0);",
+        "CREATE INDEX r81_t_ns ON r81_st.r81_t USING btree (n, s) TABLESPACE r81_space;",
+    ] {
+        assert!(t.contains(part), "{t}");
+    }
+    let plain = ddl_of(&mut h, "r81_st", "r81_plain", ObjectType::Table);
+    for default in [
+        "unlogged",
+        " using ",
+        " with (",
+        "WITH (",
+        "tablespace",
+        "TABLESPACE",
+    ] {
+        assert!(!plain.contains(default), "{plain}");
+    }
+    let parts = ddl_of(&mut h, "r81_st", "r81_parts", ObjectType::Table);
+    for part in [
+        "constraint r81_parts_pkey PRIMARY KEY (n) WITH (fillfactor='90')\n",
+        "\n) partition by RANGE (n) tablespace r81_space;",
+    ] {
+        assert!(parts.contains(part), "{parts}");
+    }
+    for ddl in [&t, &plain, &parts] {
+        run_ddl(&mut h, ddl, "r81_st.", "r81_st_copy.");
+    }
+    let state = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relkind, c.relpersistence, c.reloptions, \
+                                         s.reloptions, coalesce(t.spcname, '-'), \
+                                         coalesce(a.amname, '-')), \
+                               '; ' order by c.relname) \
+               from pg_class c left join pg_am a on a.oid = c.relam \
+               left join pg_class s on s.oid = c.reltoastrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              where c.relnamespace = '{schema}'::regnamespace"
+        ))
+    };
+    let was = state(&mut h, "r81_st");
+    for relation in [
+        "r81_t r u {fillfactor=70} {autovacuum_enabled=false} r81_space r81_heap",
+        "r81_t_id_seq S u - -",
+        "r81_t_pk i u {fillfactor=80} r81_space btree",
+        "r81_t_s i u {fillfactor=60} r81_space btree",
+        "r81_parts p p r81_space -",
+        "r81_parts_pkey I p {fillfactor=90} - btree",
+    ] {
+        assert!(
+            was.as_deref().is_some_and(|w| w.contains(relation)),
+            "{was:?}"
+        );
+    }
+    assert_eq!(state(&mut h, "r81_st_copy"), was, "{t}\n\n{parts}");
+    h.ok("drop schema r81_st, r81_st_copy cascade");
+    h.ok("drop tablespace r81_space");
+    h.ok("drop access method r81_heap");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another

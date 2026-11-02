@@ -1126,6 +1126,15 @@ All notable changes to Pythia are documented here. The format follows
   security invoker view read its tables as its owner again, and a view
   `with check option` took rows it doesn't show. The DDL now has them,
   `with (security_barrier='true') as … with local check option`.
+- PostgreSQL: a table's DDL makes it as it is (#352), as a materialized
+  view's does since #330: `create unlogged table` where it is unlogged,
+  its `serial` sequences too, with its access method, storage parameters
+  (its TOAST table's too) and tablespace where they aren't the defaults,
+  and each index in its tablespace, a primary key's or unique
+  constraint's with its storage parameters. Run elsewhere, the copy was
+  logged, `heap`, with the default parameters, and it and its indexes
+  were in the database's tablespace. A materialized view's indexes keep
+  their tablespace too.
 
 ## [0.10.0] - 2026-10-30
 

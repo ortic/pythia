@@ -615,6 +615,32 @@ const STORAGE: &str = "(select string_agg(p.name || '=' \
 const CHECK_OPTION: &str = "(select split_part(o.x, '=', 2) from unnest(c.reloptions) o(x) \
                               where split_part(o.x, '=', 1) = 'check_option')";
 
+/// What the `CREATE` of a table, materialized view or view writes after its
+/// columns or its name where it isn't the default (#330, #352): ` using
+/// <method>` where it isn't the session's `default_table_access_method`,
+/// ` with (…)` with its [`STORAGE`] parameters, ` tablespace <name>` where
+/// it isn't the database's. `c` is its `pg_class`, `a` its `pg_am` and `t`
+/// its `pg_tablespace`, left joined; a view has none but its options.
+fn options() -> String {
+    format!(
+        "concat(case when a.amname <> current_setting('default_table_access_method') \
+                     then ' using ' || quote_ident(a.amname) end, \
+                ' with (' || {STORAGE} || ')', \
+                ' tablespace ' || quote_ident(t.spcname))"
+    )
+}
+
+/// `definition` with `clauses` before `tail`, the clauses it ends with,
+/// where `CREATE INDEX` or a constraint takes them: a tablespace before a
+/// `WHERE`, an index's parameters before `DEFERRABLE`. As it is where it
+/// doesn't end so.
+fn inserted(definition: &str, clauses: &str, tail: &str) -> String {
+    match definition.strip_suffix(tail) {
+        Some(head) if !clauses.is_empty() => format!("{head}{clauses}{tail}"),
+        _ => definition.to_owned(),
+    }
+}
+
 /// `CREATE` of a view or materialized view as stored, if there is one. A
 /// view is replaced in place, but Edit drops a materialized view and
 /// creates it again from this: without them the new one would come without
@@ -639,18 +665,15 @@ fn view_ddl(
     let Some(row) = pg.first(
         &format!(
             "select pg_get_viewdef(c.oid, true), c.oid, obj_description(c.oid, 'pg_class'), \
-                    c.relispopulated, \
-                    concat(case when a.amname <> current_setting('default_table_access_method') \
-                                then ' using ' || quote_ident(a.amname) end, \
-                           ' with (' || {STORAGE} || ')', \
-                           ' tablespace ' || quote_ident(t.spcname)), \
+                    c.relispopulated, {}, \
                     case when r.rolname <> current_user then quote_ident(r.rolname) end, \
                     {CHECK_OPTION} \
                from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                join pg_roles r on r.oid = c.relowner \
                left join pg_am a on a.oid = c.relam \
                left join pg_tablespace t on t.oid = c.reltablespace \
-              where n.nspname = $1 and c.relname = $2"
+              where n.nspname = $1 and c.relname = $2",
+            options()
         ),
         &[&owner, &name],
     )?
@@ -708,7 +731,8 @@ fn view_ddl(
 /// sequence is made by its table's DDL (#263): its own says so and sets the
 /// identity's options, which next to a copy of the table gives the copy's
 /// identity the same and elsewhere fails, where a `CREATE SEQUENCE` made a
-/// sequence no column uses (#332).
+/// sequence no column uses (#332). An unlogged sequence, as an unlogged
+/// table's `serial` ones are, is made so (#352).
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -716,8 +740,9 @@ fn sequence_ddl(
     owned: bool,
 ) -> Result<Option<(String, String)>, DbError> {
     let row = pg.first(
-        "select c.oid, d.deptype, format_type(s.seqtypid, null), s.seqincrement, s.seqmin, \
-                s.seqmax, s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
+        "select c.oid, d.deptype, c.relpersistence = 'u', format_type(s.seqtypid, null), \
+                s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle, \
+                tn.nspname, t.relname, a.attname \
            from pg_sequence s join pg_class c on c.oid = s.seqrelid \
            join pg_namespace n on n.oid = c.relnamespace \
            left join pg_depend d on d.classid = 'pg_class'::regclass and d.objid = c.oid \
@@ -729,7 +754,7 @@ fn sequence_ddl(
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let (head, row) = row.split_at(2);
+        let (head, row) = row.split_at(3);
         let (v, column) = row.split_at(7);
         let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
         let oid = head[0].clone().unwrap_or_default();
@@ -762,8 +787,13 @@ fn sequence_ddl(
             _ => String::new(),
         };
         let create = format!(
-            "create sequence {} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
+            "create {}sequence {} as {}\n  increment by {} minvalue {} maxvalue {}\n  \
              start with {} cache {}{}{owned_by}",
+            if head[2].as_deref() == Some("t") {
+                "unlogged "
+            } else {
+                ""
+            },
             Dialect::POSTGRES.qualified(owner, name),
             v[0],
             v[1],
@@ -805,15 +835,23 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
 /// comments, its grants and the sequences'. A serial column's sequence goes
 /// with the table, as `pg_dump` writes it: run elsewhere, the DDL makes the
 /// copy a sequence of its own (#263), which roles use as they use the
-/// table's (#331).
+/// table's (#331). The table is unlogged where it is, with its access
+/// method, storage parameters and tablespace where they aren't the
+/// defaults, as a materialized view (#352).
 fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let (owner, name) = stored(pg, owner, name)?;
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
     let table = pg
         .first(
-            "select c.oid, c.relkind, pg_get_partkeydef(c.oid), obj_description(c.oid, 'pg_class') \
-               from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-              where n.nspname = $1 and c.relname = $2",
+            &format!(
+                "select c.oid, c.relkind, pg_get_partkeydef(c.oid), \
+                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {} \
+                   from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+                   left join pg_am a on a.oid = c.relam \
+                   left join pg_tablespace t on t.oid = c.reltablespace \
+                  where n.nspname = $1 and c.relname = $2",
+                options()
+            ),
             &[&owner, &name],
         )?
         .ok_or_else(|| DbError::new(format!("No table {owner}.{name}")))?;
@@ -821,6 +859,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let oid = table.next().flatten().unwrap_or_default();
     let partitions = table.nth(1).flatten();
     let comment = table.next().flatten();
+    let unlogged = table.next().flatten().as_deref() == Some("t");
+    let options = table.next().flatten().unwrap_or_default();
     let mut lines: Vec<String> = pg
         .rows(
             &format!(
@@ -838,18 +878,30 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .into_iter()
         .filter_map(first)
         .collect();
-    lines.extend(
-        pg.rows(
-            &format!(
-                "select 'constraint ' || quote_ident(conname) || ' ' || pg_get_constraintdef(oid, true) \
-                   from pg_constraint where conrelid = {oid} and contype in ('p', 'u', 'f', 'c', 'x') \
-                  order by position(contype::text in 'pucfx'), conname"
-            ),
-            &[],
-        )?
-        .into_iter()
-        .filter_map(first),
-    );
+    // pg_get_constraintdef leaves out the storage parameters of a key's
+    // index and the tablespace of a key's or exclusion constraint's (#352).
+    let constraints = pg.rows(
+        &format!(
+            "select 'constraint ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid, true), \
+                    concat(case when k.contype in ('p', 'u') then ' WITH (' || {STORAGE} || ')' end, \
+                           ' USING INDEX TABLESPACE ' || quote_ident(t.spcname)), \
+                    concat(' WHERE (' || pg_get_expr(i.indpred, i.indrelid, true) || ')', \
+                           case when k.condeferrable then ' DEFERRABLE' end, \
+                           case when k.condeferred then ' INITIALLY DEFERRED' end) \
+               from pg_constraint k \
+               left join pg_index i on i.indexrelid = k.conindid and k.contype in ('p', 'u', 'x') \
+               left join pg_class c on c.oid = i.indexrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
+              where k.conrelid = {oid} and k.contype in ('p', 'u', 'f', 'c', 'x') \
+              order by position(k.contype::text in 'pucfx'), k.conname"
+        ),
+        &[],
+    )?;
+    lines.extend(constraints.into_iter().filter_map(|row| {
+        let mut values = row.into_iter().map(Option::unwrap_or_default);
+        let (definition, index, tail) = (values.next()?, values.next()?, values.next()?);
+        Some(inserted(&definition, &index, &tail))
+    }));
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
     for (_, sequence, _) in &sequences {
@@ -858,12 +910,14 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         }
     }
     ddl.push_str(&format!(
-        "create table {qualified} (\n    {}\n)",
+        "create {}table {qualified} (\n    {}\n)",
+        if unlogged { "unlogged " } else { "" },
         lines.join(",\n    ")
     ));
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
+    ddl.push_str(&options);
     ddl.push(';');
     for (_, sequence, column) in &sequences {
         ddl.push_str(&format!(
@@ -883,7 +937,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
 
 /// The relation's indexes that no constraint makes, then the comments on
 /// it (a `kind`: `table`, `materialized view`) and on its columns, each
-/// statement with its `;`, appended to `ddl`.
+/// statement with its `;`, appended to `ddl`. An index in a tablespace
+/// that isn't the database's has it, which `pg_get_indexdef` leaves out
+/// (#352).
 fn indexes_and_comments(
     pg: &Pg<'_>,
     ddl: &mut String,
@@ -894,7 +950,11 @@ fn indexes_and_comments(
 ) -> Result<(), DbError> {
     let indexes = pg.rows(
         &format!(
-            "select pg_get_indexdef(i.indexrelid) from pg_index i \
+            "select pg_get_indexdef(i.indexrelid), \
+                    coalesce(' TABLESPACE ' || quote_ident(t.spcname), ''), \
+                    coalesce(' WHERE ' || pg_get_expr(i.indpred, i.indrelid), '') \
+               from pg_index i join pg_class c on c.oid = i.indexrelid \
+               left join pg_tablespace t on t.oid = c.reltablespace \
               where i.indrelid = {oid} \
                 and not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid \
                                    and k.conrelid = i.indrelid) \
@@ -902,8 +962,10 @@ fn indexes_and_comments(
         ),
         &[],
     )?;
-    for index in indexes.into_iter().filter_map(first) {
-        ddl.push_str(&format!("\n\n{index};"));
+    for row in indexes {
+        if let [Some(index), Some(tablespace), Some(tail)] = row.as_slice() {
+            ddl.push_str(&format!("\n\n{};", inserted(index, tablespace, tail)));
+        }
     }
     if let Some(comment) = comment {
         ddl.push_str(&format!(
