@@ -433,6 +433,10 @@ All notable changes to Pythia are documented here. The format follows
 - MariaDB: a new password in the user form keeps the account's other
   ways to log in (`unix_socket OR mysql_native_password`), which it
   replaced with the password alone (#463).
+- A read-only connection refuses changes everywhere, not only in SQL
+  windows: the browser's Drop and other actions, object forms, the table
+  editor, Import, Maintenance, recompiles, job actions and the monitor's
+  kills ran (#464).
 
 ## [0.11.0] - 2026-11-02
 

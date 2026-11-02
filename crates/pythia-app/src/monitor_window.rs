@@ -105,6 +105,7 @@ impl MonitorWindow {
             .monitor
             .set_analyze(!cx.settings.ai.backends.is_empty());
         state.monitor.set_dialect(cx.dialect);
+        state.monitor.set_read_only(cx.read_only);
         let out = state.monitor.ui(ui);
         for request in out.requests {
             let id = request_id();

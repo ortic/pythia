@@ -133,6 +133,22 @@ pub enum MonitorTab {
     Detail(usize),
 }
 
+impl Want {
+    /// Whether it changes something on the server: a session ended or
+    /// cancelled, tracing turned on or off, a snapshot taken.
+    fn changes(&self) -> bool {
+        matches!(
+            self,
+            Want::Kill { .. }
+                | Want::CancelSql { .. }
+                | Want::Disconnect { .. }
+                | Want::KillConnection { .. }
+                | Want::Trace { .. }
+                | Want::CreateSnapshot
+        )
+    }
+}
+
 /// What a view wants fetched or done. Turned into tasks by the driver.
 pub(crate) enum Want {
     Capabilities,
@@ -395,6 +411,8 @@ pub struct Monitor {
     jobs: HashMap<Token, Job>,
     next_token: Token,
     toast: Option<(String, bool, f64)>,
+    /// The connection is read-only (see [`Monitor::set_read_only`]).
+    read_only: bool,
     /// Follow-up requests produced while handling results.
     deferred: Vec<Want>,
     /// Things for the host that came out of results (a report to open).
@@ -430,6 +448,7 @@ impl Monitor {
             jobs: HashMap::new(),
             next_token: 1,
             toast: None,
+            read_only: false,
             deferred: Vec::new(),
             actions: Vec::new(),
             analyze: false,
@@ -445,6 +464,11 @@ impl Monitor {
     /// The connection's database. A MySQL, PostgreSQL or SQL Server
     /// connection gets its dashboard and sessions; other tabs show the
     /// dashboard.
+    /// A read-only connection: nothing that changes the server runs (#464).
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
     pub fn set_dialect(&mut self, dialect: Dialect) {
         self.dialect = dialect;
         self.connections.set_kind(dialect.kind());
@@ -564,7 +588,7 @@ impl Monitor {
                     _ => self.mysql.ui(ui, now, &mut wants),
                 },
             }
-            self.handle(wants, &mut out);
+            self.handle(wants, &mut out, now);
             return out;
         }
         if self.caps.is_none() && !self.caps_pending {
@@ -604,13 +628,22 @@ impl Monitor {
                 None => self.tab = MonitorTab::Sessions,
             },
         }
-        self.handle(wants, &mut out);
+        self.handle(wants, &mut out, now);
         out
     }
 
     /// Turns what the views want into requests and actions.
-    fn handle(&mut self, wants: Wants, out: &mut MonitorOutput) {
+    fn handle(&mut self, wants: Wants, out: &mut MonitorOutput, now: f64) {
         for want in wants.list {
+            // A read-only connection's sessions are left as they are (#464).
+            if self.read_only && want.changes() {
+                self.toast(
+                    "Connection is read-only: sessions, tracing and snapshots are left as they are",
+                    true,
+                    now,
+                );
+                continue;
+            }
             if let Want::Analyze(analysis) = want {
                 out.actions.push(MonitorAction::Analyze(analysis));
                 continue;
