@@ -318,6 +318,8 @@ All notable changes to Pythia are documented here. The format follows
   ever. A failed attempt to open a lost main session again no longer
   closes the connection with every window's session: the next request
   tries again.
+- SQLite: a text with a NUL character can be changed in a result and
+  written as INSERT statements (#425); its literal ended at the NUL.
 
 ## [0.11.0] - 2026-11-02
 

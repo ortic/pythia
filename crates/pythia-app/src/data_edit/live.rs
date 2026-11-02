@@ -653,7 +653,9 @@ fn sqlite_values_find_their_rows() {
            '2026-10-31', '2026-10-31 12:34:56.789', '{\"a\":  [1, 2.50]}', 'text', 1)",
         "insert into types values (2, 9223372036854775807, 1e300, 99, '', ' ', x'', \
            '2026-11-01', null, '[]', 7, 0)",
-        "insert into types values (3, 0, -2.2250738585072014e-308, 0.333, 'x', 'y', \
+        // A NUL in a text (#425).
+        "insert into types values (3, 0, -2.2250738585072014e-308, 0.333, \
+           'x' || char(0) || '&' || char(0), 'y', \
            zeroblob(5000), null, null, null, 1.5, null)",
         "insert into types (id) values (4)",
         "create table floats (id integer primary key, d double, r real)",

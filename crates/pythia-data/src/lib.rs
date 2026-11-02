@@ -1203,12 +1203,29 @@ fn sqlite_literal(col: &Column, value: Option<&str>) -> String {
     if is_number(col, v) || sqlite_number(v) {
         return v.to_owned();
     }
-    apart_from_ampersands(
-        v,
-        |p| format!("'{}'", p.replace('\'', "''")),
-        "char(38)",
-        " || ",
-    )
+    let text = |piece: &str| {
+        apart_from_ampersands(
+            piece,
+            |p| format!("'{}'", p.replace('\'', "''")),
+            "char(38)",
+            " || ",
+        )
+    };
+    // SQLite reads a statement up to a NUL, so one in a string ended it
+    // there (#425): it is char(0) between the pieces.
+    if !v.contains('\0') {
+        return text(v);
+    }
+    let mut parts = Vec::new();
+    for (i, piece) in v.split('\0').enumerate() {
+        if i > 0 {
+            parts.push("char(0)".to_owned());
+        }
+        if !piece.is_empty() {
+            parts.push(text(piece));
+        }
+    }
+    parts.join(" || ")
 }
 
 /// The zone INSERT statements of `columns` set while they run: in MySQL's
