@@ -1542,7 +1542,7 @@ fn binds_as_variables(sql: &str) -> String {
     let mut names: Vec<String> = Vec::new();
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
-    for token in pythia_plsql::tokenize(sql) {
+    for token in pythia_plsql::tokenize_in(sql, pythia_plsql::Syntax::TSql) {
         if token.kind != pythia_plsql::TokenKind::BindVar {
             continue;
         }

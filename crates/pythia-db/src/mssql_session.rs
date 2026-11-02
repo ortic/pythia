@@ -622,7 +622,7 @@ impl Worker {
                 Box::pin(client.simple_query(sql))
             } else {
                 let mut values = Vec::new();
-                let sql = replace_binds(sql, binds, |n, value| {
+                let sql = replace_binds(sql, pythia_plsql::Syntax::TSql, binds, |n, value| {
                     values.push(value.clone());
                     format!("@P{n}")
                 });

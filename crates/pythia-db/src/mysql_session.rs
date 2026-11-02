@@ -823,7 +823,7 @@ fn kill_query(opts: &Opts, id: u32) {
 /// text and bytes alike, as the column's type wants them.
 fn positional(sql: &str, binds: &[(String, Bind)]) -> (String, Vec<Value>) {
     let mut values = Vec::new();
-    let sql = replace_binds(sql, binds, |_, value| {
+    let sql = replace_binds(sql, Syntax::MySql, binds, |_, value| {
         values.push(match value {
             Bind::Text(Some(v)) => Value::Bytes(v.clone().into_bytes()),
             Bind::Text(None) => Value::NULL,

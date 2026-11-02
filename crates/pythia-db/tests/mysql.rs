@@ -316,6 +316,21 @@ fn values_types_and_binds() {
     assert_eq!(rows[0][0].as_deref(), Some("42"));
     assert_eq!(rows[0][1].as_deref(), Some("1"));
     assert_eq!(rows[0][2].as_deref(), Some("41"));
+    h.settle();
+
+    // A `:a` in a string with a `\'` stays in it.
+    h.session.send(DbRequest::Execute {
+        id: 3,
+        sql: r"select 'it\'s :a' as s, :a as v".into(),
+        max_rows: 10,
+        binds: vec![("a".into(), Bind::Text(Some("41".into())))],
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("it's :a"));
+    assert_eq!(rows[0][1].as_deref(), Some("41"));
 }
 
 /// A float keeps its exponent also in a query with binds (#261), which

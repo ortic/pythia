@@ -378,13 +378,18 @@ impl Worker {
         let sql = if binds.is_empty() {
             sql.to_owned()
         } else {
-            replace_binds(sql, binds, |_, value| match value {
-                Bind::Text(text) => text.as_deref().map_or_else(|| "null".into(), literal),
-                whole => {
-                    params.push(whole.clone());
-                    format!("${}", params.len())
-                }
-            })
+            replace_binds(
+                sql,
+                pythia_plsql::Syntax::Postgres,
+                binds,
+                |_, value| match value {
+                    Bind::Text(text) => text.as_deref().map_or_else(|| "null".into(), literal),
+                    whole => {
+                        params.push(whole.clone());
+                        format!("${}", params.len())
+                    }
+                },
+            )
         };
         let effect = TxEffect::of(&sql);
         // Changes wait for Commit: they get a transaction of their own.

@@ -66,6 +66,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: an array slice's bounds (`a[1:n]`, `a[1:2]`) are no bind
   variables (#398): the window asked for a value of `n`, and Explain
   plan sent `a[1$1]`, a syntax error.
+- MySQL and PostgreSQL: a `:name` in a string with `\'` (or `E'…'`) is
+  no longer replaced by a bind variable's value (#399), which broke the
+  statement; binds are put in as the database reads its strings.
 
 ## [0.11.0] - 2026-11-02
 
