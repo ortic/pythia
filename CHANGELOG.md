@@ -117,6 +117,17 @@ All notable changes to Pythia are documented here. The format follows
   command, roles, `using` and `with check`, restrictive or not. Run
   elsewhere, the copy had neither, so every role that could read it read
   every row, and rows no policy let through could be written to it.
+- PostgreSQL: a table's DDL keeps its row level security (#373): `alter
+  table … enable row level security` and `force row level security`
+  where they are on, and a `create policy` for each policy, with its
+  command, roles, `using` and `with check`, restrictive or not. Run
+  elsewhere, the copy had neither, so every role that could read it read
+  every row, and rows no policy let through could be written to it.
+- PostgreSQL: a table's DDL gives each column its collation where it
+  isn't its type's (#375), `code text collate "C"`, with its schema
+  where it isn't `pg_catalog`. Run elsewhere, the copy's columns took
+  their type's collation, mostly the database's, and sorted and compared
+  otherwise: the copy of a column collated `"C"` sorted `a` before `B`.
 
 ## [0.11.0] - 2026-11-02
 

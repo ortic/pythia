@@ -871,6 +871,20 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
         .collect())
 }
 
+/// ` collate <collation>` of the column `a` (`pg_attribute`) where it isn't
+/// its type's, a domain's where it isn't the domain's, as `pg_dump` writes
+/// it; null where it is. A collation of another schema than `pg_catalog`
+/// has its schema. Without it, a copy's column sorted and compared as its
+/// type does, mostly as the database (#375).
+const COLLATION: &str = "(select ' collate ' \
+                                 || case when cn.nspname = 'pg_catalog' then '' \
+                                         else quote_ident(cn.nspname) || '.' end \
+                                 || quote_ident(co.collname) \
+                            from pg_collation co \
+                            join pg_namespace cn on cn.oid = co.collnamespace \
+                            join pg_type ty on ty.oid = a.atttypid \
+                           where co.oid = a.attcollation and a.attcollation <> ty.typcollation)";
+
 /// The sequences its columns own, `CREATE TABLE` with its columns and
 /// constraints, the sequences' owners, then its other indexes and
 /// comments, its grants and the sequences' comments (#354) and grants. A
@@ -916,6 +930,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             &format!(
                 "select quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod) \
                         || coalesce(' options (' || {} || ')', '') \
+                        || coalesce({COLLATION}, '') \
                         || coalesce(case when a.attidentity <> '' or a.attgenerated <> '' \
                                          then ' ' else ' default ' end || {DEFAULT}, '') \
                         || case when a.attnotnull then ' not null' else '' end \

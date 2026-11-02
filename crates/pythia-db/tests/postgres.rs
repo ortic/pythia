@@ -2291,6 +2291,74 @@ fn a_tables_ddl_keeps_its_row_level_security() {
     h.ok(&format!("drop function {schema}.r81_rls_ok(int)"));
 }
 
+/// A table's DDL gives each column its collation where it isn't its
+/// type's, a domain's too, with its schema but `pg_catalog`'s: run in
+/// another schema, the copy's columns compare and sort as the original's
+/// (#375).
+#[test]
+fn a_tables_ddl_keeps_its_columns_collations() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_co, r81_co_copy cascade");
+    h.ok("create schema r81_co");
+    h.ok("create schema r81_co_copy");
+    for schema in ["r81_co", "r81_co_copy"] {
+        h.ok(&format!(
+            "create collation {schema}.\"R81 Coll\" from \"C\""
+        ));
+        h.ok(&format!(
+            "create domain {schema}.r81_d as text collate \"POSIX\""
+        ));
+    }
+    h.ok(
+        "create table r81_co.r81_t (a text collate \"C\", b varchar(10) collate \"POSIX\" not null, \
+         c text, d r81_co.r81_d, e r81_co.r81_d collate \"C\", f text collate r81_co.\"R81 Coll\", \
+         g text[] collate \"C\", n int)",
+    );
+    let t = ddl_of(&mut h, "r81_co", "r81_t", ObjectType::Table);
+    for line in [
+        "\n    a text collate \"C\",\n",
+        "\n    b character varying(10) collate \"POSIX\" not null,\n",
+        "\n    c text,\n",
+        "\n    d r81_co.r81_d,\n",
+        "\n    e r81_co.r81_d collate \"C\",\n",
+        "\n    f text collate r81_co.\"R81 Coll\",\n",
+        "\n    g text[] collate \"C\",\n",
+        "\n    n integer\n",
+    ] {
+        assert!(t.contains(line), "{t}");
+    }
+    run_ddl(&mut h, &t, "r81_co.", "r81_co_copy.");
+    let collations = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(a.attname || ' ' || coalesce(o.collname, '-'), ', ' order by a.attnum) \
+               from pg_attribute a left join pg_collation o on o.oid = a.attcollation \
+              where a.attrelid = '{schema}.r81_t'::regclass and a.attnum > 0"
+        ))
+    };
+    let was = collations(&mut h, "r81_co");
+    assert_eq!(
+        was.as_deref(),
+        Some("a C, b POSIX, c default, d POSIX, e C, f R81 Coll, g C, n -")
+    );
+    assert_eq!(collations(&mut h, "r81_co_copy"), was, "{t}");
+    // What the collation means: "B" before "a" in C, after it in the
+    // database's.
+    for schema in ["r81_co", "r81_co_copy"] {
+        h.ok(&format!(
+            "insert into {schema}.r81_t (a, b) values ('a', 'a'), ('B', 'B')"
+        ));
+    }
+    assert_eq!(
+        h.scalar("select string_agg(a, '' order by a) from r81_co_copy.r81_t")
+            .as_deref(),
+        Some("Ba")
+    );
+    h.ok("drop schema r81_co, r81_co_copy cascade");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another
