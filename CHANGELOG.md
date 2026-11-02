@@ -1119,6 +1119,13 @@ All notable changes to Pythia are documented here. The format follows
   *Edit* in a SQL window whose search path finds another `t` first made
   the trigger on that table, and a routine whose argument types it finds
   elsewhere was made again beside the one edited, with those types.
+- PostgreSQL: *Edit* of a view keeps its `security_barrier`,
+  `security_invoker` and check option (#351). The view's DDL left them
+  out, and its `create or replace view` reset them: a security barrier
+  view let the functions of a query see the rows it filters out, a
+  security invoker view read its tables as its owner again, and a view
+  `with check option` took rows it doesn't show. The DDL now has them,
+  `with (security_barrier='true') as … with local check option`.
 
 ## [0.10.0] - 2026-10-30
 

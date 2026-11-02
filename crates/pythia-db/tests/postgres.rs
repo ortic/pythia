@@ -1593,6 +1593,84 @@ fn the_ddl_of_triggers_and_routines_names_their_schemas() {
     h.ok("drop domain r81_sp_d");
 }
 
+/// A view's DDL keeps its security_barrier, security_invoker and check
+/// option, which pg_get_viewdef leaves out: Edit's CREATE OR REPLACE
+/// without them reset them (#351). Run in place, as Edit runs it, and
+/// in another schema, the views have the options they had.
+#[test]
+fn a_views_ddl_keeps_its_security_and_check_option() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_vo, r81_vo_copy cascade");
+    h.ok("create schema r81_vo");
+    h.ok("create schema r81_vo_copy");
+    for schema in ["r81_vo", "r81_vo_copy"] {
+        h.ok(&format!("create table {schema}.r81_t (n int)"));
+    }
+    h.ok("create view r81_vo.r81_barrier with (security_barrier) as \
+          select n from r81_vo.r81_t where n > 0 with local check option");
+    h.ok(
+        "create view r81_vo.r81_invoker with (security_invoker = true, security_barrier = false) \
+          as select n from r81_vo.r81_barrier with cascaded check option",
+    );
+    h.ok("create view r81_vo.r81_plain as select n from r81_vo.r81_t");
+    let barrier = ddl_of(&mut h, "r81_vo", "r81_barrier", ObjectType::View);
+    assert_eq!(
+        barrier,
+        "create or replace view r81_vo.r81_barrier with (security_barrier='true') as\n \
+         SELECT n\n   FROM r81_vo.r81_t\n  WHERE n > 0\nwith local check option;"
+    );
+    let invoker = ddl_of(&mut h, "r81_vo", "r81_invoker", ObjectType::View);
+    assert!(
+        invoker.starts_with(
+            "create or replace view r81_vo.r81_invoker \
+             with (security_invoker='true', security_barrier='false') as\n"
+        ),
+        "{invoker}"
+    );
+    assert!(
+        invoker.ends_with("\nwith cascaded check option;"),
+        "{invoker}"
+    );
+    let plain = ddl_of(&mut h, "r81_vo", "r81_plain", ObjectType::View);
+    assert_eq!(
+        plain,
+        "create or replace view r81_vo.r81_plain as\n SELECT n\n   FROM r81_vo.r81_t;"
+    );
+    let options = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(relname || ' ' || coalesce(array_to_string(reloptions, ','), '-'), \
+                               '; ' order by relname) \
+               from pg_class where relnamespace = '{schema}'::regnamespace and relkind = 'v'"
+        ))
+    };
+    let was = options(&mut h, "r81_vo");
+    assert_eq!(
+        was.as_deref(),
+        Some(
+            "r81_barrier security_barrier=true,check_option=local; \
+             r81_invoker security_invoker=true,security_barrier=false,check_option=cascaded; \
+             r81_plain -"
+        )
+    );
+    for ddl in [&barrier, &invoker, &plain] {
+        run_ddl(&mut h, ddl, "", "");
+    }
+    assert_eq!(options(&mut h, "r81_vo"), was, "{barrier}\n\n{invoker}");
+    for ddl in [&barrier, &invoker, &plain] {
+        run_ddl(&mut h, ddl, "r81_vo.", "r81_vo_copy.");
+    }
+    assert_eq!(
+        options(&mut h, "r81_vo_copy"),
+        was,
+        "{barrier}\n\n{invoker}"
+    );
+    h.fails("insert into r81_vo_copy.r81_barrier values (-1)");
+    h.ok("drop schema r81_vo, r81_vo_copy cascade");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another

@@ -2031,6 +2031,78 @@ fn postgres_edit_keeps_a_materialized_views_owner_data_and_storage() {
     assert!(results.iter().all(Result::is_ok), "{results:?}");
 }
 
+/// *Edit* of a PostgreSQL view keeps its `security_barrier`,
+/// `security_invoker` and check option: the script's CREATE OR REPLACE
+/// came without them and reset them (#351).
+#[test]
+fn postgres_edit_keeps_a_views_security_and_check_option() {
+    use crate::browser::ObjectAction;
+    use pythia_config::DbKind;
+    use pythia_db::ObjectType;
+    let pg = "PYTHIA_TEST_POSTGRES";
+    let connection = "r81-v";
+    let Some(mut h) = connect_to(pg, connection, DbKind::Postgres) else {
+        return;
+    };
+    let drop = "drop table if exists r81_evt cascade";
+    let results = crate::test_db::execute_on(
+        pg,
+        DbKind::Postgres,
+        &[
+            drop,
+            "create table r81_evt (n int)",
+            "create view r81_ev with (security_barrier, security_invoker) as \
+             select n, 1 as k from r81_evt where n > 0 with local check option",
+        ],
+    )
+    .unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    // The view's options and query.
+    let state = || {
+        crate::test_db::run_on(pg, DbKind::Postgres, move |c| {
+            c.query(
+                "select array_to_string(reloptions, ','), pg_get_viewdef(oid) from pg_class \
+                  where oid = 'r81_ev'::regclass",
+                &[],
+            )
+            .unwrap()
+            .remove(0)
+        })
+        .unwrap()
+    };
+    let was = state();
+    assert_eq!(
+        was[0].as_deref(),
+        Some("security_barrier=true,security_invoker=true,check_option=local")
+    );
+    let view = ObjectRef {
+        owner: "public".into(),
+        name: "r81_ev".into(),
+        object_type: ObjectType::View,
+    };
+    h.state_mut()
+        .test_object_action(connection, ObjectAction::Edit(view));
+    wait_until(&mut h, "the script", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("r81_ev"))
+    });
+    let script = h.state_mut().test_sql_window().editor.text().to_owned();
+    let edited = script.replacen("1 AS k", "2 AS k", 1);
+    assert_ne!(edited, script);
+    h.state_mut().test_sql_window().editor.set_text(edited);
+    h.state_mut().test_execute_focused();
+    wait_until(&mut h, "the script to run", |app| !app.test_focused_busy());
+    h.state_mut().test_close_focused();
+    let now = state();
+    assert!(
+        now[1].as_deref().is_some_and(|d| d.contains("2 AS k")),
+        "{now:?}"
+    );
+    assert_eq!(now[0], was[0], "{script}");
+    let results = crate::test_db::execute_on(pg, DbKind::Postgres, &[drop]).unwrap();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+}
+
 /// `WHENEVER SQLERROR EXIT ROLLBACK` rolls back when a statement fails, as
 /// in SQL*Plus (#286); the window only stopped. Without `ROLLBACK` the
 /// changes before stay pending.

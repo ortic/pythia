@@ -593,7 +593,9 @@ fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
 /// A relation's storage parameters, then its TOAST table's as `toast.…`, as
 /// `with (…)` takes them (`c` is its `pg_class`); null without any. A value
 /// is quoted unless it is a name that needs no quotes, as `pg_get_indexdef`
-/// writes them: `fillfactor='70', autovacuum_enabled=off`.
+/// writes them: `fillfactor='70', autovacuum_enabled=off`. A view's options
+/// are its `security_barrier` and `security_invoker`; its check option has
+/// a clause of its own ([`CHECK_OPTION`]).
 const STORAGE: &str = "(select string_agg(p.name || '=' \
                                           || case when quote_ident(p.value) = p.value then p.value \
                                                   else quote_literal(p.value) end, \
@@ -601,11 +603,17 @@ const STORAGE: &str = "(select string_agg(p.name || '=' \
                           from (select false as toast, o.n, quote_ident(split_part(o.x, '=', 1)) as name, \
                                        substr(o.x, strpos(o.x, '=') + 1) as value \
                                   from unnest(c.reloptions) with ordinality o(x, n) \
+                                 where split_part(o.x, '=', 1) <> 'check_option' \
                                 union all \
                                 select true, o.n, 'toast.' || quote_ident(split_part(o.x, '=', 1)), \
                                        substr(o.x, strpos(o.x, '=') + 1) \
                                   from pg_class s cross join unnest(s.reloptions) with ordinality o(x, n) \
                                  where s.oid = c.reltoastrelid) p)";
+
+/// A view's check option, `local` or `cascaded`, kept with its options
+/// (`c` is its `pg_class`); null without one.
+const CHECK_OPTION: &str = "(select split_part(o.x, '=', 2) from unnest(c.reloptions) o(x) \
+                              where split_part(o.x, '=', 1) = 'check_option')";
 
 /// `CREATE` of a view or materialized view as stored, if there is one. A
 /// view is replaced in place, but Edit drops a materialized view and
@@ -616,7 +624,10 @@ const STORAGE: &str = "(select string_agg(p.name || '=' \
 /// they aren't the defaults, and `with no data` where it has none; its
 /// owner follows where it isn't the role reading the DDL. A role that can
 /// drop the view but can't give it back to its owner gets an error, and
-/// Edit's block leaves the view as it was.
+/// Edit's block leaves the view as it was. A view's `CREATE` has its
+/// options and its check option, which `pg_get_viewdef` leaves out: CREATE
+/// OR REPLACE without them resets them, a security barrier view's too
+/// (#351).
 fn view_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -633,7 +644,8 @@ fn view_ddl(
                                 then ' using ' || quote_ident(a.amname) end, \
                            ' with (' || {STORAGE} || ')', \
                            ' tablespace ' || quote_ident(t.spcname)), \
-                    case when r.rolname <> current_user then quote_ident(r.rolname) end \
+                    case when r.rolname <> current_user then quote_ident(r.rolname) end, \
+                    {CHECK_OPTION} \
                from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                join pg_roles r on r.oid = c.relowner \
                left join pg_am a on a.oid = c.relam \
@@ -655,10 +667,14 @@ fn view_ddl(
     let populated = next().as_deref() != Some("f");
     let storage = next().unwrap_or_default();
     let role = next();
+    let check = next();
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
     let definition = definition.trim_end().trim_end_matches(';');
     let ddl = if object_type == ObjectType::View {
-        format!("create or replace view {qualified} as\n{definition}")
+        let check = check
+            .map(|check| format!("\nwith {check} check option"))
+            .unwrap_or_default();
+        format!("create or replace view {qualified}{storage} as\n{definition}{check}")
     } else {
         let data = if populated { "" } else { "\nwith no data" };
         format!("create materialized view {qualified}{storage} as\n{definition}{data}")
