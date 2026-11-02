@@ -1737,7 +1737,7 @@ mod tests {
         conn.execute("insert into pythia_oe_t values (2, 'twin', sysdate)", &[])
             .unwrap();
         let mut twins = reloaded.clone();
-        twins.columns.truncate(0);
+        twins.columns.clear();
         twins.columns.push(index::IndexColumn {
             expr: "name".into(),
             desc: false,
