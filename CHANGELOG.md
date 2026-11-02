@@ -440,6 +440,10 @@ All notable changes to Pythia are documented here. The format follows
 - SQLite: Edit of a table without a primary key checks a row's values
   beside its rowid, which VACUUM renumbers: a stale result's Delete took
   another row (#465).
+- Oracle: the index form makes an index again for new columns with its
+  table's owner, compression, REVERSE, INVISIBLE and LOCAL partitioning,
+  which it lost, and doesn't make domain or globally partitioned indexes
+  again (#466).
 
 ## [0.11.0] - 2026-11-02
 
