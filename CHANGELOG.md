@@ -229,6 +229,25 @@ All notable changes to Pythia are documented here. The format follows
   still open at the end of the script, as while they are typed, end at
   that first `;` as before, so the statements after them stay apart.
   Format Code keeps such a query as written.
+- Oracle: a query with PL/SQL declarations, `with function f … end;
+  select f from dual`, runs as one statement (#358), also in an INSERT,
+  a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
+  The script ended it at the first `;` inside the function, which failed
+  with ORA-02000, and ran the rest on its own. It ends at the `;` after
+  the query, or at `/` on a line of its own as in SQL*Plus; declarations
+  still open at the end of the script, as while they are typed, end at
+  that first `;` as before, so the statements after them stay apart.
+  Format Code keeps such a query as written.
+- Search data with Exact finds a value in each column that can hold it
+  (#363). A number past NUMBER's range (`1e300`), `inf`, `nan` or a day
+  no month has (`2024-02-30`) failed the query of every table with a
+  number or date column, and a table with a CLOB or NCLOB failed for any
+  value: their hits went unfound, text columns too. `-2e-300` found the
+  zeros. Each column now gets a literal of its type: a BINARY_DOUBLE or
+  BINARY_FLOAT `1e300d` or `binary_double_nan` as since #339, a NUMBER
+  only a number it holds, a date only a day Oracle reads (1500-02-29
+  is one, by the Julian calendar); a CLOB is compared with
+  `dbms_lob.compare`.
 
 ## [0.11.0] - 2026-11-02
 

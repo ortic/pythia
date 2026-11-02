@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use egui::{RichText, Ui};
 use pythia_db::oracle::Connection;
-use pythia_db::{DbError, DbEvent, DbRequest, Dialect};
+use pythia_db::{Column, DbError, DbEvent, DbRequest, Dialect};
 use serde::{Deserialize, Serialize};
 
 use crate::browser::{written, written_qualified};
@@ -96,27 +96,97 @@ fn value_kinds(value: &str, mode: Match) -> Vec<ValueKind> {
     kinds
 }
 
-/// `YYYY-MM-DD` dates.
+/// `YYYY-MM-DD` days that Oracle reads (#363): one the month has, in a
+/// year from 1 (ORA-01847, ORA-01841), by the Julian calendar before 15
+/// October 1582 (1500-02-29 is one), and none of the ten days skipped
+/// then, which Oracle reads as the 15th.
 fn chrono_like_date(v: &str) -> bool {
-    let b = v.trim().as_bytes();
-    b.len() == 10
+    let v = v.trim();
+    let b = v.as_bytes();
+    if !(b.len() == 10
         && b[4] == b'-'
         && b[7] == b'-'
         && b.iter()
             .enumerate()
-            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let part = |at: std::ops::Range<usize>| v[at].parse::<u32>().unwrap_or_default();
+    let day = (part(0..4), part(5..7), part(8..10));
+    let (year, month, d) = day;
+    let julian = day < (1582, 10, 15);
+    let leap =
+        year.is_multiple_of(4) && (julian || !year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        2 => 28 + u32::from(leap),
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => 0,
+    };
+    year > 0 && (1..=days).contains(&d) && !((1582, 10, 5)..(1582, 10, 15)).contains(&day)
 }
 
 fn quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', "''"))
 }
 
-/// The condition for one column.
-fn condition(column: &str, kind: ValueKind, value: &str, mode: Match, match_case: bool) -> String {
+/// `v`, a number, as a literal of a column of numeric `data_type`, or
+/// `None` where the column holds no such value (#363). A NUMBER (FLOAT is
+/// one) holds 0 and finite numbers from 1e-130 to below 1e126: as its
+/// literal 1e300 fails with ORA-01426, `nan` is a name, and -2e-300 is 0,
+/// which would find the zeros. A BINARY_DOUBLE's or BINARY_FLOAT's is a
+/// literal of its type (#339), `1e300d` or `binary_float_nan`, but for a
+/// number beyond the type's range or that it rounds to 0 (ORA-01426).
+fn number_literal(data_type: &str, v: &str) -> Option<String> {
+    // `inf` and `nan` have no digits. Only zeros before the exponent make
+    // a 0; `1e-400` reads as one too.
+    let digits = v.bytes().any(|b| b.is_ascii_digit());
+    let mantissa = v.split(['e', 'E']).next().unwrap_or_default();
+    let zero = !mantissa.bytes().any(|b| matches!(b, b'1'..=b'9'));
+    let number = match data_type {
+        "BINARY_FLOAT" => f64::from(v.parse::<f32>().ok()?),
+        _ => v.parse::<f64>().ok()?,
+    };
+    let held = match data_type {
+        "BINARY_DOUBLE" | "BINARY_FLOAT" => {
+            !digits || (number.is_finite() && (number != 0.0 || zero))
+        }
+        _ => digits && ((number == 0.0 && zero) || (1e-130..1e126).contains(&number.abs())),
+    };
+    let col = Column {
+        name: String::new(),
+        type_name: data_type.to_owned(),
+        numeric: true,
+    };
+    held.then(|| pythia_data::sql_literal(&col, Some(v)))
+}
+
+/// The condition for one column of type `data_type`, or `None` where it
+/// can't hold the value (#363).
+fn condition(
+    column: &str,
+    data_type: &str,
+    kind: ValueKind,
+    value: &str,
+    mode: Match,
+    match_case: bool,
+) -> Option<String> {
     let col = quote_ident(column);
-    match (kind, mode) {
-        (ValueKind::Number, _) => format!("{col} = {}", value.trim()),
+    // A LOB isn't compared with `=` (ORA-22848).
+    let lob = matches!(data_type, "CLOB" | "NCLOB");
+    Some(match (kind, mode) {
+        (ValueKind::Number, _) => format!("{col} = {}", number_literal(data_type, value.trim())?),
         (ValueKind::Date, _) => format!("trunc({col}) = date {}", quote(value.trim())),
+        (ValueKind::Text, Match::Exact) if lob && match_case => {
+            format!("dbms_lob.compare({col}, to_clob({})) = 0", quote(value))
+        }
+        (ValueKind::Text, Match::Exact) if lob => {
+            format!(
+                "dbms_lob.compare(upper({col}), upper(to_clob({}))) = 0",
+                quote(value)
+            )
+        }
         (ValueKind::Text, Match::Exact) if match_case => format!("{col} = {}", quote(value)),
         (ValueKind::Text, Match::Exact) => format!("upper({col}) = upper({})", quote(value)),
         (ValueKind::Text, Match::Contains) if match_case => {
@@ -132,7 +202,7 @@ fn condition(column: &str, kind: ValueKind, value: &str, mode: Match, match_case
                 if match_case { "c" } else { "i" }
             )
         }
-    }
+    })
 }
 
 impl DataSearch {
@@ -425,8 +495,8 @@ fn search(
           order by c.table_name, c.column_id",
         &[&owner, &Some(tables).filter(|t| !t.is_empty())],
     )?;
-    // (table, [(column, kind)])
-    let mut plan: Vec<(String, Vec<(String, ValueKind)>)> = Vec::new();
+    // (table, [(column, condition)])
+    let mut plan: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for row in rows {
         let (table, column, data_type) = row?;
         let kind = match data_type.as_str() {
@@ -436,10 +506,14 @@ fn search(
             _ => None,
         }
         .filter(|k| kinds.contains(k));
-        let Some(kind) = kind else { continue };
+        let Some(condition) =
+            kind.and_then(|k| condition(&column, &data_type, k, value, mode, match_case))
+        else {
+            continue;
+        };
         match plan.last_mut() {
-            Some((t, cols)) if *t == table => cols.push((column, kind)),
-            _ => plan.push((table, vec![(column, kind)])),
+            Some((t, cols)) if *t == table => cols.push((column, condition)),
+            _ => plan.push((table, vec![(column, condition)])),
         }
     }
     progress.total.store(plan.len(), Ordering::Relaxed);
@@ -448,14 +522,11 @@ fn search(
             break;
         }
         *progress.current.lock().expect("current") = table.clone();
-        let conditions: Vec<String> = columns
+        let counts: Vec<String> = columns
             .iter()
-            .map(|(c, k)| condition(c, *k, value, mode, match_case))
+            .map(|(_, c)| format!("count(case when {c} then 1 end)"))
             .collect();
-        let counts: Vec<String> = conditions
-            .iter()
-            .map(|c| format!("count(case when {c} then 1 end)"))
-            .collect();
+        let conditions: Vec<&str> = columns.iter().map(|(_, c)| c.as_str()).collect();
         let sql = format!(
             "select {} from {}.{} where {}",
             counts.join(", "),
@@ -467,7 +538,7 @@ fn search(
             Ok(mut rows) => {
                 if let Some(Ok(row)) = rows.next() {
                     let mut hits = progress.hits.lock().expect("hits");
-                    for (i, (column, _)) in columns.iter().enumerate() {
+                    for (i, (column, condition)) in columns.iter().enumerate() {
                         let count: u64 = row.get(i).unwrap_or(0);
                         if count > 0 {
                             hits.push(Hit {
@@ -475,7 +546,7 @@ fn search(
                                 table: table.clone(),
                                 column: column.clone(),
                                 count,
-                                condition: conditions[i].clone(),
+                                condition: condition.clone(),
                                 data_type: None,
                             });
                         }
@@ -498,17 +569,94 @@ mod tests {
     #[test]
     fn conditions() {
         assert_eq!(
-            condition("NAME", ValueKind::Text, "o'k", Match::Contains, false),
-            "instr(upper(NAME), upper('o''k')) > 0"
+            condition(
+                "NAME",
+                "VARCHAR2",
+                ValueKind::Text,
+                "o'k",
+                Match::Contains,
+                false
+            )
+            .as_deref(),
+            Some("instr(upper(NAME), upper('o''k')) > 0")
         );
         assert_eq!(
-            condition("ID", ValueKind::Number, " 42 ", Match::Exact, false),
-            "ID = 42"
+            condition(
+                "ID",
+                "NUMBER",
+                ValueKind::Number,
+                " 42 ",
+                Match::Exact,
+                false
+            )
+            .as_deref(),
+            Some("ID = 42")
         );
         assert_eq!(
-            condition("D", ValueKind::Date, "2024-01-31", Match::Exact, false),
-            "trunc(D) = date '2024-01-31'"
+            condition(
+                "D",
+                "DATE",
+                ValueKind::Date,
+                "2024-01-31",
+                Match::Exact,
+                false
+            )
+            .as_deref(),
+            Some("trunc(D) = date '2024-01-31'")
         );
+        // Each type's literal, or none where the column can't hold it
+        // (#363).
+        let number =
+            |data_type, v| condition("X", data_type, ValueKind::Number, v, Match::Exact, false);
+        assert_eq!(number("NUMBER", "1e300"), None);
+        assert_eq!(number("NUMBER", "-2e-300"), None);
+        assert_eq!(number("NUMBER", "nan"), None);
+        assert_eq!(number("FLOAT", "-1e-130").as_deref(), Some("X = -1e-130"));
+        assert_eq!(number("NUMBER", "0e-999").as_deref(), Some("X = 0e-999"));
+        assert_eq!(
+            number("BINARY_DOUBLE", "1e300").as_deref(),
+            Some("X = 1e300d")
+        );
+        assert_eq!(
+            number("BINARY_DOUBLE", "1e-310").as_deref(),
+            Some("X = 1e-310d")
+        );
+        assert_eq!(number("BINARY_DOUBLE", "1e400"), None);
+        assert_eq!(number("BINARY_DOUBLE", "1e-400"), None);
+        assert_eq!(
+            number("BINARY_DOUBLE", "-inf").as_deref(),
+            Some("X = -binary_double_infinity")
+        );
+        assert_eq!(
+            number("BINARY_FLOAT", "NaN").as_deref(),
+            Some("X = binary_float_nan")
+        );
+        assert_eq!(number("BINARY_FLOAT", "1e300"), None);
+        assert_eq!(number("BINARY_FLOAT", "1e-50"), None);
+        assert_eq!(number("BINARY_FLOAT", "0.1").as_deref(), Some("X = 0.1f"));
+        assert_eq!(
+            condition("C", "NCLOB", ValueKind::Text, "a", Match::Exact, true).as_deref(),
+            Some("dbms_lob.compare(C, to_clob('a')) = 0")
+        );
+        for day in [
+            "2024-02-29",
+            "1500-02-29",
+            "1582-10-04",
+            "1582-10-15",
+            "0001-01-01",
+        ] {
+            assert!(chrono_like_date(day), "{day}");
+        }
+        for day in [
+            "2023-02-29",
+            "1700-02-29",
+            "2024-04-31",
+            "2024-13-01",
+            "0000-01-01",
+            "1582-10-10",
+        ] {
+            assert!(!chrono_like_date(day), "{day}");
+        }
         assert_eq!(
             value_kinds("42", Match::Exact),
             [ValueKind::Text, ValueKind::Number]
@@ -648,5 +796,78 @@ mod tests {
         for t in ["\"R71_Data\"", "\"r71_data\""] {
             conn.execute(&format!("drop table {t} purge"), &[]).unwrap();
         }
+    }
+
+    /// Exact finds a typed value where a column holds it and nowhere else,
+    /// whatever it is (#363): a number past NUMBER's range, `inf` or `nan`,
+    /// a day no calendar has, failed each table's query with ORA-01426,
+    /// ORA-00904 or ORA-01847, and so did a CLOB, with ORA-22848; the
+    /// table's hits went unfound. A number that rounds to 0 as a NUMBER
+    /// found the zeros. Each hit's query reads its rows.
+    #[test]
+    fn typed_values_find_their_rows() {
+        let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let (cred, db) = spec.rsplit_once('@').unwrap();
+        let (user, pw) = cred.split_once('/').unwrap();
+        let conn = Connection::connect(user, pw, db).unwrap();
+        let _ = conn.execute("drop table r84_typed purge", &[]);
+        for sql in [
+            "create table r84_typed (n number, f float, bd binary_double, bf binary_float, \
+             s varchar2(20), d date, c clob, nc nclob)",
+            "insert into r84_typed values (0, 0, 1e300d, 3.4e38f, '1e300', date '2020-01-01', '1e300', null)",
+            "insert into r84_typed values (1e125, null, binary_double_nan, binary_float_nan, 'nan', \
+             date '1500-02-29', 'NaN', 'nAn')",
+            "insert into r84_typed values (1e-130, null, binary_double_infinity, \
+             -binary_float_infinity, 'inf', null, '2024-02-30', 'Inf')",
+            "insert into r84_typed values (0.1, 0.1, -2e-300d, 0.1f, '2024-02-30', null, '-2e-300', null)",
+        ] {
+            conn.execute(sql, &[]).unwrap();
+        }
+        conn.commit().unwrap();
+        let owner = user.to_uppercase();
+        let found_in_case = |value: &str, match_case: bool| {
+            let progress = Progress::default();
+            search(
+                &conn,
+                &owner,
+                "R84_TYPED",
+                value,
+                Match::Exact,
+                match_case,
+                &progress,
+            )
+            .unwrap();
+            let hits = progress.hits.lock().unwrap();
+            hits.iter()
+                .map(|h| {
+                    let read = match conn.query(&hit_query(h), &[]) {
+                        Ok(rows) => rows.count().to_string(),
+                        Err(e) => e.to_string().chars().take(9).collect(),
+                    };
+                    assert_eq!(read, h.count.to_string(), "{value}: {}", h.condition);
+                    format!("{}={}", h.column, h.count)
+                })
+                .collect::<Vec<_>>()
+        };
+        let found = |value: &str| found_in_case(value, false);
+        assert_eq!(found("1e300"), ["BD=1", "S=1", "C=1"]);
+        assert_eq!(found("nan"), ["BD=1", "BF=1", "S=1", "C=1", "NC=1"]);
+        assert_eq!(found("inf"), ["BD=1", "S=1", "NC=1"]);
+        assert_eq!(found_in_case("NaN", true), ["BD=1", "BF=1", "C=1"]);
+        assert_eq!(found_in_case("Inf", true), ["BD=1", "NC=1"]);
+        assert_eq!(found("-inf"), ["BF=1"]);
+        assert_eq!(found("-2e-300"), ["BD=1", "C=1"]);
+        assert_eq!(found("1e-400"), Vec::<String>::new());
+        assert_eq!(found("3.4e38"), ["BF=1"]);
+        assert_eq!(found("1e125"), ["N=1"]);
+        assert_eq!(found("1e-130"), ["N=1"]);
+        assert_eq!(found("0.1"), ["N=1", "F=1", "BF=1"]);
+        assert_eq!(found("0"), ["N=1", "F=1"]);
+        assert_eq!(found("2024-02-30"), ["S=1", "C=1"]);
+        assert_eq!(found("1500-02-29"), ["D=1"]);
+        assert_eq!(found("2020-01-01"), ["D=1"]);
+        conn.execute("drop table r84_typed purge", &[]).unwrap();
     }
 }
