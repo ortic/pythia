@@ -408,9 +408,30 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
         "PIVOT",
         "UNPIVOT",
     ];
+    // A second table after a comma, also past an alias written with AS or
+    // one the lexer takes for a keyword (`key`, `type`), or SQL Server's
+    // `WITH (NOLOCK)`: the cell of another table's column was written to
+    // the first one (#449). The FROM clause ends at the next clause.
+    const CLAUSES: &[&str] = &[
+        "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "OPTION", "WINDOW",
+        "QUALIFY",
+    ];
+    let mut depth = 0i32;
+    let mut comma = false;
+    for j in next..tokens.len() {
+        match tokens[j].kind {
+            TokenKind::LParen => depth += 1,
+            TokenKind::RParen => depth -= 1,
+            TokenKind::Comma if depth == 0 => {
+                comma = true;
+                break;
+            }
+            _ if depth == 0 && CLAUSES.iter().any(|w| is(j, w)) => break,
+            _ => {}
+        }
+    }
     // From the table on: a join word that isn't a keyword looks like an alias.
-    let multi = tokens.get(next).is_some_and(|t| t.kind == TokenKind::Comma)
-        || (i + 1..tokens.len()).any(|j| joins.iter().any(|w| is(j, w)));
+    let multi = comma || (i + 1..tokens.len()).any(|j| joins.iter().any(|w| is(j, w)));
     if multi {
         return None;
     }
@@ -1593,6 +1614,34 @@ mod tests {
         assert_eq!(
             single_table(Dialect::SQLSERVER, "select * from [it's \"odd\"] -- [x]"),
             Some("[it's \"odd\"]".into())
+        );
+        // A second table after a comma, past an alias with AS, one that is
+        // a keyword or a table hint (#449).
+        for sql in [
+            "select o.id, c.status from orders as o, customers as c where o.cid = c.id",
+            "select * from orders o with (nolock), customers c with (nolock)",
+            "select * from orders key, customers c",
+            "select * from orders with (index(ix_a, ix_b)) , customers",
+        ] {
+            assert_eq!(single_table(Dialect::SQLSERVER, sql), None, "{sql}");
+        }
+        // Commas of the later clauses are no tables.
+        for sql in [
+            "select * from orders as o where o.id in (1, 2) order by o.id, o.n",
+            "select * from orders with (nolock, index(ix)) where n = 1",
+        ] {
+            assert_eq!(
+                single_table(Dialect::SQLSERVER, sql),
+                Some("orders".into()),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            single_table(
+                Dialect::MYSQL,
+                "select * from t as x group by a, b limit 1, 2"
+            ),
+            Some("t".into())
         );
         // What APPLY or PIVOT brings in isn't the table's.
         for sql in [

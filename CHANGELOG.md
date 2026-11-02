@@ -392,6 +392,10 @@ All notable changes to Pythia are documented here. The format follows
   server's default, the login script or a `SET`), a SQL window reads a
   `\` in a string as itself: `'C:\'` no longer runs on to the end of the
   script, in splitting, highlighting and binds (#412).
+- Edit leaves a query over tables joined with commas read-only also when
+  an alias is written with `AS` or is a keyword, or a table has SQL
+  Server's `WITH (NOLOCK)`: another table's cells were written to the
+  first table (#449).
 
 ## [0.11.0] - 2026-11-02
 
