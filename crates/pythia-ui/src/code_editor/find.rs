@@ -60,11 +60,7 @@ impl FindBar {
             }
             Some(Ok(m)) => {
                 let text = text();
-                let scope = self
-                    .scope
-                    .clone()
-                    .map(|r| r.start.min(text.len())..r.end.min(text.len()));
-                m.find_all(&text, scope)
+                m.find_all(&text, self.scope.clone())
             }
         };
         self.current = self.current.filter(|i| *i < self.matches.len());
@@ -75,6 +71,18 @@ impl FindBar {
         let i = next_match(&self.matches, cursor, forward)?;
         self.current = Some(i);
         Some(self.matches[i].clone())
+    }
+
+    /// Moves the end of the "in selection" scope by what `replacements`
+    /// (inside it) add or take away, so it still covers the selection.
+    pub fn follow_replacements(&mut self, replacements: &[(Range<usize>, String)]) {
+        if let Some(scope) = &mut self.scope {
+            let grown: isize = replacements
+                .iter()
+                .map(|(r, new)| new.len() as isize - r.len() as isize)
+                .sum();
+            scope.end = scope.end.saturating_add_signed(grown).max(scope.start);
+        }
     }
 
     /// Replacement texts for the given matches.
@@ -220,4 +228,24 @@ fn short_regex_error(e: &regex::Error) -> String {
         .trim()
         .trim_start_matches("error: ")
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Replacing in a selection moves its end, so it still covers the
+    /// selection: after a replace all that took text out, the old end was
+    /// inside a character, and the next search panicked (#418).
+    #[test]
+    fn the_scope_follows_replacements() {
+        let mut find = FindBar {
+            scope: Some(2..10),
+            ..Default::default()
+        };
+        find.follow_replacements(&[(3..4, String::new()), (6..7, "xyz".into())]);
+        assert_eq!(find.scope, Some(2..11));
+        find.follow_replacements(&[(2..11, String::new())]);
+        assert_eq!(find.scope, Some(2..2));
+    }
 }

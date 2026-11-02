@@ -293,6 +293,10 @@ All notable changes to Pythia are documented here. The format follows
   SQLite columns of REAL or BLOB affinity) aren't keys now; another
   unique key or SQLite's rowid finds the row, or the result is
   read-only. *Save to file…* refuses a key that finds several rows.
+- Editor: Find/Replace *In selection* reads the text around the
+  selection (`^`, `$`, `\b`) as `$1` does, and follows the selection
+  through replacements (#418). A raw `$1` went in at the selection's
+  edges, and *Replace all* that shortened the text could crash Pythia.
 
 ## [0.11.0] - 2026-11-02
 
