@@ -359,6 +359,9 @@ All notable changes to Pythia are documented here. The format follows
   table's triggers, which *Edit* dropped (#440).
 - MySQL: Maintenance's facts of a table and the monitor's storage figures
   are current, not as MySQL cached them up to a day ago (#441).
+- PostgreSQL: Maintenance's facts of a partitioned table are its
+  partitions' rows, size and transaction ID age, not 0 and a false
+  wraparound warning (#442).
 
 ## [0.11.0] - 2026-11-02
 
