@@ -325,6 +325,9 @@ All notable changes to Pythia are documented here. The format follows
   string, ORA-01861.
 - Export tables and data compare take a filter that is all comment as
   none (#427); `where -- id = 6` failed with ORA-00936.
+- The value editor's calendar keeps a date without a time so (#428):
+  it added ` 00:00:00`, which SQLite kept, so the row no longer equalled
+  the date.
 
 ## [0.11.0] - 2026-11-02
 

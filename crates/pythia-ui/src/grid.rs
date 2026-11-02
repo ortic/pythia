@@ -3147,6 +3147,20 @@ fn is_temporal(col: &Column) -> bool {
     t.starts_with("DATE") || t.starts_with("TIMESTAMP")
 }
 
+/// `text`, a date's value, with the `day` picked: its time as it was; none
+/// for a value without one, as a date column holds (SQLite keeps the text,
+/// which then no longer equals a date, #428); midnight for an empty value
+/// of a type with a time.
+fn with_day(text: &str, day: jiff::civil::Date, date_only: bool) -> String {
+    let time = text.get(10..).unwrap_or_default();
+    let time = if !time.trim().is_empty() || date_only {
+        time.trim_end()
+    } else {
+        " 00:00:00"
+    };
+    format!("{day}{time}")
+}
+
 /// The dialog editing one cell: multi-line text, a calendar for dates.
 fn value_editor(
     ctx: &egui::Context,
@@ -3161,6 +3175,16 @@ fn value_editor(
     let column = columns.get(ed.col);
     let name = column.map_or("", |c| c.name.as_str());
     let date = column.is_some_and(is_temporal) && ed.long.is_none();
+    // A value of a DATE that holds no time (all but Oracle's) or one shown
+    // without a time.
+    let date_only = column.is_some_and(|c| {
+        c.type_name.eq_ignore_ascii_case("DATE")
+            && state.dialect.kind() != pythia_db::DbKind::Oracle
+    }) || (ed.text.len() == 10
+        && ed
+            .text
+            .get(..10)
+            .is_some_and(|d| d.parse::<jiff::civil::Date>().is_ok()));
     let files = state.value_files && column.is_some_and(|c| file_kind(state.dialect, c).is_some());
     let mut open = true;
     let mut result: Option<Cell> = None;
@@ -3193,13 +3217,7 @@ fn value_editor(
                         )
                         .changed()
                     {
-                        let time = ed.text.get(10..).unwrap_or_default().to_owned();
-                        let time = if time.trim().is_empty() {
-                            " 00:00:00".to_owned()
-                        } else {
-                            time
-                        };
-                        ed.text = format!("{day}{time}");
+                        ed.text = with_day(&ed.text, day, date_only);
                     }
                     ui.weak("Format YYYY-MM-DD HH24:MI:SS");
                 });
@@ -5667,6 +5685,20 @@ mod tests {
     /// scroll through, not to edit: Save to file… and Load from file… take
     /// it to a file and back. One of 100,000 still edits, in a field that
     /// scrolls: the dialog grew with its text, Apply off the screen.
+    /// A day picked keeps the value's time, or its lack of one.
+    #[test]
+    fn days_picked_keep_the_time() {
+        let day = jiff::civil::date(2024, 1, 6);
+        assert_eq!(with_day("2024-01-05", day, true), "2024-01-06");
+        assert_eq!(with_day("2024-01-05", day, false), "2024-01-06 00:00:00");
+        assert_eq!(with_day("", day, true), "2024-01-06");
+        assert_eq!(with_day("", day, false), "2024-01-06 00:00:00");
+        assert_eq!(
+            with_day("2024-01-05 13:45:01.5", day, false),
+            "2024-01-06 13:45:01.5"
+        );
+    }
+
     /// A binary value the grid holds cut short shows read-only in the
     /// value editor: its first bytes, edited, were written as the whole
     /// value (or, with the size left at the end, not at all).
