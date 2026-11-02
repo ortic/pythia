@@ -602,6 +602,33 @@ fn rules_in_words() {
     }
 }
 
+/// On MySQL a table's name is as written (on Linux): a word that may be a
+/// name keeps its case, only reserved words change (#419). `User` and
+/// `Session` were lowercased with keywords and named other tables. And
+/// only ASCII letters change case: `straße` was `STRASSE` on Oracle, which
+/// keeps `STRAßE`, and PostgreSQL's `тест` became `ТЕСТ`, another name.
+#[test]
+fn case_keeps_names() {
+    let lower = with(|o| o.keyword_case = Case::Lower);
+    let f = format_in(
+        "SELECT u.Id FROM User u JOIN Session s ON s.UserId = u.Id WHERE u.Level > 1",
+        Syntax::MySql,
+        &lower,
+    );
+    assert_eq!(
+        f.text,
+        "select u.Id\nfrom User u\njoin Session s on s.UserId = u.Id\nwhere u.Level > 1"
+    );
+    let upper = with(|o| {
+        o.keyword_case = Case::Upper;
+        o.identifier_case = Case::Upper;
+    });
+    for syntax in [Syntax::Oracle, Syntax::Postgres] {
+        let f = format_in("select straße, тест from t", syntax, &upper);
+        assert_eq!(f.text, "SELECT STRAßE, тест FROM T", "{syntax:?}");
+    }
+}
+
 /// Strings, comments and quoted names stay as each database reads them
 /// (#FMT). Lexed as Oracle's, MySQL's `'it\\'s from here'` got a line break
 /// and a space inside, `#` comments ran into the code after them, SQL

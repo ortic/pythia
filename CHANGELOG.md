@@ -297,6 +297,11 @@ All notable changes to Pythia are documented here. The format follows
   selection (`^`, `$`, `\b`) as `$1` does, and follows the selection
   through replacements (#418). A raw `$1` went in at the selection's
   edges, and *Replace all* that shortened the text could crash Pythia.
+- The formatter no longer renames names (#419): on MySQL, tables named
+  like keywords (`User`, `Session`) were lowercased with them, another
+  table on Linux; and `straße` became `STRASSE` with identifier case
+  Upper. Only ASCII letters change case, and on MySQL only reserved
+  words.
 
 ## [0.11.0] - 2026-11-02
 

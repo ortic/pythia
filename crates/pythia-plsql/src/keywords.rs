@@ -994,6 +994,13 @@ pub fn is_reserved(word: &str, syntax: crate::Syntax) -> bool {
     }
 }
 
+/// Whether `word` is MySQL's own reserved word, which can't be a name
+/// unquoted (without Oracle's keywords, which [`is_reserved`] adds to
+/// quote names safely everywhere).
+pub fn is_mysql_reserved(word: &str) -> bool {
+    contains(MYSQL_RESERVED, word)
+}
+
 /// Case-insensitive lookup in a sorted, uppercase list.
 fn contains(list: &[&str], word: &str) -> bool {
     // The longest word is 30 bytes; avoid allocating for longer words.

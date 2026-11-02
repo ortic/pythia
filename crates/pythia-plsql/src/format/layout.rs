@@ -223,6 +223,7 @@ struct Clause {
 type Stop<'x, 'a, 's> = &'x dyn Fn(&Layout<'a, 's>) -> bool;
 
 pub(crate) struct Layout<'a, 's> {
+    syntax: crate::Syntax,
     toks: &'a [Tok<'s>],
     pos: usize,
     o: &'a FormatOptions,
@@ -252,8 +253,9 @@ enum Item {
 }
 
 impl<'a, 's> Layout<'a, 's> {
-    pub fn new(toks: &'a [Tok<'s>], o: &'a FormatOptions) -> Self {
+    pub fn new(toks: &'a [Tok<'s>], o: &'a FormatOptions, syntax: crate::Syntax) -> Self {
         Self {
+            syntax,
             toks,
             pos: 0,
             o,
@@ -339,7 +341,13 @@ impl<'a, 's> Layout<'a, 's> {
     // ----- emitting tokens -------------------------------------------------
 
     fn token_text(&self, t: &Tok<'s>) -> String {
+        // On MySQL a table's name is as written (on Linux): a word that may
+        // be one keeps its case, User and Session as much as a column
+        // (#419). Only MySQL's reserved words, which can't be names, change.
+        let named =
+            self.syntax == crate::Syntax::MySql && !crate::keywords::is_mysql_reserved(t.text);
         match t.kind {
+            TokenKind::Keyword | TokenKind::Ident if named => t.text.to_owned(),
             TokenKind::Keyword => apply_case(self.o.keyword_case, t.text),
             TokenKind::Ident
                 if EXTRA_KEYWORDS
@@ -1928,10 +1936,13 @@ fn join_clauses(clauses: Vec<Doc>, force: bool) -> Doc {
     group(cat(parts))
 }
 
+/// `s` in `case`, its ASCII letters only: a database folds those alike
+/// (PostgreSQL no others), and Oracle keeps `ß`, which `to_uppercase`
+/// made `SS`, another name (#419).
 fn apply_case(case: Case, s: &str) -> String {
     match case {
-        Case::Upper => s.to_uppercase(),
-        Case::Lower => s.to_lowercase(),
+        Case::Upper => s.to_ascii_uppercase(),
+        Case::Lower => s.to_ascii_lowercase(),
         Case::Preserve => s.to_owned(),
     }
 }
