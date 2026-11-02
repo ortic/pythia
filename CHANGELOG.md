@@ -345,6 +345,8 @@ All notable changes to Pythia are documented here. The format follows
 - An Excel export that passes Excel's limits (32,767 characters a cell,
   1,048,576 rows a sheet) says which row and column, and to export as CSV
   or JSON (#434); it failed with the library's error only.
+- Oracle: a numbered substitution variable, `&1`, is substituted in code
+  too, not only in strings (#435).
 
 ## [0.11.0] - 2026-11-02
 

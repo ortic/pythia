@@ -3982,6 +3982,13 @@ mod tests {
             substitute(sql, &values, Syntax::Oracle),
             "select '1', 2 || x from t where c = 3 -- &d\n/* &e */"
         );
+        // A numbered one, as a script's arguments are, in code too.
+        let sql = "select &1, '&1' from dual";
+        let values = BTreeMap::from([("1".into(), "42".into())]);
+        assert_eq!(
+            substitute(sql, &values, Syntax::Oracle),
+            "select 42, '42' from dual"
+        );
     }
 
     #[test]

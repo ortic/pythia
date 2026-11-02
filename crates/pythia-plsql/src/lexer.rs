@@ -49,8 +49,9 @@ pub enum TokenKind {
     #[regex(r":[\p{L}][\p{L}\p{N}_$#]*")]
     #[regex(r":[0-9]+")]
     BindVar,
-    /// SQL*Plus substitution variable `&var` / `&&var`.
-    #[regex(r"&&?[\p{L}_][\p{L}\p{N}_$#]*\.?")]
+    /// SQL*Plus substitution variable `&var` / `&&var`, also a numbered
+    /// one, `&1`, as a script's arguments are (#435).
+    #[regex(r"&&?[\p{L}\p{N}_][\p{L}\p{N}_$#]*\.?")]
     SubstVar,
     /// `::` is PostgreSQL's cast (`x::int` has no bind variable `:int`).
     #[regex(r":=|::|=>|\|\||<=|>=|<>|!=|\^=|~=|\.\.|\*\*|<<|>>|[+\-*/=<>@%|!^~?&:]")]
