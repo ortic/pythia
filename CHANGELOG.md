@@ -277,6 +277,10 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: a trigger's DDL keeps it disabled, or enabled for replicas
   or always, where it is so (#415), and *Edit* keeps that state:
   replaced or made again, it fired as an ordinary trigger.
+- PostgreSQL: *Edit* of a trigger whose name is on several tables
+  replaces each of them (#377); the script replaced the first and failed
+  at the second, "already exists". With a constraint trigger among them,
+  the whole script is one block.
 
 ## [0.11.0] - 2026-11-02
 
