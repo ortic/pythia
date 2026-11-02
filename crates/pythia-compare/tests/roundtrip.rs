@@ -120,6 +120,15 @@ fn schema_and_data_roundtrip() {
         let d = data::compare(&conn, &query, &conn, &tgt, filtered, |_, _| {})
             .expect("data compare with comments");
         assert_eq!(d.equal, 3, "{d:?}");
+        // A filter that is all comment is no filter.
+        let commented = DataOptions {
+            key_columns: vec!["ID".into()],
+            filter: "-- id > 1".into(),
+            ..options_again()
+        };
+        let d = data::compare(&conn, &query, &conn, &tgt, commented, |_, _| {})
+            .expect("data compare with a commented-out filter");
+        assert_eq!(d.equal, 3, "{d:?}");
     }));
     teardown_schemas(&conn, schemas);
     if let Err(e) = result {

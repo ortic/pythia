@@ -127,7 +127,11 @@ pub fn fetch_chunk(
         .collect();
     // On lines of their own: a `--` comment at the filter's or the
     // query's end would take what follows with it.
-    if !filter.trim().is_empty() {
+    // A filter that is all comment is none (#427).
+    if pythia_plsql::tokenize(filter)
+        .iter()
+        .any(|t| !t.kind.is_trivia())
+    {
         conditions.push(format!("(\n{}\n)", filter.trim()));
     }
     let mut binds: Vec<String> = Vec::new();

@@ -323,6 +323,8 @@ All notable changes to Pythia are documented here. The format follows
 - Oracle: *Follow foreign keys* over a key with a DATE or TIMESTAMP
   column opens the related rows (#426); its query wrote the date as a
   string, ORA-01861.
+- Export tables and data compare take a filter that is all comment as
+  none (#427); `where -- id = 6` failed with ORA-00936.
 
 ## [0.11.0] - 2026-11-02
 

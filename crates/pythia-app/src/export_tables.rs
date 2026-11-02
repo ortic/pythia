@@ -549,7 +549,11 @@ pub fn export(
             quote_ident(&owner),
             quote_ident(&job.table)
         );
-        if !job.filter.is_empty() {
+        // A filter that is all comment is none (#427): `where -- x` failed.
+        if pythia_plsql::tokenize(&job.filter)
+            .iter()
+            .any(|t| !t.kind.is_trivia())
+        {
             sql.push_str(&format!(" where {}", job.filter));
         }
         let path = settings
@@ -784,6 +788,14 @@ mod tests {
         assert_eq!(csv, "ID;TAG\n1;NULL\n2;x\n3;NULL\n");
         let ddl = std::fs::read_to_string(folder.join("pythia_exp_a.ddl.sql")).unwrap();
         assert!(ddl.contains("CREATE TABLE \"PYTHIA_EXP_A\""), "{ddl}");
+
+        // A filter that is all comment exports every row.
+        let commented = [Job {
+            table: "PYTHIA_EXP_A".into(),
+            filter: "-- id <= 1".into(),
+        }];
+        let all = export(&conn, &settings, &commented, &Progress::default()).unwrap();
+        assert!(all > 3, "{all}");
 
         // A bad filter fails that table and leaves no partial file.
         let bad = [Job {
