@@ -1112,6 +1112,14 @@ All notable changes to Pythia are documented here. The format follows
   the statement's, or the fetch's, as one without rows first is. An error
   after a result of a statement with several, which comes the same way
   on MySQL, PostgreSQL and SQL Server, is too.
+- *Edit in dialog…* no longer freezes Pythia on a text of megabytes
+  (#356), fetched or loaded from a file: its text field laid all of it
+  out on every frame and for each letter typed, seconds for 10 MB. A
+  text over 100,000 characters now shows in rows, as *View value…* shows
+  it, to read but not to edit there: *Save to file…* writes it and *Load
+  from file…* takes it back. A shorter text scrolls in its field, where
+  one of some thousand characters made the dialog taller than the
+  screen and put *Apply* out of reach.
 
 ## [0.10.0] - 2026-10-30
 
