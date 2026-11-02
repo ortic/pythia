@@ -267,6 +267,13 @@ All notable changes to Pythia are documented here. The format follows
   table's DDL makes it (#381). It was a plain table's, which, run before
   the ledger table's DDL, made that fail with Msg 37355, and run alone
   made a table no ledger keeps.
+- SQLite: windows of a database in memory (`:memory:`, a `file:` URI of
+  memory, `cache=shared`) wait for each other's locks as windows of a
+  file do (#374): up to five seconds, then they say which window holds
+  it. A SELECT or INSERT of a table another window had changed and not
+  committed failed at once with "database table is locked", and while a
+  window had uncommitted DDL, the object browser and completion came up
+  empty. Lookups answer as they did last while the schema is locked.
 
 ## [0.11.0] - 2026-11-02
 

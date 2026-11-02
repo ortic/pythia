@@ -245,7 +245,7 @@ pub struct CompileError {
     pub warning: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetaQuery {
     Schemas,
     Objects {
