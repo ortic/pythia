@@ -63,6 +63,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         autocommit: false,
         tx: Transaction::default(),
         time_zone: None,
+        syntax: Syntax::MySql,
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
@@ -71,6 +72,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
                 worker.events.send(DbEvent::Notice(notice));
             }
             worker.report_time_zone();
+            worker.report_lexing(true);
         }
         Err(e) => {
             *shared.lock().expect("cancel mutex") = None;
@@ -152,6 +154,8 @@ struct Worker {
     tx: Transaction,
     /// The time zone last reported (see [`Worker::report_time_zone`]).
     time_zone: Option<String>,
+    /// How the session reads strings (see [`Worker::report_lexing`]).
+    syntax: Syntax,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -234,7 +238,7 @@ impl Worker {
             requests,
             kill: &self.kill,
         };
-        let ran = Self::run_statement(&mut self.conn, sql, binds, fetch, &mut next);
+        let ran = Self::run_statement(&mut self.conn, sql, binds, self.syntax, fetch, &mut next);
         match ran {
             Ok(outcome) => {
                 self.tx.after(effect);
@@ -285,6 +289,9 @@ impl Worker {
         if matches!(words.first(), Some(&("SET" | "CALL"))) {
             self.report_time_zone();
         }
+        if words.first() == Some(&"SET") {
+            self.report_lexing(false);
+        }
         // USE, or DROP DATABASE of the one in use (#320).
         if matches!(words[..], ["USE", ..] | ["DROP", "DATABASE" | "SCHEMA"]) {
             self.report_context();
@@ -297,6 +304,7 @@ impl Worker {
         conn: &mut Conn,
         sql: &str,
         binds: &[(String, Bind)],
+        syntax: Syntax,
         fetch: Fetch<'_>,
         next: &mut Option<DbRequest>,
     ) -> Result<Outcome, mysql::Error> {
@@ -304,7 +312,7 @@ impl Worker {
             let result = conn.query_iter(sql)?;
             fetch.stream(result, next)
         } else {
-            let (sql, values) = positional(sql, binds);
+            let (sql, values) = positional(sql, binds, syntax);
             let result = conn.exec_iter(sql, Params::Positional(values))?;
             fetch.stream(result, next)
         }
@@ -336,6 +344,28 @@ impl Worker {
     /// changed (#213). `SYSTEM`, which another server reads as its own
     /// zone, as the server's offset when it has the same one all year (a
     /// server on UTC: `+00:00`).
+    /// Says how the session reads strings, when it connected (`always`) or
+    /// when that changed: without backslash escapes while its `sql_mode`
+    /// has `NO_BACKSLASH_ESCAPES` (#412), which the server's default, the
+    /// login script or a `SET` may set.
+    fn report_lexing(&mut self, always: bool) {
+        let mode: Result<Option<String>, _> = self.conn.query_first("select @@session.sql_mode");
+        let syntax = match mode {
+            Ok(Some(mode)) if mode.to_uppercase().contains("NO_BACKSLASH_ESCAPES") => {
+                Syntax::MySqlNoEscapes
+            }
+            Ok(_) => Syntax::MySql,
+            Err(e) => {
+                warn!("reading the sql_mode: {e}");
+                return;
+            }
+        };
+        if always || syntax != self.syntax {
+            self.syntax = syntax;
+            self.events.send(DbEvent::Lexing(syntax));
+        }
+    }
+
     fn report_time_zone(&mut self) {
         // The session's zone, the server's offsets in January and July.
         type Zone = (String, Option<i64>, Option<i64>);
@@ -828,9 +858,9 @@ fn kill_query(opts: &Opts, id: u32) {
 
 /// Replaces `:name` binds by `?` with their values in order: MySQL takes
 /// text and bytes alike, as the column's type wants them.
-fn positional(sql: &str, binds: &[(String, Bind)]) -> (String, Vec<Value>) {
+fn positional(sql: &str, binds: &[(String, Bind)], syntax: Syntax) -> (String, Vec<Value>) {
     let mut values = Vec::new();
-    let sql = replace_binds(sql, Syntax::MySql, binds, |_, value| {
+    let sql = replace_binds(sql, syntax, binds, |_, value| {
         values.push(match value {
             Bind::Text(Some(v)) => Value::Bytes(v.clone().into_bytes()),
             Bind::Text(None) => Value::NULL,
@@ -1228,6 +1258,7 @@ mod tests {
         let (sql, values) = positional(
             "select * from t where id = :ID or :n is null and x = ':id'",
             &binds,
+            Syntax::MySql,
         );
         assert_eq!(
             sql,

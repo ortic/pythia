@@ -344,8 +344,7 @@ impl<'a, 's> Layout<'a, 's> {
         // On MySQL a table's name is as written (on Linux): a word that may
         // be one keeps its case, User and Session as much as a column
         // (#419). Only MySQL's reserved words, which can't be names, change.
-        let named =
-            self.syntax == crate::Syntax::MySql && !crate::keywords::is_mysql_reserved(t.text);
+        let named = self.syntax.is_mysql() && !crate::keywords::is_mysql_reserved(t.text);
         match t.kind {
             TokenKind::Keyword | TokenKind::Ident if named => t.text.to_owned(),
             TokenKind::Keyword => apply_case(self.o.keyword_case, t.text),

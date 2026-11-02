@@ -148,6 +148,9 @@ pub struct RunState {
     /// The zone the session shows MySQL's TIMESTAMP values in, as it last
     /// said: INSERT statements of its results set it (#213).
     pub time_zone: Option<String>,
+    /// How the session reads strings, as it last said: MySQL's without
+    /// backslash escapes under `NO_BACKSLASH_ESCAPES` (#412).
+    pub lexing: Option<Syntax>,
     /// Error stacks to look up, not sent yet.
     stack_lookups: Vec<StackLookup>,
 }
@@ -567,6 +570,16 @@ impl SqlWindow {
     }
 
     /// Starts executing the selection / whole text, or the current statement.
+    /// How the window's text is read: as its session said (#412), else as
+    /// its connection's dialect reads it.
+    fn syntax_in(&self, cx: &DocContext) -> Syntax {
+        let dialect = cx.dialect.syntax();
+        self.state
+            .lexing
+            .filter(|lexing| lexing.is_mysql() == dialect.is_mysql())
+            .unwrap_or(dialect)
+    }
+
     pub fn execute(&mut self, current_only: bool, cx: &DocContext) -> Effects {
         // Executing again runs the statement waiting for values.
         if self.waiting_for_values() {
@@ -575,7 +588,7 @@ impl SqlWindow {
         if self.is_running() {
             return Effects::default();
         }
-        self.state.syntax = cx.dialect.syntax();
+        self.state.syntax = self.syntax_in(cx);
         let statements = self.statements(current_only);
         let state = &mut self.state;
         state.results.clear();
@@ -960,7 +973,7 @@ impl SqlWindow {
         }
         // MySQL's EXPLAIN takes no parameters, and a value in their place
         // would change the plan (NULL makes it "no matching row").
-        if syntax == Syntax::MySql && !find_binds(&stmt.sql, syntax).is_empty() {
+        if syntax.is_mysql() && !find_binds(&stmt.sql, syntax).is_empty() {
             self.warn("Explain plan doesn't take bind variables on MySQL; use literals");
             self.state.bottom = BottomTab::Messages;
             return effects;
@@ -2379,6 +2392,7 @@ impl SqlWindow {
             // A new session says its own zone, if it has one.
             DbEvent::Connected(_) => {
                 self.state.time_zone = None;
+                self.state.lexing = None;
                 self.state.in_transaction = false;
             }
             DbEvent::Transaction { pending } => {
@@ -2412,6 +2426,7 @@ impl SqlWindow {
                 self.state.failed_last = false;
             }
             DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
+            DbEvent::Lexing(syntax) => self.state.lexing = Some(syntax),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
                 self.forget_run();
                 self.error(&error);
@@ -2472,7 +2487,7 @@ impl SqlWindow {
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
-        self.state.syntax = cx.dialect.syntax();
+        self.state.syntax = self.syntax_in(cx);
         self.editor.set_syntax(self.state.syntax);
         let substitution = self.substitutes();
         self.editor.set_substitution(substitution);
@@ -4419,6 +4434,38 @@ mod tests {
         assert_eq!(w.line_ending, crate::text_file::LineEnding::CrLf);
         assert!(w.changed_on_disk().is_none() && !w.is_dirty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A MySQL window reads strings as its session said (#412): under
+    /// NO_BACKSLASH_ESCAPES `'C:\\'` ends at its quote, and the script is
+    /// two statements, not one string to its end. A new session says again.
+    #[test]
+    fn mysql_window_lexes_as_its_session_says() {
+        let settings = pythia_config::Settings::default();
+        let cx = DocContext {
+            dialect: pythia_db::Dialect::MYSQL,
+            ..test_cx(&settings, false)
+        };
+        let script = "select 'C:\\' as p;\nselect 2;";
+        let first = |w: &mut SqlWindow| {
+            let sent = sent(&w.execute(false, &cx));
+            w.forget_run();
+            sent.first().map(|(_, sql)| sql.clone()).unwrap_or_default()
+        };
+        let mut w = SqlWindow::new("t".into(), script.into());
+        assert_eq!(first(&mut w), script);
+        let _ = w.on_event(DbEvent::Lexing(Syntax::MySqlNoEscapes), &cx);
+        assert_eq!(first(&mut w), "select 'C:\\' as p");
+        let server = pythia_db::ServerInfo {
+            dialect: pythia_db::Dialect::MYSQL,
+            version: "9.4.0".into(),
+            release: (9, 4),
+            banner: String::new(),
+            current_schema: String::new(),
+            context: pythia_db::NameContext::default(),
+        };
+        let _ = w.on_event(DbEvent::Connected(server), &cx);
+        assert_eq!(first(&mut w), script);
     }
 
     /// MySQL's EXPLAIN takes no bind variables: it says so rather than

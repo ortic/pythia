@@ -650,6 +650,30 @@ mod tests {
         assert!(h.substitution());
     }
 
+    /// Under MySQL's NO_BACKSLASH_ESCAPES, `'C:\\'` ends at its quote
+    /// (#412): the line after it isn't a string.
+    #[test]
+    fn mysql_without_backslash_escapes() {
+        let (tokens, end) =
+            lex_line_in("select 'C:\\' p", LineState::Normal, Syntax::MySqlNoEscapes);
+        let tokens: Vec<_> = tokens
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Whitespace)
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(
+            (tokens, end),
+            (
+                vec![TokenKind::Keyword, TokenKind::String, TokenKind::Ident],
+                LineState::Normal
+            )
+        );
+        assert_eq!(
+            mysql("select 'C:\\' p", LineState::Normal).1,
+            LineState::Str
+        );
+    }
+
     #[test]
     fn mysql_lines() {
         // What the server runs: `--x` is code, `#` a comment (#188, #189).

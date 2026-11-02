@@ -388,6 +388,10 @@ All notable changes to Pythia are documented here. The format follows
   on the file go (#185).
 - SQLite: text that isn't UTF-8 shows, copies and exports as Windows-1252,
   not with replacement characters (#413).
+- MySQL: with `NO_BACKSLASH_ESCAPES` in the session's `sql_mode` (the
+  server's default, the login script or a `SET`), a SQL window reads a
+  `\` in a string as itself: `'C:\'` no longer runs on to the end of the
+  script, in splitting, highlighting and binds (#412).
 
 ## [0.11.0] - 2026-11-02
 

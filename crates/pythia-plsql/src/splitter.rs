@@ -29,6 +29,9 @@ pub enum Syntax {
     /// ([`crate::tokenize_in`]), or as the `mysql` client's: after a line
     /// `DELIMITER x`, at `x` (`DELIMITER ;` goes back).
     MySql,
+    /// MySQL with `NO_BACKSLASH_ESCAPES` in the session's `sql_mode` (#412):
+    /// a `\` in a string stands for itself, so `'C:\'` ends at its quote.
+    MySqlNoEscapes,
     /// PostgreSQL: every statement ends at `;`. Routine bodies are
     /// (dollar-quoted) strings; `BEGIN ATOMIC … END` keeps its `;`.
     Postgres,
@@ -45,7 +48,15 @@ pub enum Syntax {
 impl Syntax {
     /// Statements end as in SQL*Plus: at `;`, or at `/` after a block.
     fn sqlplus(self) -> bool {
-        matches!(self, Syntax::Oracle | Syntax::MySql)
+        matches!(
+            self,
+            Syntax::Oracle | Syntax::MySql | Syntax::MySqlNoEscapes
+        )
+    }
+
+    /// MySQL's or MariaDB's, with backslash escapes or without.
+    pub fn is_mysql(self) -> bool {
+        matches!(self, Syntax::MySql | Syntax::MySqlNoEscapes)
     }
 }
 
@@ -290,7 +301,7 @@ impl<'a> Splitter<'a> {
     /// line of its own (#203): `x`, and where the line ends.
     fn delimiter_command(&self, idx: usize) -> Option<(&'a str, usize)> {
         let t = &self.tokens[idx];
-        if self.syntax != Syntax::MySql || !self.word_eq(t, &["DELIMITER"]) {
+        if !self.syntax.is_mysql() || !self.word_eq(t, &["DELIMITER"]) {
             return None;
         }
         let line_end = self.src[t.span.end..]
@@ -543,7 +554,7 @@ impl<'a> Splitter<'a> {
             }
             return StatementKind::Sql;
         }
-        if self.syntax == Syntax::MySql && self.word_eq(first, &["BEGIN"]) {
+        if self.syntax.is_mysql() && self.word_eq(first, &["BEGIN"]) {
             // `BEGIN [WORK]` starts a transaction; MariaDB's `BEGIN NOT
             // ATOMIC` opens a block (#225).
             let block = words.next().is_some_and(|n| self.word_eq(n, &["NOT"]));
@@ -571,7 +582,7 @@ impl<'a> Splitter<'a> {
                 return StatementKind::SqlPlus;
             }
         }
-        let mysql = self.syntax == Syntax::MySql;
+        let mysql = self.syntax.is_mysql();
         // MySQL's events: `… DO BEGIN … END` is a block, up to `/` or the
         // DELIMITER, a body without one ends at `;` (#432).
         let event_block = |mut rest: std::iter::Take<_>| {
@@ -1473,6 +1484,23 @@ mod tests {
                 (StatementKind::Sql, "exec sp_who\n  @loginame = 'sa'"),
             ]
         );
+    }
+
+    /// Under MySQL's NO_BACKSLASH_ESCAPES, `'C:\'` and `"C:\"` end at their
+    /// quote (#412): with backslash escapes the string ran on to the end of
+    /// the script, one statement.
+    #[test]
+    fn mysql_without_backslash_escapes() {
+        let src = "select 'C:\\' as p;\nselect \"D:\\\" as q, 'it''s';\nselect 3;";
+        assert_eq!(
+            split_in(src, Syntax::MySqlNoEscapes),
+            vec![
+                (StatementKind::Sql, "select 'C:\\' as p"),
+                (StatementKind::Sql, "select \"D:\\\" as q, 'it''s'"),
+                (StatementKind::Sql, "select 3"),
+            ]
+        );
+        assert_eq!(split_in(src, Syntax::MySql).len(), 1);
     }
 
     /// Service Broker's END CONVERSATION ends no block (#448): the block

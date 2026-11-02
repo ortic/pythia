@@ -131,7 +131,9 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
             Err(()) => TokenKind::Error,
         };
         let own = match syntax {
-            Syntax::MySql => mysql_token(src, kind, span.clone()),
+            Syntax::MySql | Syntax::MySqlNoEscapes => {
+                mysql_token(src, kind, span.clone(), syntax == Syntax::MySql)
+            }
             Syntax::Postgres => postgres_token(src, kind, span.clone()),
             _ => None,
         };
@@ -143,7 +145,7 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
         }
         // Oracle's `$IF` and `$$name` (#171): the raw lexer knows `$` only
         // in dollar-quoted strings. PostgreSQL's `$$name` is one (#201).
-        if !matches!(syntax, Syntax::MySql | Syntax::Postgres)
+        if !(syntax.is_mysql() || syntax == Syntax::Postgres)
             && matches!(kind, TokenKind::Ident | TokenKind::Keyword)
             && let Some(last) = tokens.last_mut().filter(|t: &&mut Token| {
                 t.kind == TokenKind::Error
@@ -259,7 +261,7 @@ fn push_leading<'a>(sql: &'a str, syntax: Syntax, n: usize, out: &mut Vec<&'a st
             continue;
         }
         match text.strip_prefix("/*!") {
-            Some(code) if syntax == Syntax::MySql && t.kind == TokenKind::Hint => {
+            Some(code) if syntax.is_mysql() && t.kind == TokenKind::Hint => {
                 let code = code.strip_suffix("*/").unwrap_or(code);
                 let code = code.trim_start_matches(|c: char| c.is_ascii_digit());
                 push_leading(code, syntax, n, out);
@@ -270,8 +272,14 @@ fn push_leading<'a>(sql: &'a str, syntax: Syntax, n: usize, out: &mut Vec<&'a st
 }
 
 /// A token MySQL reads differently from Oracle, as its kind and where it
-/// ends; `None` when it reads it the same.
-fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenKind, usize)> {
+/// ends; `None` when it reads it the same. A string has backslash escapes
+/// unless the session's `sql_mode` turns them off (#412).
+fn mysql_token(
+    src: &str,
+    kind: TokenKind,
+    span: Range<usize>,
+    escapes: bool,
+) -> Option<(TokenKind, usize)> {
     let text = &src[span.clone()];
     match kind {
         TokenKind::LineComment => {
@@ -306,7 +314,7 @@ fn mysql_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(TokenK
         }
         TokenKind::String | TokenKind::QuotedIdent if !text.starts_with(['$', '`']) => {
             let quote = text.find(['\'', '"'])?;
-            let end = escaped_string_end(src, span.start + quote);
+            let end = string_end(src, span.start + quote, escapes);
             (end != span.end || kind == TokenKind::QuotedIdent).then_some((TokenKind::String, end))
         }
         _ => None,
@@ -320,19 +328,19 @@ fn postgres_token(src: &str, kind: TokenKind, span: Range<usize>) -> Option<(Tok
     (kind.is_word()
         && src[span.clone()].eq_ignore_ascii_case("e")
         && src[span.end..].starts_with('\''))
-    .then(|| (TokenKind::String, escaped_string_end(src, span.end)))
+    .then(|| (TokenKind::String, string_end(src, span.end, true)))
 }
 
-/// Where a string with backslash escapes that opens at `open` ends: after
-/// its closing quote (a doubled one stands for itself), or at the end of
-/// the text.
-fn escaped_string_end(src: &str, open: usize) -> usize {
+/// Where a string that opens at `open` ends, with backslash escapes or
+/// without: after its closing quote (a doubled one stands for itself), or
+/// at the end of the text.
+fn string_end(src: &str, open: usize, escapes: bool) -> usize {
     let bytes = src.as_bytes();
     let quote = bytes[open];
     let mut i = open + 1;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2,
+            b'\\' if escapes => i += 2,
             b if b == quote && bytes.get(i + 1) == Some(&quote) => i += 2,
             b if b == quote => return i + 1,
             _ => i += 1,
@@ -422,7 +430,7 @@ fn string(lex: &mut logos::Lexer<TokenKind>) {
 /// has no dollar quotes: `$$` is text there, as in `DELIMITER $$`.
 fn dollar_string(lex: &mut logos::Lexer<TokenKind>) -> bool {
     let syntax = lex.extras;
-    if syntax == Syntax::MySql {
+    if syntax.is_mysql() {
         return false;
     }
     let rest = lex.remainder();

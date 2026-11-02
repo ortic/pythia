@@ -987,7 +987,9 @@ pub fn is_keyword(word: &str) -> bool {
 pub fn is_reserved(word: &str, syntax: crate::Syntax) -> bool {
     match syntax {
         crate::Syntax::Oracle => contains(ORACLE_RESERVED, word) || is_keyword(word),
-        crate::Syntax::MySql => contains(MYSQL_RESERVED, word) || is_keyword(word),
+        crate::Syntax::MySql | crate::Syntax::MySqlNoEscapes => {
+            contains(MYSQL_RESERVED, word) || is_keyword(word)
+        }
         crate::Syntax::Postgres => contains(POSTGRES_RESERVED, word),
         crate::Syntax::TSql => contains(TSQL_RESERVED, word),
         crate::Syntax::Sqlite => contains(SQLITE_RESERVED, word),

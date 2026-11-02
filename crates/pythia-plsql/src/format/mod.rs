@@ -469,7 +469,7 @@ pub fn equivalent_in(a: &str, b: &str, syntax: Syntax) -> bool {
                 // case, only reserved words don't (#419).
                 let text = match t.kind {
                     TokenKind::Keyword | TokenKind::Ident
-                        if syntax == Syntax::MySql && !crate::keywords::is_mysql_reserved(text) =>
+                        if syntax.is_mysql() && !crate::keywords::is_mysql_reserved(text) =>
                     {
                         text.to_owned()
                     }
