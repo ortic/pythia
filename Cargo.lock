@@ -6096,7 +6096,7 @@ dependencies = [
 [[package]]
 name = "tiberius"
 version = "0.13.0"
-source = "git+https://github.com/ortic/tiberius?rev=54a0969477f45974ef8e79d2c9911254ee453628#54a0969477f45974ef8e79d2c9911254ee453628"
+source = "git+https://github.com/ortic/tiberius?rev=31e0164bd48e4a1d81734cfa3b88c57c828e0b38#31e0164bd48e4a1d81734cfa3b88c57c828e0b38"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
@@ -6129,7 +6129,7 @@ dependencies = [
 [[package]]
 name = "tiberius-macros"
 version = "0.1.0"
-source = "git+https://github.com/ortic/tiberius?rev=54a0969477f45974ef8e79d2c9911254ee453628#54a0969477f45974ef8e79d2c9911254ee453628"
+source = "git+https://github.com/ortic/tiberius?rev=31e0164bd48e4a1d81734cfa3b88c57c828e0b38#31e0164bd48e4a1d81734cfa3b88c57c828e0b38"
 dependencies = [
  "proc-macro2",
  "quote",

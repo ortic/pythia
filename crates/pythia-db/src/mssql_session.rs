@@ -1472,6 +1472,9 @@ mod tests {
         );
         assert_eq!(timeout("server=localhost;commandtimeout = 0"), None);
         assert!(config("Server=localhost;Command Timeout=soon").is_err());
+        // Non-ASCII values (#414): the string was refused whole.
+        let c = config("Server=sql01;Database=Bücher;User ID=app;Password='Grüße;1'");
+        assert_eq!(c.map(|c| c.get_addr()).ok().as_deref(), Some("sql01:1433"));
     }
 
     #[test]

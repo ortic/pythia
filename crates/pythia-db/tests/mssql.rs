@@ -270,7 +270,8 @@ fn values_types_and_binds() {
                 cast('13:45:01.5' as time(1)) tm, \
                 cast('6F9619FF-8B86-D011-B42D-00C04FC964FF' as uniqueidentifier) g, \
                 cast(2.5 as float) f, cast(-123 as numeric(18,0)) z, \
-                cast(-0.05 as decimal(5,2)) nd",
+                cast(-0.05 as decimal(5,2)) nd, cast(922337203685477.5807 as money) mo, \
+                cast(-1234567890123.4567 as money) mn, cast(-5 as smallmoney) sm",
     ) else {
         panic!("expected QueryStarted")
     };
@@ -296,6 +297,10 @@ fn values_types_and_binds() {
             Some("2.5".into()),
             Some("-123".into()),
             Some("-0.05".into()),
+            // Every digit of money (#186): as a double, …477.6 and …4568.
+            Some("922337203685477.5807".into()),
+            Some("-1234567890123.4567".into()),
+            Some("-5.0000".into()),
         ]
     );
     h.settle();
