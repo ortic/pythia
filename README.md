@@ -367,9 +367,12 @@ for Linux, Windows and macOS.
   comments and grants, in one block that a failing create undoes.
 - On SQL Server every result set of a batch shows; `PRINT` output and
   informational messages show as messages, in order with them. Break
-  stops the batch and keeps the transaction. The driver is our fork of
-  [tiberius](https://github.com/ortic/tiberius) (branch `pythia`), which
-  passes those messages on and reads the server's answer to a Break.
+  stops the batch and keeps the transaction. So does a statement run
+  while a result has rows left, when that result's batch only reads; one
+  that may change something is read to its end first. The driver is our
+  fork of [tiberius](https://github.com/ortic/tiberius) (branch `pythia`),
+  which passes those messages on and reads the server's answer to a
+  Break.
 
 **SQLite (experimental)**
 - *Type: SQLite* with the database file's path (*…* picks one, *New…*

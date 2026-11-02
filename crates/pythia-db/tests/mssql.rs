@@ -495,25 +495,21 @@ fn queries_see_commits_and_lock_nothing() {
     a.ok("drop table fresh_t");
 }
 
-/// The next statement closes a result with rows left, and runs once the
-/// driver has read the rest off the wire: SQL Server isn't stopped, as
-/// MySQL's server is by KILL QUERY.
+/// The next statement closes a result with rows left, and stops the
+/// server, as MySQL's KILL QUERY and PostgreSQL's cancel do (#383): the
+/// rest isn't sent and read off the wire first. An open transaction stays.
 #[test]
-fn closing_an_open_result_reads_the_rest_off_the_wire() {
+fn closing_an_open_result_stops_the_server() {
     let Some(mut h) = Harness::connect() else {
         return;
     };
-    // A million rows; only ten are fetched. The driver reads the rest.
-    let big = "select top 1000000 a.object_id, b.name \
-               from sys.all_objects a cross join sys.all_objects b";
-    h.execute(1, big, 10);
+    h.ok("create table #kept (n int)");
+    assert!(h.ok("insert into #kept values (1)"));
+    // A hundred million rows, a minute to send; only ten are fetched.
+    h.execute(1, &counted(100_000_000, ""), 10);
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
 
-    // The next statement waits while the driver reads the rest off the
-    // wire, as fast as the server sends it, without making rows of it (the
-    // server isn't stopped, as MySQL's is): a second or two, ten on a busy
-    // machine. The limit is for waiting longer than that.
     let started = Instant::now();
     h.execute(3, "select 'next'", 10);
     assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
@@ -526,10 +522,12 @@ fn closing_an_open_result_reads_the_rest_off_the_wire() {
     };
     assert_eq!(rows[0][0].as_deref(), Some("next"));
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
+    assert!(h.settle(), "the transaction is still open");
+    assert_eq!(h.scalar("select count(*) from #kept").as_deref(), Some("1"));
 
     // Fetching more of the closed result says it is closed.
     h.session.send(DbRequest::FetchMore {
@@ -538,16 +536,66 @@ fn closing_an_open_result_reads_the_rest_off_the_wire() {
     });
     assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
 
+    // A result the server has sent in full is closed too.
     h.execute(2, &numbers(30), 10);
     assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
     assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
     h.session.send(DbRequest::Rollback);
     assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 2 }));
+    // The query's end, then the rollback's.
+    assert!(h.settle());
+    assert!(!h.settle());
 
     // The connection is in step.
     for i in 0..3 {
         assert_eq!(h.scalar(&format!("select {i}")), Some(i.to_string()));
     }
+}
+
+/// A batch that may change something, closed with rows left, isn't
+/// stopped (#383): a change with OUTPUT is made whole, as with no result
+/// open. Nor is a query when XACT_ABORT is on in a transaction, which the
+/// attention would roll back.
+#[test]
+fn closing_a_result_keeps_the_changes_of_its_batch() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("create table #changed (n int)");
+    let output = counted(200_000, "insert into #changed output inserted.n ");
+    h.execute(1, &output, 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.execute(2, "select count(*) from #changed", 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 1 }));
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 2, .. }
+    ));
+    let DbEvent::Rows { rows: inserted, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(inserted[0][0].as_deref(), Some("200000"));
+    assert!(h.settle());
+
+    h.ok("set xact_abort on");
+    h.execute(3, &counted(200_000, ""), 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.execute(4, "select @@trancount", 10);
+    assert!(matches!(h.next_result(), DbEvent::QueryClosed { id: 3 }));
+    assert!(matches!(
+        h.next_result(),
+        DbEvent::QueryStarted { id: 4, .. }
+    ));
+    let DbEvent::Rows { rows: open, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(open[0][0].as_deref(), Some("1"), "the transaction is kept");
+    assert!(h.settle());
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    h.ok("set xact_abort off");
 }
 
 /// A query of `rows` numbers made of VALUES only, `into` before its
