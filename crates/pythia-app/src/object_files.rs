@@ -36,9 +36,11 @@ pub fn relative_path(object_type: ObjectType, name: &str) -> Option<PathBuf> {
 /// unquoted is its lowercase as before (`DEMO_EMP` → `demo_emp`). Letters
 /// are lowercase, and a `^` stands before each run of the other case
 /// (`"Foo"` → `f^oo`, `"foo"` → `^foo`). What a file name can't hold on
-/// Windows, `%` and `^` themselves, and a letter whose case doesn't turn
-/// back (`ß`) are `%` and the hex of their UTF-8 (`"A/B"` → `a%2Fb`), as
-/// is the last letter of a device's name (`CON` → `co%4E`).
+/// Windows, `%` and `^` themselves, a `.` (which would read as the start
+/// of the extension: `X.DDL`'s data was `x.ddl.sql`, the DDL file of `X`)
+/// and a letter whose case doesn't turn back (`ß`) are `%` and the hex of
+/// their UTF-8 (`"A/B"` → `a%2Fb`), as is the last letter of a device's
+/// name (`CON` → `co%4E`).
 /// [`object_name`] reads it back.
 pub fn file_stem(name: &str) -> String {
     let mut stem = String::new();
@@ -63,7 +65,7 @@ pub fn file_stem(name: &str) -> String {
                 }
                 stem.push(letter);
             }
-            None if cased || c.is_control() || "<>:\"/\\|?*%^".contains(c) => {
+            None if cased || c.is_control() || "<>:\"/\\|?*%^.".contains(c) => {
                 escape(&mut stem, c);
             }
             None => stem.push(c),
@@ -300,6 +302,8 @@ mod tests {
             "Ärzte",
             "STRAßE",
             "TAB\tX",
+            "X.DDL",
+            "CON.X",
         ];
         let mut seen = std::collections::HashMap::new();
         for name in names {
@@ -333,6 +337,8 @@ mod tests {
             ("A/B", "a%2Fb"),
             ("CON", "co%4E"),
             ("ÄRZTE", "ärzte"),
+            // Not the DDL file of X, `x.ddl.sql`.
+            ("X.DDL", "x%2Eddl"),
         ] {
             assert_eq!(file_stem(name), stem);
         }
@@ -340,6 +346,7 @@ mod tests {
         assert_eq!(object_name("billing"), Some("BILLING".into()));
         assert_eq!(object_name("Billing"), Some("BILLING".into()));
         assert_eq!(object_name("a%2"), None);
+        assert_eq!(object_name("x.ddl"), Some("X.DDL".into()));
     }
 
     #[test]

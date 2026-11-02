@@ -93,6 +93,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: `money` sorts by its amount, and the selection's summary
   and charts count it (#407); written as `$1,234.56`, it sorted as text
   and was left out.
+- Export tables and Export schema write a `.` in an object's name as
+  `%2E` in its file's name (#408): `"X.DDL"`'s rows went to
+  `x.ddl.sql`, over the DDL of table `X`.
 
 ## [0.11.0] - 2026-11-02
 
