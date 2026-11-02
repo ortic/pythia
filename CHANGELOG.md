@@ -29,6 +29,10 @@ All notable changes to Pythia are documented here. The format follows
   now read with the database's comments (and SQL Server's `#temp`
   names), and a result is editable only when it ends with the key
   columns that were added.
+- PostgreSQL and SQL Server: block comments nest, as the servers read
+  them (#391). In `/* off /* step 2 */ delete from t; */`, Pythia ended
+  the comment at the first `*/` and ran the `delete`, which the server
+  would have left commented out. The editor highlights it as comment too.
 
 ## [0.11.0] - 2026-11-02
 

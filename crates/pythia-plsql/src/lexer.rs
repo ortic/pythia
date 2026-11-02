@@ -299,10 +299,47 @@ fn is_directive(dollars: &str, word: &str) -> bool {
 }
 
 /// Consumes a block comment body up to and including `*/` (or end of input).
+/// PostgreSQL and SQL Server nest them: `/* a /* b */ c */` is one comment.
 fn block_comment(lex: &mut logos::Lexer<TokenKind>) {
     let rest = lex.remainder();
-    let len = rest.find("*/").map_or(rest.len(), |i| i + 2);
+    let len = comment_body(rest, lex.extras).unwrap_or(rest.len());
     lex.bump(len);
+}
+
+/// The length of a block comment's body in `rest`, the text after its
+/// `/*`, up to and including the `*/` that closes it; or, if `rest` ends
+/// first, how many comments are still open there. Only PostgreSQL and SQL
+/// Server count a `/*` inside.
+fn comment_body(rest: &str, syntax: Syntax) -> Result<usize, usize> {
+    let nests = matches!(syntax, Syntax::Postgres | Syntax::TSql);
+    let bytes = rest.as_bytes();
+    let (mut depth, mut i) = (1, 0);
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"/*" if nests => {
+                depth += 1;
+                i += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 || !nests {
+                    return Ok(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Err(depth)
+}
+
+/// How many block comments are still open at the end of `comment`, a
+/// block comment token's text (with its `/*`): 0 when it is closed.
+/// Comments nest in PostgreSQL's and SQL Server's syntax.
+pub fn open_comments(comment: &str, syntax: Syntax) -> usize {
+    comment
+        .strip_prefix("/*")
+        .map_or(0, |body| comment_body(body, syntax).err().unwrap_or(0))
 }
 
 /// Consumes a string body after the opening quote, honouring `''` escapes.
@@ -453,6 +490,41 @@ mod tests {
         );
         assert_eq!(kinds("q'[abc"), vec![(TokenKind::QString, "q'[abc")]);
         assert_eq!(kinds("$$ ab;c"), vec![(TokenKind::String, "$$ ab;c")]);
+    }
+
+    /// PostgreSQL and SQL Server nest block comments; Oracle, MySQL and
+    /// SQLite end one at the first `*/`.
+    #[test]
+    fn nested_block_comments() {
+        let src = "/* off /* step 2 */ delete from t; */ select 1";
+        let first = |syntax| {
+            let t = &tokenize_in(src, syntax)[0];
+            (t.kind, &src[t.span.clone()])
+        };
+        for syntax in [Syntax::Postgres, Syntax::TSql] {
+            assert_eq!(
+                first(syntax),
+                (
+                    TokenKind::BlockComment,
+                    "/* off /* step 2 */ delete from t; */"
+                ),
+                "{syntax:?}"
+            );
+        }
+        for syntax in [Syntax::Oracle, Syntax::MySql, Syntax::Sqlite] {
+            assert_eq!(
+                first(syntax),
+                (TokenKind::BlockComment, "/* off /* step 2 */"),
+                "{syntax:?}"
+            );
+        }
+        assert_eq!(open_comments("/* a /* b */", Syntax::Postgres), 1);
+        assert_eq!(open_comments("/* a /* b", Syntax::TSql), 2);
+        assert_eq!(open_comments("/* a /* b */ */", Syntax::TSql), 0);
+        assert_eq!(open_comments("/* a /* b */", Syntax::Oracle), 0);
+        assert_eq!(open_comments("/* a /* b", Syntax::Oracle), 1);
+        assert_eq!(open_comments("/**/", Syntax::Postgres), 0);
+        assert_eq!(open_comments("/*/", Syntax::Postgres), 1);
     }
 
     fn mysql_kinds(src: &str) -> Vec<(TokenKind, &str)> {

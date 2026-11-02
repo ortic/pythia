@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use pythia_plsql::{Syntax, TokenKind, tokenize_in};
+use pythia_plsql::{Syntax, TokenKind, open_comments, tokenize_in};
 use ropey::Rope;
 
 use super::text::line_text;
@@ -20,6 +20,9 @@ pub enum LineState {
     Normal,
     /// Inside `/* ... */`.
     Comment,
+    /// Inside that many nested `/* ... */`, two or more: PostgreSQL and SQL
+    /// Server nest them.
+    Comments(u8),
     /// Inside `/*+ ... */`.
     Hint,
     /// Inside `'...'`.
@@ -99,6 +102,7 @@ pub fn lex_line_in(line: &str, state: LineState, syntax: Syntax) -> (Vec<LineTok
     let prefix: String = match state {
         LineState::Normal | LineState::Dollar(_) => String::new(),
         LineState::Comment => "/*".into(),
+        LineState::Comments(n) => "/*".repeat(usize::from(n)),
         LineState::Hint => "/*+".into(),
         LineState::Str => "'".into(),
         LineState::DoubleStr => "\"".into(),
@@ -375,7 +379,11 @@ fn mark_sqlplus(line: &str, tokens: &mut [LineToken]) {
 /// State after the last token of a line: unterminated constructs continue.
 fn end_state(text: &str, kind: TokenKind, syntax: Syntax) -> LineState {
     match kind {
-        TokenKind::BlockComment if !(text.len() >= 4 && text.ends_with("*/")) => LineState::Comment,
+        TokenKind::BlockComment => match open_comments(text, syntax) {
+            0 => LineState::Normal,
+            1 => LineState::Comment,
+            n => LineState::Comments(n.min(255) as u8),
+        },
         TokenKind::Hint if !(text.len() >= 5 && text.ends_with("*/")) => LineState::Hint,
         TokenKind::String if text.starts_with('$') => {
             let tag = &text[1..text[1..].find('$').map_or(1, |i| i + 1)];
@@ -763,6 +771,32 @@ mod tests {
             LineState::Normal
         );
         assert_eq!(postgres(r"x = E'it\'", LineState::Normal).1, open);
+    }
+
+    /// A comment in a comment, on PostgreSQL and SQL Server, ends with
+    /// the second `*/`: the line between them is still comment.
+    #[test]
+    fn nested_comments_across_lines() {
+        let (_, state) = postgres("/* disabled", LineState::Normal);
+        assert_eq!(state, LineState::Comment);
+        let (_, state) = postgres("/* step 2: purge */", state);
+        assert_eq!(state, LineState::Comment);
+        let (tokens, state) = postgres("delete from t;", state);
+        assert_eq!(tokens, [(TokenKind::BlockComment, "delete from t;")]);
+        let (_, state) = postgres("/* a /* b", state);
+        assert_eq!(state, LineState::Comments(3));
+        let (_, state) = postgres("*/ */", state);
+        assert_eq!(state, LineState::Comment);
+        let (tokens, state) = postgres("*/ select 1", state);
+        assert_eq!(tokens[0], (TokenKind::BlockComment, "*/"));
+        assert_eq!(state, LineState::Normal);
+        let (_, state) = lex_line_in("/* a /* b */ x */ y", LineState::Normal, Syntax::TSql);
+        assert_eq!(state, LineState::Normal);
+        // Oracle's end at the first `*/`.
+        assert_eq!(
+            kinds("/* a /* b */ x", LineState::Normal).0.last(),
+            Some(&(TokenKind::Ident, "x"))
+        );
     }
 
     #[test]
