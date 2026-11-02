@@ -8,6 +8,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime};
+use pythia_db::Dialect;
 
 use crate::{Error, Result};
 
@@ -370,23 +371,19 @@ pub fn oracle_type(info: &ColumnInfo) -> String {
     }
 }
 
-/// Turns a header into an Oracle column name: `Order date` → `ORDER_DATE`.
+/// Turns a header into an Oracle column name: `Order date` → `ORDER_DATE`,
+/// `Café` → `CAFÉ` as Oracle folds `café` (#380).
 pub fn column_name(header: &str) -> String {
-    let mut name: String = header
+    let name = header
         .trim()
         .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>()
         .split('_')
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("_");
+    let mut name = Dialect::ORACLE.dictionary_name(&name);
     if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
         name = format!("C_{name}");
     }
@@ -499,6 +496,9 @@ mod tests {
         assert_eq!(column_name("Order date"), "ORDER_DATE");
         assert_eq!(column_name(" 2nd value! "), "C_2ND_VALUE");
         assert_eq!(column_name(&"Ä".repeat(100)).len(), 128);
+        // As Oracle folds café and straße (#380).
+        assert_eq!(column_name("Café"), "CAFÉ");
+        assert_eq!(column_name("Straße"), "STRAßE");
     }
 
     #[test]

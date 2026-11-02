@@ -306,9 +306,20 @@ impl Dialect {
     /// How the dictionary stores an unquoted name the user typed: Oracle
     /// folds it to uppercase, PostgreSQL to lowercase; MySQL, SQL Server and
     /// SQLite keep it (and compare names without case where it matters).
+    /// Oracle folds letter by letter, each to one letter: café is CAFÉ,
+    /// straße STRAßE, not STRASSE (#380).
     pub fn dictionary_name(self, name: &str) -> String {
         match self.0 {
-            DbKind::Oracle => name.to_uppercase(),
+            DbKind::Oracle => name
+                .chars()
+                .map(|c| {
+                    let mut upper = c.to_uppercase();
+                    match (upper.next(), upper.next()) {
+                        (Some(one), None) => one,
+                        _ => c,
+                    }
+                })
+                .collect(),
             DbKind::Postgres => name.to_lowercase(),
             DbKind::MySql | DbKind::SqlServer | DbKind::Sqlite => name.to_owned(),
         }
@@ -382,6 +393,17 @@ mod tests {
         assert_eq!(Dialect::MYSQL.typed_name("`my db`"), "my db");
         assert_eq!(Dialect::MYSQL.typed_name("Shop"), "Shop");
         assert_eq!(Dialect::SQLSERVER.typed_name("[a]]b]"), "a]b");
+    }
+
+    /// Oracle folds an unquoted name letter by letter, each to one letter:
+    /// café is CAFÉ, straße STRAßE (#380).
+    #[test]
+    fn oracle_folds_letter_by_letter() {
+        let o = Dialect::ORACLE;
+        assert_eq!(o.dictionary_name("café"), "CAFÉ");
+        assert_eq!(o.dictionary_name("straße"), "STRAßE");
+        assert_eq!(o.typed_name("r83_straße"), "R83_STRAßE");
+        assert_eq!(o.typed_parts("hr.straße"), ["HR", "STRAßE"]);
     }
 
     /// A typed `owner.name` splits at the dots outside quotes (#369).

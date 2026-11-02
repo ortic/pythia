@@ -3926,7 +3926,8 @@ fn import_csv() {
 
 /// Imports into new tables named as given: a quoted name keeps its case,
 /// and columns that read quoted (a reserved word, a letter that isn't
-/// ASCII) are created as they are inserted into (#335).
+/// ASCII) are created as they are inserted into (#335). Café is CAFÉ, as
+/// Oracle reads café (#380).
 #[test]
 fn import_keeps_quoted_names() {
     let Some((profile, password)) = profile() else {
@@ -3959,7 +3960,7 @@ fn import_keeps_quoted_names() {
         let rows: Vec<(i64, String, String)> = conn
             .query_as(
                 &format!(
-                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), \"CAFé\" from {table} order by id"
+                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), café from {table} order by id"
                 ),
                 &[],
             )
@@ -9225,7 +9226,7 @@ fn describe_takes_names_as_typed() {
     let (cred, db) = spec.rsplit_once('@').unwrap();
     let (user, pw) = cred.split_once('/').unwrap();
     let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
-    let tables = ["\"R83_Desc\"", "r83_desc", "\"R83.Desc\""];
+    let tables = ["\"R83_Desc\"", "r83_desc", "\"R83.Desc\"", "r83_straße"];
     for t in tables {
         let _ = conn.execute(&format!("drop table {t} purge"), &[]);
     }
@@ -9233,6 +9234,7 @@ fn describe_takes_names_as_typed() {
         "create table \"R83_Desc\" (id number(4) not null, \"Mixed\" varchar2(5))",
         "create table r83_desc (plain date)",
         "create table \"R83.Desc\" (described number)",
+        "create table r83_straße (lang varchar2(2))",
     ] {
         conn.execute(ddl, &[]).unwrap();
     }
@@ -9245,6 +9247,8 @@ fn describe_takes_names_as_typed() {
         "r83_desc",
         "pythia.\"R83.Desc\"",
         "\"R83.Desc\"",
+        // R83_STRAßE, as Oracle folds it (#380).
+        "r83_straße",
     ] {
         let (_, rows, _) = grid_rows(&mut h, "pythia@FREEPDB1", &format!("desc {name}"));
         let columns: Vec<String> = rows
@@ -9263,6 +9267,7 @@ fn describe_takes_names_as_typed() {
             ("r83_desc", "PLAIN".to_owned()),
             ("pythia.\"R83.Desc\"", "DESCRIBED".to_owned()),
             ("\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("r83_straße", "LANG".to_owned()),
         ]
     );
 }
