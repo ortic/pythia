@@ -7,6 +7,13 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- SQL Server: `money` and `smallmoney` show every digit (#186): read as
+  a double, 922337203685477.5807 showed as 922337203685477.6, and an
+  edit of such a value found no row. They show with their four decimals,
+  as SQL Server writes them.
+- SQL Server: an ADO.NET connection string with a non-ASCII character
+  (`Database=Bücher`, a password `Grüße`) connects (#414); it was
+  refused whole.
 - SQLite: the Triggers tab shows a trigger's event right when the
   trigger's name is an event word itself (#386): `create trigger
   "delete" after insert …` showed as `DELETE AFTER INSERT`. A
