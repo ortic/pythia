@@ -1500,6 +1500,7 @@ fn column_defaults_read_as_sql() {
            b bit(3) default b'101', dd date default '2020-01-01', t time default '12:30:00', \
            ts timestamp null default current_timestamp on update current_timestamp, \
            dt datetime(3) default current_timestamp(3), u varchar(36) default (uuid()), \
+           x text default ('it''s'), j json default (json_object('a', 'b\\\\c')), \
            n varchar(5) default null, nn varchar(5) not null)",
     );
     let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
@@ -1513,10 +1514,24 @@ fn column_defaults_read_as_sql() {
         .iter()
         .map(|c| (c.name.as_str(), c.default.as_deref()))
         .collect();
-    let (now, now3, null) = if mariadb {
-        ("current_timestamp()", "current_timestamp(3)", Some("NULL"))
+    // An expression's strings as SHOW CREATE TABLE writes them, not
+    // escaped once more as MySQL's information_schema gives them.
+    let (now, now3, null, text, json) = if mariadb {
+        (
+            "current_timestamp()",
+            "current_timestamp(3)",
+            Some("NULL"),
+            r"'it\'s'",
+            r"json_object('a','b\\c')",
+        )
     } else {
-        ("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(3)", None)
+        (
+            "CURRENT_TIMESTAMP",
+            "CURRENT_TIMESTAMP(3)",
+            None,
+            r"_utf8mb4'it\'s'",
+            r"json_object(_utf8mb4'a',_utf8mb4'b\\c')",
+        )
     };
     assert_eq!(
         defaults,
@@ -1536,6 +1551,8 @@ fn column_defaults_read_as_sql() {
             ("ts", Some(now)),
             ("dt", Some(now3)),
             ("u", Some("uuid()")),
+            ("x", Some(text)),
+            ("j", Some(json)),
             ("n", null),
             ("nn", None),
         ]

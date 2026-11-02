@@ -11,6 +11,10 @@ All notable changes to Pythia are documented here. The format follows
   trigger's name is an event word itself (#386): `create trigger
   "delete" after insert …` showed as `DELETE AFTER INSERT`. A
   `[bracketed]` name is unquoted too.
+- MySQL: a column's default expression with a string in it shows as
+  SHOW CREATE TABLE writes it (#387): `default ('it''s')` showed as
+  `_utf8mb4\'it\\\'s\'`, escaped once more as `information_schema`
+  gives it.
 
 ## [0.11.0] - 2026-11-02
 
