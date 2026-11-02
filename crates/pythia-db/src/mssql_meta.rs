@@ -506,10 +506,36 @@ fn ddl(
 /// they go between quotes. A typed XML column names its schema collection,
 /// which is made apart, as a foreign key's table is (#349). ROWGUIDCOL, a
 /// persisted computed column's NOT NULL and NOT FOR REPLICATION are kept
-/// (#355). What CREATE TABLE can't give follows the table: its lock
-/// escalation, foreign keys and checks that aren't trusted, disabled ones
-/// disabled, and disabled indexes (#326).
+/// (#355). A graph's node or edge table is made one, without the columns
+/// SQL Server adds to it, and with its edge constraints (#360). What CREATE
+/// TABLE can't give follows the table: its lock escalation, foreign keys
+/// and checks that aren't trusted, disabled ones disabled, and disabled
+/// indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
+    // Catalog columns of later versions: a columnstore index's ORDER
+    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022), a
+    // temporal table's HISTORY_RETENTION_PERIOD (2017), the AUTO_DROP of
+    // statistics (2022), graph tables (2017) and their edge constraints
+    // (2019).
+    let later = ms
+        .rows(
+            "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
+                    col_length('sys.indexes', 'optimize_for_sequential_key'), \
+                    col_length('sys.partitions', 'xml_compression'), \
+                    col_length('sys.tables', 'history_retention_period'), \
+                    col_length('sys.stats', 'auto_drop'), \
+                    col_length('sys.tables', 'is_node'), \
+                    col_length('sys.edge_constraints', 'object_id')",
+            &[],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    let graph = has(5);
+    let graph_type = if graph { "c.graph_type" } else { "null" };
+    // Each column and whether SQL Server added it to a graph table: those
+    // are left out, AS NODE or AS EDGE adds them (#360).
     let columns = ms.rows(
         &format!(
             "select quotename(c.name) + ' ' \
@@ -549,7 +575,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                              + case when c.is_nullable = 1 then ' null' else ' not null' end \
                              + case when c.is_rowguidcol = 1 then ' rowguidcol' else '' end \
                              + coalesce(' constraint ' + quotename(dc.name) + ' default ' \
-                                        + dc.definition, '') end \
+                                        + dc.definition, '') end, \
+                    {graph_type} \
                from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
                left join sys.computed_columns cc on cc.object_id = c.object_id \
                 and cc.column_id = c.column_id \
@@ -569,23 +596,11 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     if columns.is_empty() {
         return Err(DbError::new(format!("No table {object}")));
     }
-    // Catalog columns of later versions: a columnstore index's ORDER
-    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022), a
-    // temporal table's HISTORY_RETENTION_PERIOD (2017) and the AUTO_DROP of
-    // statistics (2022).
-    let later = ms
-        .rows(
-            "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
-                    col_length('sys.indexes', 'optimize_for_sequential_key'), \
-                    col_length('sys.partitions', 'xml_compression'), \
-                    col_length('sys.tables', 'history_retention_period'), \
-                    col_length('sys.stats', 'auto_drop')",
-            &[],
-        )?
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    let node_or_edge = if graph {
+        "case when t.is_node = 1 then 'node' when t.is_edge = 1 then 'edge' end"
+    } else {
+        "null"
+    };
     let retention = if has(3) {
         "case when t.history_retention_period > 0 \
               then cast(t.history_retention_period as varchar(10)) + ' ' \
@@ -602,7 +617,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // where SQL Server didn't name it, MSSQL_TemporalHistoryFor_ and the
     // table's object_id in its schema, so that a copy gets its own, and the
     // history's retention where it isn't infinite (#324). Its lock
-    // escalation where it isn't TABLE (#326).
+    // escalation where it isn't TABLE (#326). Whether it is a graph's node
+    // or edge table (#360).
     let table = ms
         .rows(
             &format!(
@@ -622,7 +638,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                         end, \
                         {retention}, \
                         case when t.lock_escalation <> 0 and t.is_memory_optimized = 0 \
-                             then lower(t.lock_escalation_desc collate database_default) end \
+                             then lower(t.lock_escalation_desc collate database_default) end, \
+                        {node_or_edge} \
                    from sys.tables t \
                    join sys.indexes i on i.object_id = t.object_id and i.index_id in (0, 1) \
                    left join sys.data_spaces l on l.data_space_id = t.lob_data_space_id \
@@ -640,15 +657,32 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let (durability, textimage, rows_in) = (next(), next(), next().unwrap_or_default());
     let (period, versioned) = (next(), next().as_deref() == Some("2"));
     let (history, retention, escalation) = (next(), next(), next());
+    let node_or_edge = next();
     let storage = index_storage(ms, object, has(1), has(2))?;
     let no_storage = Storage::default();
     let storage_of = |index: &str| storage.get(index).unwrap_or(&no_storage);
     let table_storage = storage_of(&rows_in);
-    // A key's columns, a foreign key's and the ones it references, and the
-    // columns of the indexes, quoted, as lists (see Lists).
+    // A key's columns, a foreign key's and the ones it references, and an
+    // edge constraint's clauses (#360), quoted, as lists (see Lists).
+    let key_column = column_of("ic", graph);
+    let clauses = if has(6) {
+        "union all \
+         select e.name, 'columns', \
+                quotename(object_schema_name(c.from_object_id)) + '.' \
+                  + quotename(object_name(c.from_object_id)) + ' to ' \
+                  + quotename(object_schema_name(c.to_object_id)) + '.' \
+                  + quotename(object_name(c.to_object_id)), \
+                c.clause_number \
+           from sys.edge_constraints e \
+           join sys.edge_constraint_clauses c on c.object_id = e.object_id \
+          where e.parent_object_id = object_id(@P1)"
+    } else {
+        ""
+    };
     let lists = Lists::read(
         ms,
-        "select k.name, 'columns', quotename(col_name(ic.object_id, ic.column_id)) \
+        &format!(
+            "select k.name, 'columns', {key_column} \
                   + case when ic.is_descending_key = 1 then ' desc' else '' end, ic.key_ordinal \
            from sys.key_constraints k \
            join sys.index_columns ic on ic.object_id = k.parent_object_id \
@@ -667,16 +701,31 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
            from sys.foreign_keys f \
            join sys.foreign_key_columns fc on fc.constraint_object_id = f.object_id \
           where f.parent_object_id = object_id(@P1) \
-          order by 4",
+         {clauses} \
+          order by 4"
+        ),
         object,
     )?;
     // Each constraint as (name, its line up to the columns, what follows
     // them: a foreign key's REFERENCES and its actions, a key's index), and
     // whether a foreign key or check isn't trusted (1), as WITH NOCHECK
     // makes it, or is disabled too (2) (#326). One NOT FOR REPLICATION is
-    // never trusted, however it is made (#355).
+    // never trusted, however it is made (#355). Edge constraints follow
+    // the checks (#360).
+    let edges = if has(6) {
+        "union all \
+         select e.name, 'constraint ' + quotename(e.name) + ' connection', null, \
+                case when e.delete_referential_action = 1 then ' on delete cascade' else '' end, \
+                null, \
+                case when e.is_disabled = 1 then 2 when e.is_not_trusted = 1 then 1 else 0 end, \
+                5 \
+           from sys.edge_constraints e where e.parent_object_id = object_id(@P1)"
+    } else {
+        ""
+    };
     let constraints = ms.rows(
-        "select name, line, refs, actions, ix, untrusted, quotename(name) from ( \
+        &format!(
+            "select name, line, refs, actions, ix, untrusted, quotename(name) from ( \
            select k.name, 'constraint ' + quotename(k.name) \
                   + case k.type when 'PK' then ' primary key ' else ' unique ' end \
                   + lower(i.type_desc collate database_default) as line, \
@@ -712,10 +761,16 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                        else 0 end, \
                   4 \
              from sys.check_constraints c where c.parent_object_id = object_id(@P1) \
-         ) x order by ord, name",
+           {edges} \
+         ) x order by ord, name"
+        ),
         &[object],
     )?;
-    let mut lines: Vec<String> = columns.into_iter().filter_map(first).collect();
+    let mut lines: Vec<String> = columns
+        .into_iter()
+        .filter(|row| !row.get(1).is_some_and(Option::is_some))
+        .filter_map(first)
+        .collect();
     // The constraints that aren't trusted are added after the table and its
     // indexes, WITH NOCHECK, and the disabled ones disabled.
     let mut nocheck = Vec::new();
@@ -775,7 +830,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
             "select i.name, case when i.type = 5 then null \
                                  when ic.is_included_column = 0 or i.type = 6 then 'columns' \
                                  when i.type = 2 then 'include' end, \
-                    quotename(col_name(ic.object_id, ic.column_id)) \
+                    {key_column} \
                       + case when ic.is_descending_key = 1 then ' desc' else '' end, \
                     ic.key_ordinal, ic.index_column_id \
                from sys.indexes i \
@@ -828,9 +883,12 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // indexes (7) are a memory-optimized table's (#302). The clustered
     // index, rowstore or columnstore, comes first, so that the others
     // aren't built again over it; hypothetical indexes, which have
-    // statistics and no rows, are left out (#327).
+    // statistics and no rows, are left out (#327), and so is a graph
+    // table's own unique index (#360).
+    let own_index = own_index(graph);
     let rows = ms.rows(
-        "select i.index_id, i.name, quotename(i.name), \
+        &format!(
+            "select i.index_id, i.name, quotename(i.name), \
                 case when i.is_unique = 1 then 'unique ' else '' end, \
                 case x.xml_index_type when 0 then 'primary xml' when 2 then 'selective xml' \
                      else lower(i.type_desc collate database_default) end, \
@@ -856,9 +914,11 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
             and t.index_id = i.index_id \
           where i.object_id = object_id(@P1) and i.type in (1, 2, 3, 4, 5, 6, 7) \
             and i.is_primary_key = 0 and i.is_unique_constraint = 0 and i.is_hypothetical = 0 \
+            {own_index} \
           order by case when i.type in (1, 5) then 0 when x.using_xml_index_id is null then 1 \
                         else 2 end, \
-                   i.name",
+                   i.name"
+        ),
         &[object],
     )?;
     for row in rows {
@@ -893,8 +953,16 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     lines.extend(period);
     // The table's filegroup or partition scheme, and its LOB data's, then
     // its options: a memory-optimized table's, a heap's compression, a
-    // temporal table's versioning.
-    let mut ddl = format!("create table {object} (\n    {}\n)", lines.join(",\n    "));
+    // temporal table's versioning. An edge table may have no columns of its
+    // own (#360).
+    let mut ddl = if lines.is_empty() {
+        format!("create table {object}")
+    } else {
+        format!("create table {object} (\n    {}\n)", lines.join(",\n    "))
+    };
+    if let Some(node_or_edge) = node_or_edge {
+        ddl.push_str(&format!(" as {node_or_edge}"));
+    }
     if let Some(on) = table_storage.on.as_ref().filter(|_| !table_storage.default) {
         ddl.push_str(&format!(" on {on}"));
     }
@@ -937,16 +1005,18 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // takes no more indexes or constraints (#326).
     let disabled = ms
         .rows(
-            "select quotename(i.name) from sys.indexes i \
-              where i.object_id = object_id(@P1) and i.is_disabled = 1 \
-                and i.is_hypothetical = 0 \
-              order by case when i.type in (1, 5) then 1 else 0 end, i.name",
+            &format!(
+                "select quotename(i.name) from sys.indexes i \
+                  where i.object_id = object_id(@P1) and i.is_disabled = 1 \
+                    and i.is_hypothetical = 0 {own_index} \
+                  order by case when i.type in (1, 5) then 1 else 0 end, i.name"
+            ),
             &[object],
         )?
         .into_iter()
         .filter_map(first)
         .map(|index| format!("alter index {index} on {object} disable;"));
-    let statistics = statistics(ms, object, has(4))?;
+    let statistics = statistics(ms, object, has(4), graph)?;
     for statement in indexes
         .into_iter()
         .chain(statistics)
@@ -961,17 +1031,26 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
 /// The statistics made on the table, after its indexes, with their filters
 /// and the options that aren't the defaults (#357); those of its indexes,
 /// and the ones SQL Server made itself, aren't. `auto_drop` tells whether
-/// the catalog has AUTO_DROP (2022). A persisted sample percent isn't kept
-/// by CREATE STATISTICS on a table without rows.
-fn statistics(ms: &mut Ms<'_>, object: &str, auto_drop: bool) -> Result<Vec<String>, DbError> {
+/// the catalog has AUTO_DROP (2022), `graph` graph tables (2017). A
+/// persisted sample percent isn't kept by CREATE STATISTICS on a table
+/// without rows.
+fn statistics(
+    ms: &mut Ms<'_>,
+    object: &str,
+    auto_drop: bool,
+    graph: bool,
+) -> Result<Vec<String>, DbError> {
+    let column = column_of("sc", graph);
     let columns = Lists::read(
         ms,
-        "select s.name, 'columns', quotename(col_name(sc.object_id, sc.column_id)), \
-                sc.stats_column_id \
-           from sys.stats s \
-           join sys.stats_columns sc on sc.object_id = s.object_id and sc.stats_id = s.stats_id \
-          where s.object_id = object_id(@P1) and s.user_created = 1 \
-          order by 4",
+        &format!(
+            "select s.name, 'columns', {column}, sc.stats_column_id \
+               from sys.stats s \
+               join sys.stats_columns sc on sc.object_id = s.object_id \
+                and sc.stats_id = s.stats_id \
+              where s.object_id = object_id(@P1) and s.user_created = 1 \
+              order by 4"
+        ),
         object,
     )?;
     let auto_drop = if auto_drop { "s.auto_drop" } else { "0" };
@@ -1011,6 +1090,40 @@ fn statistics(ms: &mut Ms<'_>, object: &str, auto_drop: bool) -> Result<Vec<Stri
             ))
         })
         .collect())
+}
+
+/// The column of `columns` (`sys.index_columns` or `sys.stats_columns`)
+/// quoted, as an index or statistics are made on it. On a graph table
+/// (`graph`: the catalog has them, from 2017), the columns SQL Server added
+/// are named as their pseudo-column, `$node_id` or `$edge_id`, and
+/// `$from_id` and `$to_id` for the pairs they stand for (#360): the second
+/// of a pair is NULL, which Lists leaves out.
+fn column_of(columns: &str, graph: bool) -> String {
+    if !graph {
+        return format!("quotename(col_name({columns}.object_id, {columns}.column_id))");
+    }
+    format!(
+        "(select case gc.graph_type \
+                   when 1 then case when gt.is_edge = 1 then '$edge_id' else '$node_id' end \
+                   when 4 then '$from_id' when 7 then '$to_id' \
+                   when 3 then null when 6 then null \
+                   else quotename(gc.name) end \
+            from sys.columns gc join sys.tables gt on gt.object_id = gc.object_id \
+           where gc.object_id = {columns}.object_id and gc.column_id = {columns}.column_id)"
+    )
+}
+
+/// A condition that leaves out the unique index SQL Server makes on a node
+/// or edge table's `$node_id` or `$edge_id`, `GRAPH_UNIQUE_INDEX_…`, where
+/// no key is on it: AS NODE or AS EDGE makes it again (#360).
+fn own_index(graph: bool) -> &'static str {
+    if graph {
+        "and not (i.name like 'GRAPH[_]UNIQUE[_]INDEX[_]%' \
+                  and i.object_id in (select g.object_id from sys.tables g \
+                                       where g.is_node = 1 or g.is_edge = 1))"
+    } else {
+        ""
+    }
 }
 
 /// What an index has that isn't the default: its options, for `with (…)`,

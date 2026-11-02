@@ -1133,6 +1133,12 @@ All notable changes to Pythia are documented here. The format follows
   `norecompute`, `incremental = on` and `auto_drop = on`. A copy had
   none of them, and SQL Server makes no statistics on several columns
   or with a filter by itself.
+- SQL Server: a graph table's DDL makes a node or edge table (#360),
+  `create table … (…) as node` or `as edge`, with its edge constraints.
+  It made a plain table with the columns SQL Server adds to a graph
+  table written out (`graph_id_…`, `$node_id_…`) and the unique index on
+  them, which took no rows without them and no `$node_id`; indexes and
+  statistics on `$node_id`, `$from_id` and `$to_id` now name those.
 
 ## [0.10.0] - 2026-10-30
 

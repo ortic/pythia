@@ -2918,6 +2918,182 @@ fn user_statistics() {
     drop_database(&mut dba, "r82_stats");
 }
 
+/// The graph tables of `owner` whose names start with `prefix`, as the
+/// catalog has them: node or edge, their columns, graph ones by their
+/// kind, their indexes, a node table's own unique index without its
+/// number, and their edge constraints.
+fn catalog_graph(h: &mut Harness, owner: &str, prefix: &str) -> Vec<Option<String>> {
+    let tables = format!(
+        "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+            and name like '{prefix}%'"
+    );
+    [
+        format!(
+            "select string_agg(concat_ws(' ', t.name, t.is_node, t.is_edge) \
+                               collate database_default, '; ') within group (order by t.name) \
+               from sys.tables t where t.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(c.object_id), \
+                                         coalesce(c.graph_type_desc, c.name), \
+                                         type_name(c.user_type_id), c.is_nullable, c.is_hidden) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(c.object_id), c.column_id) \
+               from sys.columns c where c.object_id in ({tables})"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(i.object_id), \
+                                         case when i.name like 'GRAPH[_]UNIQUE[_]INDEX[_]%' \
+                                              then 'GRAPH_UNIQUE_INDEX' else i.name end, \
+                                         i.type_desc, i.is_unique, i.is_primary_key, cols.names) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(i.object_id), i.name) \
+               from sys.indexes i \
+              outer apply (select string_agg((coalesce(c.graph_type_desc, c.name) \
+                                              + case when ic.is_descending_key = 1 \
+                                                     then ' desc' else '' end) \
+                                             collate database_default, ',') \
+                                    within group (order by ic.key_ordinal) as names \
+                             from sys.index_columns ic \
+                             join sys.columns c on c.object_id = ic.object_id \
+                              and c.column_id = ic.column_id \
+                            where ic.object_id = i.object_id and ic.index_id = i.index_id) cols \
+              where i.object_id in ({tables}) and i.type > 0"
+        ),
+        format!(
+            "select string_agg(concat_ws(' ', object_name(e.parent_object_id), e.name, \
+                                         e.delete_referential_action, e.is_disabled, \
+                                         e.is_not_trusted, cl.clauses) \
+                               collate database_default, '; ') within group (order by e.name) \
+               from sys.edge_constraints e \
+              outer apply (select string_agg(object_name(c.from_object_id) + '>' \
+                                             + object_name(c.to_object_id), ',') \
+                                    within group (order by c.clause_number) as clauses \
+                             from sys.edge_constraint_clauses c \
+                            where c.object_id = e.object_id) cl \
+              where e.parent_object_id in ({tables})"
+        ),
+    ]
+    .iter()
+    .map(|sql| h.scalar(sql))
+    .collect()
+}
+
+/// A graph table's DDL makes a node or edge table (#360), without the
+/// columns SQL Server adds to it and a node table's own unique index, with
+/// indexes and statistics on `$node_id`, `$from_id` and `$to_id`, and an
+/// edge table's edge constraints: run elsewhere, the copy is the same kind
+/// of table, which MATCH reads.
+#[test]
+fn graph_tables() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // Graph tables came with SQL Server 2017, edge constraints with 2019.
+    if major < 15 {
+        return;
+    }
+    let drop = |h: &mut Harness, owner: &str| {
+        h.ok(&format!(
+            "drop table if exists [{owner}].[r82_ge], [{owner}].[r82_gk]"
+        ));
+        drop_tables(h, owner, "r82_g");
+    };
+    drop(&mut h, "r82_copy_g");
+    h.ok("drop schema if exists r82_copy_g");
+    drop(&mut h, &schema);
+    for sql in [
+        "create table r82_gp (id int constraint r82_gp_pk primary key, name varchar(20)) as node",
+        "create table r82_gn (x int, constraint r82_gn_pk primary key nonclustered ($node_id)) \
+         as node",
+        "create index r82_gn_x on r82_gn ($node_id desc, x)",
+        "create table r82_ge (rating int, \
+         constraint r82_ge_ec connection (r82_gp to r82_gp, r82_gp to r82_gn) on delete cascade) \
+         as edge",
+        "create index r82_ge_ft on r82_ge ($from_id, $to_id desc)",
+        "create statistics r82_ge_s on r82_ge ($to_id, rating)",
+        "create table r82_gk as edge",
+        "alter table r82_gk add constraint r82_gk_ec connection (r82_gn to r82_gn)",
+        "alter table r82_gk nocheck constraint r82_gk_ec",
+    ] {
+        h.ok(sql);
+    }
+    let (gp, gn, ge, gk) = (
+        format!("[{schema}].[r82_gp]"),
+        format!("[{schema}].[r82_gn]"),
+        format!("[{schema}].[r82_ge]"),
+        format!("[{schema}].[r82_gk]"),
+    );
+    let ddls: Vec<String> = ["r82_gp", "r82_gn", "r82_ge", "r82_gk"]
+        .iter()
+        .map(|table| table_ddl(&mut h, &schema, table))
+        .collect();
+    assert_eq!(
+        ddls,
+        [
+            format!(
+                "create table {gp} (\n    \
+                   [id] int not null,\n    \
+                   [name] varchar(20) null,\n    \
+                   constraint [r82_gp_pk] primary key clustered ([id])\n\
+                 ) as node;\nGO\n"
+            ),
+            format!(
+                "create table {gn} (\n    \
+                   [x] int null,\n    \
+                   constraint [r82_gn_pk] primary key nonclustered ($node_id)\n\
+                 ) as node;\n\n\
+                 create nonclustered index [r82_gn_x] on {gn} ($node_id desc, [x]);\nGO\n"
+            ),
+            format!(
+                "create table {ge} (\n    \
+                   [rating] int null,\n    \
+                   constraint [r82_ge_ec] connection ({gp} to {gp}, {gp} to {gn}) \
+                     on delete cascade\n\
+                 ) as edge;\n\n\
+                 create nonclustered index [r82_ge_ft] on {ge} ($from_id, $to_id desc);\n\n\
+                 create statistics [r82_ge_s] on {ge} ($to_id, [rating]);\nGO\n"
+            ),
+            format!(
+                "create table {gk} as edge;\n\n\
+                 alter table {gk} with nocheck add constraint [r82_gk_ec] \
+                   connection ({gn} to {gn});\n\n\
+                 alter table {gk} nocheck constraint [r82_gk_ec];\nGO\n"
+            ),
+        ]
+    );
+    let before = catalog_graph(&mut h, &schema, "r82_g");
+    assert_eq!(before.len(), 4, "{before:?}");
+    h.ok("create schema r82_copy_g");
+    let tables = ["r82_gp", "r82_gn", "r82_ge", "r82_gk"];
+    for ddl in &ddls {
+        run_ddl_in(&mut h, ddl, &schema, "r82_copy_g", &tables);
+    }
+    assert_eq!(catalog_graph(&mut h, "r82_copy_g", "r82_g"), before);
+    // The copy's nodes and edges make a graph.
+    h.ok("insert into r82_copy_g.r82_gp values (1, 'a'), (2, 'b')");
+    h.ok("insert into r82_copy_g.r82_ge ($from_id, $to_id, rating) \
+         select a.$node_id, b.$node_id, 5 from r82_copy_g.r82_gp a, r82_copy_g.r82_gp b \
+          where a.id = 1 and b.id = 2");
+    assert_eq!(
+        h.scalar(
+            "select b.name from r82_copy_g.r82_gp a, r82_copy_g.r82_ge e, r82_copy_g.r82_gp b \
+              where match(a-(e)->b) and a.id = 1"
+        )
+        .as_deref(),
+        Some("b")
+    );
+    drop(&mut h, "r82_copy_g");
+    h.ok("drop schema r82_copy_g");
+    drop(&mut h, &schema);
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.
