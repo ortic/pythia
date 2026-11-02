@@ -153,6 +153,22 @@ All notable changes to Pythia are documented here. The format follows
   body* went from one to the other; `"PLAIN"` in the spec wasn't
   `plain` in the body. *Test…* of `"MyProc"`, from the object browser
   too, also took the parameters of a `"myproc"`.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
+- Forms keep the case of a name they pick or read (#365). The column
+  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
+  trigger failed with ORA-00904; a job's list of procedures offered
+  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
+  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
+  and *Edit* of a database link made again with its user `"hr_ro"` used
+  `HR_RO`.
 
 ## [0.11.0] - 2026-11-02
 

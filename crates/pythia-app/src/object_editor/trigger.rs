@@ -3,9 +3,11 @@
 //! further (and compiled) in a program window.
 
 use egui::{RichText, Ui};
+use pythia_db::Dialect;
 
 use super::program::source_name;
 use super::{Lists, form_grid, form_row, ident, picker};
+use crate::browser::written;
 use crate::documents::quote_ident;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -310,7 +312,8 @@ pub fn ui(ui: &mut Ui, def: &mut TriggerDef, lists: &mut Lists) {
                                 if !def.update_columns.trim().is_empty() {
                                     def.update_columns.push_str(", ");
                                 }
-                                def.update_columns.push_str(&quote_ident(&c).to_lowercase());
+                                // As SQL reads it: "Mixed" isn't "mixed" (#365).
+                                def.update_columns.push_str(&written(Dialect::ORACLE, &c));
                             }
                         }
                         None => lists.want_columns = Some(table),

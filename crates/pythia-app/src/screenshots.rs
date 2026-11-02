@@ -7298,6 +7298,144 @@ create table pythia_nof_items (id number primary key, label varchar2(40), price 
     wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
 }
 
+/// A name picked in a form, or read into it, is written as SQL reads it:
+/// the trigger's column "Mixed", the job's "R83_JobPkg"."R83_Run" and the
+/// index's tablespace "r83_ts" keep their case (#365).
+#[test]
+fn forms_take_names_as_picked() {
+    use crate::object_editor::{EditTarget, IndexDef, JobDef, TriggerDef};
+    use pythia_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table \"R83_Trg\" purge", &[]);
+    for ddl in [
+        "create table \"R83_Trg\" (id number, \"Mixed\" number)",
+        "create or replace package \"R83_JobPkg\" as procedure \"R83_Run\"; end;",
+        "create or replace package body \"R83_JobPkg\" as\n  \
+         procedure \"R83_Run\" is begin null; end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    // A tablespace of lowercase letters, which only a DBA makes.
+    let dba = crate::test_db::connect("PYTHIA_TEST_DB_DBA");
+    if let Some(dba) = &dba {
+        let _ = dba.execute(
+            "drop tablespace \"r83_ts\" including contents and datafiles",
+            &[],
+        );
+        let file: String = dba
+            .query_row_as(
+                "select substr(file_name, 1, instr(file_name, '/', -1)) from dba_data_files \
+                  where tablespace_name = 'USERS'",
+                &[],
+            )
+            .unwrap();
+        for sql in [
+            format!("create tablespace \"r83_ts\" datafile '{file}r83_ts01.dbf' size 8m"),
+            format!("alter user {user} quota 1m on \"r83_ts\""),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    }
+    let table = ObjectRef {
+        owner: "PYTHIA".into(),
+        name: "R83_Trg".into(),
+        object_type: ObjectType::Table,
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let open = |h: &mut Ui, target| {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: "pythia@FREEPDB1".into(),
+            target,
+        });
+        h.run_steps(2);
+        wait_until(h, "form", |app| !app.test_focused_busy());
+        h.run_steps(2);
+    };
+    let new = |object_type, from: Option<&ObjectRef>| EditTarget::New {
+        owner: "PYTHIA".into(),
+        object_type,
+        from: from.cloned(),
+    };
+    // Opens the `nth` picker of the form, once it shows, and picks `item`,
+    // typed into its filter (a long list scrolls).
+    let pick = |h: &mut Ui, nth: usize, item: &str| {
+        let start = Instant::now();
+        while h.query_all_by_label("▾").count() <= nth {
+            assert!(start.elapsed() < Duration::from_secs(30), "no picker {nth}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        h.query_all_by_label("▾").nth(nth).unwrap().click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(item.into()));
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(2);
+    };
+    fn field<T: 'static>(h: &mut Ui, read: impl Fn(&T) -> String) -> String {
+        let mut value = String::new();
+        h.state_mut()
+            .test_object_editor()
+            .edit_for_test(|d| value = read(d.downcast_mut::<T>().unwrap()));
+        value
+    }
+
+    // The trigger's On and Update of.
+    open(&mut h, new(ObjectType::Trigger, Some(&table)));
+    pick(&mut h, 1, "Mixed");
+    let columns = field(&mut h, |d: &TriggerDef| d.update_columns.clone());
+    assert_eq!(columns, "\"Mixed\"");
+
+    // The job's stored procedure.
+    open(&mut h, new(ObjectType::Job, None));
+    h.get_by_label("stored procedure").click();
+    h.run_steps(2);
+    pick(&mut h, 0, "\"R83_JobPkg\".\"R83_Run\"");
+    let action = field(&mut h, |d: &JobDef| d.action.clone());
+    assert_eq!(action, "\"R83_JobPkg\".\"R83_Run\"");
+
+    // The index's Table and Tablespace; an index there reads so.
+    if let Some(dba) = &dba {
+        open(&mut h, new(ObjectType::Index, Some(&table)));
+        pick(&mut h, 1, "r83_ts");
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute(
+            "create index r83_trg_ix on \"R83_Trg\" (id) tablespace \"r83_ts\"",
+            &[],
+        )
+        .unwrap();
+        open(
+            &mut h,
+            EditTarget::Edit(ObjectRef {
+                owner: "PYTHIA".into(),
+                name: "R83_TRG_IX".into(),
+                object_type: ObjectType::Index,
+            }),
+        );
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+        for sql in [
+            format!("alter user {user} quota 0 on \"r83_ts\""),
+            "drop tablespace \"r83_ts\" including contents and datafiles".to_owned(),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    } else {
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+    }
+    conn.execute("drop package \"R83_JobPkg\"", &[]).unwrap();
+}
+
 /// The object browser's right-click menus open the forms: New table… on
 /// the Tables folder, New ▸ Index on this table… on a table, New user… on
 /// Users.
