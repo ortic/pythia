@@ -210,6 +210,10 @@ pub struct Changes {
     /// Values loaded from files, by row and column (#293). The new value
     /// in `updates` or `inserts` is what the grid shows of one.
     pub loaded: BTreeMap<(RowRef, usize), Loaded>,
+    /// Cells of new rows (row, column) set to NULL on purpose (*Set NULL*,
+    /// Delete): written as NULL, where a cell left alone or pasted empty is
+    /// left out of the INSERT and gets the column's default (#262).
+    pub nulls: BTreeSet<(usize, usize)>,
 }
 
 /// A value loaded from a file into a cell (#293): held whole until Apply
@@ -1138,6 +1142,8 @@ impl GridState {
                     .get_mut(i)
                     .and_then(|row| row.get_mut(col))
                 {
+                    // Set NULL on purpose again by set_null.
+                    edit.changes.nulls.remove(&(i, col));
                     *cell = value;
                 }
             }
@@ -1230,7 +1236,12 @@ impl GridState {
         edit.changes
             .inserts
             .retain(|_| kept_rows.next().is_some_and(Option::is_some));
-        // So do the files loaded into them (#293).
+        // So do the files loaded into them (#293), and their NULLs.
+        let nulls = std::mem::take(&mut edit.changes.nulls);
+        edit.changes.nulls = nulls
+            .into_iter()
+            .filter_map(|(i, col)| Some((kept.get(i).copied()??, col)))
+            .collect();
         let loaded = std::mem::take(&mut edit.changes.loaded);
         edit.changes.loaded = loaded
             .into_iter()
@@ -1249,10 +1260,27 @@ impl GridState {
         self.undoable(|s| {
             for row in r {
                 for &col in &c {
-                    s.set_value(rows, row, col, None);
+                    s.set_null_value(rows, row, col);
                 }
             }
         });
+    }
+
+    /// Sets a cell NULL on purpose: in a new row, the INSERT writes NULL,
+    /// where a cell left alone (or pasted empty) gets the column's default.
+    fn set_null_value(&mut self, rows: &[Vec<Cell>], view_row: usize, col: usize) {
+        self.set_value(rows, view_row, col, None);
+        let row_ref = self.row_ref(view_row);
+        if let (RowRef::New(i), Some(edit)) = (row_ref, self.edit.as_mut())
+            && !edit.is_locked(col)
+            && edit
+                .changes
+                .inserts
+                .get(i)
+                .is_some_and(|row| col < row.len())
+        {
+            edit.changes.nulls.insert((i, col));
+        }
     }
 
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
@@ -3261,7 +3289,10 @@ fn value_editor(
     if let Some(value) = result {
         let (view_row, col) = (ed.view_row, ed.col);
         state.value_editor = None;
-        state.undoable(|s| s.set_value(rows, view_row, col, value));
+        state.undoable(|s| match value {
+            None => s.set_null_value(rows, view_row, col),
+            value => s.set_value(rows, view_row, col, value),
+        });
     } else if !open {
         state.value_editor = None;
     }
@@ -5773,6 +5804,39 @@ mod tests {
     /// (#296). They stayed at their places in the view, on other rows: Set
     /// NULL, Delete, the value typed and the dialog's Apply went into rows
     /// that weren't selected.
+    /// A new row's cell set NULL on purpose is told from one left alone
+    /// or pasted empty, which the INSERT leaves to the column's default.
+    #[test]
+    fn new_rows_know_their_nulls() {
+        let columns = cols();
+        let rows = vec![vec![Some("1".to_owned()), Some("a".to_owned())]];
+        let mut state = GridState::default();
+        state.set_editable(None);
+        let ctx = egui::Context::default();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.insert_row(2);
+        state.insert_row(2);
+        let nulls = |state: &GridState| state.changes().unwrap().nulls.clone();
+        state.select((2, 1), false);
+        state.set_null(&rows, 2);
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+        // Typed over: no longer NULL.
+        state.edit_cell(&rows, 2, 1, Some("x".into()));
+        assert!(nulls(&state).is_empty());
+        state.set_null(&rows, 2);
+        // Pasted empty: left to the default.
+        state.cursor = Some((1, 0));
+        state.paste(&rows, 2, "7\t");
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+        // The first new row goes: the second's NULL moves up with it.
+        state.select((1, 0), false);
+        state.delete_rows(2);
+        assert_eq!(nulls(&state), BTreeSet::from([(0, 1)]));
+        // Undone, it is back where it was.
+        state.undo(&rows);
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+    }
+
     #[test]
     fn a_sort_or_a_filter_keeps_the_selection_on_its_rows() {
         let columns = cols();

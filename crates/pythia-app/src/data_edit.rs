@@ -12,7 +12,7 @@
 //! concurrency), so a row changed by another session is reported as a
 //! conflict rather than silently overwritten.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pythia_data::literal;
 use pythia_db::{Bind, Cell, Client, Column, DbError, DbKind, Dialect};
@@ -863,7 +863,8 @@ pub struct Unapplied {
     /// A row's key, its changed cells, and the files loaded into them.
     updates: Vec<(Vec<Cell>, Cells, Files)>,
     deletes: Vec<Vec<Cell>>,
-    inserts: Vec<(Vec<Cell>, Files)>,
+    /// A new row, its files, and the columns set to NULL.
+    inserts: Vec<(Vec<Cell>, Files, BTreeSet<usize>)>,
 }
 
 /// The values loaded from files into a row's cells, by column (#293).
@@ -907,12 +908,12 @@ impl Unapplied {
                     out.updates
                         .push((key, cells, files_of(changes, RowRef::Existing(r))));
                 }
-                Change::Insert(i) => out.inserts.extend(
-                    changes
-                        .inserts
-                        .get(i)
-                        .map(|row| (row.clone(), files_of(changes, RowRef::New(i)))),
-                ),
+                Change::Insert(i) => out.inserts.extend(changes.inserts.get(i).map(|row| {
+                    let nulls = (0..row.len())
+                        .filter(|&c| changes.nulls.contains(&(i, c)))
+                        .collect();
+                    (row.clone(), files_of(changes, RowRef::New(i)), nulls)
+                })),
             }
         }
         out
@@ -985,8 +986,9 @@ impl Unapplied {
                     .insert((RowRef::Existing(r), c), loaded.clone());
             }
         }
-        for (i, (row, files)) in self.inserts.iter().enumerate() {
+        for (i, (row, files, nulls)) in self.inserts.iter().enumerate() {
             changes.inserts.push(row.clone());
+            changes.nulls.extend(nulls.iter().map(|&c| (i, c)));
             for (&c, loaded) in files {
                 changes.loaded.insert((RowRef::New(i), c), loaded.clone());
             }
@@ -1335,11 +1337,13 @@ pub fn dml(
     }
     for (i, row) in changes.inserts.iter().enumerate() {
         let file = |c: usize| changes.loaded.get(&(RowRef::New(i), c));
-        let cells: Vec<(usize, &str)> = row
+        // A cell left NULL gets the column's default; one set NULL is NULL.
+        let cells: Vec<(usize, Option<&str>)> = row
             .iter()
             .enumerate()
             .filter(|(c, v)| editable(*c) && (file(*c).is_some() || !cut(v)))
-            .filter_map(|(c, v)| Some((c, v.as_deref()?)))
+            .filter(|(c, v)| v.is_some() || changes.nulls.contains(&(i, *c)))
+            .map(|(c, v)| (c, v.as_deref()))
             .collect();
         if cells.is_empty() {
             continue;
@@ -1351,7 +1355,7 @@ pub fn dml(
         let mut binds = Vec::new();
         let values: Vec<String> = cells
             .iter()
-            .map(|(c, v)| written(dialect, &columns[*c], Some(v), file(*c), &mut binds))
+            .map(|(c, v)| written(dialect, &columns[*c], *v, file(*c), &mut binds))
             .collect();
         out.push(Dml {
             sql: format!(
@@ -1806,6 +1810,30 @@ mod tests {
             &edit(RowKey::Columns(vec![long])),
             &columns(&["x", &cut])
         ));
+    }
+
+    /// A new row's cell set NULL on purpose is written as NULL; one left
+    /// alone is left out, for the column's default (#262).
+    #[test]
+    fn new_rows_write_the_nulls_they_were_given() {
+        let columns = vec![
+            col("id", "INT", true),
+            col("status", "VARCHAR", false),
+            col("note", "VARCHAR", false),
+            col("pythia$id", "INT", true),
+        ];
+        let edit = Editable {
+            table: "t".into(),
+            source: "select id, status, note from t".into(),
+            key: RowKey::Columns(vec!["id".into()]),
+        };
+        let changes = Changes {
+            inserts: vec![vec![Some("2".into()), None, None, None]],
+            nulls: BTreeSet::from([(0, 1)]),
+            ..Changes::default()
+        };
+        let sql = dml(Dialect::MYSQL, &edit, &columns, &[], &changes);
+        assert_eq!(sql[0].sql, "insert into t (id, status) values (2, NULL)");
     }
 
     #[test]

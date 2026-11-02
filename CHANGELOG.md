@@ -85,6 +85,8 @@ All notable changes to Pythia are documented here. The format follows
   trigger form's WHEN or an import column's expression no longer
   comments out what follows it (#404), which failed with ORA-00907 or
   the like.
+- A new row's cell set to NULL (*Set NULL*, Delete) is inserted as NULL
+  (#405); it got the column's default, as a cell left alone does.
 
 ## [0.11.0] - 2026-11-02
 
