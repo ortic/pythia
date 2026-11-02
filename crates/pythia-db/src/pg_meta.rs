@@ -900,7 +900,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .ok_or_else(|| DbError::new(format!("No table {owner}.{name}")))?;
     let mut table = table.into_iter();
     let oid = table.next().flatten().unwrap_or_default();
-    let partitions = table.nth(1).flatten();
+    // A foreign table (`f`) is made with its server and options (#409).
+    let foreign = table.next().flatten().as_deref() == Some("f");
+    let partitions = table.next().flatten();
     let comment = table.next().flatten();
     let unlogged = table.next().flatten().as_deref() == Some("t");
     let options = table.next().flatten().unwrap_or_default();
@@ -909,13 +911,15 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .rows(
             &format!(
                 "select quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod) \
+                        || coalesce(' options (' || {} || ')', '') \
                         || coalesce(case when a.attidentity <> '' or a.attgenerated <> '' \
                                          then ' ' else ' default ' end || {DEFAULT}, '') \
                         || case when a.attnotnull then ' not null' else '' end \
                    from pg_attribute a \
                    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
                   where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
-                  order by a.attnum"
+                  order by a.attnum",
+                fdw_options("a.attfdwoptions")
             ),
             &[],
         )?
@@ -973,9 +977,18 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     }
     ddl.push_str(&format!(
         "create {}table {qualified} (\n    {}\n)",
-        if unlogged { "unlogged " } else { "" },
+        if foreign {
+            "foreign "
+        } else if unlogged {
+            "unlogged "
+        } else {
+            ""
+        },
         lines.join(",\n    ")
     ));
+    if foreign && let Some(server) = foreign_server(pg, &oid)? {
+        ddl.push_str(&server);
+    }
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
@@ -988,10 +1001,12 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             Dialect::POSTGRES.quote_ident(column)
         ));
     }
+    // ALTER TABLE and COMMENT ON TABLE refuse a foreign table.
+    let kind = if foreign { "foreign table" } else { "table" };
     if let Some(role) = role {
-        ddl.push_str(&format!("\n\nalter table {qualified} owner to {role};"));
+        ddl.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
+    indexes_and_comments(pg, &mut ddl, &oid, kind, &qualified, comment)?;
     for constraint in late {
         ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
     }
@@ -1002,6 +1017,32 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         grants(pg, &mut ddl, Privileges::Relation, sequence_oid, &on)?;
     }
     Ok(ddl)
+}
+
+/// SQL listing the options in `options`, a `text[]` of `key=value` as
+/// PostgreSQL keeps a foreign table's or column's: `key 'value', …`; NULL
+/// for none.
+fn fdw_options(options: &str) -> String {
+    format!(
+        "(select string_agg(quote_ident(split_part(o, '=', 1)) || ' ' \
+                            || quote_literal(substr(o, strpos(o, '=') + 1)), ', ') \
+            from unnest({options}) o)"
+    )
+}
+
+/// ` server … options (…)` of the foreign table `oid`.
+fn foreign_server(pg: &Pg<'_>, oid: &str) -> Result<Option<String>, DbError> {
+    let row = pg.first(
+        &format!(
+            "select ' server ' || quote_ident(s.srvname) \
+                    || coalesce(' options (' || {} || ')', '') \
+               from pg_foreign_table f join pg_foreign_server s on s.oid = f.ftserver \
+              where f.ftrelid = {oid}",
+            fdw_options("f.ftoptions")
+        ),
+        &[],
+    )?;
+    Ok(row.and_then(first))
 }
 
 /// The relation's indexes that no constraint makes, then the comments on

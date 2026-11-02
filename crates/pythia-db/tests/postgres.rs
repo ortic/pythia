@@ -1574,6 +1574,63 @@ fn a_key_to_the_tables_own_unique_index_runs_again() {
     h.ok("drop schema r95_tree, r95_tree_copy cascade");
 }
 
+/// A foreign table's DDL makes a foreign table again, on its server with
+/// its options and its columns', not a plain table: run elsewhere, it made
+/// an empty local one. Needs postgres_fdw, which a superuser can create.
+#[test]
+fn a_foreign_tables_ddl_makes_a_foreign_table() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let installed = h
+        .scalar("select count(*) from pg_extension where extname = 'postgres_fdw'")
+        .as_deref()
+        == Some("1");
+    let superuser = h
+        .scalar("select rolsuper from pg_roles where rolname = current_user")
+        .as_deref()
+        == Some("t");
+    if !installed && !superuser {
+        return;
+    }
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("create extension if not exists postgres_fdw");
+    h.ok("drop schema if exists r96_ft, r96_ft_copy cascade");
+    h.ok("drop server if exists r96_srv cascade");
+    h.ok("create server r96_srv foreign data wrapper postgres_fdw options (dbname 'pythia')");
+    h.ok("create schema r96_ft");
+    h.ok("create schema r96_ft_copy");
+    h.ok(
+        "create foreign table r96_ft.remote (id int options (column_name 'ident') not null, \
+           name text) server r96_srv options (schema_name 'public', table_name 'it''s')",
+    );
+    h.ok("comment on foreign table r96_ft.remote is 'over there'");
+    let ddl = ddl_of(&mut h, "r96_ft", "remote", ObjectType::Table);
+    assert!(
+        ddl.starts_with("create foreign table r96_ft.remote ("),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("id integer options (column_name 'ident') not null"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains(") server r96_srv options (schema_name 'public', table_name 'it''s');"),
+        "{ddl}"
+    );
+    run_ddl(&mut h, &ddl, "r96_ft.", "r96_ft_copy.");
+    assert_eq!(
+        h.scalar(
+            "select c.relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+              where n.nspname = 'r96_ft_copy' and c.relname = 'remote'"
+        )
+        .as_deref(),
+        Some("f")
+    );
+    h.ok("drop schema r96_ft, r96_ft_copy cascade");
+    h.ok("drop server r96_srv cascade");
+}
+
 /// A view's DDL names its tables and functions with their schemas, as a
 /// table's does (#226): run with another search path, by Edit in a window
 /// that set one, the view reads the same tables as before (#329).

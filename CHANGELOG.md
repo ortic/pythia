@@ -96,6 +96,8 @@ All notable changes to Pythia are documented here. The format follows
 - Export tables and Export schema write a `.` in an object's name as
   `%2E` in its file's name (#408): `"X.DDL"`'s rows went to
   `x.ddl.sql`, over the DDL of table `X`.
+- PostgreSQL: a foreign table's DDL makes a foreign table, on its server
+  with its and its columns' options (#409); it was a plain CREATE TABLE.
 
 ## [0.11.0] - 2026-11-02
 
