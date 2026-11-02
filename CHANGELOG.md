@@ -375,6 +375,9 @@ All notable changes to Pythia are documented here. The format follows
 - SQL Server: `END CONVERSATION` inside a `BEGIN … END` block doesn't end
   the block, which a script was cut at, the rest running outside it
   (#448).
+- SQL Server: dropped ledger tables, their history tables and views,
+  which SQL Server keeps under names of its own, aren't listed or found
+  (#382).
 
 ## [0.11.0] - 2026-11-02
 

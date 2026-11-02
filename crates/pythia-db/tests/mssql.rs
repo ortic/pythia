@@ -3616,6 +3616,46 @@ fn ledger_history_tables() {
         table_ddl(&mut h, "dbo", "r82_ln_hist"),
         "-- The ledger history table of [dbo].[r82_ln], made by that table's DDL.\nGO\n"
     );
+
+    // Dropped, a ledger table is kept with its history table and view
+    // under names of SQL Server's, which aren't listed or found (#382).
+    h.ok("drop table r82_ln");
+    let kept = h
+        .scalar(
+            "select count(*) from sys.objects \
+              where name like 'MSSQL[_]DroppedLedger%' and type in ('U', 'V')",
+        )
+        .unwrap();
+    assert_eq!(kept, "3");
+    let listed = |h: &mut Harness, object_type: ObjectType| {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: "dbo".into(),
+            object_type,
+            filter: None,
+        }) else {
+            panic!("expected objects")
+        };
+        objects.into_iter().map(|o| o.name).collect::<Vec<_>>()
+    };
+    let tables = listed(&mut h, ObjectType::Table);
+    assert!(tables.contains(&"r82_lu".to_owned()), "{tables:?}");
+    assert!(
+        !tables.iter().any(|t| t.starts_with("MSSQL_Dropped")),
+        "{tables:?}"
+    );
+    let views = listed(&mut h, ObjectType::View);
+    assert!(views.contains(&"r82_lu_Ledger".to_owned()), "{views:?}");
+    assert!(
+        !views.iter().any(|v| v.starts_with("MSSQL_Dropped")),
+        "{views:?}"
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "MSSQL_DROPPED*".into(),
+        limit: 10,
+    }) else {
+        panic!("expected objects")
+    };
+    assert!(found.is_empty(), "{found:?}");
     drop(h);
     drop_database(&mut dba, "r82_ledger_h");
 }

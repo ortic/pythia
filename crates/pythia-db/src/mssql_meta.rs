@@ -145,6 +145,32 @@ fn object_rows(rows: Vec<Vec<Cell>>) -> Vec<DbObject> {
         .collect()
 }
 
+/// SQL that leaves `o` out where it is a dropped ledger table, its history
+/// table or its view (#382): SQL Server keeps them, under names of its own,
+/// for the ledger's verification, but they are no table to work with.
+/// Nothing before 2022, whose catalog has no ledger.
+fn not_dropped_ledger(ms: &mut Ms<'_>) -> Result<&'static str, DbError> {
+    let ledger = ms
+        .rows(
+            "select col_length('sys.tables', 'is_dropped_ledger_table')",
+            &[],
+        )?
+        .into_iter()
+        .find_map(first)
+        .is_some();
+    Ok(if ledger {
+        " and o.object_id not in ( \
+            select t.object_id from sys.tables t where t.is_dropped_ledger_table = 1 \
+            union all \
+            select t.history_table_id from sys.tables t \
+             where t.is_dropped_ledger_table = 1 and t.history_table_id is not null \
+            union all \
+            select v.object_id from sys.views v where v.is_dropped_ledger_view = 1)"
+    } else {
+        ""
+    })
+}
+
 fn objects(
     ms: &mut Ms<'_>,
     owner: &str,
@@ -152,12 +178,17 @@ fn objects(
     filter: Option<&str>,
 ) -> Result<Vec<DbObject>, DbError> {
     let pattern = like_pattern(filter.unwrap_or(""));
+    let ledger = if matches!(object_type, ObjectType::Table | ObjectType::View) {
+        not_dropped_ledger(ms)?
+    } else {
+        ""
+    };
     let rows = ms.rows(
         &format!(
             "select s.name, o.name, {TYPE}, convert(varchar(19), o.modify_date, 120) \
                from sys.objects o join sys.schemas s on s.schema_id = o.schema_id \
               where s.name = @P1 and upper(o.name) like @P2 escape '\\' \
-                and o.type in ({TYPES}) and {TYPE} = @P3 and o.is_ms_shipped = 0 \
+                and o.type in ({TYPES}) and {TYPE} = @P3 and o.is_ms_shipped = 0{ledger} \
               order by o.name"
         ),
         &[owner, &pattern, object_type.dictionary_name()],
@@ -169,12 +200,13 @@ fn objects(
 /// then the shortest names.
 fn find(ms: &mut Ms<'_>, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
     let pattern = like_pattern(pattern);
+    let ledger = not_dropped_ledger(ms)?;
     let rows = ms.rows(
         &format!(
             "select top ({limit}) s.name, o.name, {TYPE}, convert(varchar(19), o.modify_date, 120) \
                from sys.objects o join sys.schemas s on s.schema_id = o.schema_id \
               where upper(o.name) like @P1 escape '\\' and o.type in ({TYPES}) \
-                and o.is_ms_shipped = 0 \
+                and o.is_ms_shipped = 0{ledger} \
               order by case when s.name = schema_name() then 0 else 1 end, len(o.name), o.name, \
                        s.name"
         ),
