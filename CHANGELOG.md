@@ -1144,6 +1144,10 @@ All notable changes to Pythia are documented here. The format follows
   gets its owner before `owned by`, which needs the table's. *Edit*
   replaces views and routines in place, keeping their owner, so the line
   changes nothing there.
+- PostgreSQL: the DDL of a view, sequence, function, procedure or
+  trigger has its comments (#354), a view's columns' too, as a table's
+  and a materialized view's have since #301, and a table's has its
+  `serial` sequences'. Run elsewhere, a copy came without them.
 
 ## [0.10.0] - 2026-10-30
 

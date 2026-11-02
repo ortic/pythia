@@ -524,9 +524,10 @@ fn ddl(
         }
         ObjectType::Sequence => {
             let (owner, name) = stored(pg, owner, name)?;
-            let (oid, create) = sequence_ddl(pg, &owner, &name, true)?.ok_or_else(missing)?;
+            let (oid, create, note) = sequence_ddl(pg, &owner, &name, true)?.ok_or_else(missing)?;
             let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, &name));
             let mut rest = String::new();
+            comment_on(&mut rest, &on, note.as_deref());
             grants(pg, &mut rest, Privileges::Relation, &oid, &on)?;
             Ok(followed(&create, &rest, end))
         }
@@ -547,8 +548,17 @@ fn followed(ddl: &str, rest: &str, end: &str) -> String {
     }
 }
 
-/// Each overload of a function or procedure with its [`OWNER`] (#353) and
-/// its grants (#331), if there is one.
+/// `comment on <on> is …;` appended to `ddl`, where there is a comment.
+/// Each object's DDL has it after its `CREATE` and owner, before its
+/// grants, as tables and materialized views have it (#301, #354).
+fn comment_on(ddl: &mut String, on: &str, comment: Option<&str>) {
+    if let Some(comment) = comment {
+        ddl.push_str(&format!("\n\ncomment on {on} is {};", literal(comment)));
+    }
+}
+
+/// Each overload of a function or procedure with its [`OWNER`] (#353), its
+/// comment and its grants (#331), if there is one.
 fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
     let rows = pg.rows(
         &format!(
@@ -556,7 +566,7 @@ fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
                     case p.prokind when 'p' then 'procedure ' else 'function ' end \
                     || quote_ident(n.nspname) || '.' || quote_ident(p.proname) \
                     || '(' || pg_get_function_identity_arguments(p.oid) || ')', \
-                    {OWNER} \
+                    {OWNER}, obj_description(p.oid, 'pg_proc') \
                from pg_proc p \
                join pg_namespace n on n.oid = p.pronamespace \
                join pg_roles r on r.oid = p.proowner \
@@ -567,11 +577,12 @@ fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
     )?;
     let mut overloads = Vec::new();
     for row in rows {
-        if let [Some(definition), Some(oid), Some(on), role] = row.as_slice() {
+        if let [Some(definition), Some(oid), Some(on), role, note] = row.as_slice() {
             let mut rest = String::new();
             if let Some(role) = role {
                 rest.push_str(&format!("\n\nalter {on} owner to {role};"));
             }
+            comment_on(&mut rest, on, note.as_deref());
             grants(pg, &mut rest, Privileges::Routine, oid, on)?;
             overloads.push(followed(definition.trim_end(), &rest, end));
         }
@@ -579,21 +590,29 @@ fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
     Ok((!overloads.is_empty()).then(|| overloads.join("\n\n")))
 }
 
-/// The triggers of the name on the schema's tables, if there is one.
+/// The triggers of the name on the schema's tables, each with its comment
+/// (#354), if there is one.
 fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
     let rows = pg.rows(
-        "select pg_get_triggerdef(t.oid, true) from pg_trigger t \
+        "select pg_get_triggerdef(t.oid, true), \
+                'trigger ' || quote_ident(t.tgname) || ' on ' \
+                || quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
+                obj_description(t.oid, 'pg_trigger') \
+           from pg_trigger t \
            join pg_class c on c.oid = t.tgrelid \
            join pg_namespace n on n.oid = c.relnamespace \
           where n.nspname = $1 and t.tgname = $2 and not t.tgisinternal \
           order by c.relname",
         &[owner, name],
     )?;
-    let triggers: Vec<String> = rows
-        .into_iter()
-        .filter_map(first)
-        .map(|t| format!("{t}{end}"))
-        .collect();
+    let mut triggers = Vec::new();
+    for row in rows {
+        if let [Some(definition), Some(on), note] = row.as_slice() {
+            let mut rest = String::new();
+            comment_on(&mut rest, on, note.as_deref());
+            triggers.push(followed(definition, &rest, end));
+        }
+    }
     Ok((!triggers.is_empty()).then(|| triggers.join("\n\n")))
 }
 
@@ -664,11 +683,12 @@ const OWNER: &str = "case when r.rolname <> current_user then quote_ident(r.roln
 /// it, populated, with the default storage (#330). So a materialized view's
 /// `CREATE` has its access method, storage parameters and tablespace where
 /// they aren't the defaults, and `with no data` where it has none; its
-/// [`OWNER`] follows, a view's too (#353). A role that can drop the view
-/// but can't give it back to its owner gets an error, and Edit's block
-/// leaves the view as it was. A view's `CREATE` has its options and its
-/// check option, which `pg_get_viewdef` leaves out: CREATE OR REPLACE
-/// without them resets them, a security barrier view's too (#351).
+/// [`OWNER`] follows, a view's too (#353), and its comments, a view's too
+/// (#354). A role that can drop the view but can't give it back to its
+/// owner gets an error, and Edit's block leaves the view as it was. A
+/// view's `CREATE` has its options and its check option, which
+/// `pg_get_viewdef` leaves out: CREATE OR REPLACE without them resets
+/// them, a security barrier view's too (#351).
 fn view_ddl(
     pg: &Pg<'_>,
     owner: &str,
@@ -716,48 +736,41 @@ fn view_ddl(
         format!("create materialized view {qualified}{storage} as\n{definition}{data}")
     };
     let mut rest = String::new();
+    let kind = object_type.dictionary_name().to_lowercase();
     if let Some(role) = role {
-        let kind = object_type.dictionary_name().to_lowercase();
         rest.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    if object_type == ObjectType::MaterializedView {
-        indexes_and_comments(
-            pg,
-            &mut rest,
-            &oid,
-            "materialized view",
-            &qualified,
-            comment,
-        )?;
-    }
-    // A view's too, for a copy: Edit's CREATE OR REPLACE keeps them anyway
-    // (#331).
+    // A view's comments and grants too, for a copy: Edit's CREATE OR
+    // REPLACE keeps them anyway (#331, #354). A view has no indexes.
+    indexes_and_comments(pg, &mut rest, &oid, &kind, &qualified, comment)?;
     grants(pg, &mut rest, Privileges::Relation, &oid, &qualified)?;
     Ok(Some(followed(&ddl, &rest, end)))
 }
 
-/// `CREATE SEQUENCE` of a sequence as stored, without its `;`, and its oid,
-/// if there is one. `owned` names the column that owns it (`serial`, `OWNED
-/// BY`), so that a copy goes with the copy's column (#307), and its
-/// [`OWNER`] (#353), which must be the table's: `alter sequence … owner
-/// to`, then `owned by`. A table's DDL makes the column the owner after the
-/// table, and its owner the sequence's with the table's. An identity column's
-/// sequence is made by its table's DDL (#263): its own says so and sets the
-/// identity's options, which next to a copy of the table gives the copy's
-/// identity the same and elsewhere fails, where a `CREATE SEQUENCE` made a
-/// sequence no column uses (#332). An unlogged sequence, as an unlogged
-/// table's `serial` ones are, is made so (#352).
+/// `CREATE SEQUENCE` of a sequence as stored, without its `;`, its oid and
+/// its comment (#354), if there is one. `owned` names the column that owns
+/// it (`serial`, `OWNED BY`), so that a copy goes with the copy's column
+/// (#307), and its [`OWNER`] (#353), which must be the table's: `alter
+/// sequence … owner to`, then `owned by`. A table's DDL makes the column
+/// the owner after the table, and its owner the sequence's with the
+/// table's. An identity column's sequence is made by its table's DDL
+/// (#263): its own says so and sets the identity's options, which next to
+/// a copy of the table gives the copy's identity the same and elsewhere
+/// fails, where a `CREATE SEQUENCE` made a sequence no column uses (#332).
+/// An unlogged sequence, as an unlogged table's `serial` ones are, is made
+/// so (#352).
 fn sequence_ddl(
     pg: &Pg<'_>,
     owner: &str,
     name: &str,
     owned: bool,
-) -> Result<Option<(String, String)>, DbError> {
+) -> Result<Option<(String, String, Option<String>)>, DbError> {
     let row = pg.first(
         &format!(
             "select c.oid, d.deptype, c.relpersistence = 'u', {OWNER}, \
-                    format_type(s.seqtypid, null), s.seqincrement, s.seqmin, s.seqmax, \
-                    s.seqstart, s.seqcache, s.seqcycle, tn.nspname, t.relname, a.attname \
+                    obj_description(c.oid, 'pg_class'), format_type(s.seqtypid, null), \
+                    s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle, \
+                    tn.nspname, t.relname, a.attname \
                from pg_sequence s join pg_class c on c.oid = s.seqrelid \
                join pg_namespace n on n.oid = c.relnamespace \
                join pg_roles r on r.oid = c.relowner \
@@ -771,10 +784,11 @@ fn sequence_ddl(
         &[owner, name],
     )?;
     Ok(row.map(|row| {
-        let (head, row) = row.split_at(4);
+        let (head, row) = row.split_at(5);
         let (v, column) = row.split_at(7);
         let v: Vec<&str> = v.iter().map(|v| v.as_deref().unwrap_or_default()).collect();
         let oid = head[0].clone().unwrap_or_default();
+        let note = head[4].clone();
         let column = match column {
             [Some(schema), Some(table), Some(column)] => Some((
                 Dialect::POSTGRES.qualified(schema, table),
@@ -797,7 +811,7 @@ fn sequence_ddl(
                 v[5],
                 if v[6] == "t" { "cycle" } else { "no cycle" }
             );
-            return (oid, alter);
+            return (oid, alter, note);
         }
         let qualified = Dialect::POSTGRES.qualified(owner, name);
         let owned_by = match column {
@@ -830,7 +844,7 @@ fn sequence_ddl(
             (None, Some(owned_by)) => create.push_str(&format!("\n  {owned_by}")),
             (None, None) => {}
         }
-        (oid, create)
+        (oid, create, note)
     }))
 }
 
@@ -859,10 +873,10 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
 
 /// The sequences its columns own, `CREATE TABLE` with its columns and
 /// constraints, the sequences' owners, then its other indexes and
-/// comments, its grants and the sequences'. A serial column's sequence goes
-/// with the table, as `pg_dump` writes it: run elsewhere, the DDL makes the
-/// copy a sequence of its own (#263), which roles use as they use the
-/// table's (#331). The table is unlogged where it is, with its access
+/// comments, its grants and the sequences' comments (#354) and grants. A
+/// serial column's sequence goes with the table, as `pg_dump` writes it:
+/// run elsewhere, the DDL makes the copy a sequence of its own (#263),
+/// which roles use as they use the table's (#331). The table is unlogged where it is, with its access
 /// method, storage parameters and tablespace where they aren't the
 /// defaults, as a materialized view (#352). Its [`OWNER`] comes after the
 /// sequences are its columns', so that they go to it with the table (#353).
@@ -934,9 +948,11 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     }));
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
+    let mut notes = Vec::new();
     for (_, sequence, _) in &sequences {
-        if let Some((_, create)) = sequence_ddl(pg, &owner, sequence, false)? {
+        if let Some((_, create, note)) = sequence_ddl(pg, &owner, sequence, false)? {
             ddl.push_str(&format!("{create};\n\n"));
+            notes.push(note);
         }
     }
     ddl.push_str(&format!(
@@ -961,18 +977,19 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     }
     indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
-    for (sequence_oid, sequence, _) in &sequences {
+    for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
+        comment_on(&mut ddl, &on, note.as_deref());
         grants(pg, &mut ddl, Privileges::Relation, sequence_oid, &on)?;
     }
     Ok(ddl)
 }
 
 /// The relation's indexes that no constraint makes, then the comments on
-/// it (a `kind`: `table`, `materialized view`) and on its columns, each
-/// statement with its `;`, appended to `ddl`. An index in a tablespace
-/// that isn't the database's has it, which `pg_get_indexdef` leaves out
-/// (#352).
+/// it (a `kind`: `table`, `view`, `materialized view`) and on its columns,
+/// each statement with its `;`, appended to `ddl`. An index in a
+/// tablespace that isn't the database's has it, which `pg_get_indexdef`
+/// leaves out (#352).
 fn indexes_and_comments(
     pg: &Pg<'_>,
     ddl: &mut String,
@@ -1000,12 +1017,7 @@ fn indexes_and_comments(
             ddl.push_str(&format!("\n\n{};", inserted(index, tablespace, tail)));
         }
     }
-    if let Some(comment) = comment {
-        ddl.push_str(&format!(
-            "\n\ncomment on {kind} {qualified} is {};",
-            literal(&comment)
-        ));
-    }
+    comment_on(ddl, &format!("{kind} {qualified}"), comment.as_deref());
     let comments = pg.rows(
         &format!(
             "select quote_ident(attname), col_description(attrelid, attnum) from pg_attribute \

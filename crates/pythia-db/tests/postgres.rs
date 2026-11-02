@@ -1906,6 +1906,109 @@ fn the_ddl_keeps_the_owner() {
     h.ok("drop role \"R81 Owner\"");
 }
 
+/// The DDL of a view, a sequence, a routine and a trigger has their
+/// comments, a view's columns' too, as a table's and a materialized view's
+/// has (#301), and a table's has its serial sequences': run in another
+/// schema, the copies have them too (#354).
+#[test]
+fn the_ddl_has_the_comments() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_cm, r81_cm_copy cascade");
+    h.ok("create schema r81_cm");
+    h.ok("create schema r81_cm_copy");
+    for sql in [
+        "create table r81_cm.r81_t (id serial, n int)",
+        "comment on sequence r81_cm.r81_t_id_seq is 'The ids'",
+        "create view r81_cm.r81_v as select n from r81_cm.r81_t",
+        "comment on view r81_cm.r81_v is 'It''s the view'",
+        "comment on column r81_cm.r81_v.n is 'The n'",
+        "create sequence r81_cm.r81_s",
+        "comment on sequence r81_cm.r81_s is 'A sequence'",
+        "create function r81_cm.r81_f(x int) returns int language sql as 'select x'",
+        "comment on function r81_cm.r81_f(int) is 'For ints'",
+        "create function r81_cm.r81_f(x text) returns text language sql as 'select x'",
+        "create procedure r81_cm.r81_p() language sql as 'select 1'",
+        "comment on procedure r81_cm.r81_p() is 'A procedure'",
+        "create function r81_cm.r81_tf() returns trigger language plpgsql \
+         as 'begin return new; end'",
+        "create trigger r81_tr before insert on r81_cm.r81_t for each row \
+         execute function r81_cm.r81_tf()",
+        "comment on trigger r81_tr on r81_cm.r81_t is 'The trigger'",
+    ] {
+        h.ok(sql);
+    }
+    let mut ddls = Vec::new();
+    for (name, object_type, comment) in [
+        (
+            "r81_t",
+            ObjectType::Table,
+            "\n\ncomment on sequence r81_cm.r81_t_id_seq is 'The ids';",
+        ),
+        (
+            "r81_v",
+            ObjectType::View,
+            "\n\ncomment on view r81_cm.r81_v is 'It''s the view';\n\
+             comment on column r81_cm.r81_v.n is 'The n';",
+        ),
+        (
+            "r81_s",
+            ObjectType::Sequence,
+            "\n\ncomment on sequence r81_cm.r81_s is 'A sequence';",
+        ),
+        (
+            "r81_f",
+            ObjectType::Function,
+            "\n\ncomment on function r81_cm.r81_f(x integer) is 'For ints';",
+        ),
+        (
+            "r81_p",
+            ObjectType::Procedure,
+            "\n\ncomment on procedure r81_cm.r81_p() is 'A procedure';",
+        ),
+        ("r81_tf", ObjectType::Function, ""),
+        (
+            "r81_tr",
+            ObjectType::Trigger,
+            "\n\ncomment on trigger r81_tr on r81_cm.r81_t is 'The trigger';",
+        ),
+    ] {
+        let ddl = ddl_of(&mut h, "r81_cm", name, object_type);
+        assert!(ddl.contains(comment), "{ddl}");
+        ddls.push(ddl);
+    }
+    assert_eq!(ddls[3].matches("comment on").count(), 1, "{}", ddls[3]);
+    for ddl in &ddls {
+        run_ddl(&mut h, ddl, "r81_cm.", "r81_cm_copy.");
+    }
+    // The comments on what is in the schema.
+    let comments = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(o.name || ': ' || d.description, '; ' order by o.name) \
+               from pg_description d \
+              cross join lateral (select replace(pg_describe_object(d.classoid, d.objoid, \
+                                                                    d.objsubid), \
+                                                 '{schema}.', '') as name) o \
+              where position('{schema}.' in pg_describe_object(d.classoid, d.objoid, \
+                                                                d.objsubid)) > 0"
+        ))
+    };
+    let was = comments(&mut h, "r81_cm");
+    assert_eq!(
+        was.as_deref(),
+        Some(
+            "column n of view r81_v: The n; function r81_f(integer): For ints; \
+             function r81_p(): A procedure; sequence r81_s: A sequence; \
+             sequence r81_t_id_seq: The ids; trigger r81_tr on table r81_t: The trigger; \
+             view r81_v: It's the view"
+        )
+    );
+    assert_eq!(comments(&mut h, "r81_cm_copy"), was);
+    h.ok("drop schema r81_cm, r81_cm_copy cascade");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another
