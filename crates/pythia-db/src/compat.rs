@@ -19,6 +19,27 @@ pub fn at_least(conn: &Connection, major: i32, minor: i32) -> Result<bool, crate
     Ok(release(conn)? >= (major, minor))
 }
 
+/// The columns of table `owner.table` to read its rows by: with its
+/// invisible columns (12.1), which `select *` leaves out (#444), and
+/// without its virtual ones unless `with_virtual`, as no INSERT or UPDATE
+/// takes them (#443). Dictionary names, in the table's order, invisible
+/// ones last; none if the dictionary doesn't show the table.
+pub fn table_columns(
+    conn: &Connection,
+    owner: &str,
+    table: &str,
+    with_virtual: bool,
+) -> Result<Vec<String>, crate::oracle::Error> {
+    conn.query_as::<String>(
+        "select column_name from all_tab_cols \
+          where owner = :1 and table_name = :2 and user_generated = 'YES' \
+            and (:3 = 1 or virtual_column = 'NO') \
+          order by column_id nulls last, internal_column_id",
+        &[&owner, &table, &i32::from(with_virtual)],
+    )?
+    .collect()
+}
+
 /// The first `n` rows of `sql` (which may end in `order by`). `FETCH FIRST`
 /// needs 12.1; an ordered inline view with ROWNUM works on every version
 /// and gets the same top-N plan.

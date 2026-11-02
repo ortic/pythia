@@ -362,6 +362,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: Maintenance's facts of a partitioned table are its
   partitions' rows, size and transaction ID age, not 0 and a false
   wraparound warning (#442).
+- Oracle: Export Tables and Data Compare read a table's invisible columns
+  too (#444), and leave out its virtual columns where they write
+  INSERTs and UPDATEs, which Oracle refused (#443).
 
 ## [0.11.0] - 2026-11-02
 

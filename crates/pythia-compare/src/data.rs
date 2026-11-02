@@ -28,13 +28,26 @@ pub enum DataSource {
 }
 
 impl DataSource {
-    fn base_sql(&self) -> String {
-        match self {
+    /// A table's rows with its invisible columns (#444) and without its
+    /// virtual ones, which follow from the others and which the sync
+    /// script couldn't write (#443).
+    fn base_sql(&self, conn: &Connection) -> Result<String, Error> {
+        Ok(match self {
             DataSource::Table { schema, table } => {
-                format!("select * from {}.{}", ident(schema), ident(table))
+                let columns = pythia_db::compat::table_columns(conn, schema, table, false)?;
+                let list = if columns.is_empty() {
+                    "*".to_owned()
+                } else {
+                    columns
+                        .iter()
+                        .map(|c| ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("select {list} from {}.{}", ident(schema), ident(table))
             }
             DataSource::Query(q) => q.trim().trim_end_matches(';').to_owned(),
-        }
+        })
     }
 
     /// Name used in the sync script.
@@ -152,7 +165,7 @@ pub fn fetch_chunk(
     let sql = pythia_db::compat::first_rows(
         &format!(
             "select * from (\n{}\n) where {} order by {key_list}",
-            source.base_sql(),
+            source.base_sql(conn)?,
             conditions.join(" and "),
         ),
         limit.max(1),
