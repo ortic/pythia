@@ -309,6 +309,10 @@ All notable changes to Pythia are documented here. The format follows
   triggers (`PRECEDES`, #421), and a trigger's or routine's the
   `sql_mode` it was made under (#422). *Edit* made it fire last, and
   under the window's mode, where `||` may mean OR.
+- PostgreSQL: Commit of a transaction that failed says nothing was
+  committed (#423). After a failed savepoint statement (`release
+  savepoint` with a typo) PostgreSQL had rolled it back, and Commit
+  said "Committed".
 
 ## [0.11.0] - 2026-11-02
 

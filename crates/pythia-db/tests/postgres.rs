@@ -337,6 +337,59 @@ fn scripts_split_as_the_server_reads_them() {
     h.ok("drop function fs_three()");
 }
 
+/// A transaction that failed (a savepoint statement failed, which no
+/// savepoint of Pythia's undoes) can't be committed: PostgreSQL answers
+/// COMMIT with a rollback and no error, and Commit said "Committed".
+#[test]
+fn a_failed_transaction_is_not_called_committed() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    // The events up to the transaction's state: its errors' messages.
+    let errors = |h: &mut Harness| {
+        let mut errors = Vec::new();
+        loop {
+            match h.next() {
+                DbEvent::Error(e) => errors.push(e.message),
+                DbEvent::Transaction { pending } => return (pending, errors),
+                _ => {}
+            }
+        }
+    };
+    h.ok("drop table if exists tx_ab");
+    h.ok("create table tx_ab (a int)");
+    for commit in ["button", "commit", "end"] {
+        assert!(h.ok("insert into tx_ab values (1)"));
+        assert!(h.fails("release savepoint no_such_savepoint"));
+        if commit == "button" {
+            h.session.send(DbRequest::Commit);
+        } else {
+            h.execute(0, commit, 100);
+        }
+        let (pending, errors) = errors(&mut h);
+        assert!(!pending, "{commit}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("Nothing was committed")),
+            "{commit}: {errors:?}"
+        );
+        assert_eq!(
+            h.scalar("select count(*) from tx_ab").as_deref(),
+            Some("0"),
+            "{commit}"
+        );
+    }
+    // A statement that fails alone is undone alone: the rest commits.
+    assert!(h.ok("insert into tx_ab values (1)"));
+    assert!(h.fails("select 1 / 0"));
+    h.session.send(DbRequest::Commit);
+    let (_, errors) = errors(&mut h);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(h.scalar("select count(*) from tx_ab").as_deref(), Some("1"));
+    h.ok("drop table tx_ab");
+}
+
 #[test]
 fn transactions_and_autocommit() {
     let Some(mut h) = Harness::connect() else {
