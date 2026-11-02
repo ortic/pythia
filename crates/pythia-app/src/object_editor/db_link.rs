@@ -2,10 +2,11 @@
 //! connect string. A change recreates the link.
 
 use egui::Ui;
-use pythia_db::DbError;
 use pythia_db::oracle::Connection;
+use pythia_db::{DbError, Dialect};
 
 use super::{form_grid, form_row, name_field, qualified};
+use crate::browser::written;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LinkDef {
@@ -35,7 +36,10 @@ pub fn load(conn: &Connection, owner: &str, name: &str) -> Result<LinkDef, DbErr
     Ok(LinkDef {
         public: owner == "PUBLIC",
         name: name.to_lowercase(),
-        user: user.unwrap_or_default().to_lowercase(),
+        // As SQL reads it: a user "hr_ro" isn't HR_RO (#365).
+        user: user
+            .map(|u| written(Dialect::ORACLE, &u))
+            .unwrap_or_default(),
         password: String::new(),
         using: host.unwrap_or_default(),
     })

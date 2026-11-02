@@ -1057,6 +1057,11 @@ pub(crate) fn config(params: &ConnectParams) -> Result<tiberius::Config, DbError
         config.authentication(AuthMethod::sql_server(&params.username, &params.password));
     }
     config.application_name("Pythia");
+    // SQL Server keeps nvarchar, nchar and ntext as UCS-2 it doesn't check,
+    // as in the names of incremental statistics' objects: what isn't UTF-16
+    // reads as U+FFFD. Strict, it failed the result as a protocol error,
+    // and the connection was opened again, without its transaction (#371).
+    config.lossy_utf16_decoding(true);
     // A statement runs until it ends or Break stops it, a lock wait too:
     // the driver's default gave up after 30 s without a word from the
     // server, and the connection with its transaction was lost (#199).

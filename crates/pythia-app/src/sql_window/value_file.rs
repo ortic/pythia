@@ -386,10 +386,15 @@ impl SqlWindow {
                     .fetch
                     .as_ref()
                     .is_some_and(|f| f.binary);
-                match rows.into_iter().next().map(|row| row.into_iter().next()) {
-                    Some(Some(Some(text))) => pythia_ui::value_bytes(&text, binary).map(Some),
-                    Some(_) => Ok(None),
-                    None => Err("the row isn't in the table any more".into()),
+                // Its key finds one row, or the value may be another's.
+                if rows.len() > 1 {
+                    Err(format!("its key finds {} rows", rows.len()))
+                } else {
+                    match rows.into_iter().next().map(|row| row.into_iter().next()) {
+                        Some(Some(Some(text))) => pythia_ui::value_bytes(&text, binary).map(Some),
+                        Some(_) => Ok(None),
+                        None => Err("the row isn't in the table any more".into()),
+                    }
                 }
             }
             DbEvent::TaskDone { result, .. } => match result {

@@ -520,7 +520,7 @@ fn postgres(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
         online: true,
         ..Facts::default()
     };
-    let row = first_row(
+    let mut row = first_row(
         c.query(
             "select s.n_live_tup, s.n_dead_tup, \
                     extract(epoch from now() - greatest(s.last_vacuum, s.last_autovacuum)), \
@@ -534,7 +534,8 @@ fn postgres(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
                     current_setting('autovacuum_freeze_max_age'), \
                     (select count(*) from pg_index i where i.indrelid = c.oid), \
                     (select count(*) from pg_index i where i.indrelid = c.oid \
-                        and not i.indisvalid) \
+                        and not i.indisvalid), \
+                    c.relkind = 'p' \
                from pg_class c \
                join pg_namespace n on n.oid = c.relnamespace \
                left join pg_stat_all_tables s on s.relid = c.oid \
@@ -543,6 +544,36 @@ fn postgres(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
         )?,
         object,
     )?;
+    // A partitioned table holds no rows, has no size and no frozen
+    // transaction ID (its age is the largest there is): its partitions'
+    // are its own (#442).
+    if text(&row, 13).as_deref() == Some("t") {
+        let leaves = first_row(
+            c.query(
+                "with recursive tree (oid, kind) as ( \
+                   select c.oid, c.relkind from pg_class c \
+                     join pg_namespace n on n.oid = c.relnamespace \
+                    where n.nspname = $1 and c.relname = $2 \
+                   union all \
+                   select k.oid, k.relkind from tree \
+                     join pg_inherits i on i.inhparent = tree.oid \
+                     join pg_class k on k.oid = i.inhrelid \
+                    where tree.kind = 'p') \
+                 select sum(s.n_live_tup), sum(s.n_dead_tup), \
+                        sum(pg_total_relation_size(t.oid)), \
+                        max(age(k.relfrozenxid)) filter (where k.relkind = 'r') \
+                   from tree t \
+                   join pg_class k on k.oid = t.oid \
+                   left join pg_stat_all_tables s on s.relid = t.oid \
+                  where t.kind <> 'p'",
+                &[&object.owner, &object.name],
+            )?,
+            object,
+        )?;
+        for (from, to) in [(0, 0), (1, 1), (2, 7), (3, 8)] {
+            row[to] = leaves[from].clone();
+        }
+    }
     let version = int(&row, 9).unwrap_or(0);
     f.release = ((version / 10000) as i32, (version % 10000 / 100) as i32);
     let live = int(&row, 0).unwrap_or(0);
@@ -617,6 +648,10 @@ fn postgres(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
 
 fn mysql(c: &mut dyn Client, object: &ObjectRef) -> Result<Facts, DbError> {
     let mut f = Facts::default();
+    // MySQL 8 caches a table's sizes and last change for a day: after an
+    // OPTIMIZE, or rows written, they were the old ones (#441). MariaDB
+    // has no such cache (and no variable).
+    let _ = c.execute("set session information_schema_stats_expiry = 0");
     let row = first_row(
         c.query(
             "select engine, table_rows, data_length, index_length, data_free, \
@@ -757,6 +792,82 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MySQL's facts are the table's as it is, not as it was cached when
+    /// they were first read (#441): its last change, after rows written.
+    #[test]
+    fn mysql_facts_are_current() {
+        crate::test_db::run_on("PYTHIA_TEST_MYSQL", DbKind::MySql, |c| {
+            let schema = c.query("select database()", &[]).unwrap()[0][0]
+                .clone()
+                .unwrap();
+            c.execute("drop table if exists fd_facts").unwrap();
+            c.execute("create table fd_facts (n int primary key)")
+                .unwrap();
+            let table = ObjectRef {
+                owner: schema,
+                name: "fd_facts".into(),
+                object_type: ObjectType::Table,
+            };
+            let changed = |c: &mut dyn Client| {
+                other(c, &table)
+                    .unwrap()
+                    .state
+                    .iter()
+                    .any(|f| f.label == "Last change")
+            };
+            // Read once, as the facts of a new table are.
+            // MariaDB has no cache.
+            let _ = c.execute("set session information_schema_stats_expiry = 86400");
+            assert!(!changed(c));
+            c.execute("insert into fd_facts values (1)").unwrap();
+            // MariaDB has no cache.
+            let _ = c.execute("set session information_schema_stats_expiry = 86400");
+            assert!(changed(c));
+            c.execute("drop table fd_facts").unwrap();
+        });
+    }
+
+    /// A partitioned table's facts are its partitions' (#442): their rows
+    /// and size, the oldest transaction ID of theirs, which was the largest
+    /// age there is, past the wraparound limit.
+    #[test]
+    fn postgres_partitioned_tables_are_their_partitions() {
+        crate::test_db::run_on("PYTHIA_TEST_POSTGRES", DbKind::Postgres, |c| {
+            for sql in [
+                "drop table if exists fd_parted",
+                "create table fd_parted (n int) partition by range (n)",
+                "create table fd_parted_low partition of fd_parted for values from (0) to (100) \
+                   partition by range (n)",
+                "create table fd_parted_low1 partition of fd_parted_low for values from (0) to (50)",
+                "create table fd_parted_low2 partition of fd_parted_low \
+                   for values from (50) to (100)",
+                "create table fd_parted_high partition of fd_parted for values from (100) to (200)",
+                "insert into fd_parted select generate_series(0, 149)",
+                "analyze fd_parted",
+            ] {
+                c.execute(sql).unwrap();
+            }
+            let table = ObjectRef {
+                owner: "public".into(),
+                name: "fd_parted".into(),
+                object_type: ObjectType::Table,
+            };
+            let facts = other(c, &table).unwrap();
+            let fact = |label: &str| {
+                facts
+                    .state
+                    .iter()
+                    .find(|f| f.label == label)
+                    .unwrap_or_else(|| panic!("{label}"))
+            };
+            assert_eq!(fact("Rows").value, "150");
+            assert_ne!(fact("Size").value, bytes(0.0));
+            let age = fact("Transaction ID age");
+            assert!(!age.warn, "{}", age.value);
+            c.execute("drop table fd_parted").unwrap();
+        });
+    }
 
     #[test]
     fn groups_digits() {

@@ -2110,6 +2110,19 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
         (pythia_db::DbKind::MySql, ObjectType::View) => {
             format!("{database}{}\n", create_or(ddl, "or replace", ""))
         }
+        // An object made under a sql_mode of its own is made again under it
+        // (#422); the window's mode is set back after it.
+        (pythia_db::DbKind::MySql, _)
+            if ddl.starts_with(pythia_db::MYSQL_SQL_MODE_PREFIX)
+                && let Some((mode, rest)) = ddl.split_once("\n\n") =>
+        {
+            let inner = replace_script(dialect, o, rest, mariadb);
+            let inner = inner.strip_prefix(&database).unwrap_or(&inner);
+            format!(
+                "{database}set @pythia_sql_mode = @@session.sql_mode;\n{mode}\n\n{inner}\
+                 set session sql_mode = @pythia_sql_mode;\n"
+            )
+        }
         (pythia_db::DbKind::MySql, _) if mariadb => {
             format!("{database}{}\n/\n", create_or(ddl, "or replace", ""))
         }
@@ -2128,17 +2141,9 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
         }
         // A constraint trigger has no OR REPLACE: dropped (on its table)
         // and created in one block.
-        (pythia_db::DbKind::Postgres, ObjectType::Trigger) => match constraint_trigger_table(ddl) {
-            Some(table) => {
-                let name = dialect.quote_ident(&o.name);
-                pg_block(
-                    &kind,
-                    &format!("drop trigger if exists {name} on {table}"),
-                    ddl,
-                )
-            }
-            None => format!("{}\n", create_or(ddl, "or replace", "TRIGGER")),
-        },
+        (pythia_db::DbKind::Postgres, ObjectType::Trigger) => {
+            pg_trigger_script(&dialect.quote_ident(&o.name), ddl)
+        }
         (pythia_db::DbKind::Postgres, ObjectType::MaterializedView) => {
             pg_block(&kind, &format!("drop {kind} if exists {qualified}"), ddl)
         }
@@ -2169,16 +2174,51 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
 /// create leaves the `kind` as it was (#286).
 fn pg_block(kind: &str, drop: &str, ddl: &str) -> String {
     let ddl = pythia_plsql::terminated(ddl, pythia_plsql::Syntax::Postgres);
+    pg_do(kind, &format!("{drop};\n\n{ddl}"))
+}
+
+/// PostgreSQL: `body` in one `DO` block, whose failure undoes it all.
+fn pg_do(kind: &str, body: &str) -> String {
     let mut tag = "$pythia$".to_owned();
-    while ddl.contains(&tag) {
+    while body.contains(&tag) {
         tag.insert(tag.len() - 1, '_');
     }
     // A column named `found` is the view's, not PL/pgSQL's FOUND.
     format!(
         "-- One block: if the create fails, the {kind} stays as it was.\n\
          do {tag}\n#variable_conflict use_column\nbegin\n\
-         {drop};\n\n{ddl}\nend\n{tag};\n"
+         {body}\nend\n{tag};\n"
     )
+}
+
+/// PostgreSQL: the script that replaces a trigger, whose DDL has one
+/// statement for each table with a trigger `name`, then their states and
+/// comments. Each is `CREATE OR REPLACE TRIGGER` (#377: only the first was,
+/// the second failed as existing). A constraint trigger has no OR REPLACE:
+/// it is dropped and created, and then the whole script is one block
+/// (#397), so that a failing create leaves every trigger as it was.
+fn pg_trigger_script(name: &str, ddl: &str) -> String {
+    let syntax = pythia_plsql::Syntax::Postgres;
+    let mut constraint = false;
+    let statements: Vec<String> = pythia_plsql::split_statements_in(ddl, syntax)
+        .iter()
+        .map(|s| {
+            let text = s.text(ddl);
+            match constraint_trigger_table(text) {
+                Some(table) => {
+                    constraint = true;
+                    format!("drop trigger if exists {name} on {table};\n\n{text}")
+                }
+                None => create_or(text, "or replace", "TRIGGER"),
+            }
+        })
+        .collect();
+    let body = format!("{};", statements.join(";\n\n"));
+    if constraint {
+        pg_do("trigger", &body)
+    } else {
+        format!("{body}\n")
+    }
 }
 
 /// The table of PostgreSQL's `CREATE CONSTRAINT TRIGGER … ON table …`, as
@@ -2290,6 +2330,25 @@ fn create_or(ddl: &str, words: &str, next: &str) -> String {
                 && !ddl[after.span.clone()].eq_ignore_ascii_case("or")
                 && (next.is_empty() || ddl[after.span.clone()].eq_ignore_ascii_case(next)) =>
         {
+            // OR REPLACE can't go with IF NOT EXISTS, which MariaDB keeps in
+            // a trigger's DDL (#420): it goes from the statement's head.
+            let head: Vec<&pythia_plsql::Token> = tokens
+                .iter()
+                .filter(|t| !t.kind.is_trivia())
+                .take(12)
+                .collect();
+            let is = |i: usize, word: &str| {
+                head.get(i)
+                    .is_some_and(|t| ddl[t.span.clone()].eq_ignore_ascii_case(word))
+            };
+            let mut ddl = ddl.to_owned();
+            if let Some(i) =
+                (0..head.len()).find(|&i| is(i, "IF") && is(i + 1, "NOT") && is(i + 2, "EXISTS"))
+            {
+                let end = head[i + 2].span.end;
+                let end = end + ddl[end..].len() - ddl[end..].trim_start().len();
+                ddl.replace_range(head[i].span.start..end, "");
+            }
             format!(
                 "{} {words}{}",
                 &ddl[..create.span.end],
@@ -3206,6 +3265,30 @@ mod tests {
             replace_script(Dialect::MYSQL, &trigger, ddl, true)
                 .starts_with("use shop;\n\nCREATE or replace DEFINER=`app`@`%` TRIGGER t ")
         );
+        // Made under a sql_mode of its own: set for it, the window's after.
+        let moded = "set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
+                     CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s";
+        assert_eq!(
+            replace_script(Dialect::MYSQL, &trigger, moded, true),
+            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode;\n\
+             set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
+             CREATE or replace TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s\n/\n\
+             set session sql_mode = @pythia_sql_mode;\n"
+        );
+        let script = replace_script(Dialect::MYSQL, &trigger, moded, false);
+        assert!(
+            script.contains("set session sql_mode = 'PIPES_AS_CONCAT';\n\n-- MySQL can't")
+                && script.ends_with("/\nset session sql_mode = @pythia_sql_mode;\n"),
+            "{script}"
+        );
+        // MariaDB keeps IF NOT EXISTS, which OR REPLACE can't go with.
+        let kept = "CREATE DEFINER=`app`@`%` trigger if not exists t before insert on o \
+                    for each row set new.n = 1";
+        assert_eq!(
+            replace_script(Dialect::MYSQL, &trigger, kept, true),
+            "use shop;\n\nCREATE or replace DEFINER=`app`@`%` trigger t before insert on o \
+             for each row set new.n = 1\n/\n"
+        );
     }
 
     #[test]
@@ -3337,6 +3420,24 @@ mod tests {
         assert_eq!(
             constraint_trigger_table("CREATE TRIGGER t AFTER UPDATE ON x"),
             None
+        );
+        // A trigger of its name on two tables: both replaced, the state and
+        // comment after them kept.
+        let two = "CREATE TRIGGER audit BEFORE INSERT ON app.orders FOR EACH ROW EXECUTE FUNCTION app.f();\n\n\
+                   CREATE TRIGGER audit BEFORE INSERT ON app.items FOR EACH ROW EXECUTE FUNCTION app.f();\n\n\
+                   alter table app.items disable trigger audit;\n\n\
+                   comment on trigger audit on app.items is 'x';";
+        assert_eq!(
+            replace_script(
+                Dialect::POSTGRES,
+                &o("audit", ObjectType::Trigger),
+                two,
+                false
+            ),
+            "CREATE or replace TRIGGER audit BEFORE INSERT ON app.orders FOR EACH ROW EXECUTE FUNCTION app.f();\n\n\
+             CREATE or replace TRIGGER audit BEFORE INSERT ON app.items FOR EACH ROW EXECUTE FUNCTION app.f();\n\n\
+             alter table app.items disable trigger audit;\n\n\
+             comment on trigger audit on app.items is 'x';\n"
         );
         let drop = drop_sql(Dialect::POSTGRES, &o("t", ObjectType::Trigger));
         assert!(drop.contains("g.tgname = 't'"), "{drop}");

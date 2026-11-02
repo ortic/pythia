@@ -120,6 +120,15 @@ fn schema_and_data_roundtrip() {
         let d = data::compare(&conn, &query, &conn, &tgt, filtered, |_, _| {})
             .expect("data compare with comments");
         assert_eq!(d.equal, 3, "{d:?}");
+        // A filter that is all comment is no filter.
+        let commented = DataOptions {
+            key_columns: vec!["ID".into()],
+            filter: "-- id > 1".into(),
+            ..options_again()
+        };
+        let d = data::compare(&conn, &query, &conn, &tgt, commented, |_, _| {})
+            .expect("data compare with a commented-out filter");
+        assert_eq!(d.equal, 3, "{d:?}");
     }));
     teardown_schemas(&conn, schemas);
     if let Err(e) = result {
@@ -174,6 +183,77 @@ fn reserved_words_sync() {
                 .unwrap();
             assert_eq!(columns, 5, "{t}");
         }
+    }));
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// A table's invisible columns are compared and synced, which `select *`
+/// left out (#444); its virtual ones are neither, as the sync statements
+/// can't write them (#443): run, they make the target the source.
+#[test]
+fn invisible_and_virtual_columns_sync() {
+    let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (user, password) = credentials.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, password, connect_string).unwrap();
+    let tables = ["FD_COLS_S", "FD_COLS_T"];
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    for t in tables {
+        run(
+            &conn,
+            &format!(
+                "create table {t} (id number primary key, n number, \
+                   hidden_n number invisible, twice as (n * 2) virtual)"
+            ),
+        );
+    }
+    run(
+        &conn,
+        "insert into fd_cols_s (id, n, hidden_n) values (1, 1, 10);
+         insert into fd_cols_s (id, n, hidden_n) values (2, 2, 20);
+         insert into fd_cols_t (id, n, hidden_n) values (1, 1, 99);",
+    );
+    let owner = user.to_ascii_uppercase();
+    let table = |name: &str| DataSource::Table {
+        schema: owner.clone(),
+        table: name.into(),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let diff = data::compare(
+            &conn,
+            &table("FD_COLS_S"),
+            &conn,
+            &table("FD_COLS_T"),
+            DataOptions::default(),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!((diff.changed, diff.only_in_source), (1, 1));
+        assert!(
+            diff.statements.iter().all(|s| !s.contains("twice")),
+            "{:?}",
+            diff.statements
+        );
+        for statement in &diff.statements {
+            run(&conn, statement);
+        }
+        let same: i64 = conn
+            .query_row_as(
+                "select count(*) from (select id, n, hidden_n, twice from fd_cols_s \
+                   minus select id, n, hidden_n, twice from fd_cols_t)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(same, 0);
     }));
     for t in tables {
         common::try_run(&conn, &format!("drop table {t} purge"));

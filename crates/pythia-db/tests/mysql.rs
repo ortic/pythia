@@ -26,6 +26,7 @@ use pythia_db::{
     Bind, ConnectParams, DbEvent, DbKind, DbRequest, Detail, Dialect, MetaQuery, MetaResult,
     ObjectType, Session,
 };
+use pythia_plsql::Syntax;
 
 fn params() -> Option<ConnectParams> {
     mysql_params(&std::env::var("PYTHIA_TEST_MYSQL").ok()?)
@@ -111,7 +112,10 @@ impl Harness {
     fn next_result(&mut self) -> DbEvent {
         loop {
             match self.next() {
-                DbEvent::Transaction { .. } | DbEvent::TimeZone(_) | DbEvent::Notice(_) => {
+                DbEvent::Transaction { .. }
+                | DbEvent::TimeZone(_)
+                | DbEvent::Lexing(_)
+                | DbEvent::Notice(_) => {
                     continue;
                 }
                 event => return event,
@@ -232,6 +236,59 @@ fn time_zone_is_reported() {
         Some("Europe/Zurich")
     );
     assert_eq!(h.zone_after("set time_zone = 'SYSTEM'"), connected);
+}
+
+/// The session says how it reads strings when it connects and after a
+/// `SET` that changed it (#412): without backslash escapes under
+/// `NO_BACKSLASH_ESCAPES`, where `'C:\'` is a string of its own, and a
+/// bind after it is one, not part of it.
+#[test]
+fn lexing_follows_the_sql_mode() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let lexing_after = |h: &mut Harness, sql: &str| {
+        h.session.send(DbRequest::Execute {
+            id: 0,
+            sql: sql.into(),
+            max_rows: 100,
+            binds: vec![],
+        });
+        let mut lexing = None;
+        loop {
+            match h.next() {
+                DbEvent::Lexing(syntax) => lexing = Some(syntax),
+                DbEvent::Transaction { .. } => return lexing,
+                DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                _ => {}
+            }
+        }
+    };
+    assert_eq!(lexing_after(&mut h, "select 1"), Some(Syntax::MySql));
+    assert_eq!(lexing_after(&mut h, "set @x = 1"), None);
+    assert_eq!(
+        lexing_after(
+            &mut h,
+            "set session sql_mode = concat(@@session.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+        ),
+        Some(Syntax::MySqlNoEscapes)
+    );
+    h.session.send(DbRequest::Execute {
+        id: 1,
+        sql: "select 'C:\\' as p, :v as v".into(),
+        max_rows: 10,
+        binds: vec![("v".into(), Some("x".to_owned()).into())],
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("rows")
+    };
+    h.settle();
+    assert_eq!(rows[0], [Some("C:\\".into()), Some("x".into())]);
+    assert_eq!(
+        lexing_after(&mut h, "set session sql_mode = default"),
+        Some(Syntax::MySql)
+    );
 }
 
 #[test]
@@ -748,7 +805,7 @@ fn outline(h: &mut Harness, id: u64) -> Vec<String> {
     loop {
         out.push(match h.next() {
             DbEvent::Transaction { .. } => return out,
-            DbEvent::TimeZone(_) | DbEvent::Notice(_) => continue,
+            DbEvent::TimeZone(_) | DbEvent::Lexing(_) | DbEvent::Notice(_) => continue,
             DbEvent::QueryStarted { id: of, columns } if of == id => {
                 let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
                 format!("cols {}", names.join(" "))
@@ -1491,6 +1548,78 @@ fn index_key_parts_as_defined() {
         ]
     );
     h.ok("drop table r53_ix");
+}
+
+fn trigger_ddl(h: &mut Harness, schema: &str, name: &str) -> String {
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema.into(),
+        name: name.into(),
+        object_type: ObjectType::Trigger,
+    }) else {
+        panic!("expected DDL")
+    };
+    ddl
+}
+
+/// A trigger's DDL keeps its place among its table's triggers of the same
+/// timing and event (`PRECEDES` the next one) and the sql_mode it was
+/// made under, where the session's isn't it: dropped and made again from
+/// it, it fired last, and `||` was no concatenation.
+#[test]
+fn trigger_ddl_keeps_order_and_sql_mode() {
+    // Making triggers with binary logging on takes SUPER (or
+    // log_bin_trust_function_creators): as the DBA.
+    let Some(params) = std::env::var("PYTHIA_TEST_MYSQL_DBA")
+        .ok()
+        .and_then(|spec| mysql_params(&spec))
+    else {
+        return;
+    };
+    let mut h = Harness::with(params);
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r99_ord");
+    h.ok("create table r99_ord (s varchar(10))");
+    for name in ["a", "b", "c"] {
+        h.ok(&format!(
+            "create trigger r99_ord_{name} before insert on r99_ord for each row \
+             set new.s = concat(new.s, '{name}')"
+        ));
+    }
+    let a = trigger_ddl(&mut h, &schema, "r99_ord_a");
+    assert!(
+        a.to_uppercase()
+            .contains("FOR EACH ROW PRECEDES R99_ORD_B "),
+        "{a}"
+    );
+    let c = trigger_ddl(&mut h, &schema, "r99_ord_c");
+    assert!(!c.contains("PRECEDES"), "{c}");
+    // Made again from its DDL, it fires first again.
+    h.ok("drop trigger r99_ord_a");
+    h.ok(&a);
+    h.ok("insert into r99_ord values ('')");
+    assert_eq!(h.scalar("select s from r99_ord").as_deref(), Some("abc"));
+
+    // Made under PIPES_AS_CONCAT: the DDL sets it.
+    h.ok("set @before = @@session.sql_mode");
+    h.ok("set session sql_mode = concat(@@session.sql_mode, ',PIPES_AS_CONCAT')");
+    h.ok("create trigger r99_ord_p before update on r99_ord for each row set new.s = 'p' || new.s");
+    h.ok("set session sql_mode = @before");
+    let p = trigger_ddl(&mut h, &schema, "r99_ord_p");
+    let (mode, create) = p.split_once("\n\n").expect(&p);
+    assert!(
+        mode.starts_with("set session sql_mode = '") && mode.contains("PIPES_AS_CONCAT"),
+        "{p}"
+    );
+    h.ok("drop trigger r99_ord_p");
+    h.ok(mode);
+    h.ok(create);
+    h.ok("set session sql_mode = @before");
+    h.ok("update r99_ord set s = 'x'");
+    assert_eq!(h.scalar("select s from r99_ord").as_deref(), Some("px"));
+    // In the session's own mode, the DDL doesn't set it.
+    let a = trigger_ddl(&mut h, &schema, "r99_ord_a");
+    assert!(!a.starts_with("set session"), "{a}");
+    h.ok("drop table r99_ord");
 }
 
 /// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE

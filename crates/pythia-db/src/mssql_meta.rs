@@ -25,8 +25,12 @@ const TYPE: &str = "case when o.type = 'U' then 'TABLE' when o.type = 'V' then '
 const TYPES: &str = "'U', 'V', 'P', 'PC', 'TR', 'SO', 'SN', 'FN', 'IF', 'TF', 'FS', 'FT'";
 
 /// The column's type as written in DDL (`c` is `sys.columns`, `t`
-/// `sys.types`).
-const COLUMN_TYPE: &str = "case when t.name in ('varchar', 'char', 'varbinary', 'binary') \
+/// `sys.types`). A user-defined type, an alias or a CLR type, is named with
+/// its schema, as it is found by its name only in `sys` and the session's
+/// default schema (#372); an alias has its length.
+const COLUMN_TYPE: &str = "case when t.is_user_defined = 1 \
+                                  then quotename(schema_name(t.schema_id)) + '.' + quotename(t.name) \
+                                when t.name in ('varchar', 'char', 'varbinary', 'binary') \
                                   then t.name + '(' + case when c.max_length = -1 then 'max' \
                                        else cast(c.max_length as varchar(10)) end + ')' \
                                 when t.name in ('nvarchar', 'nchar') \
@@ -141,6 +145,32 @@ fn object_rows(rows: Vec<Vec<Cell>>) -> Vec<DbObject> {
         .collect()
 }
 
+/// SQL that leaves `o` out where it is a dropped ledger table, its history
+/// table or its view (#382): SQL Server keeps them, under names of its own,
+/// for the ledger's verification, but they are no table to work with.
+/// Nothing before 2022, whose catalog has no ledger.
+fn not_dropped_ledger(ms: &mut Ms<'_>) -> Result<&'static str, DbError> {
+    let ledger = ms
+        .rows(
+            "select col_length('sys.tables', 'is_dropped_ledger_table')",
+            &[],
+        )?
+        .into_iter()
+        .find_map(first)
+        .is_some();
+    Ok(if ledger {
+        " and o.object_id not in ( \
+            select t.object_id from sys.tables t where t.is_dropped_ledger_table = 1 \
+            union all \
+            select t.history_table_id from sys.tables t \
+             where t.is_dropped_ledger_table = 1 and t.history_table_id is not null \
+            union all \
+            select v.object_id from sys.views v where v.is_dropped_ledger_view = 1)"
+    } else {
+        ""
+    })
+}
+
 fn objects(
     ms: &mut Ms<'_>,
     owner: &str,
@@ -148,12 +178,17 @@ fn objects(
     filter: Option<&str>,
 ) -> Result<Vec<DbObject>, DbError> {
     let pattern = like_pattern(filter.unwrap_or(""));
+    let ledger = if matches!(object_type, ObjectType::Table | ObjectType::View) {
+        not_dropped_ledger(ms)?
+    } else {
+        ""
+    };
     let rows = ms.rows(
         &format!(
             "select s.name, o.name, {TYPE}, convert(varchar(19), o.modify_date, 120) \
                from sys.objects o join sys.schemas s on s.schema_id = o.schema_id \
               where s.name = @P1 and upper(o.name) like @P2 escape '\\' \
-                and o.type in ({TYPES}) and {TYPE} = @P3 and o.is_ms_shipped = 0 \
+                and o.type in ({TYPES}) and {TYPE} = @P3 and o.is_ms_shipped = 0{ledger} \
               order by o.name"
         ),
         &[owner, &pattern, object_type.dictionary_name()],
@@ -165,12 +200,13 @@ fn objects(
 /// then the shortest names.
 fn find(ms: &mut Ms<'_>, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbError> {
     let pattern = like_pattern(pattern);
+    let ledger = not_dropped_ledger(ms)?;
     let rows = ms.rows(
         &format!(
             "select top ({limit}) s.name, o.name, {TYPE}, convert(varchar(19), o.modify_date, 120) \
                from sys.objects o join sys.schemas s on s.schema_id = o.schema_id \
               where upper(o.name) like @P1 escape '\\' and o.type in ({TYPES}) \
-                and o.is_ms_shipped = 0 \
+                and o.is_ms_shipped = 0{ledger} \
               order by case when s.name = schema_name() then 0 else 1 end, len(o.name), o.name, \
                        s.name"
         ),
@@ -271,7 +307,7 @@ fn details(
                from sys.triggers t where t.parent_id = object_id(@P1) \
               order by t.name"
         }
-        Detail::Grants => {
+        Detail::Grants | Detail::RoutineGrants => {
             "select user_name(p.grantee_principal_id) as GRANTEE, \
                     p.permission_name as PRIVILEGE, p.state_desc as STATE \
                from sys.database_permissions p \
@@ -493,9 +529,44 @@ fn ddl(
         }
     };
     Ok(if runnable {
-        format!("{text}\nGO\n")
+        let order = if object_type == ObjectType::Trigger {
+            trigger_order(ms, &object)?
+        } else {
+            String::new()
+        };
+        format!("{text}\nGO\n{order}")
     } else {
         text
+    })
+}
+
+/// A trigger's place among its table's triggers of an event, where it is
+/// the first or the last: `sp_settriggerorder` calls that set it, in a
+/// batch of their own, or nothing. `ALTER TRIGGER` drops it, and the
+/// trigger made again from its DDL fired in no order (#440).
+fn trigger_order(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
+    let rows = ms.rows(
+        "select te.type_desc, case when te.is_first = 1 then 'First' else 'Last' end \
+           from sys.trigger_events te \
+          where te.object_id = object_id(@P1) and (te.is_first = 1 or te.is_last = 1) \
+          order by te.type",
+        &[object],
+    )?;
+    let name = object.replace('\'', "''");
+    let calls: String = rows
+        .into_iter()
+        .filter_map(|row| match row.as_slice() {
+            [Some(event), Some(order)] => Some(format!(
+                "exec sp_settriggerorder @triggername = N'{name}', @order = N'{order}', \
+                 @stmttype = N'{event}';\n"
+            )),
+            _ => None,
+        })
+        .collect();
+    Ok(if calls.is_empty() {
+        calls
+    } else {
+        format!("{calls}GO\n")
     })
 }
 
@@ -539,6 +610,23 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .next()
         .unwrap_or_default();
     let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    // A ledger history table is made by its ledger table's DDL (#366),
+    // which fails where one was made before (#381).
+    if has(7)
+        && let Some(ledger) = ms
+            .rows(
+                "select quotename(schema_name(t.schema_id)) + '.' + quotename(t.name) \
+                   from sys.tables t \
+                  where t.history_table_id = object_id(@P1) and t.ledger_type = 2",
+                &[object],
+            )?
+            .into_iter()
+            .find_map(first)
+    {
+        return Ok(format!(
+            "-- The ledger history table of {ledger}, made by that table's DDL."
+        ));
+    }
     let graph = has(5);
     let graph_type = if graph { "c.graph_type" } else { "null" };
     // Each column and whether SQL Server added it to a graph table: those

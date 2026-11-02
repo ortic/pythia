@@ -19,6 +19,7 @@ use crate::documents::{DocContext, Effects, Target, quote_ident, request_id};
 pub struct ExportTables {
     /// Schema to export from (empty: the current schema).
     pub owner: String,
+    #[serde(default, with = "crate::serde_path::option")]
     pub folder: Option<PathBuf>,
     #[serde(with = "format_name")]
     pub format: Format,
@@ -544,12 +545,29 @@ pub fn export(
             std::fs::write(&path, ddl)
                 .map_err(|e| DbError::new(format!("{}: {e}", path.display())))?;
         }
+        // Invisible columns too (#444); INSERTs without the virtual ones,
+        // which Oracle refuses to write (#443).
+        let with_virtual = settings.format != Format::Insert;
+        let columns = pythia_db::compat::table_columns(conn, &owner, &job.table, with_virtual)?;
+        let list = if columns.is_empty() {
+            "*".to_owned()
+        } else {
+            columns
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let mut sql = format!(
-            "select * from {}.{}",
+            "select {list} from {}.{}",
             quote_ident(&owner),
             quote_ident(&job.table)
         );
-        if !job.filter.is_empty() {
+        // A filter that is all comment is none (#427): `where -- x` failed.
+        if pythia_plsql::tokenize(&job.filter)
+            .iter()
+            .any(|t| !t.kind.is_trivia())
+        {
             sql.push_str(&format!(" where {}", job.filter));
         }
         let path = settings
@@ -664,6 +682,62 @@ mod tests {
             .unwrap();
         assert_eq!(copies, 2);
         conn.execute("drop table r54_exp_words purge", &[]).unwrap();
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// A table's invisible columns are exported, which `select *` left
+    /// out (#444); its INSERTs leave out its virtual columns, which Oracle
+    /// refuses to write (#443), and run back into it. A CSV has them both.
+    #[test]
+    fn invisible_and_virtual_columns() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        let _ = conn.execute("drop table fd_exp_cols purge", &[]);
+        conn.execute(
+            "create table fd_exp_cols (id number, n number, hidden_n number invisible, \
+             twice as (n * 2) virtual)",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into fd_exp_cols (id, n, hidden_n) values (1, 2, 3)",
+            &[],
+        )
+        .unwrap();
+        let folder = std::env::temp_dir().join(format!("pythia-fd-cols-{}", std::process::id()));
+        let export_as = |format: Format| {
+            let settings = Settings {
+                owner: String::new(),
+                folder: folder.clone(),
+                format,
+                options: Options::default(),
+                include_ddl: false,
+            };
+            let jobs = [Job {
+                table: "FD_EXP_COLS".into(),
+                filter: String::new(),
+            }];
+            export(&conn, &settings, &jobs, &Progress::default()).unwrap();
+            let path = folder.join(format!("fd_exp_cols.{}", format.extension()));
+            std::fs::read_to_string(path).unwrap()
+        };
+        let csv = export_as(Format::Csv);
+        assert!(csv.starts_with("ID,N,TWICE,HIDDEN_N"), "{csv}");
+        let text = export_as(Format::Insert);
+        let insert = text.trim_end().trim_end_matches(';');
+        assert!(!insert.contains("twice"), "{insert}");
+        conn.execute(insert, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{insert}"));
+        let copies: i64 = conn
+            .query_row_as(
+                "select count(*) from fd_exp_cols where id = 1 and n = 2 and hidden_n = 3 \
+                 and twice = 4",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(copies, 2);
+        conn.execute("drop table fd_exp_cols purge", &[]).unwrap();
         std::fs::remove_dir_all(folder).unwrap();
     }
 
@@ -784,6 +858,14 @@ mod tests {
         assert_eq!(csv, "ID;TAG\n1;NULL\n2;x\n3;NULL\n");
         let ddl = std::fs::read_to_string(folder.join("pythia_exp_a.ddl.sql")).unwrap();
         assert!(ddl.contains("CREATE TABLE \"PYTHIA_EXP_A\""), "{ddl}");
+
+        // A filter that is all comment exports every row.
+        let commented = [Job {
+            table: "PYTHIA_EXP_A".into(),
+            filter: "-- id <= 1".into(),
+        }];
+        let all = export(&conn, &settings, &commented, &Progress::default()).unwrap();
+        assert!(all > 3, "{all}");
 
         // A bad filter fails that table and leaves no partial file.
         let bad = [Job {

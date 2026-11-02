@@ -225,7 +225,9 @@ impl Dialect {
             (DbKind::Postgres, ObjectType::View | ObjectType::MaterializedView) => {
                 &[Detail::Uses, Detail::UsedBy, Detail::Grants]
             }
-            (DbKind::Postgres, ObjectType::Function | ObjectType::Procedure) => &[Detail::Grants],
+            (DbKind::Postgres, ObjectType::Function | ObjectType::Procedure) => {
+                &[Detail::RoutineGrants]
+            }
             (DbKind::Postgres, _) => &[],
             (
                 DbKind::SqlServer,
@@ -306,9 +308,20 @@ impl Dialect {
     /// How the dictionary stores an unquoted name the user typed: Oracle
     /// folds it to uppercase, PostgreSQL to lowercase; MySQL, SQL Server and
     /// SQLite keep it (and compare names without case where it matters).
+    /// Oracle folds letter by letter, each to one letter: café is CAFÉ,
+    /// straße STRAßE, not STRASSE (#380).
     pub fn dictionary_name(self, name: &str) -> String {
         match self.0 {
-            DbKind::Oracle => name.to_uppercase(),
+            DbKind::Oracle => name
+                .chars()
+                .map(|c| {
+                    let mut upper = c.to_uppercase();
+                    match (upper.next(), upper.next()) {
+                        (Some(one), None) => one,
+                        _ => c,
+                    }
+                })
+                .collect(),
             DbKind::Postgres => name.to_lowercase(),
             DbKind::MySql | DbKind::SqlServer | DbKind::Sqlite => name.to_owned(),
         }
@@ -332,6 +345,34 @@ impl Dialect {
             None => self.dictionary_name(name),
         }
     }
+
+    /// The parts of a name typed as `owner.name`, split at the dots outside
+    /// quotes, each as [`typed_name`](Self::typed_name) reads it:
+    /// `hr."My.Table"` is `HR` and `My.Table` (#369).
+    pub fn typed_parts(self, name: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let (mut start, mut close) = (0, None);
+        let mut chars = name.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            match close {
+                // A doubled closing quote stands for one.
+                Some(q) if c == q && chars.next_if(|&(_, n)| n == q).is_none() => close = None,
+                Some(_) => {}
+                None => match c {
+                    '"' => close = Some('"'),
+                    '`' => close = Some('`'),
+                    '[' => close = Some(']'),
+                    '.' => {
+                        parts.push(self.typed_name(&name[start..i]));
+                        start = i + 1;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        parts.push(self.typed_name(&name[start..]));
+        parts
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +395,31 @@ mod tests {
         assert_eq!(Dialect::MYSQL.typed_name("`my db`"), "my db");
         assert_eq!(Dialect::MYSQL.typed_name("Shop"), "Shop");
         assert_eq!(Dialect::SQLSERVER.typed_name("[a]]b]"), "a]b");
+    }
+
+    /// Oracle folds an unquoted name letter by letter, each to one letter:
+    /// café is CAFÉ, straße STRAßE (#380).
+    #[test]
+    fn oracle_folds_letter_by_letter() {
+        let o = Dialect::ORACLE;
+        assert_eq!(o.dictionary_name("café"), "CAFÉ");
+        assert_eq!(o.dictionary_name("straße"), "STRAßE");
+        assert_eq!(o.typed_name("r83_straße"), "R83_STRAßE");
+        assert_eq!(o.typed_parts("hr.straße"), ["HR", "STRAßE"]);
+    }
+
+    /// A typed `owner.name` splits at the dots outside quotes (#369).
+    #[test]
+    fn typed_parts() {
+        let o = Dialect::ORACLE;
+        assert_eq!(o.typed_parts("hr.\"My.Table\""), ["HR", "My.Table"]);
+        assert_eq!(o.typed_parts("\"R83.Dot\""), ["R83.Dot"]);
+        assert_eq!(o.typed_parts(" hr . emp "), ["HR", "EMP"]);
+        assert_eq!(o.typed_parts("\"a\"\".b\".c"), ["a\".b", "C"]);
+        assert_eq!(o.typed_parts("emp"), ["EMP"]);
+        assert_eq!(o.typed_parts(""), [""]);
+        assert_eq!(Dialect::MYSQL.typed_parts("`my.db`.t"), ["my.db", "t"]);
+        assert_eq!(Dialect::SQLSERVER.typed_parts("[a]].b].c"), ["a].b", "c"]);
     }
 
     #[test]

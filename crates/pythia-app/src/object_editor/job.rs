@@ -4,11 +4,12 @@
 //! `DBMS_SCHEDULER.CREATE_JOB`; a change sets the changed attributes.
 
 use egui::{RichText, Ui};
-use pythia_db::DbError;
 use pythia_db::oracle::Connection;
 use pythia_db::oracle::sql_type::{OracleType, ToSql};
+use pythia_db::{DbError, Dialect};
 
 use super::{Lists, form_grid, form_row, ident, name_field, names, picker, qualified};
+use crate::browser::written;
 use crate::documents::quote_ident;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,17 +144,25 @@ pub fn load(conn: &Connection, owner: &str, name: &str) -> Result<JobDef, DbErro
 /// The schema's procedures, packaged ones too, and what the session may
 /// do.
 pub fn lists(conn: &Connection, owner: &str, lists: &mut super::BaseLists) -> Result<(), DbError> {
-    lists.procedures = names(
-        conn,
-        "select distinct lower(case when procedure_name is null then object_name
-                                    else object_name || '.' || procedure_name end)
+    // As SQL reads them, picked into the Procedure field: "MyProc" isn't
+    // myproc (#365).
+    lists.procedures.clear();
+    for row in conn.query_as::<(String, Option<String>)>(
+        "select distinct object_name, procedure_name
            from all_procedures
           where owner = :1
             and (object_type = 'PROCEDURE' and procedure_name is null
                  or object_type = 'PACKAGE' and procedure_name is not null)
-          order by 1",
+          order by 1, 2",
         &[&owner],
-    )?;
+    )? {
+        let (object, procedure) = row?;
+        let object = written(Dialect::ORACLE, &object);
+        lists.procedures.push(match procedure {
+            Some(p) => format!("{object}.{}", written(Dialect::ORACLE, &p)),
+            None => object,
+        });
+    }
     lists.session_privileges = names(conn, "select privilege from session_privs", &[])?;
     lists.session_user = conn.query_row_as::<String>("select user from dual", &[])?;
     Ok(())

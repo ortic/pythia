@@ -337,6 +337,59 @@ fn scripts_split_as_the_server_reads_them() {
     h.ok("drop function fs_three()");
 }
 
+/// A transaction that failed (a savepoint statement failed, which no
+/// savepoint of Pythia's undoes) can't be committed: PostgreSQL answers
+/// COMMIT with a rollback and no error, and Commit said "Committed".
+#[test]
+fn a_failed_transaction_is_not_called_committed() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    // The events up to the transaction's state: its errors' messages.
+    let errors = |h: &mut Harness| {
+        let mut errors = Vec::new();
+        loop {
+            match h.next() {
+                DbEvent::Error(e) => errors.push(e.message),
+                DbEvent::Transaction { pending } => return (pending, errors),
+                _ => {}
+            }
+        }
+    };
+    h.ok("drop table if exists tx_ab");
+    h.ok("create table tx_ab (a int)");
+    for commit in ["button", "commit", "end"] {
+        assert!(h.ok("insert into tx_ab values (1)"));
+        assert!(h.fails("release savepoint no_such_savepoint"));
+        if commit == "button" {
+            h.session.send(DbRequest::Commit);
+        } else {
+            h.execute(0, commit, 100);
+        }
+        let (pending, errors) = errors(&mut h);
+        assert!(!pending, "{commit}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("Nothing was committed")),
+            "{commit}: {errors:?}"
+        );
+        assert_eq!(
+            h.scalar("select count(*) from tx_ab").as_deref(),
+            Some("0"),
+            "{commit}"
+        );
+    }
+    // A statement that fails alone is undone alone: the rest commits.
+    assert!(h.ok("insert into tx_ab values (1)"));
+    assert!(h.fails("select 1 / 0"));
+    h.session.send(DbRequest::Commit);
+    let (_, errors) = errors(&mut h);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(h.scalar("select count(*) from tx_ab").as_deref(), Some("1"));
+    h.ok("drop table tx_ab");
+}
+
 #[test]
 fn transactions_and_autocommit() {
     let Some(mut h) = Harness::connect() else {
@@ -1574,6 +1627,247 @@ fn a_key_to_the_tables_own_unique_index_runs_again() {
     h.ok("drop schema r95_tree, r95_tree_copy cascade");
 }
 
+/// A table, a function and a procedure of one name: each one's grants
+/// and DDL are its own. The table's Grants listed the function's EXECUTE,
+/// the function's DDL held the procedure.
+#[test]
+fn objects_of_one_name_keep_apart() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r99_same cascade");
+    h.ok("create schema r99_same");
+    for sql in [
+        "create table r99_same.sample (n int)",
+        "create function r99_same.sample(int) returns int language sql as 'select 1'",
+        "create procedure r99_same.sample(text) language sql as 'select 1'",
+        "grant select on r99_same.sample to public",
+        "revoke execute on function r99_same.sample(int) from public",
+        "grant execute on function r99_same.sample(int) to public",
+    ] {
+        h.ok(sql);
+    }
+    let privileges = |h: &mut Harness, detail: Detail| -> Vec<String> {
+        let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+            owner: "r99_same".into(),
+            name: "sample".into(),
+            detail,
+        }) else {
+            panic!("expected rows")
+        };
+        rows.iter()
+            .filter_map(|r| r.get(1).cloned().flatten())
+            .collect()
+    };
+    let table = privileges(&mut h, Detail::Grants);
+    assert!(table.contains(&"SELECT".to_owned()), "{table:?}");
+    assert!(!table.contains(&"EXECUTE".to_owned()), "{table:?}");
+    let routine = privileges(&mut h, Detail::RoutineGrants);
+    assert!(routine.contains(&"EXECUTE".to_owned()), "{routine:?}");
+    assert!(!routine.contains(&"SELECT".to_owned()), "{routine:?}");
+    let function = ddl_of(&mut h, "r99_same", "sample", ObjectType::Function);
+    assert!(
+        function.contains("FUNCTION r99_same.sample(integer)"),
+        "{function}"
+    );
+    assert!(!function.contains("PROCEDURE"), "{function}");
+    let procedure = ddl_of(&mut h, "r99_same", "sample", ObjectType::Procedure);
+    assert!(
+        procedure.contains("PROCEDURE r99_same.sample(IN text)"),
+        "{procedure}"
+    );
+    assert!(!procedure.contains("FUNCTION"), "{procedure}");
+    h.ok("drop schema r99_same cascade");
+}
+
+/// A child table's DDL inherits from its parents, with only the columns
+/// and constraints of its own (#376): a copy was a table of its own, which
+/// a query on the parent's copy didn't read.
+#[test]
+fn a_child_tables_ddl_inherits() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r99_inh, r99_inh_copy cascade");
+    h.ok("create schema r99_inh");
+    h.ok("create schema r99_inh_copy");
+    h.ok("create table r99_inh.parent (id int, n int check (n > 0))");
+    h.ok("create table r99_inh.other (o text)");
+    h.ok(
+        "create table r99_inh.child (x int not null, constraint child_x check (x < 9)) \
+           inherits (r99_inh.parent, r99_inh.other)",
+    );
+    let ddl = ddl_of(&mut h, "r99_inh", "child", ObjectType::Table);
+    assert!(
+        ddl.contains(") inherits (r99_inh.parent, r99_inh.other);"),
+        "{ddl}"
+    );
+    assert!(ddl.contains("x integer not null"), "{ddl}");
+    assert!(ddl.contains("child_x"), "{ddl}");
+    assert!(
+        !ddl.contains("id integer") && !ddl.contains("parent_n_check"),
+        "{ddl}"
+    );
+    for table in ["parent", "other"] {
+        let parent = ddl_of(&mut h, "r99_inh", table, ObjectType::Table);
+        run_ddl(&mut h, &parent, "r99_inh.", "r99_inh_copy.");
+    }
+    run_ddl(&mut h, &ddl, "r99_inh.", "r99_inh_copy.");
+    h.ok("insert into r99_inh_copy.child (id, n, o, x) values (1, 2, 'a', 3)");
+    assert_eq!(
+        h.scalar("select count(*) from r99_inh_copy.parent")
+            .as_deref(),
+        Some("1")
+    );
+    h.ok("drop schema r99_inh, r99_inh_copy cascade");
+}
+
+/// A table's DDL has the comments on its indexes, a key's too, and on its
+/// constraints, a foreign key made after the indexes too; a materialized
+/// view's on its indexes (#379): a copy had none.
+#[test]
+fn ddl_keeps_comments_on_indexes_and_constraints() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r100_cm, r100_cm_copy cascade");
+    h.ok("create schema r100_cm");
+    h.ok("create schema r100_cm_copy");
+    for sql in [
+        "create table r100_cm.t (id int constraint t_pk primary key, \
+           n int constraint positive check (n > 0), up int)",
+        "create unique index t_up on r100_cm.t (up)",
+        "alter table r100_cm.t add constraint t_up_fk foreign key (id) references r100_cm.t (up)",
+        "create index t_n on r100_cm.t (n)",
+        "comment on constraint t_pk on r100_cm.t is 'The key'",
+        "comment on index r100_cm.t_pk is 'The key''s index'",
+        "comment on constraint positive on r100_cm.t is 'Positive'",
+        "comment on constraint t_up_fk on r100_cm.t is 'Up'",
+        "comment on index r100_cm.t_n is 'By n'",
+        "create materialized view r100_cm.mv as select id from r100_cm.t",
+        "create index mv_id on r100_cm.mv (id)",
+        "comment on index r100_cm.mv_id is 'By id'",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r100_cm", "t", ObjectType::Table);
+    let view = ddl_of(&mut h, "r100_cm", "mv", ObjectType::MaterializedView);
+    run_ddl(&mut h, &table, "r100_cm.", "r100_cm_copy.");
+    run_ddl(&mut h, &view, "r100_cm.", "r100_cm_copy.");
+    let comments = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(d.description, ', ' order by d.description) \
+               from pg_description d \
+              where d.objoid in (select c.oid from pg_class c \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                  union all \
+                                 select k.oid from pg_constraint k \
+                                  where k.connamespace = '{schema}'::regnamespace)"
+        ))
+    };
+    let original = comments(&mut h, "r100_cm");
+    assert_eq!(
+        original.as_deref(),
+        Some("By id, By n, Positive, The key, The key's index, Up")
+    );
+    assert_eq!(
+        comments(&mut h, "r100_cm_copy"),
+        original,
+        "{table}\n{view}"
+    );
+    h.ok("drop schema r100_cm, r100_cm_copy cascade");
+}
+
+/// A table's DDL has what is set on it after its CREATE (#378): its
+/// columns' storage, compression, statistics targets and options, its
+/// replica identity and its rules, a disabled one disabled; a materialized
+/// view's columns' settings too. A copy had none of them: its `delete`
+/// deleted the rows a rule kept.
+#[test]
+fn ddl_keeps_rules_replica_identity_and_column_settings() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r100_set, r100_set_copy cascade");
+    h.ok("create schema r100_set");
+    h.ok("create schema r100_set_copy");
+    for sql in [
+        "create table r100_set.t (id int primary key, s text, n int, u int not null)",
+        "create table r100_set.log (id int)",
+        "alter table r100_set.t alter column s set storage external",
+        "alter table r100_set.t alter column s set compression pglz",
+        "alter table r100_set.t alter column n set statistics 1000",
+        "alter table r100_set.t alter column n set (n_distinct = -0.5)",
+        "create unique index t_u on r100_set.t (u)",
+        "alter table r100_set.t replica identity using index t_u",
+        "create rule keep as on delete to r100_set.t do instead nothing",
+        "create rule logged as on insert to r100_set.t do also \
+           insert into r100_set.log values (new.id)",
+        "alter table r100_set.t disable rule logged",
+        "create table r100_set.f (id int)",
+        "alter table r100_set.f replica identity full",
+        "create materialized view r100_set.mv as select id, s from r100_set.t",
+        "alter materialized view r100_set.mv alter column s set statistics 50",
+    ] {
+        h.ok(sql);
+    }
+    for (name, object_type) in [
+        ("log", ObjectType::Table),
+        ("t", ObjectType::Table),
+        ("f", ObjectType::Table),
+        ("mv", ObjectType::MaterializedView),
+    ] {
+        let ddl = ddl_of(&mut h, "r100_set", name, object_type);
+        run_ddl(&mut h, &ddl, "r100_set.", "r100_set_copy.");
+    }
+    let settings = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(c.relname || '.' || a.attname || ' ' || a.attstorage::text || ' ' \
+                               || a.attcompression::text || ' ' || coalesce(a.attstattarget, -1) \
+                               || ' ' || coalesce(array_to_string(a.attoptions, ','), ''), \
+                               '; ' order by c.relname, a.attnum) \
+                    || ' | ' || (select string_agg(c.relname || ' ' || c.relreplident::text, ', ' \
+                                                   order by c.relname) \
+                                   from pg_class c \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                    and c.relkind = 'r') \
+                    || ' | ' || (select string_agg(w.rulename || ' ' || w.ev_enabled::text, ', ' \
+                                                   order by w.rulename) \
+                                   from pg_rewrite w join pg_class c on c.oid = w.ev_class \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                    and w.rulename <> '_RETURN') \
+               from pg_attribute a join pg_class c on c.oid = a.attrelid \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind in ('r', 'm') \
+                and a.attnum > 0 and (a.attstorage = 'e' or a.attcompression <> '' \
+                                      or a.attstattarget >= 0 or a.attoptions is not null)"
+        ))
+    };
+    let original = settings(&mut h, "r100_set");
+    assert_eq!(
+        original.as_deref(),
+        Some(
+            "mv.s x  50 ; t.s e p -1 ; t.n p  1000 n_distinct=-0.5 \
+             | f f, log d, t i | keep O, logged D"
+        )
+    );
+    assert_eq!(settings(&mut h, "r100_set_copy"), original);
+    h.ok("insert into r100_set_copy.t values (1, 'a', 1, 1)");
+    h.ok("delete from r100_set_copy.t");
+    assert_eq!(
+        h.scalar(
+            "select count(*) || ' ' || (select count(*) from r100_set_copy.log) \
+                    from r100_set_copy.t"
+        )
+        .as_deref(),
+        Some("1 0")
+    );
+    h.ok("drop schema r100_set, r100_set_copy cascade");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.
@@ -1688,6 +1982,55 @@ fn a_views_ddl_names_its_tables_with_their_schemas() {
 /// search path, by Edit in a window that set one, the trigger stays on its
 /// table and calls its function, and each routine is replaced rather than
 /// made again with other argument types (#350).
+/// A trigger's DDL keeps a trigger that isn't enabled as created so:
+/// disabled, replica or always. Created again, it fired on every insert.
+#[test]
+fn a_triggers_ddl_keeps_its_state() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r98_tr cascade");
+    h.ok("create schema r98_tr");
+    for sql in [
+        "create table r98_tr.orders (n int)",
+        "create table r98_tr.items (n int)",
+        "create table r98_tr.lines (n int)",
+        "create function r98_tr.audit() returns trigger language plpgsql \
+           as 'begin new.n = -1; return new; end'",
+        "create trigger audit before insert on r98_tr.orders for each row \
+           execute function r98_tr.audit()",
+        "create trigger audit before insert on r98_tr.items for each row \
+           execute function r98_tr.audit()",
+        "create trigger audit before insert on r98_tr.lines for each row \
+           execute function r98_tr.audit()",
+        "alter table r98_tr.items disable trigger audit",
+        "alter table r98_tr.lines enable always trigger audit",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = ddl_of(&mut h, "r98_tr", "audit", ObjectType::Trigger);
+    assert!(
+        ddl.contains("alter table r98_tr.items disable trigger audit;"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("alter table r98_tr.lines enable always trigger audit;"),
+        "{ddl}"
+    );
+    assert!(!ddl.contains("r98_tr.orders disable"), "{ddl}");
+    // Run again as Edit runs it, each trigger replaced: the states stay.
+    let script = ddl.replace("CREATE TRIGGER", "CREATE OR REPLACE TRIGGER");
+    run_ddl(&mut h, &script, "", "");
+    let states = h.scalar(
+        "select string_agg(c.relname || '=' || t.tgenabled::text, ',' order by c.relname) \
+           from pg_trigger t join pg_class c on c.oid = t.tgrelid \
+          where t.tgname = 'audit' and c.relnamespace = 'r98_tr'::regnamespace",
+    );
+    assert_eq!(states.as_deref(), Some("items=D,lines=A,orders=O"));
+    h.ok("drop schema r98_tr cascade");
+}
+
 #[test]
 fn the_ddl_of_triggers_and_routines_names_their_schemas() {
     let Some(mut h) = Harness::connect() else {
@@ -2202,6 +2545,161 @@ fn the_ddl_has_the_comments() {
     );
     assert_eq!(comments(&mut h, "r81_cm_copy"), was);
     h.ok("drop schema r81_cm, r81_cm_copy cascade");
+}
+
+/// A table's DDL enables and forces its row level security where it does,
+/// and creates its policies, with their command, roles, USING and WITH
+/// CHECK, restrictive or permissive, and every name with its schema. Run
+/// in another schema, the copy has the same (#373).
+#[test]
+fn a_tables_ddl_keeps_its_row_level_security() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r81_rls, r81_rls_copy cascade");
+    h.ok("drop function if exists r81_rls_ok(int)");
+    h.ok("create schema r81_rls");
+    h.ok("create schema r81_rls_copy");
+    h.ok(&format!(
+        "create function {schema}.r81_rls_ok(x int) returns bool language sql \
+         as 'select x > 0'"
+    ));
+    for sql in [
+        "create table r81_rls.r81_log (id int)",
+        "create table r81_rls.r81_t (id int primary key, who text, n int)",
+        "alter table r81_rls.r81_t enable row level security",
+        "alter table r81_rls.r81_t force row level security",
+        "create policy r81_own on r81_rls.r81_t using (who = current_user)",
+        "create policy \"R81 Insert\" on r81_rls.r81_t as restrictive for insert \
+         to pg_monitor, pg_read_all_stats with check (r81_rls_ok(n))",
+        "create policy r81_upd on r81_rls.r81_t for update \
+         using (n in (select id from r81_rls.r81_log)) with check (n < 100)",
+        "create table r81_rls.r81_on (n int)",
+        "alter table r81_rls.r81_on enable row level security",
+    ] {
+        h.ok(sql);
+    }
+    let t = ddl_of(&mut h, "r81_rls", "r81_t", ObjectType::Table);
+    for part in [
+        "\n\nalter table r81_rls.r81_t enable row level security;\n\n\
+         alter table r81_rls.r81_t force row level security;\n\n"
+            .to_owned(),
+        "\n\ncreate policy r81_own on r81_rls.r81_t\n  using (who = CURRENT_USER);".to_owned(),
+        format!(
+            "\n\ncreate policy \"R81 Insert\" on r81_rls.r81_t as restrictive for insert\n  \
+             to pg_monitor, pg_read_all_stats\n  with check ({schema}.r81_rls_ok(n));"
+        ),
+        "\n\ncreate policy r81_upd on r81_rls.r81_t for update\n  using (".to_owned(),
+        "FROM r81_rls.r81_log)))\n  with check (n < 100);".to_owned(),
+    ] {
+        assert!(t.contains(&part), "{t}");
+    }
+    let on = ddl_of(&mut h, "r81_rls", "r81_on", ObjectType::Table);
+    assert!(
+        on.ends_with("\n\nalter table r81_rls.r81_on enable row level security;"),
+        "{on}"
+    );
+    let log = ddl_of(&mut h, "r81_rls", "r81_log", ObjectType::Table);
+    assert!(!log.contains("row level security"), "{log}");
+    for ddl in [&log, &t, &on] {
+        run_ddl(&mut h, ddl, "r81_rls.", "r81_rls_copy.");
+    }
+    // Each table's row level security and policies.
+    let security = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.relname, c.relrowsecurity, c.relforcerowsecurity, \
+                      (select string_agg(concat_ws(' ', p.polname, p.polcmd, p.polpermissive, \
+                                                   p.polroles::regrole[]::text, \
+                                                   pg_get_expr(p.polqual, p.polrelid), \
+                                                   pg_get_expr(p.polwithcheck, p.polrelid)), \
+                                         '; ' order by p.polname) \
+                         from pg_policy p where p.polrelid = c.oid)), \
+                               ' | ' order by c.relname) \
+               from pg_class c \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind = 'r'"
+        ))
+        .map(|s| s.replace(&format!("{schema}."), ""))
+    };
+    let was = security(&mut h, "r81_rls");
+    assert!(
+        was.as_deref().is_some_and(|w| w.contains(
+            "R81 Insert a f {pg_monitor,pg_read_all_stats} r81_rls_ok(n); r81_own * t {-}"
+        )),
+        "{was:?}"
+    );
+    assert_eq!(security(&mut h, "r81_rls_copy"), was, "{t}");
+    h.ok("drop schema r81_rls, r81_rls_copy cascade");
+    h.ok(&format!("drop function {schema}.r81_rls_ok(int)"));
+}
+
+/// A table's DDL gives each column its collation where it isn't its
+/// type's, a domain's too, with its schema but `pg_catalog`'s: run in
+/// another schema, the copy's columns compare and sort as the original's
+/// (#375).
+#[test]
+fn a_tables_ddl_keeps_its_columns_collations() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r81_co, r81_co_copy cascade");
+    h.ok("create schema r81_co");
+    h.ok("create schema r81_co_copy");
+    for schema in ["r81_co", "r81_co_copy"] {
+        h.ok(&format!(
+            "create collation {schema}.\"R81 Coll\" from \"C\""
+        ));
+        h.ok(&format!(
+            "create domain {schema}.r81_d as text collate \"POSIX\""
+        ));
+    }
+    h.ok(
+        "create table r81_co.r81_t (a text collate \"C\", b varchar(10) collate \"POSIX\" not null, \
+         c text, d r81_co.r81_d, e r81_co.r81_d collate \"C\", f text collate r81_co.\"R81 Coll\", \
+         g text[] collate \"C\", n int)",
+    );
+    let t = ddl_of(&mut h, "r81_co", "r81_t", ObjectType::Table);
+    for line in [
+        "\n    a text collate \"C\",\n",
+        "\n    b character varying(10) collate \"POSIX\" not null,\n",
+        "\n    c text,\n",
+        "\n    d r81_co.r81_d,\n",
+        "\n    e r81_co.r81_d collate \"C\",\n",
+        "\n    f text collate r81_co.\"R81 Coll\",\n",
+        "\n    g text[] collate \"C\",\n",
+        "\n    n integer\n",
+    ] {
+        assert!(t.contains(line), "{t}");
+    }
+    run_ddl(&mut h, &t, "r81_co.", "r81_co_copy.");
+    let collations = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(a.attname || ' ' || coalesce(o.collname, '-'), ', ' order by a.attnum) \
+               from pg_attribute a left join pg_collation o on o.oid = a.attcollation \
+              where a.attrelid = '{schema}.r81_t'::regclass and a.attnum > 0"
+        ))
+    };
+    let was = collations(&mut h, "r81_co");
+    assert_eq!(
+        was.as_deref(),
+        Some("a C, b POSIX, c default, d POSIX, e C, f R81 Coll, g C, n -")
+    );
+    assert_eq!(collations(&mut h, "r81_co_copy"), was, "{t}");
+    // What the collation means: "B" before "a" in C, after it in the
+    // database's.
+    for schema in ["r81_co", "r81_co_copy"] {
+        h.ok(&format!(
+            "insert into {schema}.r81_t (a, b) values ('a', 'a'), ('B', 'B')"
+        ));
+    }
+    assert_eq!(
+        h.scalar("select string_agg(a, '' order by a) from r81_co_copy.r81_t")
+            .as_deref(),
+        Some("Ba")
+    );
+    h.ok("drop schema r81_co, r81_co_copy cascade");
 }
 
 /// A materialized view's DDL makes it as it is: owned by its owner where

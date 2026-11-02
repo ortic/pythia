@@ -33,6 +33,7 @@ pub fn is_sql_file(path: &Path) -> bool {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default, with = "crate::serde_path::option")]
     pub root: Option<PathBuf>,
     expanded: BTreeSet<PathBuf>,
     /// Show only changed files, as a flat list.

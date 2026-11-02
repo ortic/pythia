@@ -987,11 +987,20 @@ pub fn is_keyword(word: &str) -> bool {
 pub fn is_reserved(word: &str, syntax: crate::Syntax) -> bool {
     match syntax {
         crate::Syntax::Oracle => contains(ORACLE_RESERVED, word) || is_keyword(word),
-        crate::Syntax::MySql => contains(MYSQL_RESERVED, word) || is_keyword(word),
+        crate::Syntax::MySql | crate::Syntax::MySqlNoEscapes => {
+            contains(MYSQL_RESERVED, word) || is_keyword(word)
+        }
         crate::Syntax::Postgres => contains(POSTGRES_RESERVED, word),
         crate::Syntax::TSql => contains(TSQL_RESERVED, word),
         crate::Syntax::Sqlite => contains(SQLITE_RESERVED, word),
     }
+}
+
+/// Whether `word` is MySQL's own reserved word, which can't be a name
+/// unquoted (without Oracle's keywords, which [`is_reserved`] adds to
+/// quote names safely everywhere).
+pub fn is_mysql_reserved(word: &str) -> bool {
+    contains(MYSQL_RESERVED, word)
 }
 
 /// Case-insensitive lookup in a sorted, uppercase list.

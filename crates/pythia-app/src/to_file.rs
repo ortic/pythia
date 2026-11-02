@@ -637,4 +637,72 @@ mod tests {
                 .unwrap();
         }
     }
+
+    /// The INSERTs of a JSON's dates, timestamps, intervals, binary values
+    /// and binary numbers (#370), also in a JSON over 4000 bytes, run back
+    /// into a copy of their table, are the same scalars; they were strings
+    /// and NUMBERs, and NaN the string "Nan". An object MongoDB writes so,
+    /// `{"$oid":…}`, stays an object.
+    #[test]
+    fn writes_json_extended_scalars() {
+        let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+            return;
+        };
+        for table in ["r84_jx", "r84_jx_copy"] {
+            let _ = conn.execute(&format!("drop table {table} purge"), &[]);
+            conn.execute(
+                &format!("create table {table} (id number primary key, j json)"),
+                &[],
+            )
+            .unwrap();
+        }
+        for sql in [
+            "insert into r84_jx values (1, json{'a': date '2020-01-01', 'b': 1.5d, 'c': 2.5f, \
+             'd': hextoraw('ABCD'), 'e': interval '-1 02:03:04.5' day to second, \
+             'f': interval '1-2' year to month, 'n': binary_double_nan, \
+             't': timestamp '2020-01-01 10:00:00.123456789', \
+             'z': to_timestamp_tz('2020-01-01 10:00:00 -05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), \
+             'm': json('{\"$oid\":\"5f1b2c3d4e5f6a7b8c9d0e1f\",\"&\":1}'), \
+             'o': json('{\"$oid\":\"5f1b2c3d4e5f6a7b8c9d0e1f\"}')})",
+            "insert into r84_jx values (2, json_scalar(1e300d))",
+            "insert into r84_jx (id, j) \
+               select 3, json_arrayagg(json_object('d' value date '2020-01-01' + level, \
+                        'k&' value level returning json) returning json) \
+                 from dual connect by level <= 300",
+        ] {
+            conn.execute(sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let rows = texts(&conn, "select * from r84_jx order by id");
+        assert!(rows[2][1].as_ref().unwrap().len() > 8000);
+        let n = insert_into_copy(
+            &conn,
+            "select * from r84_jx order by id",
+            "r84_jx",
+            "r84_jx_copy",
+        );
+        assert_eq!(n, 3);
+        let stored = |table: &str| {
+            texts(
+                &conn,
+                &format!(
+                    "select id, json_serialize(j returning clob extended) from {table} order by id"
+                ),
+            )
+        };
+        let copied = stored("r84_jx_copy");
+        assert_eq!(copied, stored("r84_jx"));
+        assert!(
+            copied[0][1]
+                .as_deref()
+                .unwrap()
+                .contains(r#""o":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"}"#),
+            "{copied:?}"
+        );
+        assert_eq!(texts(&conn, "select * from r84_jx_copy order by id"), rows);
+        for table in ["r84_jx", "r84_jx_copy"] {
+            conn.execute(&format!("drop table {table} purge"), &[])
+                .unwrap();
+        }
+    }
 }

@@ -44,15 +44,41 @@ impl Matcher {
     }
 
     /// Byte ranges of all non-empty matches within `scope` of `haystack`.
+    /// The whole text is searched from the scope's start, so that `^`, `$`
+    /// and `\b` read the text around it as [`Self::replacement`] does: in a
+    /// slice, a selection's edges were a line's and a word's, and `$1` then
+    /// had no captures to expand (#418). A match must end in the scope. The
+    /// scope is clamped to the text and its characters.
     pub fn find_all(&self, haystack: &str, scope: Option<Range<usize>>) -> Vec<Range<usize>> {
-        let scope = scope.unwrap_or(0..haystack.len());
-        let slice = &haystack[scope.clone()];
-        self.regex
-            .find_iter(slice)
-            .map(|m| m.start() + scope.start..m.end() + scope.start)
-            .filter(|r| !r.is_empty())
-            .filter(|r| !self.whole_word || is_whole_word(haystack, r))
-            .collect()
+        let boundary = |mut i: usize| {
+            i = i.min(haystack.len());
+            while !haystack.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        };
+        let scope = scope.map_or(0..haystack.len(), |s| boundary(s.start)..boundary(s.end));
+        let mut out = Vec::new();
+        let mut at = scope.start;
+        while at <= scope.end {
+            let Some(m) = self.regex.find_at(haystack, at) else {
+                break;
+            };
+            if m.end() > scope.end {
+                break;
+            }
+            let r = m.start()..m.end();
+            if !r.is_empty() && (!self.whole_word || is_whole_word(haystack, &r)) {
+                out.push(r.clone());
+            }
+            // Past an empty match by one character.
+            at = if r.is_empty() {
+                r.end + haystack[r.end..].chars().next().map_or(1, char::len_utf8)
+            } else {
+                r.end
+            };
+        }
+        out
     }
 
     /// The replacement text for the match at `range` (expands `$1` in regex mode).
@@ -106,6 +132,47 @@ mod tests {
             text: text.into(),
             ..Default::default()
         }
+    }
+
+    fn rq(text: &str) -> SearchQuery {
+        SearchQuery {
+            regex: true,
+            case_sensitive: true,
+            ..q(text)
+        }
+    }
+
+    /// One match, from `start` to `end`.
+    fn one(start: usize, end: usize) -> Vec<Range<usize>> {
+        vec![Range { start, end }]
+    }
+
+    /// In a selection, the text around it still counts for `^`, `$` and
+    /// word boundaries, and a match must lie in it: `$1` always expands.
+    #[test]
+    fn matches_in_a_scope() {
+        let m = Matcher::new(&rq(r"(\w+)")).unwrap().unwrap();
+        // The selection ends inside `name`: only `a`.
+        let hay = "a name x";
+        let found = m.find_all(hay, Some(0..4));
+        assert_eq!(found, one(0, 1));
+        assert_eq!(m.replacement(hay, &found[0], "\"$1\""), "\"a\"");
+        // Starting mid-line, `^` is no line start there.
+        let m = Matcher::new(&rq(r"^(\s+)(\S)")).unwrap().unwrap();
+        let hay = "  x\n  y";
+        let found = m.find_all(hay, Some(2..7));
+        assert_eq!(found, one(4, 7));
+        assert_eq!(m.replacement(hay, &found[0], "$2"), "y");
+        // Ending mid-line, `$` is no line end there.
+        let m = Matcher::new(&rq(r"(\w)$")).unwrap().unwrap();
+        assert!(m.find_all("ab cd", Some(0..2)).is_empty());
+        // A scope past the text or inside a character is clamped.
+        let m = Matcher::new(&q("a")).unwrap().unwrap();
+        assert_eq!(m.find_all("t.\nü", Some(0..4)), Vec::<Range<usize>>::new());
+        assert_eq!(m.find_all("aü", Some(0..99)), one(0, 1));
+        // Empty matches are stepped over by a character.
+        let m = Matcher::new(&rq("x*")).unwrap().unwrap();
+        assert_eq!(m.find_all("üxü", None), one(2, 3));
     }
 
     #[test]

@@ -12,8 +12,12 @@
 //! committed at once; inside one it waits for Commit too (SQLite's DDL is
 //! transactional). While a session has uncommitted changes, another one that
 //! writes waits up to [`BUSY_TIMEOUT`] for the lock, then fails with
-//! "database is locked".
+//! "database is locked"; one that holds it only for the rest of a result
+//! reads that ahead, which lets it go ([`LOCK_WANTED`]). Sessions of a database in a shared cache, as
+//! `:memory:` is, wait so for each other's table and schema locks too
+//! ([`waiting`]).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +37,35 @@ use crate::types::{
 
 /// How long a statement waits for another session's lock on the file.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often [`waiting`] tries again.
+const LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// When a session of this app last waited for a lock on a database file
+/// (#185): sessions that hold one only for the rest of a result read it,
+/// which ends their statement and lets the lock go.
+static LOCK_WANTED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How long after [`LOCK_WANTED`] a session reads the rest of its result.
+const LOCK_WANTED_FOR: Duration = Duration::from_millis(500);
+
+/// How often a session with rows left looks at [`LOCK_WANTED`].
+const RELEASE_POLL: Duration = Duration::from_millis(20);
+
+/// The most of a result's rest read so (in bytes of its text): beyond it,
+/// the statement keeps its lock and the rows are read as they are fetched.
+const REST_BYTES: usize = 256 << 20;
+
+fn want_lock() {
+    *LOCK_WANTED.lock().expect("lock wanted") = Some(Instant::now());
+}
+
+fn lock_wanted() -> bool {
+    LOCK_WANTED
+        .lock()
+        .expect("lock wanted")
+        .is_some_and(|at| at.elapsed() < LOCK_WANTED_FOR)
+}
 
 /// `:memory:` is one database for all sessions of the app (each would
 /// otherwise get an empty one of its own), kept while one of them is open.
@@ -56,6 +89,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         conn,
         events,
         autocommit: false,
+        answers: in_shared_cache(&params.connect_string).then(Answers::default),
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
@@ -96,7 +130,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
             DbRequest::FetchMore { id, .. } => worker.events.send(DbEvent::QueryClosed { id }),
             DbRequest::Meta { id, query } => {
                 let started = Instant::now();
-                let result = crate::sqlite_meta::run(&worker.conn, &query);
+                let result = lookup(&worker.conn, worker.answers.as_mut(), &query);
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -115,7 +149,10 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
             }),
             DbRequest::Run { id, task } => {
                 let started = Instant::now();
-                let result = task(&mut SqliteClient(&worker.conn));
+                let result = task(&mut SqliteClient {
+                    conn: &worker.conn,
+                    answers: worker.answers.as_mut(),
+                });
                 debug!(
                     id,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -187,18 +224,26 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
             text.into_owned()
         }
     };
-    let conn = Connection::open_with_flags(&location, flags).map_err(DbError::from)?;
-    // Writing waits for another session's lock instead of failing at once.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let mut conn = Connection::open_with_flags(&location, flags).map_err(DbError::from)?;
+    // Writing waits for another session's lock instead of failing at once,
+    // and asks this app's sessions that hold one only for the rest of a
+    // result to let it go (#185).
+    conn.busy_handler(Some(|tries: i32| {
+        want_lock();
+        std::thread::sleep(LOCK_POLL);
+        LOCK_POLL * u32::try_from(tries).unwrap_or(u32::MAX) < BUSY_TIMEOUT
+    }))?;
     // Not a database at all: SQLite only notices on the first read.
-    conn.query_row("select count(*) from sqlite_schema", [], |_| Ok(()))
-        .map_err(|e| {
-            let mut error = DbError::from(e);
-            if let File::Path(path) = &target.file {
-                error.message = format!("{}: {}", path.display(), error.message);
-            }
-            error
-        })?;
+    waiting(&conn, || {
+        conn.query_row("select count(*) from sqlite_schema", [], |_| Ok(()))
+    })
+    .map_err(|e| {
+        let mut error = DbError::from(e);
+        if let File::Path(path) = &target.file {
+            error.message = format!("{}: {}", path.display(), error.message);
+        }
+        error
+    })?;
     Ok(conn)
 }
 
@@ -314,6 +359,91 @@ fn shared_memory(uri: &str) -> String {
     format!("{main}{with}cache=shared{fragment}")
 }
 
+/// Whether the sessions of `connect_string` share SQLite's cache, which locks
+/// tables and the schema session by session: `:memory:`, a URI of memory
+/// ([`shared_memory`]) or one that says `cache=shared`.
+fn in_shared_cache(connect_string: &str) -> bool {
+    match Target::parse(connect_string).map(|t| t.file) {
+        Ok(File::Memory) => true,
+        Ok(File::Uri(uri)) => uri_param(&shared_memory(&uri), "cache") == Some("shared"),
+        Ok(File::Path(_)) | Err(_) => false,
+    }
+}
+
+/// Runs `f` on `conn` again while another session holds what it needs of a
+/// database in a shared cache, for up to [`BUSY_TIMEOUT`] (#374): SQLite
+/// waits so for a file's lock (SQLITE_BUSY), but fails at once on a shared
+/// cache's (SQLITE_LOCKED), which a session holds until it commits or rolls
+/// back. A statement takes its tables' locks when it starts, preparing one
+/// the schema's. Break ends the wait. `sqlite3_unlock_notify` would wait
+/// with no limit, and no Break.
+fn waiting<T>(
+    conn: &Connection,
+    mut f: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let started = Instant::now();
+    loop {
+        match f() {
+            Err(e) if is_locked(&e) && started.elapsed() < BUSY_TIMEOUT => pause(conn)?,
+            other => return other,
+        }
+    }
+}
+
+/// Waits before [`waiting`] tries again; fails if Break came meanwhile: an
+/// interrupt while no statement runs is kept for the next, which it doesn't
+/// stop.
+fn pause(conn: &Connection) -> rusqlite::Result<()> {
+    std::thread::sleep(LOCK_POLL);
+    if conn.is_interrupted() {
+        let cancelled = rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT);
+        return Err(rusqlite::Error::SqliteFailure(cancelled, None));
+    }
+    Ok(())
+}
+
+/// Another session of the shared cache holds a table or the schema.
+fn is_locked(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(error, _)
+            if error.extended_code == rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE
+    )
+}
+
+/// A session's last answer to each lookup, on a shared cache (#374): while
+/// another session has uncommitted DDL, no other one can read the schema,
+/// and the object browser and completion came up empty.
+#[derive(Default)]
+struct Answers(HashMap<MetaQuery, MetaResult>);
+
+/// Answers a lookup. On a shared cache whose schema another session locks,
+/// as it did last, or, for one not made before, once the lock is gone, as
+/// [`waiting`] waits.
+fn lookup(
+    conn: &Connection,
+    answers: Option<&mut Answers>,
+    query: &MetaQuery,
+) -> Result<MetaResult, DbError> {
+    let Some(answers) = answers else {
+        return crate::sqlite_meta::run(conn, query);
+    };
+    if let Err(e) = conn.prepare("select 1")
+        && is_locked(&e)
+    {
+        if let Some(answer) = answers.0.get(query) {
+            return Ok(answer.clone());
+        }
+        waiting(conn, || conn.prepare("select 1").map(drop))?;
+    }
+    let answer = crate::sqlite_meta::run(conn, query)?;
+    // A plan is of the text being written.
+    if !matches!(query, MetaQuery::ExplainPlan { .. }) {
+        answers.0.insert(query.clone(), answer.clone());
+    }
+    Ok(answer)
+}
+
 /// The value of a `file:` URI's parameter `key`, as written.
 fn uri_param<'a>(uri: &'a str, key: &str) -> Option<&'a str> {
     let (_, query) = uri.split('#').next()?.split_once('?')?;
@@ -381,6 +511,8 @@ struct Worker {
     conn: Connection,
     events: Events,
     autocommit: bool,
+    /// On a shared cache.
+    answers: Option<Answers>,
 }
 
 impl Worker {
@@ -389,7 +521,9 @@ impl Worker {
     fn on_connect(&mut self, init_sql: &[String]) -> Result<(ServerInfo, Vec<String>), DbError> {
         // As most tools do: SQLite checks foreign keys only when asked to, per
         // connection. A login script can turn it off again.
-        self.conn.execute_batch("pragma foreign_keys = on")?;
+        waiting(&self.conn, || {
+            self.conn.execute_batch("pragma foreign_keys = on")
+        })?;
         let mut failed = Vec::new();
         for sql in init_sql {
             if let Err(e) = self.conn.execute_batch(sql) {
@@ -400,9 +534,7 @@ impl Worker {
                 ));
             }
         }
-        let version: String = self
-            .conn
-            .query_row("select sqlite_version()", [], |row| row.get(0))?;
+        let version = rusqlite::version().to_owned();
         let file = self
             .conn
             .path()
@@ -424,7 +556,7 @@ impl Worker {
 
     /// The attached databases (#320).
     fn context(&self) -> Result<NameContext, DbError> {
-        let mut list = self.conn.prepare("pragma database_list")?;
+        let mut list = waiting(&self.conn, || self.conn.prepare("pragma database_list"))?;
         let attached = list
             .query_map([], |row| {
                 Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
@@ -475,6 +607,8 @@ impl Worker {
             started,
             events: &self.events,
             requests,
+            // In a transaction, the lock stays until it ends.
+            release: self.conn.is_autocommit(),
         };
         match run_statement(&self.conn, &sql, values, fetch, &mut next) {
             Ok(Outcome::Query { failed }) => {
@@ -534,8 +668,10 @@ impl Worker {
         // Without a transaction there is nothing to end; SQLite would say
         // "no transaction is active".
         let result = if self.pending() {
-            self.conn
-                .execute_batch(if commit { "commit" } else { "rollback" })
+            waiting(&self.conn, || {
+                self.conn
+                    .execute_batch(if commit { "commit" } else { "rollback" })
+            })
         } else {
             Ok(())
         };
@@ -569,9 +705,18 @@ fn run_statement(
     fetch: Fetch<'_>,
     next: &mut Option<DbRequest>,
 ) -> Result<Outcome, rusqlite::Error> {
-    let mut statement = conn.prepare(sql)?;
+    // Preparing and the first step wait for another session's lock on a
+    // shared cache (#374); the values are bound once, for every try.
+    let mut statement = waiting(conn, || conn.prepare(sql))?;
+    let count = statement.parameter_count();
+    if values.len() != count {
+        return Err(rusqlite::Error::InvalidParameterCount(values.len(), count));
+    }
+    for (i, value) in values.iter().enumerate() {
+        statement.raw_bind_parameter(i + 1, value)?;
+    }
     if statement.column_count() == 0 {
-        statement.execute(params_from_iter(values))?;
+        waiting(conn, || statement.raw_execute())?;
         return Ok(Outcome::Done {
             affected: conn.changes(),
         });
@@ -581,8 +726,14 @@ fn run_statement(
         .map(|c| c.decl_type().map(str::to_owned))
         .collect();
     let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
-    let rows = statement.query(params_from_iter(values))?;
-    Ok(fetch.stream(rows, &names, &declared, next))
+    let started = Instant::now();
+    loop {
+        let wait = started.elapsed() < BUSY_TIMEOUT;
+        match fetch.stream(statement.raw_query(), &names, &declared, next, wait) {
+            None => pause(conn)?,
+            Some(outcome) => return Ok(outcome),
+        }
+    }
 }
 
 /// Reads a query's rows for [`run_statement`].
@@ -594,20 +745,67 @@ struct Fetch<'a> {
     started: Instant,
     events: &'a Events,
     requests: &'a Requests,
+    /// Whether the statement's end lets its lock on the file go: outside a
+    /// transaction.
+    release: bool,
+}
+
+/// The rest of a result read ahead of its fetches (#185), and how it ended
+/// once it did: with the last row, or failing.
+#[derive(Default)]
+struct Rest {
+    rows: std::collections::VecDeque<Vec<Cell>>,
+    end: Option<Option<DbError>>,
 }
 
 impl Fetch<'_> {
+    /// Reads the rest of `rows` into `rest` for another session that waits
+    /// for the file (#185): read to its end, the statement lets its lock
+    /// go. Up to [`REST_BYTES`]; a larger rest keeps the lock.
+    fn read_rest(&self, rows: &mut Rows<'_>, rest: &mut Rest) {
+        let mut bytes: usize = rest.rows.iter().map(|r| row_bytes(r) + 8 * r.len()).sum();
+        while bytes < REST_BYTES {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let cells: Vec<Cell> = (0..row.as_ref().column_count())
+                        .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null), self.whole))
+                        .collect();
+                    bytes += row_bytes(&cells) + 8 * cells.len();
+                    rest.rows.push_back(cells);
+                }
+                Ok(None) => {
+                    rest.end = Some(None);
+                    debug!(
+                        id = self.id,
+                        rows = rest.rows.len(),
+                        "read ahead: the lock is free"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    rest.end = Some(Some(DbError::from(e)));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Reports the rows; while it may `wait`, none for a lock of another
+    /// session of the shared cache on the first one, which reported nothing
+    /// and may be tried again.
     fn stream(
-        self,
+        &self,
         mut rows: Rows<'_>,
         names: &[String],
         declared: &[Option<String>],
         next: &mut Option<DbRequest>,
-    ) -> Outcome {
+        wait: bool,
+    ) -> Option<Outcome> {
         let id = self.id;
         let mut max_rows = self.max_rows;
         let mut started = self.started;
         let mut columns: Option<Vec<Column>> = None;
+        let mut rest = Rest::default();
         loop {
             let mut batch = Vec::with_capacity(max_rows.min(10_000));
             // The value types of the first rows, for columns without a
@@ -617,6 +815,18 @@ impl Fetch<'_> {
             let mut failed = None;
             let mut bytes = 0;
             while batch.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
+                if let Some(cells) = rest.rows.pop_front() {
+                    if self.whole {
+                        bytes += row_bytes(&cells);
+                    }
+                    batch.push(cells);
+                    continue;
+                }
+                if let Some(end) = rest.end.take() {
+                    failed = end;
+                    more = false;
+                    break;
+                }
                 match rows.next() {
                     Ok(Some(row)) => {
                         let mut cells = Vec::with_capacity(names.len());
@@ -635,6 +845,9 @@ impl Fetch<'_> {
                     Ok(None) => {
                         more = false;
                         break;
+                    }
+                    Err(e) if wait && columns.is_none() && batch.is_empty() && is_locked(&e) => {
+                        return None;
                     }
                     Err(e) => {
                         failed = Some(DbError::from(e));
@@ -662,7 +875,7 @@ impl Fetch<'_> {
                     error,
                     elapsed: started.elapsed(),
                 });
-                return Outcome::Query { failed: true };
+                return Some(Outcome::Query { failed: true });
             }
             self.events.send(DbEvent::Rows {
                 id,
@@ -671,9 +884,20 @@ impl Fetch<'_> {
                 elapsed: started.elapsed(),
             });
             if !more {
-                return Outcome::Query { failed: false };
+                return Some(Outcome::Query { failed: false });
             }
-            match self.requests.recv() {
+            let request = loop {
+                match self.requests.recv_timeout(RELEASE_POLL) {
+                    Ok(request) => break Ok(request),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if self.release && rest.end.is_none() && lock_wanted() {
+                            self.read_rest(&mut rows, &mut rest);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(()),
+                }
+            };
+            match request {
                 Ok(DbRequest::FetchMore {
                     id: wanted,
                     max_rows: n,
@@ -686,7 +910,7 @@ impl Fetch<'_> {
                     // read.
                     self.events.send(DbEvent::QueryClosed { id });
                     *next = Some(other.unwrap_or(DbRequest::Disconnect));
-                    return Outcome::Query { failed: false };
+                    return Some(Outcome::Query { failed: false });
                 }
             }
         }
@@ -794,7 +1018,14 @@ pub(crate) fn cell(value: ValueRef<'_>, whole: bool) -> Cell {
         // `{:?}`: shortest round trip, keeps `.0`, exponent for large and
         // tiny values.
         ValueRef::Real(f) => format!("{f:?}"),
-        ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        // Text that isn't UTF-8, as legacy data in Windows-1252 or Latin-1
+        // is, read as Windows-1252, not with U+FFFD for its other bytes
+        // (#413): Copy and exports have its characters. Its Edit check
+        // finds no row with that text, a conflict, as before.
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_owned(),
+            Err(_) => crate::text::windows_1252(bytes),
+        },
         ValueRef::Blob(bytes) => hex(bytes, whole),
     })
 }
@@ -868,7 +1099,11 @@ fn changes(sql: &str) -> bool {
 }
 
 /// A SQLite connection as a [`Client`].
-pub(crate) struct SqliteClient<'a>(pub(crate) &'a Connection);
+pub(crate) struct SqliteClient<'a> {
+    conn: &'a Connection,
+    /// The session's on a shared cache.
+    answers: Option<&'a mut Answers>,
+}
 
 impl Client for SqliteClient<'_> {
     fn dialect(&self) -> Dialect {
@@ -876,17 +1111,19 @@ impl Client for SqliteClient<'_> {
     }
 
     fn query(&mut self, sql: &str, params: &[&str]) -> Result<Vec<Vec<Cell>>, DbError> {
-        let mut statement = self.0.prepare(sql)?;
         let values: Vec<Value> = params.iter().map(|p| bind_value(p)).collect();
-        Ok(rows_of(&mut statement, values)?)
+        Ok(waiting(self.conn, || {
+            let mut statement = self.conn.prepare(sql)?;
+            rows_of(&mut statement, values.clone())
+        })?)
     }
 
     fn meta(&mut self, query: &MetaQuery) -> Result<MetaResult, DbError> {
-        crate::sqlite_meta::run(self.0, query)
+        lookup(self.conn, self.answers.as_deref_mut(), query)
     }
 
     fn execute(&mut self, sql: &str) -> Result<(), DbError> {
-        Ok(self.0.execute_batch(sql)?)
+        Ok(self.conn.execute_batch(sql)?)
     }
 }
 
@@ -936,6 +1173,13 @@ impl From<rusqlite::Error> for DbError {
                         "\nAnother window holds the file: it has uncommitted changes (commit or \
                          roll back there), or a result with rows left to fetch (fetch them all, \
                          or close it) while this one writes.",
+                    );
+                } else if error.extended_code == rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE {
+                    // A shared cache's, as :memory:'s, after waiting (#374).
+                    db.message.push_str(
+                        "\nAnother window holds the database: it has uncommitted changes (commit \
+                         or roll back there), or a result with rows left to fetch (fetch them \
+                         all, or close it).",
                     );
                 }
                 db

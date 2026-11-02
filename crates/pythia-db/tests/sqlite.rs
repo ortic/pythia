@@ -304,6 +304,73 @@ fn query_and_fetch_more() {
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 
+/// A window with rows left to fetch doesn't keep another one from
+/// committing (#185): its open statement held a read lock on the file,
+/// and the other's commit failed after five seconds with "database is
+/// locked". It reads the rest ahead, which ends the statement, and its
+/// fetches get the rows as they were.
+#[test]
+fn rows_left_to_fetch_dont_block_commits() {
+    use std::time::Instant;
+    let db = TempDb::new("rows-left");
+    let mut a = Harness::connect(&db.create());
+    a.session.send(DbRequest::SetAutocommit(true));
+    a.ok("create table t (n integer)");
+    a.ok(
+        "insert into t with recursive s(n) as (select 1 union all select n + 1 from s \
+           where n < 500) select n from s",
+    );
+    let mut b = Harness::connect(&db.path());
+    a.execute(1, "select n from t order by n", 10);
+    assert!(matches!(a.next_result(), DbEvent::QueryStarted { .. }));
+    assert!(matches!(a.next_result(), DbEvent::Rows { more: true, .. }));
+    let started = Instant::now();
+    b.ok("insert into t values (501)");
+    b.session.send(DbRequest::Commit);
+    let mut committed = false;
+    loop {
+        match b.next() {
+            DbEvent::Notice(n) if n == "Committed" => committed = true,
+            DbEvent::Error(e) => panic!("{e}"),
+            DbEvent::Transaction { .. } if committed => break,
+            _ => {}
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    a.session.send(DbRequest::FetchMore {
+        id: 1,
+        max_rows: 1000,
+    });
+    let DbEvent::Rows { rows, more, .. } = a.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!((rows.len(), more), (490, false));
+    assert_eq!(rows[489][0].as_deref(), Some("500"));
+    a.settle();
+    assert_eq!(a.scalar("select count(*) from t").as_deref(), Some("501"));
+}
+
+/// Text that isn't UTF-8 shows as Windows-1252, not with U+FFFD for its
+/// other bytes (#413); compared with that text, as Edit checks a row, it
+/// isn't found: its bytes differ.
+#[test]
+fn text_that_isnt_utf8() {
+    let db = TempDb::new("latin");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table t (s text)");
+    h.ok("insert into t values (cast(X'4DFC6C6C657220803520' as text))");
+    assert_eq!(h.scalar("select s from t").as_deref(), Some("Müller €5 "));
+    assert_eq!(
+        h.scalar("select count(*) from t where s = 'Müller €5 '")
+            .as_deref(),
+        Some("0")
+    );
+}
+
 /// For the grid a blob is cut short with its size; for a file it comes
 /// whole, and a batch ends once it holds 64 MB of text, so rows of large
 /// blobs come a few at a time (#204).
@@ -941,6 +1008,147 @@ fn read_only_and_shared_memory() {
         second.scalar("select count(*) from shared").as_deref(),
         Some("1")
     );
+}
+
+/// Sessions of a database in a shared cache, as `:memory:` is, wait for
+/// each other's locks as sessions of a file do (#374): up to five seconds,
+/// then "Another window holds …". SQLite fails at once on a shared cache's
+/// table and schema locks (SQLITE_LOCKED): another session's SELECT and
+/// INSERT of a table with an uncommitted insert failed with "database table
+/// is locked", and while a session had uncommitted DDL every lookup failed
+/// with "database schema is locked", so the browser and completion came up
+/// empty, and a new window didn't connect. Lookups now answer as they did
+/// before the DDL, and wait for one not made before. Break ends a wait.
+#[test]
+fn shared_cache_sessions_wait_for_each_others_locks() {
+    use std::time::Instant;
+    let memory = "file:r85_locks?mode=memory&cache=shared";
+    let mut a = Harness::connect(memory);
+    let mut b = Harness::connect(memory);
+    let mut main = Harness::connect(memory);
+    a.ok("create table t (id integer primary key)");
+    a.ok("insert into t values (1)");
+    a.session.send(DbRequest::Commit);
+    a.settle();
+    let tables = |h: &mut Harness| objects_in(h, "main");
+    assert_eq!(tables(&mut main), ["t"]);
+    // A while later, in `h`'s session thread, ends `a`'s transaction.
+    let later = |a: &mut Harness, commit: bool| {
+        std::thread::sleep(Duration::from_millis(300));
+        a.session.send(if commit {
+            DbRequest::Commit
+        } else {
+            DbRequest::Rollback
+        });
+        a.settle();
+    };
+
+    // An uncommitted insert: another session's SELECT and INSERT wait for
+    // it.
+    assert!(a.ok("insert into t values (2)"));
+    let started = Instant::now();
+    b.execute(1, "select count(*) from t", 10);
+    later(&mut a, true);
+    let event = b.next_result();
+    assert!(
+        matches!(event, DbEvent::QueryStarted { .. }),
+        "the SELECT: {event:?}"
+    );
+    let DbEvent::Rows { rows, .. } = b.next_result() else {
+        panic!("rows")
+    };
+    b.settle();
+    assert_eq!(rows[0][0].as_deref(), Some("2"));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(a.ok("insert into t values (3)"));
+    b.execute(2, "insert into t values (4)", 10);
+    later(&mut a, false);
+    let event = b.next_result();
+    assert!(
+        matches!(event, DbEvent::Executed { .. }),
+        "the INSERT: {event:?}"
+    );
+    b.settle();
+    b.session.send(DbRequest::Commit);
+    b.settle();
+    // Five seconds, then what holds it.
+    assert!(a.ok("insert into t values (5)"));
+    let started = Instant::now();
+    let error = b.fails("insert into t values (6)");
+    let waited = started.elapsed();
+    assert!(
+        error.contains("database table is locked") && error.contains("Another window holds"),
+        "{error}"
+    );
+    assert!(waited >= Duration::from_secs(5), "{waited:?}");
+    // Break ends the wait.
+    let started = Instant::now();
+    b.execute(3, "insert into t values (6)", 10);
+    std::thread::sleep(Duration::from_millis(300));
+    b.session.cancel();
+    let DbEvent::Failed { error, .. } = b.next_result() else {
+        panic!("cancelled")
+    };
+    b.settle();
+    assert_eq!(error.text(), "Cancelled");
+    assert!(started.elapsed() < Duration::from_secs(4));
+
+    // Uncommitted DDL: a lookup made before answers as it did then, also
+    // in a task (completion's); one not made before, and a new session,
+    // wait for it.
+    assert!(a.ok("create table u (x)"));
+    assert_eq!(tables(&mut main), ["t"]);
+    main.session.send(DbRequest::Run {
+        id: 7,
+        task: Box::new(|client| {
+            let found = client.meta(&MetaQuery::Objects {
+                owner: "main".into(),
+                object_type: ObjectType::Table,
+                filter: None,
+            })?;
+            let MetaResult::Objects(objects) = found else {
+                panic!("objects")
+            };
+            let names: Vec<String> = objects.into_iter().map(|o| o.name).collect();
+            Ok(Box::new(names))
+        }),
+    });
+    loop {
+        if let DbEvent::TaskDone { result, .. } = main.next() {
+            let names = result.expect("the task").downcast::<Vec<String>>().unwrap();
+            assert_eq!(*names, ["t"]);
+            break;
+        }
+    }
+    main.session.send(DbRequest::Meta {
+        id: 8,
+        query: MetaQuery::Columns {
+            owner: "main".into(),
+            table: "t".into(),
+            keys: false,
+        },
+    });
+    let (tx, wake) = mpsc::channel();
+    let session = Session::connect(params(memory), move || {
+        let _ = tx.send(());
+    });
+    let mut c = Harness { session, wake };
+    later(&mut a, false);
+    loop {
+        if let DbEvent::Meta { result, .. } = main.next() {
+            let Ok(MetaResult::Columns(columns)) = result else {
+                panic!("the columns: {result:?}")
+            };
+            assert_eq!(columns[0].name, "id");
+            break;
+        }
+    }
+    let event = c.next();
+    assert!(
+        matches!(event, DbEvent::Connected(_)),
+        "a new session: {event:?}"
+    );
+    a.ok("drop table t");
 }
 
 #[test]

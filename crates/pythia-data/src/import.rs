@@ -8,6 +8,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime};
+use pythia_db::Dialect;
 
 use crate::{Error, Result};
 
@@ -26,9 +27,11 @@ pub struct CsvOptions {
     pub header: Option<bool>,
 }
 
-/// Reads delimited text. Empty fields are NULL.
+/// Reads delimited text: UTF-8, UTF-16 with its byte order mark (Excel's
+/// "Unicode text") or Windows-1252, which were read as UTF-8, their
+/// characters past ASCII lost (#446). Empty fields are NULL.
 pub fn read_csv(data: &[u8], options: CsvOptions) -> Result<Sheet> {
-    let text = String::from_utf8_lossy(data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data));
+    let (text, _) = crate::text::decode(data);
     let delimiter = options.delimiter.unwrap_or_else(|| sniff_delimiter(&text));
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
@@ -370,23 +373,19 @@ pub fn oracle_type(info: &ColumnInfo) -> String {
     }
 }
 
-/// Turns a header into an Oracle column name: `Order date` → `ORDER_DATE`.
+/// Turns a header into an Oracle column name: `Order date` → `ORDER_DATE`,
+/// `Café` → `CAFÉ` as Oracle folds `café` (#380).
 pub fn column_name(header: &str) -> String {
-    let mut name: String = header
+    let name = header
         .trim()
         .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>()
         .split('_')
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("_");
+    let mut name = Dialect::ORACLE.dictionary_name(&name);
     if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
         name = format!("C_{name}");
     }
@@ -427,6 +426,35 @@ pub fn bind_value(value: Option<&str>, info: Option<&ColumnInfo>) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CSV in Windows-1252 or in UTF-16 (with its byte order mark) keeps
+    /// its characters past ASCII (#446): read as UTF-8, `M\xfcller` was
+    /// `M\u{fffd}ller`, and UTF-16 one column of NULs.
+    #[test]
+    fn csv_in_other_encodings() {
+        let names = |data: &[u8]| {
+            read_csv(data, CsvOptions::default())
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row[1].clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(b"id;name\r\n1;M\xfcller\r\n2;\x80 5\r\n"),
+            ["Müller", "€ 5"]
+        );
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain(
+                "id\tname\r\n1\tMüller\r\n2\t€ 5\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        assert_eq!(names(&utf16), ["Müller", "€ 5"]);
+        assert_eq!(names("id,name\n1,Müller\n".as_bytes()), ["Müller"]);
+    }
 
     #[test]
     fn csv_sniffing_and_header() {
@@ -499,6 +527,9 @@ mod tests {
         assert_eq!(column_name("Order date"), "ORDER_DATE");
         assert_eq!(column_name(" 2nd value! "), "C_2ND_VALUE");
         assert_eq!(column_name(&"Ä".repeat(100)).len(), 128);
+        // As Oracle folds café and straße (#380).
+        assert_eq!(column_name("Café"), "CAFÉ");
+        assert_eq!(column_name("Straße"), "STRAßE");
     }
 
     #[test]

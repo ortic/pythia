@@ -133,12 +133,17 @@ impl SourceSearch {
         self.state.pending.is_some()
     }
 
+    /// What is searched for: the text as typed, blanks too (#438), none
+    /// if it is only blanks.
+    fn pattern(&self) -> Option<String> {
+        Some(self.query.clone()).filter(|q| !q.trim().is_empty())
+    }
+
     pub fn search(&mut self) -> Effects {
         let mut effects = Effects::default();
-        let pattern = self.query.trim().to_owned();
-        if pattern.is_empty() || self.is_busy() {
+        let Some(pattern) = self.pattern().filter(|_| !self.is_busy()) else {
             return effects;
-        }
+        };
         let (regex, match_case, include_oracle, kind) =
             (self.regex, self.match_case, self.include_oracle, self.kind);
         // As Oracle reads it: `"my_schema"` as written (#337).
@@ -497,35 +502,32 @@ fn query(conn: &Connection, pattern: &str, f: &Filter) -> Result<Found, DbError>
             found.job_actions.insert((owner, name), text);
         }
     };
-    if matches!(f.kind, SourceKind::All | SourceKind::Views) && release >= (12, 1) {
+    if matches!(f.kind, SourceKind::All | SourceKind::Views) {
+        // TEXT_VC (12.1) holds the first 4000 bytes of the text, which SQL
+        // searches; a longer view's whole text, as every view's before
+        // 12.1, is only a LONG, which SQL can't search: its lines are
+        // matched here (#437).
+        let vc = release >= (12, 1);
+        let searched = if vc {
+            format!(" and (v.text_length > 4000 or {})", condition("v.text_vc"))
+        } else {
+            String::new()
+        };
         let sql = format!(
-            "select v.owner, v.view_name, v.text_vc from all_views v \
-              where {} and (:owner is null or v.owner = :owner) \
-                and (:name is null or upper(v.view_name) like upper(:name)){} \
-              order by v.owner, v.view_name",
-            condition("v.text_vc"),
-            oracle_filter("v.owner")
-        );
-        let sql = pythia_db::compat::first_rows(&sql, 500);
-        for row in conn.query_named(&sql, &binds)? {
-            let (owner, name, text): (String, String, Option<String>) = row?.get_as()?;
-            whole(owner, name, "VIEW", text.unwrap_or_default());
-        }
-    } else if matches!(f.kind, SourceKind::All | SourceKind::Views) {
-        // Before 12.1 the text is only a LONG, which SQL can't search:
-        // match its lines here.
-        let sql = format!(
-            "select v.owner, v.view_name, v.text from all_views v \
+            "select v.owner, v.view_name, v.text, v.text_length from all_views v \
               where (:owner is null or v.owner = :owner) \
-                and (:name is null or upper(v.view_name) like upper(:name)){} \
+                and (:name is null or upper(v.view_name) like upper(:name)){searched}{} \
               order by v.owner, v.view_name",
             oracle_filter("v.owner")
         );
+        let binds = if vc { &binds[..] } else { &binds[1..] };
         let mut hits = 0;
-        for row in conn.query_named(&sql, &binds[1..])? {
-            let (owner, name, text): (String, String, Option<String>) = row?.get_as()?;
+        for row in conn.query_named(&sql, binds)? {
+            let (owner, name, text, length): (String, String, Option<String>, Option<u64>) =
+                row?.get_as()?;
             let text = text.unwrap_or_default();
-            if text.lines().any(&line_matches) {
+            let matched_by_oracle = vc && length.is_some_and(|l| l <= 4000);
+            if matched_by_oracle || text.lines().any(&line_matches) {
                 whole(owner, name, "VIEW", text);
                 hits += 1;
                 if hits == 500 {
@@ -575,6 +577,20 @@ fn line_matcher(pattern: &str, regex: bool, match_case: bool) -> Box<dyn Fn(&str
 mod tests {
     use super::*;
 
+    /// The text is searched as typed: ` end` doesn't find `append`, and
+    /// ` +$` stays a regular expression (#438).
+    #[test]
+    fn the_pattern_keeps_its_blanks() {
+        let search = |query: &str| SourceSearch {
+            query: query.into(),
+            ..SourceSearch::default()
+        };
+        assert_eq!(search(" end").pattern().as_deref(), Some(" end"));
+        assert_eq!(search(" +$").pattern().as_deref(), Some(" +$"));
+        assert_eq!(search("  ").pattern(), None);
+        assert!(!line_matcher(" end", false, false)("x := append(y);"));
+    }
+
     #[test]
     fn line_matching() {
         assert!(line_matcher("Foo", false, false)("a foo b"));
@@ -596,6 +612,8 @@ mod tests {
         let (cred, db) = spec.rsplit_once('@').unwrap();
         let (user, pw) = cred.split_once('/').unwrap();
         let conn = Connection::connect(user, pw, db).unwrap();
+        // Left by a run that failed.
+        let _ = conn.execute("drop view pythia_ss_long", &[]);
         conn.execute(
             "create or replace view pythia_ss_v as\nselect 'needle_xq7' as marker\n  from dual",
             &[],
@@ -643,6 +661,35 @@ mod tests {
         assert!(found.rows.iter().all(|r| r.2 == "VIEW"));
         assert_eq!(found.rows.len(), 1);
 
+        // Past the 4000 bytes of TEXT_VC (#437): 2000 characters of two
+        // bytes, then a line of 2000, then the needle.
+        conn.execute(
+            "declare
+               s varchar2(32767) := 'create or replace view pythia_ss_long as select '''
+                 || rpad('ä', 1000, 'ä') || ''' a, ''' || rpad('ä', 1000, 'ä')
+                 || ''' b,' || chr(10) || '''' || rpad('x', 2000, 'x') || ''' c,'
+                 || chr(10) || '''needle_xq7'' d from dual';
+             begin
+               execute immediate s;
+             end;",
+            &[],
+        )
+        .unwrap();
+        let long = Filter {
+            name: Some("PYTHIA_SS_LONG"),
+            ..only_views
+        };
+        let found = query(&conn, "needle_xq7", &long).unwrap();
+        let lines: Vec<_> = found.rows.iter().map(|r| (r.1.as_str(), r.3)).collect();
+        assert_eq!(lines, [("PYTHIA_SS_LONG", 3)]);
+        let regex = Filter {
+            regex: true,
+            ..long
+        };
+        assert_eq!(query(&conn, "^'needle_x", &regex).unwrap().rows.len(), 1);
+        assert!(query(&conn, "needle_xq8", &long).unwrap().rows.is_empty());
+
+        conn.execute("drop view pythia_ss_long", &[]).unwrap();
         conn.execute("drop view pythia_ss_v", &[]).unwrap();
         conn.execute(
             "begin dbms_scheduler.drop_job('PYTHIA_SS_JOB', force => true); end;",

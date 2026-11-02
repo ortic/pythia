@@ -401,6 +401,12 @@ fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
         "INTERSECT",
         "MINUS",
         "EXCEPT",
+        // SQL Server's OUTER APPLY (CROSS APPLY has CROSS) and PIVOT: a
+        // column of what they bring in was written to the table (#416).
+        "OUTER",
+        "APPLY",
+        "PIVOT",
+        "UNPIVOT",
     ];
     // From the table on: a join word that isn't a keyword looks like an alias.
     let multi = tokens.get(next).is_some_and(|t| t.kind == TokenKind::Comma)
@@ -519,6 +525,21 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         Err(e) if e.code.is_some() => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    // A float's text is rounded: the row is found with a tolerance, which
+    // finds its neighbours too (#417). Field, Type, …
+    let approximate: std::collections::BTreeSet<String> = client
+        .query(&format!("show columns from {table}"), &[])
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| {
+            value(row, 1).is_some_and(|t| {
+                let t = t.to_ascii_lowercase();
+                ["float", "double", "real"].iter().any(|a| t.starts_with(a))
+            })
+        })
+        .filter_map(|row| value(row, 0))
+        .map(|c| c.to_lowercase())
+        .collect();
     // Table, Non_unique, Key_name, Seq_in_index, Column_name, Collation,
     // Cardinality, Sub_part, Packed, Null: unique ones, the primary key
     // first.
@@ -527,9 +548,11 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         .filter(|row| value(row, 1).as_deref() == Some("0"))
         .map(|row| {
             let seq = value(row, 3).and_then(|s| s.parse().ok()).unwrap_or(0);
-            // Functional key parts have no column; nullable ones don't
-            // identify a row.
-            let column = value(row, 4).filter(|_| value(row, 9).as_deref() != Some("YES"));
+            // Functional key parts have no column; nullable ones and
+            // floats don't identify a row.
+            let column = value(row, 4)
+                .filter(|_| value(row, 9).as_deref() != Some("YES"))
+                .filter(|c| !approximate.contains(&c.to_lowercase()));
             (value(row, 2).unwrap_or_default(), seq, column)
         })
         .collect();
@@ -545,7 +568,7 @@ fn mysql_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
 /// cover every row (not partial); INCLUDE columns aren't part of the key.
 fn postgres_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
     let rows = client.query(
-        "select c.relname, a.attname, a.attnotnull \
+        "select c.relname, a.attname, a.attnotnull and a.atttypid not in (700, 701) \
            from pg_index i \
            join pg_class t on t.oid = i.indrelid \
            join pg_class c on c.oid = i.indexrelid \
@@ -643,10 +666,22 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         .filter_map(|c| value(c, 0))
         .map(|n| n.to_lowercase())
         .collect();
+    // A column of REAL affinity holds rounded floats, one of BLOB affinity
+    // (or none) a 7 and a '7' alike: a lookup finds several rows (#417).
+    let loose: std::collections::BTreeSet<String> = columns
+        .iter()
+        .filter(|c| loose_affinity(&value(c, 3).unwrap_or_default()))
+        .filter_map(|c| value(c, 0))
+        .map(|n| n.to_lowercase())
+        .collect();
     let mut parts: Vec<(String, Option<String>)> = pk
         .into_iter()
         .map(|(_, column, not_null, _)| {
-            let usable = not_null || rowid_alias || !rowid_table;
+            let usable = (not_null || rowid_alias || !rowid_table)
+                && (rowid_alias
+                    || column
+                        .as_ref()
+                        .is_some_and(|c| !loose.contains(&c.to_lowercase())));
             ("primary key".to_owned(), column.filter(|_| usable))
         })
         .collect();
@@ -659,7 +694,8 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
     )?;
     parts.extend(unique.iter().map(|row| {
         // An expression has no column; a nullable one doesn't find a row.
-        let column = value(row, 1).filter(|c| not_null.contains(&c.to_lowercase()));
+        let column = value(row, 1)
+            .filter(|c| not_null.contains(&c.to_lowercase()) && !loose.contains(&c.to_lowercase()));
         (value(row, 0).unwrap_or_default(), column)
     }));
     // Its names, unless a column has taken them.
@@ -675,6 +711,20 @@ fn sqlite_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError> {
         parts.push(("rowid".to_owned(), Some(rowid.to_owned())));
     }
     Ok(keys(parts))
+}
+
+/// Whether a SQLite column of declared `type` has REAL or BLOB affinity,
+/// by SQLite's rules (INT, then CHAR/CLOB/TEXT, then BLOB or none, then
+/// REAL/FLOA/DOUB).
+fn loose_affinity(declared: &str) -> bool {
+    let t = declared.to_ascii_uppercase();
+    if t.contains("INT") || ["CHAR", "CLOB", "TEXT"].iter().any(|a| t.contains(a)) {
+        return false;
+    }
+    t.is_empty()
+        || ["BLOB", "REAL", "FLOA", "DOUB"]
+            .iter()
+            .any(|a| t.contains(a))
 }
 
 /// SQL Server: `object_id` finds the table the way the query did, by the
@@ -714,11 +764,13 @@ fn sqlserver_keys(client: &mut dyn Client, table: &str) -> Result<Keys, DbError>
             and ic.key_ordinal > 0 \
           order by i.is_primary_key desc, i.name, ic.key_ordinal"
     );
-    const SQL_VARIANT: &str = "98";
+    // Nor can a real or a float, read rounded (#417).
+    const UNCOMPARABLE: [&str; 3] = ["98", "59", "62"];
     let rows = client.query(&sql, &[table])?;
     Ok(keys(rows.iter().map(|row| {
         let column = value(row, 1).filter(|_| {
-            value(row, 2).as_deref() == Some("0") && value(row, 3).as_deref() != Some(SQL_VARIANT)
+            value(row, 2).as_deref() == Some("0")
+                && !value(row, 3).is_some_and(|t| UNCOMPARABLE.contains(&t.as_str()))
         });
         (value(row, 0).unwrap_or_default(), column)
     })))
@@ -778,11 +830,13 @@ pub struct Dml {
 /// What an UPDATE or INSERT writes into `col`: a value loaded from a file
 /// as the next of `binds`, which the statement names as returned (#293),
 /// as is a value Oracle takes no literal of ([`oracle_bind`]); any other
-/// as a literal. A literal of megabytes would be impractical anywhere.
+/// as a literal, in an UPDATE of a value that `held` the one fetched. A
+/// literal of megabytes would be impractical anywhere.
 fn written(
     dialect: Dialect,
     col: &Column,
     value: Option<&str>,
+    held: Option<&str>,
     file: Option<&Loaded>,
     binds: &mut Vec<(String, Bind)>,
 ) -> String {
@@ -792,6 +846,11 @@ fn written(
         _ => None,
     };
     let Some(bind) = bind else {
+        // An Oracle JSON keeps the scalars it holds where they stay (#370).
+        if let (DbKind::Oracle, Some(v), Some(held)) = (dialect.kind(), value, held) {
+            let name = dialect.quote_ident(&col.name);
+            return pythia_data::sql_literal_replacing(col, v, &name, held);
+        }
         return literal(dialect, col, value);
     };
     let name = format!("pythia_value{}", binds.len() + 1);
@@ -1039,7 +1098,7 @@ fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
     use sha2::{Digest, Sha256};
     let binary = matches!(
         type_name,
-        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
+        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY" | "VECTOR"
     );
     let hex =
         binary && value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit());
@@ -1148,6 +1207,8 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         }
         // A string compares with JSON as a JSON string.
         (DbKind::MySql, "JSON") => format!("{name} = cast({lit} as json)"),
+        // A VECTOR has no `=` (1210), its bytes have.
+        (DbKind::MySql, "VECTOR") => format!("cast({name} as binary) = {lit}"),
         (DbKind::Postgres, t) if POSTGRES_EQUAL.contains(&t) => format!("{name} = {lit}"),
         // The others compare as the text that was shown: json, xml and
         // points have no `=`, a real compared with a number is widened to
@@ -1307,7 +1368,8 @@ pub fn dml(
             .iter()
             .map(|(c, v)| {
                 let col = &columns[**c];
-                let value = written(dialect, col, v.as_deref(), file(**c), &mut binds);
+                let held = row.get(**c).and_then(|v| v.as_deref());
+                let value = written(dialect, col, v.as_deref(), held, file(**c), &mut binds);
                 format!("{} = {value}", dialect.quote_ident(&col.name))
             })
             .collect();
@@ -1355,7 +1417,7 @@ pub fn dml(
         let mut binds = Vec::new();
         let values: Vec<String> = cells
             .iter()
-            .map(|(c, v)| written(dialect, &columns[*c], *v, file(*c), &mut binds))
+            .map(|(c, v)| written(dialect, &columns[*c], *v, None, file(*c), &mut binds))
             .collect();
         out.push(Dml {
             sql: format!(
@@ -1532,6 +1594,15 @@ mod tests {
             single_table(Dialect::SQLSERVER, "select * from [it's \"odd\"] -- [x]"),
             Some("[it's \"odd\"]".into())
         );
+        // What APPLY or PIVOT brings in isn't the table's.
+        for sql in [
+            "select * from o outer apply (select top 1 n.note from n where n.oid = o.id) x",
+            "select * from o cross apply f(o.id) x",
+            "select * from s pivot (sum(v) for k in ([a], [b])) p",
+            "select * from s unpivot (v for k in (a, b)) u",
+        ] {
+            assert_eq!(single_table(Dialect::SQLSERVER, sql), None, "{sql}");
+        }
         // A temporary table.
         assert_eq!(
             single_table(Dialect::SQLSERVER, "select * from #orders o"),

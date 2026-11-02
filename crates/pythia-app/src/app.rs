@@ -3695,6 +3695,14 @@ impl PythiaApp {
                 } => error.is_connection_lost(),
                 _ => false,
             };
+            // A window's session that couldn't connect has ended: the next
+            // statement opens a new one. Kept, it took requests no worker
+            // read, and the window waited for ever (#424).
+            if let (DbEvent::ConnectFailed(_), SessionKey::Doc(id)) = (&event, key)
+                && let Some(conn) = self.conns.get_mut(&name)
+            {
+                conn.docs.remove(&id);
+            }
             if lost && let Some(conn) = self.conns.get_mut(&name) {
                 match key {
                     SessionKey::Doc(id) => {
@@ -3789,6 +3797,9 @@ impl PythiaApp {
     fn main_event(&mut self, name: &str, event: DbEvent) {
         match event {
             DbEvent::Connected(server) => {
+                if let Some(conn) = self.conns.get_mut(name) {
+                    conn.reconnecting = false;
+                }
                 let schema = match (server.dialect.kind(), server.current_schema.as_str()) {
                     (pythia_db::DbKind::MySql, "") => "no database".to_owned(),
                     (pythia_db::DbKind::MySql, db) => format!("database {db}"),
@@ -3843,6 +3854,22 @@ impl PythiaApp {
                         self.apply(Some(id), effects);
                     }
                 }
+            }
+            // Opening a lost main session again failed: the connection
+            // stays, with its windows' sessions and their transactions, and
+            // the next request tries again (#424).
+            DbEvent::ConnectFailed(e)
+                if self.conns.get(name).is_some_and(|c| {
+                    c.reconnecting && self.connecting.as_deref() != Some(name)
+                }) =>
+            {
+                warn!("reconnect to {name} failed: {e}");
+                if let Some(conn) = self.conns.get_mut(name) {
+                    conn.reconnect_failed(&e);
+                }
+                self.log(format!(
+                    "{name}: opening the connection again failed ({e}); the next request tries again"
+                ));
             }
             DbEvent::ConnectFailed(e) => {
                 warn!("connect to {name} failed: {e}");
@@ -5898,6 +5925,14 @@ impl PythiaApp {
             Some(DocKind::Program(w)) => w,
             _ => panic!("not a program window"),
         }
+    }
+
+    /// A program window is focused, its source loaded.
+    pub fn test_program_loaded(&self) -> bool {
+        matches!(
+            self.focused.and_then(|id| self.docs.get(&id)).map(|d| &d.kind),
+            Some(DocKind::Program(w)) if !w.is_busy()
+        )
     }
 
     pub fn test_apply_focused(&mut self, effects: Effects) {

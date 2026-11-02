@@ -536,6 +536,26 @@ fn kept_as_written_lists_what_could_be_formatted() {
     assert!(!equivalent("select a from t", "select b from t"));
 }
 
+/// A query's PL/SQL declarations are one statement with it (#358), which
+/// isn't laid out as SQL: it is kept as written, the statements after it
+/// are formatted.
+#[test]
+fn queries_with_plsql_are_kept() {
+    let query = "with function f return number is\nbegin\n  return 1;\nend;\nselect f from dual";
+    let src = format!("{query};\nSELECT 2 FROM dual;\n");
+    let o = FormatOptions::default();
+    assert_eq!(
+        format(&src, &o).text,
+        format!("{query};\nselect 2 from dual;\n")
+    );
+    let kept = kept_as_written(&src, &o);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0], 0..query.len());
+    // A common table expression called function is formatted.
+    let src = "WITH function AS (SELECT 1 a FROM dual) SELECT a FROM function";
+    assert!(format(src, &o).text.starts_with("with\n"), "{src}");
+}
+
 #[test]
 fn conditional_compilation_is_kept() {
     // `$IF x $THEN` became `$ if x $ then` (#172), which Oracle doesn't
@@ -579,6 +599,33 @@ fn rules_in_words() {
         "THEN and LOOP on their own line",
     ] {
         assert!(rules.contains(expected), "{expected}\n{rules}");
+    }
+}
+
+/// On MySQL a table's name is as written (on Linux): a word that may be a
+/// name keeps its case, only reserved words change (#419). `User` and
+/// `Session` were lowercased with keywords and named other tables. And
+/// only ASCII letters change case: `straße` was `STRASSE` on Oracle, which
+/// keeps `STRAßE`, and PostgreSQL's `тест` became `ТЕСТ`, another name.
+#[test]
+fn case_keeps_names() {
+    let lower = with(|o| o.keyword_case = Case::Lower);
+    let f = format_in(
+        "SELECT u.Id FROM User u JOIN Session s ON s.UserId = u.Id WHERE u.Level > 1",
+        Syntax::MySql,
+        &lower,
+    );
+    assert_eq!(
+        f.text,
+        "select u.Id\nfrom User u\njoin Session s on s.UserId = u.Id\nwhere u.Level > 1"
+    );
+    let upper = with(|o| {
+        o.keyword_case = Case::Upper;
+        o.identifier_case = Case::Upper;
+    });
+    for syntax in [Syntax::Oracle, Syntax::Postgres] {
+        let f = format_in("select straße, тест from t", syntax, &upper);
+        assert_eq!(f.text, "SELECT STRAßE, тест FROM T", "{syntax:?}");
     }
 }
 

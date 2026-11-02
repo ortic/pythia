@@ -111,6 +111,287 @@ All notable changes to Pythia are documented here. The format follows
   was closed) is read again when Pythia starts, unless the window has
   changes of its own; saving over such a file asks first (#411). The
   window restored its old text, and Save wrote it over the change.
+- PostgreSQL: a table's DDL keeps its row level security (#373): `alter
+  table … enable row level security` and `force row level security`
+  where they are on, and a `create policy` for each policy, with its
+  command, roles, `using` and `with check`, restrictive or not. Run
+  elsewhere, the copy had neither, so every role that could read it read
+  every row, and rows no policy let through could be written to it.
+- PostgreSQL: a table's DDL keeps its row level security (#373): `alter
+  table … enable row level security` and `force row level security`
+  where they are on, and a `create policy` for each policy, with its
+  command, roles, `using` and `with check`, restrictive or not. Run
+  elsewhere, the copy had neither, so every role that could read it read
+  every row, and rows no policy let through could be written to it.
+- PostgreSQL: a table's DDL gives each column its collation where it
+  isn't its type's (#375), `code text collate "C"`, with its schema
+  where it isn't `pg_catalog`. Run elsewhere, the copy's columns took
+  their type's collation, mostly the database's, and sorted and compared
+  otherwise: the copy of a column collated `"C"` sorted `a` before `B`.
+- SQL Server: an `nvarchar`, `nchar` or `ntext` value that isn't valid
+  UTF-16 reads with U+FFFD in its place (#371). SQL Server doesn't check
+  them, as in the names of incremental statistics' objects in
+  `sys.all_objects`: the result failed with "Protocol error: nvarchar:
+  invalid UTF-16 sequence", and the connection was opened again, which
+  rolled back the transaction.
+- SQL Server: an `nvarchar`, `nchar` or `ntext` value that isn't valid
+  UTF-16 reads with U+FFFD in its place (#371). SQL Server doesn't check
+  them, as in the names of incremental statistics' objects in
+  `sys.all_objects`: the result failed with "Protocol error: nvarchar:
+  invalid UTF-16 sequence", and the connection was opened again, which
+  rolled back the transaction.
+- SQL Server: a table's DDL and *Columns* name a user-defined type, an
+  alias or a CLR type, with its schema (#372), `[app].[ssn]`. By its name
+  alone, the DDL failed with Msg 2715 where the session's default schema
+  isn't the type's.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
+- Forms keep the case of a name they pick or read (#365). The column
+  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
+  trigger failed with ORA-00904; a job's list of procedures offered
+  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
+  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
+  and *Edit* of a database link made again with its user `"hr_ro"` used
+  `HR_RO`.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
+- Forms keep the case of a name they pick or read (#365). The column
+  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
+  trigger failed with ORA-00904; a job's list of procedures offered
+  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
+  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
+  and *Edit* of a database link made again with its user `"hr_ro"` used
+  `HR_RO`.
+- Oracle: DESCRIBE, *Compare data* and *Import* take a quoted name as
+  written (#369). `desc "MyTable"` described nothing, as it compared
+  `"MYTABLE"` with its quotes; a data compare of the table `"my_table"`
+  or with the key `"Id"` failed with ORA-01741; and Import into
+  `"My.Table"`, a dot in its quotes, failed with ORA-00922. Names
+  without quotes are still read in uppercase, and `owner.table` is split
+  at the dots outside quotes only.
+- The program window finds a package's quoted subprograms by their
+  names (#359). *Edit "MyProc"* opened the package at the top, saying
+  `"MyProc" not found`, and *Test…* and *Debug…* of it from the
+  program window called `"""MYPROC"""` without its parameters, so the
+  block failed and the debugger didn't stop. `"MyProc"` and `"myproc"`
+  were one subprogram: overloads of each other for *Test…*, and *Go to
+  body* went from one to the other; `"PLAIN"` in the spec wasn't
+  `plain` in the body. *Test…* of `"MyProc"`, from the object browser
+  too, also took the parameters of a `"myproc"`.
+- Forms keep the case of a name they pick or read (#365). The column
+  `"Mixed"` picked for a trigger's *Update of* read `"mixed"`, and the
+  trigger failed with ORA-00904; a job's list of procedures offered
+  `"MyPkg"."Run"` as `mypkg.run`, which the job ran as `MYPKG.RUN`; an
+  index's tablespace `"my_ts"`, picked or read by *Edit*, became `MY_TS`;
+  and *Edit* of a database link made again with its user `"hr_ro"` used
+  `HR_RO`.
+- Oracle: DESCRIBE, *Compare data* and *Import* take a quoted name as
+  written (#369). `desc "MyTable"` described nothing, as it compared
+  `"MYTABLE"` with its quotes; a data compare of the table `"my_table"`
+  or with the key `"Id"` failed with ORA-01741; and Import into
+  `"My.Table"`, a dot in its quotes, failed with ORA-00922. Names
+  without quotes are still read in uppercase, and `owner.table` is split
+  at the dots outside quotes only.
+- Oracle: names are folded to uppercase as Oracle folds them, letter by
+  letter (#380). Import made a header `Café` the column `"CAFé"`, which
+  `café` doesn't name, and didn't map it to an existing table's `CAFÉ`;
+  a *Schema* or *Default schema* typed `straße` named `STRASSE`, where
+  Oracle reads `STRAßE`.
+- Oracle: a query with PL/SQL declarations, `with function f … end;
+  select f from dual`, runs as one statement (#358), also in an INSERT,
+  a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
+  The script ended it at the first `;` inside the function, which failed
+  with ORA-02000, and ran the rest on its own. It ends at the `;` after
+  the query, or at `/` on a line of its own as in SQL*Plus; declarations
+  still open at the end of the script, as while they are typed, end at
+  that first `;` as before, so the statements after them stay apart.
+  Format Code keeps such a query as written.
+- Oracle: a query with PL/SQL declarations, `with function f … end;
+  select f from dual`, runs as one statement (#358), also in an INSERT,
+  a view and an UPDATE's or DELETE's subquery (`/*+ with_plsql */`).
+  The script ended it at the first `;` inside the function, which failed
+  with ORA-02000, and ran the rest on its own. It ends at the `;` after
+  the query, or at `/` on a line of its own as in SQL*Plus; declarations
+  still open at the end of the script, as while they are typed, end at
+  that first `;` as before, so the statements after them stay apart.
+  Format Code keeps such a query as written.
+- Search data with Exact finds a value in each column that can hold it
+  (#363). A number past NUMBER's range (`1e300`), `inf`, `nan` or a day
+  no month has (`2024-02-30`) failed the query of every table with a
+  number or date column, and a table with a CLOB or NCLOB failed for any
+  value: their hits went unfound, text columns too. `-2e-300` found the
+  zeros. Each column now gets a literal of its type: a BINARY_DOUBLE or
+  BINARY_FLOAT `1e300d` or `binary_double_nan` as since #339, a NUMBER
+  only a number it holds, a date only a day Oracle reads (1500-02-29
+  is one, by the Julian calendar); a CLOB is compared with
+  `dbms_lob.compare`.
+- Oracle: a JSON's dates, timestamps, intervals, binary values, IDs and
+  binary numbers show as Oracle's extended objects and keep their types
+  (#370): `{"$oracleDate":"2020-01-01T00:00:00"}`,
+  `{"$oracleTimestampTZ":"2020-01-01T10:00:00+02:00"}`,
+  `{"$intervalDaySecond":"P1DT2H"}`, `{"$numberDouble":1.5}`, a binary
+  value in hex as `{"$rawhex":"ABCD"}`. They showed as JSON strings and
+  numbers, without a time zone, NaN as `NaN`: changing such a JSON
+  reported a change by another session, and its INSERT statements wrote
+  the strings and numbers. Written, each such object is the scalar it
+  stands for, typed into a new row too; other objects, as MongoDB's
+  `{"$oid":…}`, stay objects. A changed JSON keeps the scalars it had
+  where they are as they were, also where the type shown is a guess: the
+  pure-Rust driver reads a DATE, a TIMESTAMP and a TIMESTAMP WITH TIME
+  ZONE in UTC in a JSON alike, so one without a fraction of a second
+  shows as `$oracleDate`, one with as `$oracleTimestamp`.
+- SQL Server: a ledger table's history table's DDL says that its ledger
+  table's DDL makes it (#381). It was a plain table's, which, run before
+  the ledger table's DDL, made that fail with Msg 37355, and run alone
+  made a table no ledger keeps.
+- SQLite: windows of a database in memory (`:memory:`, a `file:` URI of
+  memory, `cache=shared`) wait for each other's locks as windows of a
+  file do (#374): up to five seconds, then they say which window holds
+  it. A SELECT or INSERT of a table another window had changed and not
+  committed failed at once with "database table is locked", and while a
+  window had uncommitted DDL, the object browser and completion came up
+  empty. Lookups answer as they did last while the schema is locked.
+- PostgreSQL: a trigger's DDL keeps it disabled, or enabled for replicas
+  or always, where it is so (#415), and *Edit* keeps that state:
+  replaced or made again, it fired as an ordinary trigger.
+- PostgreSQL: *Edit* of a trigger whose name is on several tables
+  replaces each of them (#377); the script replaced the first and failed
+  at the second, "already exists". With a constraint trigger among them,
+  the whole script is one block.
+- PostgreSQL: a child table's DDL inherits from its parents, with only
+  its own columns and constraints (#376); a copy was a table of its own,
+  which a query on its parent's copy didn't read. (Foreign tables: #409.)
+- SQL Server: a result of a query with `OUTER APPLY`, `PIVOT` or
+  `UNPIVOT` can't be edited (#416); a value typed into a column they
+  bring in was written to the table of the query.
+- *Edit* no longer finds a row by a floating-point key (#417), whose
+  rounded text matched its neighbours: deleting the MySQL `FLOAT` row
+  shown as `1` deleted 1.000001 and 1.000005 too. Float columns (and
+  SQLite columns of REAL or BLOB affinity) aren't keys now; another
+  unique key or SQLite's rowid finds the row, or the result is
+  read-only. *Save to file…* refuses a key that finds several rows.
+- Editor: Find/Replace *In selection* reads the text around the
+  selection (`^`, `$`, `\b`) as `$1` does, and follows the selection
+  through replacements (#418). A raw `$1` went in at the selection's
+  edges, and *Replace all* that shortened the text could crash Pythia.
+- The formatter no longer renames names (#419): on MySQL, tables named
+  like keywords (`User`, `Session`) were lowercased with them, another
+  table on Linux; and `straße` became `STRASSE` with identifier case
+  Upper. Only ASCII letters change case, and on MySQL only reserved
+  words.
+- MariaDB: *Edit* of a trigger created with `IF NOT EXISTS` opens a
+  script that runs (#420); it failed with "Incorrect usage of OR REPLACE
+  and IF NOT EXISTS".
+- MySQL and MariaDB: a trigger's DDL keeps its place among its table's
+  triggers (`PRECEDES`, #421), and a trigger's or routine's the
+  `sql_mode` it was made under (#422). *Edit* made it fire last, and
+  under the window's mode, where `||` may mean OR.
+- PostgreSQL: Commit of a transaction that failed says nothing was
+  committed (#423). After a failed savepoint statement (`release
+  savepoint` with a typo) PostgreSQL had rolled it back, and Commit
+  said "Committed".
+- A window whose new session couldn't connect (the server still
+  restarting) answers its next statement (#424); it showed "running" for
+  ever. A failed attempt to open a lost main session again no longer
+  closes the connection with every window's session: the next request
+  tries again.
+- SQLite: a text with a NUL character can be changed in a result and
+  written as INSERT statements (#425); its literal ended at the NUL.
+- Oracle: *Follow foreign keys* over a key with a DATE or TIMESTAMP
+  column opens the related rows (#426); its query wrote the date as a
+  string, ORA-01861.
+- Export tables and data compare take a filter that is all comment as
+  none (#427); `where -- id = 6` failed with ORA-00936.
+- The value editor's calendar keeps a date without a time so (#428):
+  it added ` 00:00:00`, which SQLite kept, so the row no longer equalled
+  the date.
+- PostgreSQL: a table's and a function's grants of one name stay apart,
+  and a function's DDL leaves out a procedure of its name (#429).
+- The workspace is saved while a window's file has a name that isn't
+  UTF-8 (Linux) (#430); it wasn't saved at all then, and every window's
+  unsaved text was lost with the next restart.
+- A failed statement that took the transaction with it (SQLite after a
+  Break of a change, MySQL after a deadlock) says that the earlier
+  changes are undone (#431); only the status bar showed it.
+- MySQL and MariaDB: an event with a `DO BEGIN … END` body and
+  MariaDB's aggregate function are one statement up to `/` (#432); they
+  were cut at their first `;`.
+- SQLite: a trigger whose body uses columns named `begin` or `end` is
+  one statement (#433); it was split at such a name, or swallowed the
+  rest of the script.
+- An Excel export that passes Excel's limits (32,767 characters a cell,
+  1,048,576 rows a sheet) says which row and column, and to export as CSV
+  or JSON (#434); it failed with the library's error only.
+- Oracle: a numbered substitution variable, `&1`, is substituted in code
+  too, not only in strings (#435).
+- MySQL: a `VECTOR` is shown as the hex of its bytes, not as garbled
+  text, and Edit changes rows that have one (#436).
+- Oracle: Find in Source finds text past the first 4000 bytes of a view
+  (#437).
+- Find in Source searches the text as typed, blanks around it too
+  (#438).
+- A chart's tooltip shows a value below 0.0001 with its exponent, not as
+  0 (#439).
+- SQL Server: a trigger's DDL keeps its first or last place among its
+  table's triggers, which *Edit* dropped (#440).
+- MySQL: Maintenance's facts of a table and the monitor's storage figures
+  are current, not as MySQL cached them up to a day ago (#441).
+- PostgreSQL: Maintenance's facts of a partitioned table are its
+  partitions' rows, size and transaction ID age, not 0 and a false
+  wraparound warning (#442).
+- Oracle: Export Tables and Data Compare read a table's invisible columns
+  too (#444), and leave out its virtual columns where they write
+  INSERTs and UPDATEs, which Oracle refused (#443).
+- MariaDB: the role editor shows a role's privileges on the server
+  (`*.*`), which MariaDB's `information_schema` doesn't list (#445).
+- Import reads CSV files in Windows-1252 and UTF-16 (with its byte order
+  mark), as the editor opens them, not as UTF-8 that lost their accented
+  characters (#446).
+- MySQL: completion offers a table's own columns where another table's
+  name differs from it only in case, not both tables' (#447).
+- SQL Server: `END CONVERSATION` inside a `BEGIN … END` block doesn't end
+  the block, which a script was cut at, the rest running outside it
+  (#448).
+- SQL Server: dropped ledger tables, their history tables and views,
+  which SQL Server keeps under names of its own, aren't listed or found
+  (#382).
+- PostgreSQL: a table's DDL has the comments on its indexes and its
+  constraints, a materialized view's on its indexes (#379).
+- PostgreSQL: a table's DDL has its rules, its replica identity and its
+  columns' storage, compression, statistics targets and options, a
+  materialized view's its columns' (#378).
+- SQLite: a window with rows left to fetch doesn't keep another from
+  committing: it reads the rest ahead, up to 256 MB, which lets its lock
+  on the file go (#185).
+- SQLite: text that isn't UTF-8 shows, copies and exports as Windows-1252,
+  not with replacement characters (#413).
+- MySQL: with `NO_BACKSLASH_ESCAPES` in the session's `sql_mode` (the
+  server's default, the login script or a `SET`), a SQL window reads a
+  `\` in a string as itself: `'C:\'` no longer runs on to the end of the
+  script, in splitting, highlighting and binds (#412).
 
 ## [0.11.0] - 2026-11-02
 

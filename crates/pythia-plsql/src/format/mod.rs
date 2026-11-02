@@ -432,7 +432,7 @@ fn try_format_statement(
     {
         return Err(Kept::Unsupported);
     }
-    let mut layout = Layout::new(&toks, o);
+    let mut layout = Layout::new(&toks, o, syntax);
     let doc = layout.statement();
     if layout.opaque {
         return Err(Kept::Opaque);
@@ -465,8 +465,15 @@ pub fn equivalent_in(a: &str, b: &str, syntax: Syntax) -> bool {
             .filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Newline))
             .map(|t| {
                 let text = &s[t.span];
+                // Only ASCII letters fold alike; on MySQL a name keeps its
+                // case, only reserved words don't (#419).
                 let text = match t.kind {
-                    TokenKind::Keyword | TokenKind::Ident => text.to_uppercase(),
+                    TokenKind::Keyword | TokenKind::Ident
+                        if syntax.is_mysql() && !crate::keywords::is_mysql_reserved(text) =>
+                    {
+                        text.to_owned()
+                    }
+                    TokenKind::Keyword | TokenKind::Ident => text.to_ascii_uppercase(),
                     TokenKind::LineComment => text.trim_end().to_owned(),
                     _ => text.to_owned(),
                 };

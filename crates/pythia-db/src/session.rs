@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::oracle::sql_type::OracleType;
 use crate::oracle::{Connection, Connector, ResultSet, Row, StatementType};
@@ -112,20 +112,40 @@ pub(crate) struct Requests {
 impl Requests {
     pub(crate) fn recv(&self) -> Result<DbRequest, RecvError> {
         loop {
-            let Envelope { request, script } = self.rx.recv()?;
-            let mut current = self.current.lock().expect("script mutex");
-            *current = None;
-            if let Some(script) = script {
-                if script.is_stopped() || self.closing.load(Ordering::Acquire) {
-                    debug!(?request, "skipped: its script stopped");
-                    continue;
-                }
-                if let DbRequest::Execute { id, .. } = &request {
-                    *current = Some((*id, script));
-                }
+            if let Some(request) = self.take(self.rx.recv()?) {
+                return Ok(request);
             }
-            return Ok(request);
         }
+    }
+
+    /// [`recv`](Self::recv), waiting at most `timeout`.
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<DbRequest, RecvTimeoutError> {
+        let until = Instant::now() + timeout;
+        loop {
+            let envelope = self
+                .rx
+                .recv_timeout(until.saturating_duration_since(Instant::now()))?;
+            if let Some(request) = self.take(envelope) {
+                return Ok(request);
+            }
+        }
+    }
+
+    /// The request of `envelope`, none if its script stopped.
+    fn take(&self, envelope: Envelope) -> Option<DbRequest> {
+        let Envelope { request, script } = envelope;
+        let mut current = self.current.lock().expect("script mutex");
+        *current = None;
+        if let Some(script) = script {
+            if script.is_stopped() || self.closing.load(Ordering::Acquire) {
+                debug!(?request, "skipped: its script stopped");
+                return None;
+            }
+            if let DbRequest::Execute { id, .. } = &request {
+                *current = Some((*id, script));
+            }
+        }
+        Some(request)
     }
 }
 

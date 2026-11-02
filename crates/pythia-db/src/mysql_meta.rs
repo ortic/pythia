@@ -394,7 +394,7 @@ fn details(
               where event_object_schema = ? and event_object_table = ? \
               order by action_timing, event_manipulation, action_order"
         }
-        Detail::Grants => {
+        Detail::Grants | Detail::RoutineGrants => {
             "select grantee as GRANTEE, privilege_type as PRIVILEGE, is_grantable as GRANTABLE \
                from information_schema.table_privileges \
               where table_schema = ? and table_name = ? \
@@ -526,6 +526,19 @@ fn show_create(
     let dialect = Dialect::MYSQL;
     let sql = format!("show create {what} {}", dialect.qualified(owner, name));
     let row: Option<mysql::Row> = conn.query_first(sql)?;
+    // A routine's and a trigger's sql_mode, which SHOW CREATE gives beside
+    // the statement (#422).
+    let mode = row
+        .as_ref()
+        .filter(|_| {
+            matches!(
+                object_type,
+                ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger
+            )
+        })
+        .and_then(|row| row.get_opt::<Option<String>, _>(1))
+        .and_then(Result::ok)
+        .flatten();
     let ddl = row
         .and_then(|row| row.get_opt::<Option<String>, _>(column))
         .and_then(Result::ok)
@@ -539,7 +552,70 @@ fn show_create(
     if object_type == ObjectType::View {
         return view_ddl(conn, owner, name, ddl);
     }
+    let mut ddl = ddl;
+    if object_type == ObjectType::Trigger {
+        ddl = in_order(conn, owner, name, ddl)?;
+    }
+    // Made under another sql_mode than the session's, it is made again
+    // under its own: PIPES_AS_CONCAT makes || a concatenation, ANSI_QUOTES
+    // "x" a name (#422).
+    let session: Option<String> = conn.query_first("select @@session.sql_mode")?;
+    if let Some(mode) = mode.filter(|mode| session.as_ref() != Some(mode)) {
+        ddl = format!(
+            "{SQL_MODE_PREFIX}'{}';\n\n{ddl}",
+            mode.replace('\\', "\\\\").replace('\'', "''")
+        );
+    }
     Ok(ddl)
+}
+
+/// How a DDL that sets the object's own sql_mode first starts: *Edit*
+/// keeps the session's mode and sets it again after the object.
+pub const SQL_MODE_PREFIX: &str = "set session sql_mode = ";
+
+/// A trigger's `ddl` with its place among its table's triggers of the same
+/// timing and event, which SHOW CREATE TRIGGER leaves out: `PRECEDES` the
+/// one after it (#421). Dropped and made again, or replaced, it fired last.
+fn in_order(conn: &mut Conn, owner: &str, name: &str, ddl: String) -> Result<String, DbError> {
+    let next: Option<String> = conn.exec_first(
+        "select n.trigger_name from information_schema.triggers t \
+           join information_schema.triggers n \
+             on n.trigger_schema = t.trigger_schema \
+            and n.event_object_table = t.event_object_table \
+            and n.action_timing = t.action_timing \
+            and n.event_manipulation = t.event_manipulation \
+            and n.action_order = t.action_order + 1 \
+          where t.trigger_schema = ? and t.trigger_name = ?",
+        (owner, name),
+    )?;
+    let Some(next) = next else {
+        return Ok(ddl);
+    };
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(&ddl, pythia_plsql::Syntax::MySql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let is = |i: usize, word: &str| {
+        tokens
+            .get(i)
+            .is_some_and(|t| ddl[t.span.clone()].eq_ignore_ascii_case(word))
+    };
+    let Some(row) =
+        (0..tokens.len()).find(|&i| is(i, "FOR") && is(i + 1, "EACH") && is(i + 2, "ROW"))
+    else {
+        return Ok(ddl);
+    };
+    // MariaDB keeps a FOLLOWS or PRECEDES it was made with.
+    if is(row + 3, "FOLLOWS") || is(row + 3, "PRECEDES") {
+        return Ok(ddl);
+    }
+    let at = tokens[row + 2].span.end;
+    Ok(format!(
+        "{} PRECEDES {}{}",
+        &ddl[..at],
+        Dialect::MYSQL.quote_ident(&next),
+        &ddl[at..]
+    ))
 }
 
 /// A view's DDL with the tables of other databases named with their

@@ -95,7 +95,8 @@ pub fn load(conn: &Connection, owner: &str, name: &str) -> Result<IndexDef, DbEr
         columns,
         unique: uniqueness == "UNIQUE",
         bitmap: index_type.starts_with("BITMAP"),
-        tablespace: tablespace.unwrap_or_default(),
+        // As typed, like the other names: "my_ts" isn't MY_TS (#365).
+        tablespace: tablespace.map(|t| quote_ident(&t)).unwrap_or_default(),
         online: false,
     })
 }
@@ -214,7 +215,7 @@ pub fn ui(ui: &mut Ui, def: &mut IndexDef, existing: bool, lists: &mut Lists) {
                     .desired_width(240.0),
             );
             if let Some(ts) = picker(ui, "tablespace", &lists.tablespaces) {
-                def.tablespace = ts;
+                def.tablespace = quote_ident(&ts);
             }
         });
         form_row(ui, "Build", |ui| {

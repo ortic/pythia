@@ -39,7 +39,7 @@ pub struct SqlWindow {
     #[serde(default = "yes")]
     pub show_variables: bool,
     /// File the window was opened from or saved to.
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_path::option")]
     pub path: Option<std::path::PathBuf>,
     /// Text as last saved to `path`, to detect unsaved changes.
     #[serde(default)]
@@ -94,6 +94,9 @@ pub struct RunState {
     /// The session had a transaction open after its last statement, as it
     /// said.
     pub in_transaction: bool,
+    /// The last statement failed: a transaction it ended was rolled back
+    /// with it (#431).
+    pub failed_last: bool,
     /// The changes an Apply didn't make, for the result (by request id)
     /// that fetches its rows again (#247).
     pub unapplied: Option<(u64, crate::data_edit::Unapplied)>,
@@ -145,6 +148,9 @@ pub struct RunState {
     /// The zone the session shows MySQL's TIMESTAMP values in, as it last
     /// said: INSERT statements of its results set it (#213).
     pub time_zone: Option<String>,
+    /// How the session reads strings, as it last said: MySQL's without
+    /// backslash escapes under `NO_BACKSLASH_ESCAPES` (#412).
+    pub lexing: Option<Syntax>,
     /// Error stacks to look up, not sent yet.
     stack_lookups: Vec<StackLookup>,
 }
@@ -564,6 +570,16 @@ impl SqlWindow {
     }
 
     /// Starts executing the selection / whole text, or the current statement.
+    /// How the window's text is read: as its session said (#412), else as
+    /// its connection's dialect reads it.
+    fn syntax_in(&self, cx: &DocContext) -> Syntax {
+        let dialect = cx.dialect.syntax();
+        self.state
+            .lexing
+            .filter(|lexing| lexing.is_mysql() == dialect.is_mysql())
+            .unwrap_or(dialect)
+    }
+
     pub fn execute(&mut self, current_only: bool, cx: &DocContext) -> Effects {
         // Executing again runs the statement waiting for values.
         if self.waiting_for_values() {
@@ -572,7 +588,7 @@ impl SqlWindow {
         if self.is_running() {
             return Effects::default();
         }
-        self.state.syntax = cx.dialect.syntax();
+        self.state.syntax = self.syntax_in(cx);
         let statements = self.statements(current_only);
         let state = &mut self.state;
         state.results.clear();
@@ -957,7 +973,7 @@ impl SqlWindow {
         }
         // MySQL's EXPLAIN takes no parameters, and a value in their place
         // would change the plan (NULL makes it "no matching row").
-        if syntax == Syntax::MySql && !find_binds(&stmt.sql, syntax).is_empty() {
+        if syntax.is_mysql() && !find_binds(&stmt.sql, syntax).is_empty() {
             self.warn("Explain plan doesn't take bind variables on MySQL; use literals");
             self.state.bottom = BottomTab::Messages;
             return effects;
@@ -1652,11 +1668,11 @@ impl SqlWindow {
                 SqlPlus::Done
             }
             "DESC" | "DESCRIBE" => {
-                let name = rest.trim_end_matches(';').to_owned();
-                let (owner, object) = match name.split_once('.') {
-                    Some((o, n)) => (Some(o.to_owned()), n.to_owned()),
-                    None => (None, name),
-                };
+                // As Oracle reads it: "Mixed" as written, emp as EMP, the
+                // dots in quotes part of the name (#369).
+                let mut parts = pythia_db::Dialect::ORACLE.typed_parts(rest.trim_end_matches(';'));
+                let object = parts.pop().unwrap_or_default();
+                let owner = parts.pop();
                 SqlPlus::Query(
                     DESCRIBE_SQL.into(),
                     vec![("name".into(), Some(object)), ("owner".into(), owner)],
@@ -2253,6 +2269,7 @@ impl SqlWindow {
                 effects.extend(self.run_next(cx));
             }
             DbEvent::Failed { id, error, elapsed } => {
+                self.state.failed_last = true;
                 if self.state.fetching == Some(id) {
                     self.state.fetching = None;
                     self.error(&error);
@@ -2375,6 +2392,7 @@ impl SqlWindow {
             // A new session says its own zone, if it has one.
             DbEvent::Connected(_) => {
                 self.state.time_zone = None;
+                self.state.lexing = None;
                 self.state.in_transaction = false;
             }
             DbEvent::Transaction { pending } => {
@@ -2396,9 +2414,19 @@ impl SqlWindow {
                         "The transaction was rolled back with it: the {undone} change(s) \
                          applied before it were undone"
                     ));
+                } else if ended && self.state.failed_last {
+                    // SQLite after a Break of a change or a RAISE(ROLLBACK),
+                    // MySQL after a deadlock: nothing is pending any more,
+                    // which only the status bar showed (#431).
+                    self.warn(
+                        "The transaction was rolled back with the statement that failed: \
+                         the changes made in it before are undone",
+                    );
                 }
+                self.state.failed_last = false;
             }
             DbEvent::TimeZone(zone) => self.state.time_zone = Some(zone),
+            DbEvent::Lexing(syntax) => self.state.lexing = Some(syntax),
             DbEvent::Error(error) | DbEvent::ConnectFailed(error) => {
                 self.forget_run();
                 self.error(&error);
@@ -2459,7 +2487,7 @@ impl SqlWindow {
 
     pub fn ui(&mut self, ui: &mut Ui, cx: &DocContext) -> Effects {
         let mut effects = Effects::default();
-        self.state.syntax = cx.dialect.syntax();
+        self.state.syntax = self.syntax_in(cx);
         self.editor.set_syntax(self.state.syntax);
         let substitution = self.substitutes();
         self.editor.set_substitution(substitution);
@@ -3443,8 +3471,8 @@ const DESCRIBE_SQL: &str = "select column_name as \"Name\", \
             then '(' || data_precision || nvl2(nullif(data_scale, 0), ',' || data_scale, '') || ')' \
         end as \"Type\" \
    from all_tab_columns \
-  where table_name = upper(:name) \
-    and owner = nvl(upper(:owner), sys_context('USERENV', 'CURRENT_SCHEMA')) \
+  where table_name = :name \
+    and owner = nvl(:owner, sys_context('USERENV', 'CURRENT_SCHEMA')) \
   order by column_id";
 
 enum EditAction {
@@ -3969,6 +3997,13 @@ mod tests {
             substitute(sql, &values, Syntax::Oracle),
             "select '1', 2 || x from t where c = 3 -- &d\n/* &e */"
         );
+        // A numbered one, as a script's arguments are, in code too.
+        let sql = "select &1, '&1' from dual";
+        let values = BTreeMap::from([("1".into(), "42".into())]);
+        assert_eq!(
+            substitute(sql, &values, Syntax::Oracle),
+            "select 42, '42' from dual"
+        );
     }
 
     #[test]
@@ -4342,6 +4377,40 @@ mod tests {
             .collect()
     }
 
+    /// A failed statement that ended the transaction says so: its earlier
+    /// changes are gone (SQLite after a Break of a change, MySQL after a
+    /// deadlock). One that ended none, or a rollback asked for, doesn't.
+    #[test]
+    fn a_failure_that_ends_the_transaction_says_so() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "update t set n = 1".into());
+        let warned = |w: &SqlWindow| {
+            w.state.messages.iter().any(|m| {
+                m.text
+                    .starts_with("The transaction was rolled back with the statement")
+            })
+        };
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        let failed = || DbEvent::Failed {
+            id: 1,
+            error: pythia_db::DbError::new("interrupted"),
+            elapsed: Duration::ZERO,
+        };
+        w.on_event(failed(), &cx);
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        assert!(!warned(&w));
+        w.on_event(failed(), &cx);
+        w.on_event(DbEvent::Transaction { pending: false }, &cx);
+        assert!(warned(&w));
+        // A rollback of the user's ends it without a word.
+        w.state.messages.clear();
+        w.on_event(DbEvent::Transaction { pending: true }, &cx);
+        w.on_event(DbEvent::Notice("Rolled back".into()), &cx);
+        w.on_event(DbEvent::Transaction { pending: false }, &cx);
+        assert!(!warned(&w));
+    }
+
     /// A file changed on disk since the window read it is told apart:
     /// read again where the window has no changes of its own, and saving
     /// over it is asked first (the app does).
@@ -4365,6 +4434,38 @@ mod tests {
         assert_eq!(w.line_ending, crate::text_file::LineEnding::CrLf);
         assert!(w.changed_on_disk().is_none() && !w.is_dirty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A MySQL window reads strings as its session said (#412): under
+    /// NO_BACKSLASH_ESCAPES `'C:\\'` ends at its quote, and the script is
+    /// two statements, not one string to its end. A new session says again.
+    #[test]
+    fn mysql_window_lexes_as_its_session_says() {
+        let settings = pythia_config::Settings::default();
+        let cx = DocContext {
+            dialect: pythia_db::Dialect::MYSQL,
+            ..test_cx(&settings, false)
+        };
+        let script = "select 'C:\\' as p;\nselect 2;";
+        let first = |w: &mut SqlWindow| {
+            let sent = sent(&w.execute(false, &cx));
+            w.forget_run();
+            sent.first().map(|(_, sql)| sql.clone()).unwrap_or_default()
+        };
+        let mut w = SqlWindow::new("t".into(), script.into());
+        assert_eq!(first(&mut w), script);
+        let _ = w.on_event(DbEvent::Lexing(Syntax::MySqlNoEscapes), &cx);
+        assert_eq!(first(&mut w), "select 'C:\\' as p");
+        let server = pythia_db::ServerInfo {
+            dialect: pythia_db::Dialect::MYSQL,
+            version: "9.4.0".into(),
+            release: (9, 4),
+            banner: String::new(),
+            current_schema: String::new(),
+            context: pythia_db::NameContext::default(),
+        };
+        let _ = w.on_event(DbEvent::Connected(server), &cx);
+        assert_eq!(first(&mut w), script);
     }
 
     /// MySQL's EXPLAIN takes no bind variables: it says so rather than

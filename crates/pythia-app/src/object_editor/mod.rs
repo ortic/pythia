@@ -31,6 +31,8 @@ pub use db_link::LinkDef;
 #[cfg(test)]
 pub use directory::DirectoryDef;
 #[cfg(test)]
+pub use index::IndexDef;
+#[cfg(test)]
 pub use job::JobDef;
 #[cfg(test)]
 pub use profile::ProfileDef;
@@ -2146,6 +2148,36 @@ mod tests {
         drop(other);
         conn.execute("drop database link pythia_ob_link", &[])
             .unwrap();
+    }
+
+    /// A link's remote user reads as SQL writes it: a quoted "r83_lower"
+    /// stays the user it is when the link is made again (#365).
+    #[test]
+    fn links_keep_their_quoted_user() {
+        let Some((conn, _)) = connect("PYTHIA_TEST_DB_DBA") else {
+            return;
+        };
+        let owner = conn
+            .query_row_as::<String>("select user from dual", &[])
+            .unwrap();
+        let _ = conn.execute("drop database link r83_link", &[]);
+        conn.execute(
+            "create database link r83_link connect to \"r83_lower\" identified by \"x\" \
+             using 'nowhere'",
+            &[],
+        )
+        .unwrap();
+        let loaded = db_link::load(&conn, &owner, "R83_LINK");
+        conn.execute("drop database link r83_link", &[]).unwrap();
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.user, "\"r83_lower\"");
+        let mut edited = loaded.clone();
+        edited.password = "y".into();
+        let s = db_link::statements(Some(&loaded), &edited).unwrap();
+        assert!(
+            s[1].contains(" connect to \"r83_lower\" identified by"),
+            "{s:?}"
+        );
     }
 
     /// Users and roles through the account form's SQL (needs a DBA).

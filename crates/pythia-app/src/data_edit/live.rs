@@ -320,7 +320,12 @@ fn mysql_keys() {
         "create temporary table pythia_live_t (t int not null, u varchar(5) not null, \
            unique key (u), primary key (t))",
         "create temporary table pythia_live_tn (x int)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k float primary key, d double not null unique, \
+           u int not null unique)",
     ]);
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
     // A functional key part (MySQL 8.0.13; MariaDB has none).
     if !db.count("select version()").contains("MariaDB") {
         db.ok("alter table pythia_live_u add unique key pythia_live_u_b ((lower(e)))");
@@ -349,7 +354,7 @@ fn mysql_keys() {
     db.script(&[
         "drop temporary table pythia_live_t, pythia_live_tn",
         "drop view pythia_live_v",
-        "drop table pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t",
+        "drop table pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t, pythia_live_f",
     ]);
 }
 
@@ -374,7 +379,13 @@ fn postgres_keys() {
         "create unique index pythia_live_u_c on pythia_live_u (i) where i > 0",
         "create unique index pythia_live_u_d on pythia_live_u (x) include (n)",
         "create table pythia_live_n (x int)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k real primary key, d double precision not null unique, \
+           u int not null unique)",
     ]);
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
+    db.ok("drop table pythia_live_f");
     // The primary key comes first; unquoted names fold to lowercase.
     assert_eq!(db.key("pythia_live_k"), ["id"]);
     assert_eq!(db.key("PYTHIA_LIVE_K"), ["id"]);
@@ -483,6 +494,9 @@ fn sqlserver_keys() {
         "create unique index pythia_live_u_d on pythia_live_u (x) include (n)",
         "create table pythia_live_n (x int)",
         "create table #pythia_live_t (t int not null primary key, u int not null unique)",
+        "drop table if exists pythia_live_f",
+        "create table pythia_live_f (k real primary key, d float not null unique, \
+           u int not null unique)",
         "create table ##pythia_live_g (g int not null unique)",
     ]);
     // A temporary table, local or global, is found in tempdb.
@@ -490,7 +504,9 @@ fn sqlserver_keys() {
     assert_eq!(db.key("[#pythia_live_t]"), ["t"]);
     assert_eq!(db.key("##pythia_live_g"), ["g"]);
     assert!(db.key("#pythia_live_missing").is_empty());
-    db.ok("drop table #pythia_live_t, ##pythia_live_g");
+    // A float's text is rounded: not a key.
+    assert_eq!(db.key("pythia_live_f"), ["u"]);
+    db.ok("drop table #pythia_live_t, ##pythia_live_g, pythia_live_f");
     // The primary key comes first; the default schema and the collation
     // find the table as the query did.
     assert_eq!(db.key("pythia_live_k"), ["id"]);
@@ -590,7 +606,12 @@ fn sqlite_keys() {
         "create table temp_first (m text primary key not null)",
         &format!("attach database '{}' as other", attached.display()),
         "create table other.k (other_id integer primary key)",
+        "create table floats (f real not null primary key, b blob not null unique, \
+           u not null unique, n numeric not null unique)",
     ]);
+    // Neither a float nor a column of BLOB affinity (or none), where a 7
+    // and a '7' are two keys: a unique numeric, else the rowid.
+    assert_eq!(db.key("floats"), ["n"]);
     assert_eq!(db.key("k"), ["id"]);
     assert_eq!(db.key("K"), ["id"]);
     // The rowid itself, quoted names.
@@ -632,7 +653,9 @@ fn sqlite_values_find_their_rows() {
            '2026-10-31', '2026-10-31 12:34:56.789', '{\"a\":  [1, 2.50]}', 'text', 1)",
         "insert into types values (2, 9223372036854775807, 1e300, 99, '', ' ', x'', \
            '2026-11-01', null, '[]', 7, 0)",
-        "insert into types values (3, 0, -2.2250738585072014e-308, 0.333, 'x', 'y', \
+        // A NUL in a text (#425).
+        "insert into types values (3, 0, -2.2250738585072014e-308, 0.333, \
+           'x' || char(0) || '&' || char(0), 'y', \
            zeroblob(5000), null, null, null, 1.5, null)",
         "insert into types (id) values (4)",
         "create table floats (id integer primary key, d double, r real)",
@@ -949,6 +972,45 @@ fn mysql_bits() {
     let (_, _, rows) = db.editable("r41_bits", "id");
     assert_eq!(rows[0][1..3], [Some("01".into()), Some("05".into())]);
     db.ok("drop table r41_bits");
+}
+
+/// MySQL's VECTOR values, shown as the hex of their floats (#436) like the
+/// other binary values, not as their bytes read as text: typed again they
+/// find their row, and a new one is written as those bytes.
+#[test]
+fn mysql_vectors() {
+    let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+        return;
+    };
+    db.ok("drop table if exists fd_vectors");
+    // Before MySQL 9 and on MariaDB, no VECTOR.
+    if db
+        .run("create table fd_vectors (id int primary key, v vector(3))")
+        .is_err()
+    {
+        return;
+    }
+    db.ok("insert into fd_vectors values (1, string_to_vector('[1,2.5,3]')), (2, null)");
+    assert!(db.rewrite_all("fd_vectors", "id", &[]).is_empty());
+    let (edit, columns, rows) = db.editable("fd_vectors", "id");
+    assert_eq!(rows[0][1].as_deref(), Some("0000803F0000204000004040"));
+    let changes = Changes {
+        updates: BTreeMap::from([(1, BTreeMap::from([(1, Some("0000803F00000040".into()))]))]),
+        ..Changes::default()
+    };
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    assert_eq!(
+        db.count("select vector_to_string(v) from fd_vectors where id = 2"),
+        "[1.00000e+00,2.00000e+00]"
+    );
+    db.ok("drop table fd_vectors");
 }
 
 /// A binary value typed as the grid shows it, `0x171066e1`, is those four
@@ -1711,4 +1773,172 @@ fn oracle_long_json_and_vectors_can_be_changed() {
         "not as written"
     );
     conn.execute("drop table r76_long_json purge", &[]).unwrap();
+}
+
+/// Oracle JSON's scalars of types JSON text has none of show as Oracle's
+/// extended objects and keep their types (#370): dates, timestamps,
+/// intervals, binary values and binary numbers showed as JSON strings and
+/// numbers, so that the check of each value fetched found no row (a
+/// conflict), and what was written had strings and numbers. A fetched
+/// value set to itself or with a member changed keeps every other scalar
+/// as it was, also where the driver reads a DATE, a TIMESTAMP and a
+/// TIMESTAMP WITH TIME ZONE in UTC alike; a new row takes the extended
+/// objects typed; objects MongoDB writes so (`{"$oid":…}`) stay objects.
+#[test]
+fn oracle_json_extended_scalars() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r84_json purge", &[]);
+    for sql in [
+        "create table r84_json (id number primary key, j json)",
+        "insert into r84_json values (1, json{'a': date '2020-01-01', 'b': 1.5d, 'c': 1.5f, \
+         'd': hextoraw('ABCD'), 'e': interval '1 02:03:04.5' day to second, \
+         'f': interval '-1-2' year to month, 'g': 'x', 'h': 1, 'n': binary_double_nan, \
+         's': timestamp '2020-01-01 10:00:00', 't': timestamp '2020-01-01 10:00:00.123456789', \
+         'u': to_timestamp_tz('2020-01-01 10:00:00.5 +00:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM'), \
+         'z': to_timestamp_tz('2020-01-01 10:00:00 +02:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), \
+         'l': json_array(date '1999-12-31', -binary_float_infinity, 'y' returning json)})",
+        "insert into r84_json values (2, json_scalar(1e300d))",
+        r#"insert into r84_json values (3, json_transform(json('{"_id":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"},"&":{"$numberDouble":"1.5"}}'), set '$.d' = date '2020-01-01'))"#,
+        "insert into r84_json values (4, json('{\"plain\":[1,\"two\"]}'))",
+        "commit",
+    ] {
+        conn.execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        fetched
+    };
+    // As Oracle has them, every type to be seen.
+    let stored = || {
+        fetch("select json_serialize(j extended) from r84_json order by id")
+            .1
+            .into_iter()
+            .map(|row| row[0].clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    let before = stored();
+    let edit = Editable {
+        table: "r84_json".into(),
+        source: "select * from r84_json order by id".into(),
+        key: RowKey::Rowid,
+    };
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let shown: Vec<&str> = rows.iter().map(|row| row[1].as_deref().unwrap()).collect();
+    assert_eq!(
+        shown,
+        [
+            concat!(
+                r#"{"a":{"$oracleDate":"2020-01-01T00:00:00"},"b":{"$numberDouble":1.5},"#,
+                r#""c":{"$numberFloat":1.5},"d":{"$rawhex":"ABCD"},"#,
+                r#""e":{"$intervalDaySecond":"P1DT2H3M4.5S"},"f":{"$intervalYearMonth":"-P1Y2M"},"#,
+                r#""g":"x","h":1,"#,
+                r#""l":[{"$oracleDate":"1999-12-31T00:00:00"},{"$numberFloat":"-Inf"},"y"],"#,
+                r#""n":{"$numberDouble":"Nan"},"s":{"$oracleDate":"2020-01-01T10:00:00"},"#,
+                r#""t":{"$oracleTimestamp":"2020-01-01T10:00:00.123456789"},"#,
+                r#""u":{"$oracleTimestamp":"2020-01-01T10:00:00.5"},"#,
+                r#""z":{"$oracleTimestampTZ":"2020-01-01T10:00:00+02:00"}}"#
+            ),
+            r#"{"$numberDouble":1e300}"#,
+            r#"{"&":{"$numberDouble":"1.5"},"_id":{"$oid":"5f1b2c3d4e5f6a7b8c9d0e1f"},"d":{"$oracleDate":"2020-01-01T00:00:00"}}"#,
+            r#"{"plain":[1,"two"]}"#,
+        ]
+    );
+
+    // The check of each value finds its row, and not another's.
+    for (r, row) in rows.iter().enumerate() {
+        let rowid = row[2].as_deref().unwrap();
+        for (other, value) in rows.iter().map(|row| row[1].as_deref()).enumerate() {
+            let check = same(Dialect::ORACLE, "J", &columns[1], value).unwrap();
+            let sql = format!("select count(*) from r84_json where rowid = '{rowid}' and {check}");
+            let count = fetch(&sql).1[0][0].clone().unwrap();
+            assert_eq!(count, if other == r { "1" } else { "0" }, "{sql}");
+        }
+    }
+
+    // Each set to itself, as the window runs it: every scalar as it was.
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let mut apply = |changes: &Changes| {
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, changes) {
+            let ran = db.apply(&statement);
+            assert!(
+                matches!(ran, Ok(Ran::Done(Some(1)))),
+                "{ran:?}\n{}",
+                statement.sql
+            );
+        }
+    };
+    for (r, row) in rows.iter().enumerate() {
+        apply(&Changes {
+            updates: BTreeMap::from([(r, BTreeMap::from([(1, row[1].clone())]))]),
+            ..Changes::default()
+        });
+    }
+    assert_eq!(stored(), before);
+
+    // A member changed, one added: the others as they were.
+    let changed = shown[0].replace(r#""g":"x""#, r#""g":"changed""#).replace(
+        r#""a":{"$oracleDate":"2020-01-01T00:00:00"}"#,
+        r#""a":{"$oracleDate":"2020-01-02T00:00:00"},"added":{"$intervalYearMonth":"P3Y"}"#,
+    );
+    apply(&Changes {
+        updates: BTreeMap::from([(0, BTreeMap::from([(1, Some(changed))]))]),
+        ..Changes::default()
+    });
+    let expected = before[0].replace(r#""g":"x""#, r#""g":"changed""#).replace(
+        r#""a":{"$oracleDate":"2020-01-01T00:00:00"}"#,
+        r#""a":{"$oracleDate":"2020-01-02T00:00:00"}"#,
+    );
+    let after = stored();
+    assert_eq!(
+        after[0],
+        format!(
+            "{},{}}}",
+            &expected[..expected.len() - 1],
+            r#""added":{"$intervalYearMonth":"P3Y"}"#
+        )
+    );
+
+    // New rows take the extended objects typed, MongoDB's stay objects.
+    apply(&Changes {
+        inserts: vec![
+            vec![Some("11".into()), Some(shown[0].into()), None],
+            vec![Some("12".into()), Some(shown[2].into()), None],
+            vec![
+                Some("13".into()),
+                Some(r#"{"$oracleTimestampTZ":"2021-02-03T04:05:06.7-05:30"}"#.into()),
+                None,
+            ],
+        ],
+        ..Changes::default()
+    });
+    let after = stored();
+    // The driver can't tell s, a TIMESTAMP, and u, in UTC, from a DATE
+    // and a TIMESTAMP.
+    assert_eq!(
+        after[4],
+        before[0]
+            .replace(
+                r#""s":{"$oracleTimestamp":"2020-01-01T10:00:00"}"#,
+                r#""s":{"$oracleDate":"2020-01-01T10:00:00"}"#
+            )
+            .replace(
+                r#""u":{"$oracleTimestampTZ":"2020-01-01T10:00:00.500000Z"}"#,
+                r#""u":{"$oracleTimestamp":"2020-01-01T10:00:00.500000"}"#
+            )
+    );
+    assert_eq!(after[5], before[2]);
+    assert_eq!(
+        after[6],
+        r#"{"$oracleTimestampTZ":"2021-02-03T04:05:06.700000-05:30"}"#
+    );
+    conn.execute("drop table r84_json purge", &[]).unwrap();
 }

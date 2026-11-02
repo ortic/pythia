@@ -226,6 +226,10 @@ pub enum DbEvent {
     /// time_zone` takes it: when it connects, and after a statement that
     /// changed it. INSERT statements of its results set it (#213).
     TimeZone(String),
+    /// How the session reads strings, where its dialect's syntax doesn't
+    /// say: MySQL's after it connects and after a `SET` that changed it,
+    /// without backslash escapes under `NO_BACKSLASH_ESCAPES` (#412).
+    Lexing(pythia_plsql::Syntax),
     /// What the session's unqualified names refer to, after a statement
     /// that may have changed it (#320); [`ServerInfo::context`] when it
     /// connects.

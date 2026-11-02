@@ -28,13 +28,26 @@ pub enum DataSource {
 }
 
 impl DataSource {
-    fn base_sql(&self) -> String {
-        match self {
+    /// A table's rows with its invisible columns (#444) and without its
+    /// virtual ones, which follow from the others and which the sync
+    /// script couldn't write (#443).
+    fn base_sql(&self, conn: &Connection) -> Result<String, Error> {
+        Ok(match self {
             DataSource::Table { schema, table } => {
-                format!("select * from {}.{}", ident(schema), ident(table))
+                let columns = pythia_db::compat::table_columns(conn, schema, table, false)?;
+                let list = if columns.is_empty() {
+                    "*".to_owned()
+                } else {
+                    columns
+                        .iter()
+                        .map(|c| ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("select {list} from {}.{}", ident(schema), ident(table))
             }
             DataSource::Query(q) => q.trim().trim_end_matches(';').to_owned(),
-        }
+        })
     }
 
     /// Name used in the sync script.
@@ -48,7 +61,8 @@ impl DataSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataOptions {
-    /// Key columns (upper case). Empty: use the source table's primary key.
+    /// Key columns, as the dictionary names them. Empty: use the source
+    /// table's primary key.
     pub key_columns: Vec<String>,
     /// Optional filter applied on both sides (`WHERE` without the keyword).
     pub filter: String,
@@ -126,7 +140,11 @@ pub fn fetch_chunk(
         .collect();
     // On lines of their own: a `--` comment at the filter's or the
     // query's end would take what follows with it.
-    if !filter.trim().is_empty() {
+    // A filter that is all comment is none (#427).
+    if pythia_plsql::tokenize(filter)
+        .iter()
+        .any(|t| !t.kind.is_trivia())
+    {
         conditions.push(format!("(\n{}\n)", filter.trim()));
     }
     let mut binds: Vec<String> = Vec::new();
@@ -147,7 +165,7 @@ pub fn fetch_chunk(
     let sql = pythia_db::compat::first_rows(
         &format!(
             "select * from (\n{}\n) where {} order by {key_list}",
-            source.base_sql(),
+            source.base_sql(conn)?,
             conditions.join(" and "),
         ),
         limit.max(1),
@@ -718,12 +736,7 @@ pub fn resolve_keys(
     options: &DataOptions,
 ) -> Result<Vec<String>, Error> {
     if !options.key_columns.is_empty() {
-        return Ok(options
-            .key_columns
-            .iter()
-            .map(|k| k.trim().to_uppercase())
-            .filter(|k| !k.is_empty())
-            .collect());
+        return Ok(options.key_columns.clone());
     }
     match source {
         DataSource::Table { schema, table } => {

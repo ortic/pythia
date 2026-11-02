@@ -380,15 +380,18 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
               order by t.tgname",
             relation("t.tgrelid")
         ),
+        // A table's and a function's of the same name apart (#429).
         Detail::Grants => "select grantee as \"GRANTEE\", privilege_type as \"PRIVILEGE\", \
                                   is_grantable as \"GRANTABLE\" \
                              from information_schema.role_table_grants \
                             where table_schema = $1 and table_name = $2 \
-                           union all \
-                           select grantee, privilege_type, is_grantable \
-                             from information_schema.role_routine_grants \
-                            where routine_schema = $1 and routine_name = $2 \
                             order by 1, 2"
+            .to_owned(),
+        Detail::RoutineGrants => "select grantee as \"GRANTEE\", privilege_type as \"PRIVILEGE\", \
+                                         is_grantable as \"GRANTABLE\" \
+                                    from information_schema.role_routine_grants \
+                                   where routine_schema = $1 and routine_name = $2 \
+                                   order by 1, 2"
             .to_owned(),
         Detail::Uses => format!(
             "select distinct rn.nspname as \"OWNER\", r.relname as \"NAME\", \
@@ -517,7 +520,7 @@ fn ddl(
         // its body's tables and functions, a trigger's table and function
         // (#350).
         ObjectType::Function | ObjectType::Procedure => {
-            on_path(pg, "", || routine_ddl(pg, owner, name, end))?.ok_or_else(missing)
+            on_path(pg, "", || routine_ddl(pg, owner, name, object_type, end))?.ok_or_else(missing)
         }
         ObjectType::Trigger => {
             on_path(pg, "", || trigger_ddl(pg, owner, name, end))?.ok_or_else(missing)
@@ -559,7 +562,19 @@ fn comment_on(ddl: &mut String, on: &str, comment: Option<&str>) {
 
 /// Each overload of a function or procedure with its [`OWNER`] (#353), its
 /// comment and its grants (#331), if there is one.
-fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+fn routine_ddl(
+    pg: &Pg<'_>,
+    owner: &str,
+    name: &str,
+    object_type: ObjectType,
+    end: &str,
+) -> Result<Option<String>, DbError> {
+    // A function's overloads, not a procedure of its name (#429).
+    let kind = if object_type == ObjectType::Procedure {
+        "p"
+    } else {
+        "f"
+    };
     let rows = pg.rows(
         &format!(
             "select pg_get_functiondef(p.oid), p.oid, \
@@ -570,10 +585,10 @@ fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
                from pg_proc p \
                join pg_namespace n on n.oid = p.pronamespace \
                join pg_roles r on r.oid = p.proowner \
-              where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
+              where n.nspname = $1 and p.proname = $2 and p.prokind = $3 \
               order by p.oid"
         ),
-        &[owner, name],
+        &[owner, name, kind],
     )?;
     let mut overloads = Vec::new();
     for row in rows {
@@ -597,7 +612,11 @@ fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
         "select pg_get_triggerdef(t.oid, true), \
                 'trigger ' || quote_ident(t.tgname) || ' on ' \
                 || quote_ident(n.nspname) || '.' || quote_ident(c.relname), \
-                obj_description(t.oid, 'pg_trigger') \
+                obj_description(t.oid, 'pg_trigger'), \
+                case t.tgenabled when 'D' then 'disable' when 'R' then 'enable replica' \
+                                 when 'A' then 'enable always' end \
+                || ' trigger ' || quote_ident(t.tgname), \
+                quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
            from pg_trigger t \
            join pg_class c on c.oid = t.tgrelid \
            join pg_namespace n on n.oid = c.relnamespace \
@@ -607,8 +626,14 @@ fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
     )?;
     let mut triggers = Vec::new();
     for row in rows {
-        if let [Some(definition), Some(on), note] = row.as_slice() {
-            let mut rest = String::new();
+        if let [Some(definition), Some(on), note, state, Some(table)] = row.as_slice() {
+            // A trigger that isn't enabled as created stays so: CREATE
+            // makes it fire on every insert, as CREATE OR REPLACE does to
+            // one disabled (#415).
+            let mut rest = state
+                .as_ref()
+                .map(|state| format!("\n\nalter table {table} {state};"))
+                .unwrap_or_default();
             comment_on(&mut rest, on, note.as_deref());
             triggers.push(followed(definition, &rest, end));
         }
@@ -740,9 +765,12 @@ fn view_ddl(
     if let Some(role) = role {
         rest.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
+    if object_type == ObjectType::MaterializedView {
+        column_settings(pg, &mut rest, &oid, &kind, &qualified)?;
+    }
     // A view's comments and grants too, for a copy: Edit's CREATE OR
     // REPLACE keeps them anyway (#331, #354). A view has no indexes.
-    indexes_and_comments(pg, &mut rest, &oid, &kind, &qualified, comment)?;
+    indexes_and_comments(pg, &mut rest, &oid, &kind, (&owner, &qualified), comment)?;
     grants(pg, &mut rest, Privileges::Relation, &oid, &qualified)?;
     Ok(Some(followed(&ddl, &rest, end)))
 }
@@ -871,15 +899,30 @@ fn owned_sequences(pg: &Pg<'_>, oid: &str) -> Result<Vec<(String, String, String
         .collect())
 }
 
+/// ` collate <collation>` of the column `a` (`pg_attribute`) where it isn't
+/// its type's, a domain's where it isn't the domain's, as `pg_dump` writes
+/// it; null where it is. A collation of another schema than `pg_catalog`
+/// has its schema. Without it, a copy's column sorted and compared as its
+/// type does, mostly as the database (#375).
+const COLLATION: &str = "(select ' collate ' \
+                                 || case when cn.nspname = 'pg_catalog' then '' \
+                                         else quote_ident(cn.nspname) || '.' end \
+                                 || quote_ident(co.collname) \
+                            from pg_collation co \
+                            join pg_namespace cn on cn.oid = co.collnamespace \
+                            join pg_type ty on ty.oid = a.atttypid \
+                           where co.oid = a.attcollation and a.attcollation <> ty.typcollation)";
+
 /// The sequences its columns own, `CREATE TABLE` with its columns and
 /// constraints, the sequences' owners, then its other indexes and
 /// comments, its grants and the sequences' comments (#354) and grants. A
 /// serial column's sequence goes with the table, as `pg_dump` writes it:
 /// run elsewhere, the DDL makes the copy a sequence of its own (#263),
-/// which roles use as they use the table's (#331). The table is unlogged where it is, with its access
-/// method, storage parameters and tablespace where they aren't the
-/// defaults, as a materialized view (#352). Its [`OWNER`] comes after the
-/// sequences are its columns', so that they go to it with the table (#353).
+/// which roles use as they use the table's (#331). The table is unlogged
+/// where it is, with its access method, storage parameters and tablespace
+/// where they aren't the defaults, as a materialized view (#352). Its
+/// [`OWNER`] comes after the sequences are its columns', so that they go to
+/// it with the table (#353). Its [`row_security`] follows its comments.
 fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let (owner, name) = stored(pg, owner, name)?;
     let qualified = Dialect::POSTGRES.qualified(&owner, &name);
@@ -887,7 +930,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .first(
             &format!(
                 "select c.oid, c.relkind, pg_get_partkeydef(c.oid), \
-                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {}, {OWNER} \
+                        obj_description(c.oid, 'pg_class'), c.relpersistence = 'u', {}, {OWNER}, \
+                        c.relrowsecurity, c.relforcerowsecurity \
                    from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                    join pg_roles r on r.oid = c.relowner \
                    left join pg_am a on a.oid = c.relam \
@@ -907,17 +951,21 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     let unlogged = table.next().flatten().as_deref() == Some("t");
     let options = table.next().flatten().unwrap_or_default();
     let role = table.next().flatten();
+    let secure = table.next().flatten().as_deref() == Some("t");
+    let forced = table.next().flatten().as_deref() == Some("t");
     let mut lines: Vec<String> = pg
         .rows(
             &format!(
                 "select quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod) \
                         || coalesce(' options (' || {} || ')', '') \
+                        || coalesce({COLLATION}, '') \
                         || coalesce(case when a.attidentity <> '' or a.attgenerated <> '' \
                                          then ' ' else ' default ' end || {DEFAULT}, '') \
                         || case when a.attnotnull then ' not null' else '' end \
                    from pg_attribute a \
                    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
                   where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
+                    and a.attislocal \
                   order by a.attnum",
                 fdw_options("a.attfdwoptions")
             ),
@@ -947,6 +995,7 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
                left join pg_class c on c.oid = i.indexrelid \
                left join pg_tablespace t on t.oid = c.reltablespace \
               where k.conrelid = {oid} and k.contype in ('p', 'u', 'f', 'c', 'x') \
+                and k.conislocal \
               order by position(k.contype::text in 'pucfx'), k.conname"
         ),
         &[],
@@ -989,6 +1038,25 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     if foreign && let Some(server) = foreign_server(pg, &oid)? {
         ddl.push_str(&server);
     }
+    // A child table's parents (#376), whose columns and constraints it
+    // takes from them: only its own are written above, as pg_dump writes
+    // them. A partition's parent isn't one of these (PARTITION OF).
+    if let Some(parents) = pg
+        .first(
+            &format!(
+                "select string_agg(quote_ident(n.nspname) || '.' || quote_ident(p.relname), \
+                                   ', ' order by i.inhseqno) \
+                   from pg_inherits i join pg_class p on p.oid = i.inhparent \
+                   join pg_namespace n on n.oid = p.relnamespace \
+                   join pg_class c on c.oid = i.inhrelid \
+                  where i.inhrelid = {oid} and not c.relispartition"
+            ),
+            &[],
+        )?
+        .and_then(first)
+    {
+        ddl.push_str(&format!(" inherits ({parents})"));
+    }
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
@@ -1006,10 +1074,17 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     if let Some(role) = role {
         ddl.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    indexes_and_comments(pg, &mut ddl, &oid, kind, &qualified, comment)?;
+    column_settings(pg, &mut ddl, &oid, kind, &qualified)?;
+    indexes_and_comments(pg, &mut ddl, &oid, kind, (&owner, &qualified), comment)?;
     for constraint in late {
         ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
     }
+    constraint_comments(pg, &mut ddl, &oid, &qualified)?;
+    if !foreign {
+        replica_identity(pg, &mut ddl, &oid, &qualified)?;
+    }
+    rules(pg, &mut ddl, &oid, kind, &qualified)?;
+    row_security(pg, &mut ddl, &oid, &qualified, secure, forced)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
@@ -1045,6 +1120,67 @@ fn foreign_server(pg: &Pg<'_>, oid: &str) -> Result<Option<String>, DbError> {
     Ok(row.and_then(first))
 }
 
+/// A table's row level security, enabled and forced where it is, then its
+/// policies as `CREATE POLICY` takes them, appended to `ddl`: restrictive
+/// where they aren't permissive, for a command where they aren't for all,
+/// to their roles where they aren't `public`, with their USING and WITH
+/// CHECK. Without them, a copy showed every row to every role that could
+/// read it (#373). Read on the table's empty search path, their expressions
+/// name every table and function with its schema.
+fn row_security(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+    secure: bool,
+    forced: bool,
+) -> Result<(), DbError> {
+    if secure {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} enable row level security;"
+        ));
+    }
+    if forced {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} force row level security;"
+        ));
+    }
+    let policies = pg.rows(
+        &format!(
+            "select quote_ident(p.polname), \
+                    case when p.polpermissive then '' else ' as restrictive' end \
+                    || case p.polcmd when 'r' then ' for select' when 'a' then ' for insert' \
+                                     when 'w' then ' for update' when 'd' then ' for delete' \
+                                     else '' end, \
+                    case when p.polroles <> array[0::oid] then \
+                         (select string_agg(coalesce(quote_ident(o.rolname), 'public'), ', ' \
+                                            order by x.n) \
+                            from unnest(p.polroles) with ordinality x(role, n) \
+                            left join pg_roles o on o.oid = x.role) end, \
+                    pg_get_expr(p.polqual, p.polrelid, true), \
+                    pg_get_expr(p.polwithcheck, p.polrelid, true) \
+               from pg_policy p where p.polrelid = {oid} order by p.polname"
+        ),
+        &[],
+    )?;
+    for row in policies {
+        if let [Some(name), Some(kind), roles, using, check] = row.as_slice() {
+            ddl.push_str(&format!("\n\ncreate policy {name} on {qualified}{kind}"));
+            if let Some(roles) = roles {
+                ddl.push_str(&format!("\n  to {roles}"));
+            }
+            if let Some(using) = using {
+                ddl.push_str(&format!("\n  using ({using})"));
+            }
+            if let Some(check) = check {
+                ddl.push_str(&format!("\n  with check ({check})"));
+            }
+            ddl.push(';');
+        }
+    }
+    Ok(())
+}
+
 /// The relation's indexes that no constraint makes, then the comments on
 /// it (a `kind`: `table`, `view`, `materialized view`) and on its columns,
 /// each statement with its `;`, appended to `ddl`. An index in a
@@ -1055,7 +1191,7 @@ fn indexes_and_comments(
     ddl: &mut String,
     oid: &str,
     kind: &str,
-    qualified: &str,
+    (owner, qualified): (&str, &str),
     comment: Option<String>,
 ) -> Result<(), DbError> {
     let indexes = pg.rows(
@@ -1091,6 +1227,177 @@ fn indexes_and_comments(
         if let [Some(column), Some(comment)] = row.as_slice() {
             ddl.push_str(&format!(
                 "\ncomment on column {qualified}.{column} is {};",
+                literal(comment)
+            ));
+        }
+    }
+    // Its indexes', a key's index's too (#379), which are in its schema.
+    let comments = pg.rows(
+        &format!(
+            "select c.relname, obj_description(c.oid, 'pg_class') \
+               from pg_index i join pg_class c on c.oid = i.indexrelid \
+              where i.indrelid = {oid} and obj_description(c.oid, 'pg_class') is not null \
+              order by c.relname"
+        ),
+        &[],
+    )?;
+    for row in comments {
+        if let [Some(index), Some(comment)] = row.as_slice() {
+            ddl.push_str(&format!(
+                "\ncomment on index {} is {};",
+                Dialect::POSTGRES.qualified(owner, index),
+                literal(comment)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What is set on the columns of a table or materialized view `oid` after
+/// its CREATE (#378): a storage that isn't the type's, a compression (14
+/// and later), a statistics target and options (`n_distinct`), as
+/// `alter {kind} … alter column …`.
+fn column_settings(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    kind: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let compression = pg
+        .first(
+            "select current_setting('server_version_num')::int >= 140000",
+            &[],
+        )?
+        .and_then(first)
+        .as_deref()
+        == Some("t");
+    let compression = if compression {
+        "case a.attcompression when 'p' then 'pglz' when 'l' then 'lz4' end"
+    } else {
+        "null"
+    };
+    // A statistics target is -1, or NULL from 17 on, where it is unset.
+    let rows = pg.rows(
+        &format!(
+            "select quote_ident(a.attname), \
+                    case when a.attstorage <> t.typstorage then \
+                         case a.attstorage when 'p' then 'plain' when 'e' then 'external' \
+                                           when 'm' then 'main' when 'x' then 'extended' end end, \
+                    {compression}, \
+                    case when a.attstattarget >= 0 then a.attstattarget::text end, \
+                    array_to_string(a.attoptions, ', ') \
+               from pg_attribute a join pg_type t on t.oid = a.atttypid \
+              where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
+              order by a.attnum"
+        ),
+        &[],
+    )?;
+    for row in rows {
+        let [Some(column), storage, compression, statistics, options] = row.as_slice() else {
+            continue;
+        };
+        let settings = [
+            storage.as_ref().map(|s| format!("set storage {s}")),
+            compression.as_ref().map(|c| format!("set compression {c}")),
+            statistics.as_ref().map(|n| format!("set statistics {n}")),
+            options
+                .as_ref()
+                .filter(|o| !o.is_empty())
+                .map(|o| format!("set ({o})")),
+        ];
+        for setting in settings.into_iter().flatten() {
+            ddl.push_str(&format!(
+                "\n\nalter {kind} {qualified} alter column {column} {setting};"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A table's replica identity where it isn't its key (#378): `full`,
+/// `nothing` or one of its unique indexes, which logical replication sends
+/// old rows by.
+fn replica_identity(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let identity = pg
+        .first(
+            &format!(
+                "select case c.relreplident when 'f' then 'full' when 'n' then 'nothing' \
+                        when 'i' then (select 'using index ' || quote_ident(x.relname) \
+                                         from pg_index i join pg_class x on x.oid = i.indexrelid \
+                                        where i.indrelid = c.oid and i.indisreplident) end \
+                   from pg_class c where c.oid = {oid}"
+            ),
+            &[],
+        )?
+        .and_then(first);
+    if let Some(identity) = identity {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} replica identity {identity};"
+        ));
+    }
+    Ok(())
+}
+
+/// A table's rules (#378), as `pg_get_ruledef` writes them, and their
+/// state where they don't fire as usual.
+fn rules(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    kind: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let rules = pg.rows(
+        &format!(
+            "select pg_get_ruledef(w.oid, true), quote_ident(w.rulename), \
+                    case w.ev_enabled when 'D' then 'disable' when 'R' then 'enable replica' \
+                                      when 'A' then 'enable always' end \
+               from pg_rewrite w \
+              where w.ev_class = {oid} and w.rulename <> '_RETURN' \
+              order by w.rulename"
+        ),
+        &[],
+    )?;
+    for row in rules {
+        let [Some(rule), Some(name), state] = row.as_slice() else {
+            continue;
+        };
+        let rule = rule.trim_end().trim_end_matches(';');
+        ddl.push_str(&format!("\n\n{rule};"));
+        if let Some(state) = state {
+            ddl.push_str(&format!("\nalter {kind} {qualified} {state} rule {name};"));
+        }
+    }
+    Ok(())
+}
+
+/// The comments on a table's constraints (#379), which come after the
+/// constraints added after its indexes.
+fn constraint_comments(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let comments = pg.rows(
+        &format!(
+            "select quote_ident(k.conname), obj_description(k.oid, 'pg_constraint') \
+               from pg_constraint k \
+              where k.conrelid = {oid} and obj_description(k.oid, 'pg_constraint') is not null \
+              order by k.conname"
+        ),
+        &[],
+    )?;
+    for row in comments {
+        if let [Some(constraint), Some(comment)] = row.as_slice() {
+            ddl.push_str(&format!(
+                "\ncomment on constraint {constraint} on {qualified} is {};",
                 literal(comment)
             ));
         }

@@ -52,6 +52,12 @@ pub struct Connection {
     /// Requests sent to it and not answered yet.
     meta_pending: HashMap<u64, Answer>,
     pub docs: HashMap<DocId, DocSession>,
+    /// The main session is being opened again after it was lost.
+    pub reconnecting: bool,
+    /// Opening it again failed: the next request tries once more, rather
+    /// than the connection being closed with every window's session (#424).
+    main_down: bool,
+    notify: Option<Notify>,
 }
 
 /// The event that answers a request, so the request can be answered when
@@ -207,10 +213,29 @@ impl Connection {
 
     /// Sends a request to the main session, keeping it until it's answered.
     pub fn send_main(&mut self, request: DbRequest) {
+        if self.main_down
+            && let Some(notify) = self.notify.clone()
+        {
+            self.main_down = false;
+            self.reconnecting = true;
+            self.main = Session::connect(self.params.clone(), notify.callback());
+        }
         if let Some((id, answer)) = Answer::of(&request) {
             self.main_pending.insert(id, answer);
         }
         self.main.send(request);
+    }
+
+    /// Opening the main session again failed (#424): what waits on it is
+    /// answered with `error`, and the next request tries again.
+    pub fn reconnect_failed(&mut self, error: &DbError) {
+        self.reconnecting = false;
+        self.main_down = true;
+        self.main_failed.extend(
+            self.main_pending
+                .drain()
+                .map(|(id, answer)| answer.failed(id, error.clone())),
+        );
     }
 
     /// Replaces a lost main session with a new one. The requests waiting on
@@ -219,6 +244,8 @@ impl Connection {
     /// forever (#215). Not a lost connection itself, so it opens no other
     /// session.
     pub fn reconnect_main(&mut self, notify: &Notify) {
+        self.notify = Some(notify.clone());
+        self.reconnecting = true;
         self.main = Session::connect(self.params.clone(), notify.callback());
         self.main_pending_tx = false;
         let error = DbError::new(
@@ -367,6 +394,9 @@ impl Connections {
                 meta: None,
                 meta_pending: HashMap::new(),
                 docs: HashMap::new(),
+                reconnecting: false,
+                main_down: false,
+                notify: Some(notify.clone()),
             },
         );
         name

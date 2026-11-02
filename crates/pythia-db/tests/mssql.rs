@@ -334,6 +334,51 @@ fn values_types_and_binds() {
     );
 }
 
+/// An nvarchar that isn't valid UTF-16, a lone surrogate as SQL Server
+/// keeps it, reads with U+FFFD in its place (#371), as do the next values
+/// and rows: the result failed with a protocol error, and the connection
+/// was opened again, without the transaction.
+#[test]
+fn invalid_utf16_reads_lossily() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r82_utf16");
+    h.ok("create table r82_utf16 (id int, v nvarchar(10), t ntext)");
+    assert!(h.ok(
+        "insert into r82_utf16 values (1, cast(0x00d8 as nvarchar(1)) + N'a', \
+         cast(cast(0x00dc6200 as nvarchar(2)) as ntext)), (2, N'ok', N'ok')"
+    ));
+    let DbEvent::QueryStarted { .. } = h.run(1, "select id, v, t from r82_utf16 order by id")
+    else {
+        panic!("expected QueryStarted")
+    };
+    let DbEvent::Rows { rows, more, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert!(!more);
+    assert_eq!(
+        rows,
+        [
+            [
+                Some("1".into()),
+                Some("\u{fffd}a".into()),
+                Some("\u{fffd}b".into())
+            ],
+            [Some("2".into()), Some("ok".into()), Some("ok".into())],
+        ]
+    );
+    // The transaction is still there.
+    assert!(h.settle());
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    assert_eq!(
+        h.scalar("select count(*) from r82_utf16").as_deref(),
+        Some("0")
+    );
+    h.ok("drop table r82_utf16");
+}
+
 /// A float keeps its exponent (#261): 2e-20 came as
 /// 0.00000000000000000002, and 1e-300 as 302 characters, which the grid
 /// shows cut short as `0.0000…`.
@@ -2883,6 +2928,87 @@ fn typed_xml_columns() {
     h.ok("drop xml schema collection r82_xs");
 }
 
+/// A table's DDL names an alias type with its schema (#372), as Columns
+/// does: by its name alone, a session whose default schema isn't the
+/// type's doesn't find it. The system's types, CLR ones too, keep their
+/// names.
+#[test]
+fn alias_types_with_their_schema() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    let drop_types = |h: &mut Harness| {
+        h.ok(
+            "drop type if exists r82_ty.r82_ssn; drop type if exists r82_ty.r82_amount; \
+             drop schema if exists r82_ty",
+        );
+    };
+    drop_tables(&mut h, "r82_copy_ty", "r82_ty");
+    h.ok("drop schema if exists r82_copy_ty");
+    drop_tables(&mut h, &schema, "r82_ty");
+    drop_types(&mut h);
+    for sql in [
+        "create schema r82_ty",
+        "create type r82_ty.r82_ssn from varchar(11) not null",
+        "create type r82_ty.r82_amount from decimal(10, 2)",
+        "create table r82_ty_t (id int, s r82_ty.r82_ssn, a r82_ty.r82_amount, \
+         g geography, h hierarchyid)",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = table_ddl(&mut h, &schema, "r82_ty_t");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_ty_t] (\n    \
+               [id] int null,\n    \
+               [s] [r82_ty].[r82_ssn] not null,\n    \
+               [a] [r82_ty].[r82_amount] null,\n    \
+               [g] geography null,\n    \
+               [h] hierarchyid null\n\
+             );\nGO\n"
+        )
+    );
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema.clone(),
+        table: "r82_ty_t".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    let types: Vec<&str> = columns.iter().map(|c| c.data_type.as_str()).collect();
+    assert_eq!(
+        types,
+        [
+            "int",
+            "[r82_ty].[r82_ssn]",
+            "[r82_ty].[r82_amount]",
+            "geography",
+            "hierarchyid"
+        ]
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, schema_name(t.schema_id), t.name, \
+                                         c.is_nullable) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
+              where c.object_id = object_id('[{owner}].[r82_ty_t]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_ty");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_ty", &["r82_ty_t"]);
+    assert_eq!(catalog(&mut h, "r82_copy_ty"), before);
+    drop_tables(&mut h, "r82_copy_ty", "r82_ty");
+    h.ok("drop schema r82_copy_ty");
+    drop_tables(&mut h, &schema, "r82_ty");
+    drop_types(&mut h);
+}
+
 /// A table's DDL keeps ROWGUIDCOL, a persisted computed column's NOT NULL,
 /// and NOT FOR REPLICATION of identities, foreign keys and checks (#355),
 /// which SQL Server never trusts: run elsewhere, the copy's columns and
@@ -3454,6 +3580,86 @@ fn ledger_tables() {
     drop_database(&mut dba, "r82_ledger");
 }
 
+/// A ledger table's history table says that the ledger table's DDL makes
+/// it (#381), as one made before fails that DDL (SQL Server 2022).
+#[test]
+fn ledger_history_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let major = dba
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    if major < 16 {
+        return;
+    }
+    let mut h = own_database(&mut dba, "r82_ledger_h", &[]);
+    for sql in [
+        "create table r82_lu (id int constraint r82_lu_pk primary key, v varchar(10)) \
+         with (system_versioning = on, ledger = on)",
+        "create table r82_ln (id int) with (system_versioning = on \
+           (history_table = dbo.r82_ln_hist), ledger = on)",
+    ] {
+        h.ok(sql);
+    }
+    let history = h
+        .scalar("select object_name(history_table_id) from sys.tables where name = 'r82_lu'")
+        .expect("the history table");
+    assert_eq!(
+        table_ddl(&mut h, "dbo", &history),
+        "-- The ledger history table of [dbo].[r82_lu], made by that table's DDL.\nGO\n"
+    );
+    assert_eq!(
+        table_ddl(&mut h, "dbo", "r82_ln_hist"),
+        "-- The ledger history table of [dbo].[r82_ln], made by that table's DDL.\nGO\n"
+    );
+
+    // Dropped, a ledger table is kept with its history table and view
+    // under names of SQL Server's, which aren't listed or found (#382).
+    h.ok("drop table r82_ln");
+    let kept = h
+        .scalar(
+            "select count(*) from sys.objects \
+              where name like 'MSSQL[_]DroppedLedger%' and type in ('U', 'V')",
+        )
+        .unwrap();
+    assert_eq!(kept, "3");
+    let listed = |h: &mut Harness, object_type: ObjectType| {
+        let MetaResult::Objects(objects) = h.meta(MetaQuery::Objects {
+            owner: "dbo".into(),
+            object_type,
+            filter: None,
+        }) else {
+            panic!("expected objects")
+        };
+        objects.into_iter().map(|o| o.name).collect::<Vec<_>>()
+    };
+    let tables = listed(&mut h, ObjectType::Table);
+    assert!(tables.contains(&"r82_lu".to_owned()), "{tables:?}");
+    assert!(
+        !tables.iter().any(|t| t.starts_with("MSSQL_Dropped")),
+        "{tables:?}"
+    );
+    let views = listed(&mut h, ObjectType::View);
+    assert!(views.contains(&"r82_lu_Ledger".to_owned()), "{views:?}");
+    assert!(
+        !views.iter().any(|v| v.starts_with("MSSQL_Dropped")),
+        "{views:?}"
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "MSSQL_DROPPED*".into(),
+        limit: 10,
+    }) else {
+        panic!("expected objects")
+    };
+    assert!(found.is_empty(), "{found:?}");
+    drop(h);
+    drop_database(&mut dba, "r82_ledger_h");
+}
+
 /// A table's DDL keeps its Always Encrypted columns encrypted (#367), with
 /// their column encryption key, encryption type and algorithm: run
 /// elsewhere, the copy takes no plain values into them, as the original
@@ -3894,4 +4100,69 @@ fn values_bound_whole() {
     // The changes' transaction would keep the table.
     h.ok("rollback");
     h.ok("drop table if exists lob_bound");
+}
+
+/// A trigger's DDL keeps its place among its table's triggers of an event
+/// (#440): first or last, which `ALTER TRIGGER` drops, as *Edit* runs it.
+/// Its script, run as it is, keeps the order.
+#[test]
+fn trigger_ddl_keeps_its_order() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.scalar("select schema_name()").unwrap();
+    h.ok("drop table if exists r100_ord");
+    h.ok("create table r100_ord (s varchar(10))");
+    for name in ["a", "b", "c"] {
+        h.ok(&format!(
+            "create trigger r100_ord_{name} on r100_ord after insert, update as set nocount on"
+        ));
+    }
+    h.ok("exec sp_settriggerorder N'r100_ord_c', N'First', N'INSERT'");
+    h.ok("exec sp_settriggerorder N'r100_ord_c', N'Last', N'UPDATE'");
+    h.ok("exec sp_settriggerorder N'r100_ord_a', N'Last', N'INSERT'");
+    let ddl = |h: &mut Harness, name: &str| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: name.into(),
+            object_type: ObjectType::Trigger,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let c = ddl(&mut h, "r100_ord_c");
+    let calls = format!(
+        "GO\nexec sp_settriggerorder @triggername = N'[{schema}].[r100_ord_c]', @order = N'First', \
+         @stmttype = N'INSERT';\n\
+         exec sp_settriggerorder @triggername = N'[{schema}].[r100_ord_c]', @order = N'Last', \
+         @stmttype = N'UPDATE';\nGO\n"
+    );
+    assert!(c.ends_with(&calls), "{c}");
+    assert!(ddl(&mut h, "r100_ord_b").ends_with("set nocount on\nGO\n"));
+    let order = |h: &mut Harness| {
+        h.first_row(
+            "select string_agg(object_name(te.object_id) + ' ' + te.type_desc + ' ' \
+                     + iif(te.is_first = 1, 'first', 'last'), ', ') \
+                     within group (order by object_name(te.object_id), te.type_desc) \
+               from sys.trigger_events te \
+              where object_name(te.object_id) like 'r100%' and (te.is_first = 1 or te.is_last = 1)",
+        )
+    };
+    let before = order(&mut h);
+    assert_eq!(
+        before,
+        ["r100_ord_a INSERT last, r100_ord_c INSERT first, r100_ord_c UPDATE last"]
+    );
+    // As Edit makes it again: altered, then its order set.
+    for batch in c
+        .replace("create trigger", "create or alter trigger")
+        .split("\nGO\n")
+    {
+        if !batch.trim().is_empty() {
+            h.ok(batch);
+        }
+    }
+    assert_eq!(order(&mut h), before);
+    h.ok("drop table r100_ord");
 }

@@ -408,6 +408,7 @@ impl Worker {
                 error,
                 elapsed: started.elapsed(),
             });
+            self.check_aborted();
             self.report_transaction();
             return None;
         }
@@ -457,24 +458,46 @@ impl Worker {
                 true
             }
         };
+        // A COMMIT of a failed transaction is a rollback, which PostgreSQL
+        // answers without an error.
+        let lost = self.tx.aborted && effect == TxEffect::Ends && !failed && commits(&sql);
+        // Whether the transaction may have failed with this statement: it
+        // failed and its savepoint didn't undo it (a savepoint statement of
+        // the user's; Break during Pythia's own), or Pythia's RELEASE did.
+        let mut doubt = false;
         if failed {
             if opened {
                 // Nothing else to keep in a transaction of its own.
                 let _ = self.pg().execute("rollback");
                 self.tx.pending = false;
             } else if guarded {
-                let _ = self.pg().execute(&format!(
-                    "rollback to savepoint {SAVEPOINT}; release savepoint {SAVEPOINT}"
-                ));
+                doubt = self
+                    .pg()
+                    .execute(&format!(
+                        "rollback to savepoint {SAVEPOINT}; release savepoint {SAVEPOINT}"
+                    ))
+                    .is_err();
             } else if effect == TxEffect::Ends {
                 // A failed COMMIT rolls back.
                 self.tx.pending = false;
+            } else {
+                doubt = true;
             }
         } else {
             if guarded {
-                let _ = self.pg().execute(&format!("release savepoint {SAVEPOINT}"));
+                doubt = self
+                    .pg()
+                    .execute(&format!("release savepoint {SAVEPOINT}"))
+                    .is_err();
             }
             self.tx.after(effect);
+        }
+        if doubt {
+            self.check_aborted();
+        }
+        if lost {
+            self.events
+                .send(DbEvent::Error(DbError::new(NOT_COMMITTED)));
         }
         if changes_path(&sql) {
             self.report_context();
@@ -746,6 +769,16 @@ impl Worker {
     }
 
     fn end_transaction(&mut self, commit: bool) {
+        if commit && self.tx.aborted {
+            let _ = self.pg().execute("rollback");
+            self.tx = Transaction::default();
+            self.events
+                .send(DbEvent::Error(DbError::new(NOT_COMMITTED)));
+            self.report_context();
+            self.report_notices();
+            self.report_transaction();
+            return;
+        }
         match self
             .pg()
             .execute(if commit { "commit" } else { "rollback" })
@@ -766,6 +799,19 @@ impl Worker {
         self.report_context();
         self.report_notices();
         self.report_transaction();
+    }
+
+    /// Asks whether the pending transaction failed: PostgreSQL then refuses
+    /// a statement with 25P02.
+    fn check_aborted(&mut self) {
+        if !self.tx.pending {
+            return;
+        }
+        let probe = self.rt.block_on(self.client.batch_execute("select 1"));
+        self.tx.aborted = matches!(
+            probe,
+            Err(e) if e.code() == Some(&SqlState::IN_FAILED_SQL_TRANSACTION)
+        );
     }
 
     fn report_transaction(&self) {
@@ -1043,12 +1089,26 @@ impl TxEffect {
     }
 }
 
+/// Said when a COMMIT found the transaction failed (#423).
+const NOT_COMMITTED: &str = "Nothing was committed: a statement of the transaction failed \
+     and wasn't undone, so PostgreSQL rolled the whole transaction back";
+
+/// Whether `sql` commits (COMMIT, END, COMMIT AND CHAIN), not a ROLLBACK.
+fn commits(sql: &str) -> bool {
+    crate::sql_text::leading_words_in(sql, pythia_plsql::Syntax::Postgres)
+        .first()
+        .is_some_and(|w| w == "COMMIT" || w == "END")
+}
+
 /// Whether the session has a transaction to commit. It follows the
 /// statements; without the session's autocommit, a change opens a
 /// transaction first (see [`Worker::execute`]).
 #[derive(Debug, Default)]
 struct Transaction {
     pending: bool,
+    /// The pending transaction failed: PostgreSQL refuses every statement
+    /// in it and turns its COMMIT into a rollback (#423).
+    aborted: bool,
 }
 
 impl Transaction {
@@ -1058,6 +1118,9 @@ impl Transaction {
             TxEffect::Begins => self.pending = true,
             TxEffect::Ends => self.pending = false,
             TxEffect::Changes | TxEffect::Savepoint | TxEffect::None => {}
+        }
+        if !self.pending {
+            self.aborted = false;
         }
     }
 }

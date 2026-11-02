@@ -3926,7 +3926,8 @@ fn import_csv() {
 
 /// Imports into new tables named as given: a quoted name keeps its case,
 /// and columns that read quoted (a reserved word, a letter that isn't
-/// ASCII) are created as they are inserted into (#335).
+/// ASCII) are created as they are inserted into (#335). Café is CAFÉ, as
+/// Oracle reads café (#380).
 #[test]
 fn import_keeps_quoted_names() {
     let Some((profile, password)) = profile() else {
@@ -3959,7 +3960,7 @@ fn import_keeps_quoted_names() {
         let rows: Vec<(i64, String, String)> = conn
             .query_as(
                 &format!(
-                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), \"CAFé\" from {table} order by id"
+                    "select id, to_char(\"DATE\", 'YYYY-MM-DD'), café from {table} order by id"
                 ),
                 &[],
             )
@@ -3989,6 +3990,64 @@ fn import_keeps_quoted_names() {
         let _ = conn.execute(&format!("drop table {t} purge"), &[]);
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Imports into new tables named with a dot in their quotes, as Oracle
+/// reads them: `"R83.Dot"` and `pythia."R83.Dot2"` are tables of the
+/// session's schema and of PYTHIA (#369).
+#[test]
+fn import_reads_the_table_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pythia-import-r83-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r83.csv");
+    std::fs::write(&path, "Id;Name\n1;x\n2;y\n").unwrap();
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83.Dot\"", "\"R83.Dot2\""];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut imported = Vec::new();
+    for table in ["\"R83.Dot\"", "pythia.\"R83.Dot2\""] {
+        h.state_mut().test_import(path.clone(), table);
+        wait_until(&mut h, "import", |app| !app.test_focused_busy());
+        imported.push(h.state().test_import_message());
+    }
+    let made: Vec<String> = conn
+        .query_as(
+            "select table_name from user_tables where table_name like 'R83.Dot%' \
+              order by table_name",
+            &[],
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let rows = |table: &str| {
+        conn.query_row_as::<i64>(&format!("select count(*) from {table}"), &[])
+            .ok()
+    };
+    let counts: Vec<Option<i64>> = tables.iter().map(|t| rows(t)).collect();
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    for message in &imported {
+        assert!(
+            matches!(message, Some((false, m)) if m.starts_with("Imported 2 rows")),
+            "{imported:?}"
+        );
+    }
+    assert_eq!(made, ["R83.Dot", "R83.Dot2"]);
+    assert_eq!(counts, [Some(2), Some(2)]);
 }
 
 /// Debugs a block calling `demo_pkg.raise_salary` with a breakpoint in the
@@ -7298,6 +7357,144 @@ create table pythia_nof_items (id number primary key, label varchar2(40), price 
     wait_until(&mut h, "cleanup", |app| !app.test_focused_busy());
 }
 
+/// A name picked in a form, or read into it, is written as SQL reads it:
+/// the trigger's column "Mixed", the job's "R83_JobPkg"."R83_Run" and the
+/// index's tablespace "r83_ts" keep their case (#365).
+#[test]
+fn forms_take_names_as_picked() {
+    use crate::object_editor::{EditTarget, IndexDef, JobDef, TriggerDef};
+    use pythia_db::ObjectType;
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let _ = conn.execute("drop table \"R83_Trg\" purge", &[]);
+    for ddl in [
+        "create table \"R83_Trg\" (id number, \"Mixed\" number)",
+        "create or replace package \"R83_JobPkg\" as procedure \"R83_Run\"; end;",
+        "create or replace package body \"R83_JobPkg\" as\n  \
+         procedure \"R83_Run\" is begin null; end;\nend;",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    // A tablespace of lowercase letters, which only a DBA makes.
+    let dba = crate::test_db::connect("PYTHIA_TEST_DB_DBA");
+    if let Some(dba) = &dba {
+        let _ = dba.execute(
+            "drop tablespace \"r83_ts\" including contents and datafiles",
+            &[],
+        );
+        let file: String = dba
+            .query_row_as(
+                "select substr(file_name, 1, instr(file_name, '/', -1)) from dba_data_files \
+                  where tablespace_name = 'USERS'",
+                &[],
+            )
+            .unwrap();
+        for sql in [
+            format!("create tablespace \"r83_ts\" datafile '{file}r83_ts01.dbf' size 8m"),
+            format!("alter user {user} quota 1m on \"r83_ts\""),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    }
+    let table = ObjectRef {
+        owner: "PYTHIA".into(),
+        name: "R83_Trg".into(),
+        object_type: ObjectType::Table,
+    };
+    let mut h = harness(false);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let open = |h: &mut Ui, target| {
+        h.state_mut().test_open(OpenRequest::EditObject {
+            connection: "pythia@FREEPDB1".into(),
+            target,
+        });
+        h.run_steps(2);
+        wait_until(h, "form", |app| !app.test_focused_busy());
+        h.run_steps(2);
+    };
+    let new = |object_type, from: Option<&ObjectRef>| EditTarget::New {
+        owner: "PYTHIA".into(),
+        object_type,
+        from: from.cloned(),
+    };
+    // Opens the `nth` picker of the form, once it shows, and picks `item`,
+    // typed into its filter (a long list scrolls).
+    let pick = |h: &mut Ui, nth: usize, item: &str| {
+        let start = Instant::now();
+        while h.query_all_by_label("▾").count() <= nth {
+            assert!(start.elapsed() < Duration::from_secs(30), "no picker {nth}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        h.query_all_by_label("▾").nth(nth).unwrap().click();
+        h.run_steps(2);
+        h.event(egui::Event::Text(item.into()));
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(2);
+    };
+    fn field<T: 'static>(h: &mut Ui, read: impl Fn(&T) -> String) -> String {
+        let mut value = String::new();
+        h.state_mut()
+            .test_object_editor()
+            .edit_for_test(|d| value = read(d.downcast_mut::<T>().unwrap()));
+        value
+    }
+
+    // The trigger's On and Update of.
+    open(&mut h, new(ObjectType::Trigger, Some(&table)));
+    pick(&mut h, 1, "Mixed");
+    let columns = field(&mut h, |d: &TriggerDef| d.update_columns.clone());
+    assert_eq!(columns, "\"Mixed\"");
+
+    // The job's stored procedure.
+    open(&mut h, new(ObjectType::Job, None));
+    h.get_by_label("stored procedure").click();
+    h.run_steps(2);
+    pick(&mut h, 0, "\"R83_JobPkg\".\"R83_Run\"");
+    let action = field(&mut h, |d: &JobDef| d.action.clone());
+    assert_eq!(action, "\"R83_JobPkg\".\"R83_Run\"");
+
+    // The index's Table and Tablespace; an index there reads so.
+    if let Some(dba) = &dba {
+        open(&mut h, new(ObjectType::Index, Some(&table)));
+        pick(&mut h, 1, "r83_ts");
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute(
+            "create index r83_trg_ix on \"R83_Trg\" (id) tablespace \"r83_ts\"",
+            &[],
+        )
+        .unwrap();
+        open(
+            &mut h,
+            EditTarget::Edit(ObjectRef {
+                owner: "PYTHIA".into(),
+                name: "R83_TRG_IX".into(),
+                object_type: ObjectType::Index,
+            }),
+        );
+        let tablespace = field(&mut h, |d: &IndexDef| d.tablespace.clone());
+        assert_eq!(tablespace, "\"r83_ts\"");
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+        for sql in [
+            format!("alter user {user} quota 0 on \"r83_ts\""),
+            "drop tablespace \"r83_ts\" including contents and datafiles".to_owned(),
+        ] {
+            dba.execute(&sql, &[]).unwrap();
+        }
+    } else {
+        conn.execute("drop table \"R83_Trg\" purge", &[]).unwrap();
+    }
+    conn.execute("drop package \"R83_JobPkg\"", &[]).unwrap();
+}
+
 /// The object browser's right-click menus open the forms: New table… on
 /// the Tables folder, New ▸ Index on this table… on a table, New user… on
 /// Users.
@@ -8238,6 +8435,62 @@ fn postgres_rules_with_several_actions() {
     run_in_window(&mut h, "rollback;\ndrop table r75_r;\ncommit");
 }
 
+/// Oracle: a query's PL/SQL declarations, `with function … end; select …`,
+/// are one statement with it (#358), also in an INSERT and in an UPDATE's
+/// subquery. The script ended it at the first `;` of the function and sent
+/// `with function f(n number) return number is\n  v number := n`, which
+/// failed with ORA-02000: missing AS keyword, and the rest as statements of
+/// their own.
+#[test]
+fn oracle_queries_with_plsql_declarations() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let connection = profile.name.clone();
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection,
+        text: String::new(),
+        run: false,
+    });
+    h.run_steps(2);
+    let _ = run_in_window(
+        &mut h,
+        "begin execute immediate 'drop table r84_w purge'; exception when others then null; end;",
+    );
+    run_in_window(&mut h, "create table r84_w (x number)");
+    run_in_window(
+        &mut h,
+        "with function f(n number) return number is\n  v number := n;\nbegin\n  v := v * 2;\n  return v;\nend;\n\
+         select f(21) a from dual;\n\
+         insert /*+ with_plsql */ into r84_w\nwith function g return number is begin return 5; end;\n\
+         select g from dual;\n\
+         update /*+ with_plsql */ r84_w set x = x + (with function k return number is begin return 1; end;\n\
+         select k from dual);\n\
+         with function h return varchar2 is begin return 'end;'; end;\nselect h() b from dual\n/\n\
+         select x c from r84_w",
+    );
+    let w = h.state().test_sql_window_ref().unwrap();
+    let results: Vec<String> = w
+        .state
+        .results
+        .iter()
+        .map(|r| {
+            let column = r.columns.first().map(|c| c.name.as_str()).unwrap_or("");
+            let value = r
+                .rows
+                .first()
+                .and_then(|row| row.first().cloned().flatten());
+            format!("{column} = {}", value.unwrap_or_default())
+        })
+        .collect();
+    assert_eq!(results, ["A = 42", "B = end;", "C = 6"]);
+    run_in_window(&mut h, "rollback");
+    run_in_window(&mut h, "drop table r84_w purge");
+}
+
 /// On SQL Server and PostgreSQL a statement with several results shows
 /// each in a tab of its own (#316), as on MySQL (#290): a T-SQL batch that
 /// DECLAREs, a procedure's result sets, the SELECTs rules add to an
@@ -8946,6 +9199,60 @@ fn completed(h: &mut Ui, text: &str) -> Vec<String> {
     completion_closed(h)
 }
 
+/// A window whose session couldn't connect opens a new one for its next
+/// statement (#424): the failed one was kept, its worker gone, and the
+/// window ran for ever. SQLite's file, renamed away and back, stands for a
+/// server that was down.
+#[test]
+fn a_failed_window_session_is_opened_again() {
+    let dir = std::env::temp_dir().join(format!("pythia-r99-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("r99.db");
+    let moved = dir.join("r99-away.db");
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch("create table t (n integer); insert into t values (7);")
+        .unwrap();
+    let connection = "r99-failed-session".to_owned();
+    let profile = ConnectionProfile {
+        name: connection.clone(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: file.display().to_string(),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.clone(),
+        text: "select n from t".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    let run = |h: &mut Ui| {
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the window", |app| !app.test_focused_busy());
+    };
+    std::fs::rename(&file, &moved).unwrap();
+    run(&mut h);
+    let failed = h.state().test_sql_window_ref().unwrap().state.results.len();
+    std::fs::rename(&moved, &file).unwrap();
+    run(&mut h);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let rows: Vec<Vec<Option<String>>> = w
+        .state
+        .results
+        .last()
+        .map(|r| r.rows.clone())
+        .unwrap_or_default();
+    assert_eq!(failed, 0);
+    assert_eq!(rows, [vec![Some("7".to_owned())]]);
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A SQLite database in memory is the connection's, as a file is: its
 /// windows, its object browser and completion all have a window's table.
 /// `:memory:` is one database for all of them; a `file:` URI of memory
@@ -9015,6 +9322,64 @@ fn memory_databases_are_the_connections() {
         h.state_mut().test_close_focused();
         h.run_steps(2);
     }
+}
+
+/// DESCRIBE takes a name as Oracle reads it: `"R83_Desc"` as written,
+/// `r83_desc` in uppercase, `pythia."R83.Desc"` with the dot in its quotes
+/// (#369).
+#[test]
+fn describe_takes_names_as_typed() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let tables = ["\"R83_Desc\"", "r83_desc", "\"R83.Desc\"", "r83_straße"];
+    for t in tables {
+        let _ = conn.execute(&format!("drop table {t} purge"), &[]);
+    }
+    for ddl in [
+        "create table \"R83_Desc\" (id number(4) not null, \"Mixed\" varchar2(5))",
+        "create table r83_desc (plain date)",
+        "create table \"R83.Desc\" (described number)",
+        "create table r83_straße (lang varchar2(2))",
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let mut described = Vec::new();
+    for name in [
+        "\"R83_Desc\"",
+        "r83_desc",
+        "pythia.\"R83.Desc\"",
+        "\"R83.Desc\"",
+        // R83_STRAßE, as Oracle folds it (#380).
+        "r83_straße",
+    ] {
+        let (_, rows, _) = grid_rows(&mut h, "pythia@FREEPDB1", &format!("desc {name}"));
+        let columns: Vec<String> = rows
+            .iter()
+            .map(|r| r[0].clone().unwrap_or_default())
+            .collect();
+        described.push((name, columns.join(", ")));
+    }
+    for t in tables {
+        conn.execute(&format!("drop table {t} purge"), &[]).unwrap();
+    }
+    assert_eq!(
+        described,
+        [
+            ("\"R83_Desc\"", "ID, Mixed".to_owned()),
+            ("r83_desc", "PLAIN".to_owned()),
+            ("pythia.\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("\"R83.Desc\"", "DESCRIBED".to_owned()),
+            ("r83_straße", "LANG".to_owned()),
+        ]
+    );
 }
 
 /// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
@@ -9658,6 +10023,147 @@ fn quoted_subprograms_keep_their_case() {
     );
     h.state_mut().test_program().parts[1].editor.set_text(body);
     conn.execute("drop package \"R71_Pkg\"", &[]).unwrap();
+}
+
+/// A package's quoted subprogram is the one of its source: Edit "R83_MyProc"
+/// from an editor's menu opens the body at it, and Test… and Debug… from
+/// the outline call it with its parameters, not "R83_MYPROC" (#359).
+#[test]
+fn quoted_subprograms_open_test_and_debug() {
+    let Some((profile, password)) = profile() else {
+        return;
+    };
+    let host = std::env::var("PYTHIA_DEBUG_HOST").ok();
+    if let Some(host) = &host {
+        debug_setup(&profile.username, host);
+    }
+    let spec = std::env::var("PYTHIA_TEST_DB").unwrap();
+    let (cred, db) = spec.rsplit_once('@').unwrap();
+    let (user, pw) = cred.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, pw, db).unwrap();
+    let body = "create or replace package body \"R83_Pkg\" as\n  \
+                procedure \"r83_myproc\"(p_d date) is begin null; end;\n  \
+                procedure \"R83_MyProc\"(p_n number) is\n    l_n number := p_n;\n  \
+                begin\n    l_n := l_n + 1;\n  end;\nend;";
+    for ddl in [
+        "create or replace package \"R83_Pkg\" as\n  procedure \"R83_MyProc\"(p_n number);\n  \
+         procedure \"r83_myproc\"(p_d date);\nend;",
+        body,
+    ] {
+        conn.execute(ddl, &[]).unwrap();
+    }
+    let mut h = harness(true);
+    if let Some(host) = &host {
+        h.state_mut().test_settings_mut().debug_host = host.clone();
+    }
+    h.state_mut().test_connect(profile, password);
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    let text = "begin\n  \"R83_Pkg\".\"R83_MyProc\"(1);\nend;\n";
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "pythia@FREEPDB1".into(),
+        text: text.into(),
+        run: false,
+    });
+    h.run_steps(3);
+    let offset = text.find("R83_MyProc").unwrap() + 2;
+    let pos = h
+        .state_mut()
+        .test_sql_window()
+        .editor
+        .inner()
+        .offset_pos(offset)
+        .expect("drawn");
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+    // Waits until `label` shows (names are looked up in the background, the
+    // outline worked out once the source loaded).
+    let shown = |h: &mut Ui, label: &str| {
+        let start = Instant::now();
+        while h.query_by_label(label).is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no {label}");
+            h.step();
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    shown(&mut h, "Edit \"R83_MyProc\"");
+    h.get_by_label("Edit \"R83_MyProc\"").click();
+    h.run_steps(2);
+    wait_until(&mut h, "source", |app| app.test_program_loaded());
+    let program = h.state_mut().test_program();
+    assert_eq!(program.message(), None);
+    let at = body.find("\"R83_MyProc\"").unwrap();
+    assert_eq!(
+        (program.active, program.active_editor().unwrap().selection()),
+        (1, Some(at..at + "\"R83_MyProc\"".len()))
+    );
+
+    shown(&mut h, "\"R83_MyProc\"");
+    h.get_by_label("\"R83_MyProc\"").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("Test…").click();
+    wait_until(&mut h, "test block", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text().contains("R83_Pkg"))
+    });
+    let block = h.state_mut().test_sql_window().editor.text().to_owned();
+    // Its parameter, not "r83_myproc"'s too.
+    assert!(
+        block.contains("pythia.\"R83_Pkg\".\"R83_MyProc\"(")
+            && block.contains("p_n =>")
+            && !block.contains("p_d"),
+        "{block}"
+    );
+    h.state_mut().test_close_focused();
+    h.run_steps(3);
+
+    if host.is_some() {
+        h.state_mut().test_open(OpenRequest::Program {
+            connection: "pythia@FREEPDB1".into(),
+            object: ObjectRef {
+                owner: "PYTHIA".into(),
+                name: "R83_Pkg".into(),
+                object_type: pythia_db::ObjectType::Package,
+            },
+        });
+        h.run_steps(3);
+        wait_until(&mut h, "program window", |app| app.test_program_loaded());
+        h.get_by_label("\"R83_MyProc\"").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Debug…").click();
+        wait_until(&mut h, "values", |app| {
+            app.test_sql_window_ref()
+                .is_some_and(|w| w.waiting_for_values())
+        });
+        h.state_mut()
+            .test_sql_window()
+            .bind_values
+            .insert("p_n".into(), Some("1".into()));
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "stop on entry or the end", |app| {
+            let debug = app.test_debug();
+            debug.is_suspended() || debug.state == pythia_debugger::ui::State::Finished
+        });
+        let debug = h.state().test_debug();
+        assert!(debug.is_suspended(), "{:?}", debug.log);
+        let unit =
+            pythia_debugger::Unit::new("PYTHIA", "R83_Pkg", pythia_debugger::UnitType::PackageBody);
+        assert_eq!(debug.stack[0].method, "R83_MyProc", "{:?}", debug.stack);
+        assert_eq!(debug.entry, Some((unit, "R83_MyProc".to_owned())));
+        h.state_mut()
+            .test_debug_mut()
+            .command(pythia_debugger::DebugCommand::Resume);
+        wait_until(&mut h, "finish", |app| !app.test_debug_running());
+    }
+    conn.execute("drop package \"R83_Pkg\"", &[]).unwrap();
 }
 
 /// Go to definition, Back/Forward, Switch Spec/Body, Go to Symbol and Find

@@ -784,6 +784,7 @@ impl CodeEditor {
                 if let Some(range) = current {
                     let text = self.state.text();
                     let replacements = self.find.replacements(&text, &[range]);
+                    self.find.follow_replacements(&replacements);
                     let inserted = self.state.replace_byte_ranges(replacements, time);
                     let after = inserted
                         .first()
@@ -798,6 +799,7 @@ impl CodeEditor {
             FindAction::ReplaceAll => {
                 let text = self.state.text();
                 let replacements = self.find.replacements(&text, &self.find.matches.clone());
+                self.find.follow_replacements(&replacements);
                 if !replacements.is_empty() {
                     self.state.history.seal();
                     self.state.replace_byte_ranges(replacements, time);

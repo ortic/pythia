@@ -333,13 +333,22 @@ pub fn ui(
         });
 }
 
-/// A value for a tooltip: integers without decimals, others with up to 4.
+/// A value for a tooltip: integers without decimals, others with up to 4;
+/// one too small for them, or too large, with an exponent: 0.00001234 is
+/// 1.234e-5, not 0 (#439).
 fn number(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
+    let trim = |s: &str| s.trim_end_matches('0').trim_end_matches('.').to_owned();
+    let a = v.abs();
+    if !v.is_finite() {
+        v.to_string()
+    } else if v.fract() == 0.0 && a < 1e15 {
         format!("{}", v as i64)
+    } else if !(1e-4..1e15).contains(&a) {
+        let s = format!("{v:.3e}");
+        let (mantissa, exponent) = s.split_once('e').unwrap_or((&s, "0"));
+        format!("{}e{exponent}", trim(mantissa))
     } else {
-        let s = format!("{v:.4}");
-        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+        trim(&format!("{v:.4}"))
     }
 }
 
@@ -352,6 +361,22 @@ mod tests {
             name: name.into(),
             type_name: type_name.into(),
             numeric,
+        }
+    }
+
+    #[test]
+    fn numbers_keep_small_values() {
+        for (v, shown) in [
+            (3.0, "3"),
+            (-0.5, "-0.5"),
+            (1234.567891, "1234.5679"),
+            (0.00001234, "1.234e-5"),
+            (-0.00002, "-2e-5"),
+            (1e20, "1e20"),
+            (f64::NAN, "NaN"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(number(v), shown);
         }
     }
 
