@@ -8860,6 +8860,77 @@ fn completed(h: &mut Ui, text: &str) -> Vec<String> {
     completion_closed(h)
 }
 
+/// A SQLite database in memory is the connection's, as a file is: its
+/// windows, its object browser and completion all have a window's table.
+/// `:memory:` is one database for all of them; a `file:` URI of memory
+/// without `cache=` made one for each session (#364), so the browser and
+/// completion looked at the empty one of the connection's main session,
+/// and another window at one of its own: "no such table".
+#[test]
+fn memory_databases_are_the_connections() {
+    use pythia_db::ObjectType;
+    for (n, memory) in [":memory:", "file::memory:", "file:r85_memory?mode=memory"]
+        .into_iter()
+        .enumerate()
+    {
+        let connection = format!("r85-memory-{n}");
+        let profile = ConnectionProfile {
+            name: connection.clone(),
+            kind: pythia_config::DbKind::Sqlite,
+            connect_string: memory.into(),
+            ..Default::default()
+        };
+        let mut h = harness(true);
+        h.state_mut().test_connect(profile, String::new());
+        wait_until(&mut h, "connection", |app| app.test_connected());
+        let open = |h: &mut Ui| {
+            h.state_mut().test_open(OpenRequest::Sql {
+                connection: connection.clone(),
+                text: String::new(),
+                run: false,
+            });
+            h.run_steps(2);
+        };
+        open(&mut h);
+        run_in_window(
+            &mut h,
+            "create table r85_m (id integer primary key, in_window text)",
+        );
+        // Another window.
+        open(&mut h);
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select count(*) from r85_m");
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "the other window", |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let other: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        // Completion, from the main session.
+        let labels = completed(&mut h, "select * from r85_m c where c");
+        // The browser, also the main session's.
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let listed = h.query_by_label("r85_m").is_some();
+        run_in_window(&mut h, "drop table if exists r85_m");
+        let seen = (
+            other.iter().any(|m| m.contains("1 row selected")),
+            labels.iter().any(|l| l == "in_window"),
+            listed,
+        );
+        assert_eq!(
+            seen,
+            (true, true, true),
+            "{memory}: another window, completion, the browser: {other:?}, {labels:?}"
+        );
+        h.state_mut().test_close_focused();
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
+}
+
 /// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
 /// database, which failed on MySQL (ERROR 1065), Oracle (ORA-00900) and
 /// SQLite and stopped the script, and said "; executed" on PostgreSQL and

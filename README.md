@@ -378,7 +378,9 @@ for Linux, Windows and macOS.
   exist fails instead of leaving an empty database behind; `?create` makes
   the file, `?ro` opens it read-only, `:memory:` is one in-memory database
   for all windows, and a `file:` URI works as SQLite takes it, except that
-  it makes a missing file only with `mode=rwc`.
+  it makes a missing file only with `mode=rwc` and that one of a database
+  in memory (`file::memory:`, `mode=memory`) is one for all windows too
+  unless it says `cache=private`.
 - SQL windows with results, fetching on demand, Break, explain plan
   (`EXPLAIN QUERY PLAN`), *Execute to file* and completion. Each window
   has its own connection to the file, and transactions work as with

@@ -1130,6 +1130,12 @@ All notable changes to Pythia are documented here. The format follows
   names of the path before, and so after a `set_config('role', …)`,
   which changes the schema `"$user"` names. A function that sets the
   path in its body, without a `SET` clause, still changes it unseen.
+- SQLite: a database in memory named by a `file:` URI, `file::memory:`
+  or `file:scratch?mode=memory`, is one for all the connection's
+  sessions, as `:memory:` is (#364). Each session had one of its own:
+  the object browser and completion showed an empty database, and
+  another window had none of a window's tables. `cache=private` keeps
+  one for each.
 
 ## [0.10.0] - 2026-10-30
 
