@@ -372,6 +372,9 @@ All notable changes to Pythia are documented here. The format follows
   characters (#446).
 - MySQL: completion offers a table's own columns where another table's
   name differs from it only in case, not both tables' (#447).
+- SQL Server: `END CONVERSATION` inside a `BEGIN … END` block doesn't end
+  the block, which a script was cut at, the rest running outside it
+  (#448).
 
 ## [0.11.0] - 2026-11-02
 

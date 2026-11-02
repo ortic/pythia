@@ -397,7 +397,13 @@ impl<'a> Splitter<'a> {
             return 1;
         }
         if self.word_eq(t, &["END"]) {
-            return if depth > 0 { -1 } else { 0 };
+            // Service Broker's END CONVERSATION is a statement (#448), as
+            // BEGIN CONVERSATION is.
+            let statement = self.syntax == Syntax::TSql
+                && self
+                    .next_word(idx)
+                    .is_some_and(|n| self.word_eq(n, &["CONVERSATION"]));
+            return if depth > 0 && !statement { -1 } else { 0 };
         }
         if self.word_eq(t, &["BEGIN"]) {
             let next = self.next_word(idx);
@@ -1465,6 +1471,25 @@ mod tests {
                     "select case when a = 1 then 'x' end as go from t"
                 ),
                 (StatementKind::Sql, "exec sp_who\n  @loginame = 'sa'"),
+            ]
+        );
+    }
+
+    /// Service Broker's END CONVERSATION ends no block (#448): the block
+    /// went on to its END, and the statements after it joined it.
+    #[test]
+    fn tsql_end_conversation_in_a_block() {
+        let src = "if @h is not null begin\n  end conversation @h;\n  select 1;\nend;\n\
+                   end conversation @h with cleanup;\nselect 2;";
+        assert_eq!(
+            split_in(src, Syntax::TSql),
+            vec![
+                (
+                    StatementKind::Sql,
+                    "if @h is not null begin\n  end conversation @h;\n  select 1;\nend"
+                ),
+                (StatementKind::Sql, "end conversation @h with cleanup"),
+                (StatementKind::Sql, "select 2"),
             ]
         );
     }
