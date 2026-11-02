@@ -448,6 +448,8 @@ All notable changes to Pythia are documented here. The format follows
   (bitmap), compression, REVERSE, visibility and LOCAL partitioning, and
   compare function-based and descending indexes, which they made plain
   or left out (#467).
+- PostgreSQL: a dollar quote's tag may have letters past ASCII
+  (`$função$`), where a script was split inside its body (#468).
 
 ## [0.11.0] - 2026-11-02
 
