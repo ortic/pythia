@@ -426,6 +426,8 @@ All notable changes to Pythia are documented here. The format follows
   as one (#458), an invisible one too, keep `DEFAULT ON NULL` and an
   identity's `GENERATED ALWAYS` (#459), and write NVARCHAR2 and NCHAR
   without `CHAR`, which Oracle refused (#460).
+- SQL Server: a numeric or decimal sequence's DDL keeps its precision,
+  without which it failed (Msg 11708) (#461).
 
 ## [0.11.0] - 2026-11-02
 

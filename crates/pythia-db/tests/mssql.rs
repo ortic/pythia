@@ -4263,3 +4263,28 @@ fn a_select_batch_that_changes_waits_for_commit() {
     h.session.send(DbRequest::Commit);
     h.settle();
 }
+
+/// A sequence of a numeric type keeps its precision in its DDL (#461):
+/// `as numeric` is numeric(18,0), which a numeric(28,0)'s maximum doesn't
+/// fit (Msg 11708).
+#[test]
+fn numeric_sequences_keep_their_precision() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    h.ok("drop sequence if exists r101_seq");
+    h.ok("create sequence r101_seq as numeric(28, 0) start with 1");
+    let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+        owner: schema,
+        name: "r101_seq".into(),
+        object_type: ObjectType::Sequence,
+    }) else {
+        panic!("expected DDL")
+    };
+    assert!(ddl.contains(" as numeric(28)\n"), "{ddl}");
+    h.ok("drop sequence r101_seq");
+    h.ok(ddl.trim_end().trim_end_matches("GO").trim_end());
+    h.ok("drop sequence r101_seq");
+}

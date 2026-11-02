@@ -597,7 +597,13 @@ fn ddl(
         ObjectType::Sequence => {
             let row = ms
                 .rows(
-                    "select type_name(s.user_type_id), cast(s.start_value as varchar(40)), \
+                    // A decimal's or numeric's precision, which its
+                    // minimum and maximum need (Msg 11708) (#461).
+                    "select type_name(s.user_type_id) \
+                              + case when type_name(s.user_type_id) in ('decimal', 'numeric') \
+                                     then '(' + cast(s.precision as varchar(3)) + ')' \
+                                     else '' end, \
+                            cast(s.start_value as varchar(40)), \
                             cast(s.increment as varchar(40)), cast(s.minimum_value as varchar(40)), \
                             cast(s.maximum_value as varchar(40)), s.is_cycling, s.is_cached, \
                             s.cache_size \
