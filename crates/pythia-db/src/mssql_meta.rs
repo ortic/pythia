@@ -326,9 +326,15 @@ fn columns(
     };
     let rows = ms.rows(
         &format!(
-            "select c.name, {COLUMN_TYPE}, c.is_nullable, object_definition(c.default_object_id), \
-                    cast(p.value as nvarchar(4000)), {pk} \
+            "select c.name, {COLUMN_TYPE}, c.is_nullable, \
+                    case when cc.definition is not null \
+                         then 'as ' + cc.definition \
+                              + case when cc.is_persisted = 1 then ' persisted' else '' end \
+                         else object_definition(c.default_object_id) end, \
+                    cast(p.value as nvarchar(4000)), {pk}, c.is_computed \
                from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
+               left join sys.computed_columns cc \
+                 on cc.object_id = c.object_id and cc.column_id = c.column_id \
                left join sys.extended_properties p on p.major_id = c.object_id \
                 and p.minor_id = c.column_id and p.class = 1 and p.name = 'MS_Description' \
               where c.object_id = object_id(@P1) \
@@ -348,6 +354,7 @@ fn columns(
                 default: next(),
                 comment: next(),
                 pk_position: next().and_then(|p| p.parse().ok()),
+                generated: next().as_deref() == Some("1"),
             }
         })
         .collect())

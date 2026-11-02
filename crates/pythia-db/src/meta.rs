@@ -223,6 +223,10 @@ pub struct TableColumn {
     pub comment: Option<String>,
     /// Position in the primary key, if part of it.
     pub pk_position: Option<u32>,
+    /// Computed by the database (#471): a generated, virtual or computed
+    /// column, which no INSERT or UPDATE gives a value. Its `default` says
+    /// how, where the database tells.
+    pub generated: bool,
 }
 
 /// A procedure or function inside a package or type.
@@ -587,7 +591,9 @@ fn columns(
                     'NUMBER(' || c.data_precision || nvl2(nullif(c.data_scale, 0), ',' || c.data_scale, '') || ')' \
                   when c.data_type = 'NUMBER' and c.data_scale = 0 then 'INTEGER' \
                   else c.data_type end, \
-                c.nullable, c.data_default, cc.comments, {pk} \
+                c.nullable, c.data_default, cc.comments, {pk}, \
+                (select x.virtual_column from all_tab_cols x where x.owner = c.owner \
+                    and x.table_name = c.table_name and x.column_name = c.column_name) \
                from all_tab_columns c \
                left join all_col_comments cc \
                  on cc.owner = c.owner and cc.table_name = c.table_name and cc.column_name = c.column_name \
@@ -605,15 +611,23 @@ fn columns(
             Option<String>,
             Option<u32>,
         ) = row.get_as()?;
+        let generated = row.get::<_, Option<String>>(6)?.as_deref() == Some("YES");
+        let default = default
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty());
         out.push(TableColumn {
             name,
             data_type,
             nullable: nullable == "Y",
-            default: default
-                .map(|d| d.trim().to_owned())
-                .filter(|d| !d.is_empty()),
+            // A virtual column's "default" is its expression.
+            default: if generated {
+                default.map(|d| format!("generated always as ({d}) virtual"))
+            } else {
+                default
+            },
             comment,
             pk_position: pk,
+            generated,
         });
     }
     Ok(out)

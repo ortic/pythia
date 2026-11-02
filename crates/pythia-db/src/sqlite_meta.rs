@@ -220,7 +220,7 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
 /// table's hidden ones not.
 fn columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<TableColumn>, DbError> {
     let mut statement = conn.prepare(
-        "select name, type, \"notnull\", dflt_value, pk from pragma_table_xinfo(?, ?) \
+        "select name, type, \"notnull\", dflt_value, pk, hidden from pragma_table_xinfo(?, ?) \
           where hidden <> 1 order by cid",
     )?;
     Ok(all_rows(&mut statement, &[table, owner])?
@@ -239,6 +239,8 @@ fn columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<TableColum
                 default: value(3),
                 comment: None,
                 pk_position: pk,
+                // 2 virtual, 3 stored (#471).
+                generated: matches!(value(5).as_deref(), Some("2" | "3")),
             }
         })
         .collect())

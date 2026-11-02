@@ -237,7 +237,7 @@ fn columns(
     let sql = format!(
         "select c.column_name, c.column_type, c.is_nullable, c.column_default, \
                 nullif(c.column_comment, ''), {pk}, lower(c.data_type), c.extra, \
-                version() like '%MariaDB%' \
+                version() like '%MariaDB%', nullif(c.generation_expression, '') \
            from information_schema.columns c \
           where c.table_schema = ? and c.table_name = ? \
           order by c.ordinal_position"
@@ -252,24 +252,48 @@ fn columns(
         String,
         String,
         bool,
+        Option<String>,
     );
     let rows: Vec<Row> = conn.exec(sql, (owner, &table))?;
     Ok(rows
         .into_iter()
         .map(
-            |(name, data_type, nullable, default, comment, pk, kind, extra, mariadb)| TableColumn {
+            |(
+                name,
+                data_type,
+                nullable,
+                default,
+                comment,
+                pk,
+                kind,
+                extra,
+                mariadb,
+                expression,
+            )| TableColumn {
                 name,
                 data_type,
                 nullable: nullable == "YES",
-                default: default.map(|d| {
-                    if mariadb {
-                        d
-                    } else {
-                        mysql_default(d, &kind, &extra)
-                    }
-                }),
+                // A generated column says so, with its expression (#471).
+                default: match &expression {
+                    Some(expression) => Some(format!(
+                        "generated always as ({expression}) {}",
+                        if extra.to_uppercase().contains("STORED") {
+                            "stored"
+                        } else {
+                            "virtual"
+                        }
+                    )),
+                    None => default.map(|d| {
+                        if mariadb {
+                            d
+                        } else {
+                            mysql_default(d, &kind, &extra)
+                        }
+                    }),
+                },
                 comment,
                 pk_position: pk,
+                generated: expression.is_some(),
             },
         )
         .collect())
