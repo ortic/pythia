@@ -349,6 +349,8 @@ All notable changes to Pythia are documented here. The format follows
   too, not only in strings (#435).
 - MySQL: a `VECTOR` is shown as the hex of its bytes, not as garbled
   text, and Edit changes rows that have one (#436).
+- Oracle: Find in Source finds text past the first 4000 bytes of a view
+  (#437).
 
 ## [0.11.0] - 2026-11-02
 
