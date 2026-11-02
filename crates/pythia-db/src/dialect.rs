@@ -225,7 +225,9 @@ impl Dialect {
             (DbKind::Postgres, ObjectType::View | ObjectType::MaterializedView) => {
                 &[Detail::Uses, Detail::UsedBy, Detail::Grants]
             }
-            (DbKind::Postgres, ObjectType::Function | ObjectType::Procedure) => &[Detail::Grants],
+            (DbKind::Postgres, ObjectType::Function | ObjectType::Procedure) => {
+                &[Detail::RoutineGrants]
+            }
             (DbKind::Postgres, _) => &[],
             (
                 DbKind::SqlServer,

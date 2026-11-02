@@ -380,15 +380,18 @@ fn details(pg: &Pg<'_>, owner: &str, name: &str, detail: Detail) -> Result<MetaR
               order by t.tgname",
             relation("t.tgrelid")
         ),
+        // A table's and a function's of the same name apart (#429).
         Detail::Grants => "select grantee as \"GRANTEE\", privilege_type as \"PRIVILEGE\", \
                                   is_grantable as \"GRANTABLE\" \
                              from information_schema.role_table_grants \
                             where table_schema = $1 and table_name = $2 \
-                           union all \
-                           select grantee, privilege_type, is_grantable \
-                             from information_schema.role_routine_grants \
-                            where routine_schema = $1 and routine_name = $2 \
                             order by 1, 2"
+            .to_owned(),
+        Detail::RoutineGrants => "select grantee as \"GRANTEE\", privilege_type as \"PRIVILEGE\", \
+                                         is_grantable as \"GRANTABLE\" \
+                                    from information_schema.role_routine_grants \
+                                   where routine_schema = $1 and routine_name = $2 \
+                                   order by 1, 2"
             .to_owned(),
         Detail::Uses => format!(
             "select distinct rn.nspname as \"OWNER\", r.relname as \"NAME\", \
@@ -517,7 +520,7 @@ fn ddl(
         // its body's tables and functions, a trigger's table and function
         // (#350).
         ObjectType::Function | ObjectType::Procedure => {
-            on_path(pg, "", || routine_ddl(pg, owner, name, end))?.ok_or_else(missing)
+            on_path(pg, "", || routine_ddl(pg, owner, name, object_type, end))?.ok_or_else(missing)
         }
         ObjectType::Trigger => {
             on_path(pg, "", || trigger_ddl(pg, owner, name, end))?.ok_or_else(missing)
@@ -559,7 +562,19 @@ fn comment_on(ddl: &mut String, on: &str, comment: Option<&str>) {
 
 /// Each overload of a function or procedure with its [`OWNER`] (#353), its
 /// comment and its grants (#331), if there is one.
-fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+fn routine_ddl(
+    pg: &Pg<'_>,
+    owner: &str,
+    name: &str,
+    object_type: ObjectType,
+    end: &str,
+) -> Result<Option<String>, DbError> {
+    // A function's overloads, not a procedure of its name (#429).
+    let kind = if object_type == ObjectType::Procedure {
+        "p"
+    } else {
+        "f"
+    };
     let rows = pg.rows(
         &format!(
             "select pg_get_functiondef(p.oid), p.oid, \
@@ -570,10 +585,10 @@ fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option
                from pg_proc p \
                join pg_namespace n on n.oid = p.pronamespace \
                join pg_roles r on r.oid = p.proowner \
-              where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
+              where n.nspname = $1 and p.proname = $2 and p.prokind = $3 \
               order by p.oid"
         ),
-        &[owner, name],
+        &[owner, name, kind],
     )?;
     let mut overloads = Vec::new();
     for row in rows {

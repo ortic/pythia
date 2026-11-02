@@ -1627,6 +1627,60 @@ fn a_key_to_the_tables_own_unique_index_runs_again() {
     h.ok("drop schema r95_tree, r95_tree_copy cascade");
 }
 
+/// A table, a function and a procedure of one name: each one's grants
+/// and DDL are its own. The table's Grants listed the function's EXECUTE,
+/// the function's DDL held the procedure.
+#[test]
+fn objects_of_one_name_keep_apart() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r99_same cascade");
+    h.ok("create schema r99_same");
+    for sql in [
+        "create table r99_same.sample (n int)",
+        "create function r99_same.sample(int) returns int language sql as 'select 1'",
+        "create procedure r99_same.sample(text) language sql as 'select 1'",
+        "grant select on r99_same.sample to public",
+        "revoke execute on function r99_same.sample(int) from public",
+        "grant execute on function r99_same.sample(int) to public",
+    ] {
+        h.ok(sql);
+    }
+    let privileges = |h: &mut Harness, detail: Detail| -> Vec<String> {
+        let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+            owner: "r99_same".into(),
+            name: "sample".into(),
+            detail,
+        }) else {
+            panic!("expected rows")
+        };
+        rows.iter()
+            .filter_map(|r| r.get(1).cloned().flatten())
+            .collect()
+    };
+    let table = privileges(&mut h, Detail::Grants);
+    assert!(table.contains(&"SELECT".to_owned()), "{table:?}");
+    assert!(!table.contains(&"EXECUTE".to_owned()), "{table:?}");
+    let routine = privileges(&mut h, Detail::RoutineGrants);
+    assert!(routine.contains(&"EXECUTE".to_owned()), "{routine:?}");
+    assert!(!routine.contains(&"SELECT".to_owned()), "{routine:?}");
+    let function = ddl_of(&mut h, "r99_same", "sample", ObjectType::Function);
+    assert!(
+        function.contains("FUNCTION r99_same.sample(integer)"),
+        "{function}"
+    );
+    assert!(!function.contains("PROCEDURE"), "{function}");
+    let procedure = ddl_of(&mut h, "r99_same", "sample", ObjectType::Procedure);
+    assert!(
+        procedure.contains("PROCEDURE r99_same.sample(IN text)"),
+        "{procedure}"
+    );
+    assert!(!procedure.contains("FUNCTION"), "{procedure}");
+    h.ok("drop schema r99_same cascade");
+}
+
 /// A child table's DDL inherits from its parents, with only the columns
 /// and constraints of its own (#376): a copy was a table of its own, which
 /// a query on the parent's copy didn't read.

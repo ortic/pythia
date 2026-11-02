@@ -394,7 +394,7 @@ fn details(
               where event_object_schema = ? and event_object_table = ? \
               order by action_timing, event_manipulation, action_order"
         }
-        Detail::Grants => {
+        Detail::Grants | Detail::RoutineGrants => {
             "select grantee as GRANTEE, privilege_type as PRIVILEGE, is_grantable as GRANTABLE \
                from information_schema.table_privileges \
               where table_schema = ? and table_name = ? \

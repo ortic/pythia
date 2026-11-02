@@ -329,7 +329,7 @@ fn details(
             })
         }
         Detail::UsedBy => used_by(conn, owner, name),
-        Detail::Grants => Ok(MetaResult::Table {
+        Detail::Grants | Detail::RoutineGrants => Ok(MetaResult::Table {
             columns: text_columns(&["GRANTEE", "PRIVILEGE"]),
             rows: Vec::new(),
         }),

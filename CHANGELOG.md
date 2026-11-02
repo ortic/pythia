@@ -328,6 +328,8 @@ All notable changes to Pythia are documented here. The format follows
 - The value editor's calendar keeps a date without a time so (#428):
   it added ` 00:00:00`, which SQLite kept, so the row no longer equalled
   the date.
+- PostgreSQL: a table's and a function's grants of one name stay apart,
+  and a function's DDL leaves out a procedure of its name (#429).
 
 ## [0.11.0] - 2026-11-02
 

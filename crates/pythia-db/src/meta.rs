@@ -312,6 +312,9 @@ pub enum Detail {
     Constraints,
     Triggers,
     Grants,
+    /// A routine's grants, where a table and a routine may have one name
+    /// (PostgreSQL): [`Detail::Grants`] then are a relation's (#429).
+    RoutineGrants,
     Uses,
     UsedBy,
     /// A database link's user, host and creation time.
@@ -334,7 +337,7 @@ impl Detail {
             Detail::Indexes => "Indexes",
             Detail::Constraints => "Constraints",
             Detail::Triggers => "Triggers",
-            Detail::Grants => "Grants",
+            Detail::Grants | Detail::RoutineGrants => "Grants",
             Detail::Uses => "Uses",
             Detail::UsedBy => "Used by",
             Detail::Link => "Details",
@@ -673,7 +676,7 @@ fn details(
             "select trigger_name, trigger_type, triggering_event, status \
                from all_triggers where table_owner = :1 and table_name = :2 order by trigger_name"
         }
-        Detail::Grants => {
+        Detail::Grants | Detail::RoutineGrants => {
             "select grantee, privilege, grantable, grantor \
                from all_tab_privs where table_schema = :1 and table_name = :2 \
               order by grantee, privilege"

@@ -275,7 +275,7 @@ fn details(
                from sys.triggers t where t.parent_id = object_id(@P1) \
               order by t.name"
         }
-        Detail::Grants => {
+        Detail::Grants | Detail::RoutineGrants => {
             "select user_name(p.grantee_principal_id) as GRANTEE, \
                     p.permission_name as PRIVILEGE, p.state_desc as STATE \
                from sys.database_permissions p \
