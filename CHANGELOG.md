@@ -460,6 +460,8 @@ All notable changes to Pythia are documented here. The format follows
   how, on every database (#471).
 - SQL Server: the DDL of a view, routine or trigger has its descriptions,
   and its columns' and parameters', which a copy lacked (#472).
+- SQL Server: a lookup chosen as a deadlock's victim (Msg 1205), as the
+  catalog deadlocks with other sessions' DDL, runs again (#473).
 
 ## [0.11.0] - 2026-11-02
 
