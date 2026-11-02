@@ -155,6 +155,31 @@ struct ValueEditor {
     view_row: usize,
     col: usize,
     text: String,
+    /// A text over [`VIEWER_CHARS`], which isn't edited in a text field: a
+    /// letter typed laid it out whole again, seconds for megabytes (#356).
+    long: Option<LongText>,
+}
+
+/// A text the value editor shows in rows, as the viewer shows it.
+struct LongText {
+    chars: usize,
+    /// Where its rows start, and whether a line was cut.
+    rows: (Vec<usize>, bool),
+}
+
+impl ValueEditor {
+    fn new(view_row: usize, col: usize, text: String) -> Self {
+        let long = text.chars().nth(VIEWER_CHARS).is_some().then(|| LongText {
+            chars: text.chars().count(),
+            rows: text_rows(&text),
+        });
+        Self {
+            view_row,
+            col,
+            text,
+            long,
+        }
+    }
 }
 
 /// Rows related to a row, e.g. its parent through a foreign key.
@@ -460,7 +485,7 @@ impl GridState {
             }
             (None, None) => SaveSource::Held(held.to_owned()),
         };
-        self.file_request = Some(FileRequest::Save(SaveValue {
+        self.ask_owner(FileRequest::Save(SaveValue {
             row,
             col,
             binary,
@@ -481,7 +506,15 @@ impl GridState {
         self.last_load += 1;
         let load = self.last_load;
         self.loads.insert(load, (self.row_ref(view_row), col));
-        self.file_request = Some(FileRequest::Load { load, col, binary });
+        self.ask_owner(FileRequest::Load { load, col, binary });
+    }
+
+    /// Hands `request` to the owner. A load it took the place of, which
+    /// the owner never saw, is forgotten (#361).
+    fn ask_owner(&mut self, request: FileRequest) {
+        if let Some(FileRequest::Load { load, .. }) = self.file_request.replace(request) {
+            self.loads.remove(&load);
+        }
     }
 
     /// Puts the file of `load` into the cell it was chosen for, where its
@@ -506,6 +539,11 @@ impl GridState {
     /// Forgets `load`, whose file wasn't chosen.
     pub fn cancel_load(&mut self, load: u64) {
         self.loads.remove(&load);
+    }
+
+    /// The loads whose files haven't come yet.
+    pub fn loads_in_progress(&self) -> usize {
+        self.loads.len()
     }
 
     /// Makes a file's value the pending change of a cell (#293), a step
@@ -1283,11 +1321,7 @@ impl GridState {
                 .unwrap_or_default()
                 .to_owned(),
         };
-        self.value_editor = Some(ValueEditor {
-            view_row: cell.0,
-            col: cell.1,
-            text,
-        });
+        self.value_editor = Some(ValueEditor::new(cell.0, cell.1, text));
     }
 
     pub fn close_value_editor(&mut self) {
@@ -3081,11 +3115,12 @@ fn value_editor(
     };
     let column = columns.get(ed.col);
     let name = column.map_or("", |c| c.name.as_str());
-    let date = column.is_some_and(is_temporal);
+    let date = column.is_some_and(is_temporal) && ed.long.is_none();
     let files = state.value_files && column.is_some_and(|c| file_kind(state.dialect, c).is_some());
     let mut open = true;
     let mut result: Option<Cell> = None;
     let mut load = false;
+    let mut save = false;
     egui::Window::new(format!("Edit {name} — row {}", ed.view_row + 1))
         .id(id.with("value-editor"))
         .open(&mut open)
@@ -3124,23 +3159,50 @@ fn value_editor(
                     ui.weak("Format YYYY-MM-DD HH24:MI:SS");
                 });
             }
+            if let Some(long) = &ed.long {
+                let mut note = format!("Too long to edit here: over {VIEWER_CHARS} characters");
+                if files {
+                    note.push_str(". Save to file…, edit the file, Load from file…");
+                }
+                if long.rows.1 {
+                    note.push_str(&format!(" · lines cut every {VIEWER_ROW_CHARS} characters"));
+                }
+                ui.weak(note);
+                ui.separator();
+            }
             let height = if date {
                 ui.text_style_height(&egui::TextStyle::Monospace) + 10.0
             } else {
                 (ui.available_height() - 36.0).max(80.0)
             };
-            ui.add_sized(
-                [ui.available_width(), height],
-                egui::TextEdit::multiline(&mut ed.text)
-                    .font(egui::TextStyle::Monospace)
-                    .lock_focus(true),
-            );
+            if let Some(long) = &ed.long {
+                // Shown as the viewer shows it, a row at a time (#356).
+                ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                    text_in_rows(ui, &ed.text, &long.rows.0);
+                });
+            } else {
+                // Scrolled: a text taller than the field made the dialog
+                // taller than the screen, its buttons out of reach (#356).
+                egui::ScrollArea::vertical()
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), height],
+                            egui::TextEdit::multiline(&mut ed.text)
+                                .font(egui::TextStyle::Monospace)
+                                .lock_focus(true),
+                        );
+                    });
+            }
             ui.horizontal(|ui| {
-                if ui.button("Apply").clicked() {
+                if ed.long.is_none() && ui.button("Apply").clicked() {
                     result = Some(Some(ed.text.clone()));
                 }
                 if ui.button("Set NULL").clicked() {
                     result = Some(None);
+                }
+                if files && ed.long.is_some() && ui.button("Save to file…").clicked() {
+                    save = true;
                 }
                 if files
                     && ui
@@ -3150,12 +3212,20 @@ fn value_editor(
                 {
                     load = true;
                 }
-                ui.weak(format!("{} characters", ed.text.chars().count()));
+                let chars = ed
+                    .long
+                    .as_ref()
+                    .map_or_else(|| ed.text.chars().count(), |long| long.chars);
+                ui.weak(format!("{chars} characters"));
             });
         });
-    if load {
+    if load || save {
         let cell = (ed.view_row, ed.col);
-        state.request_load(columns, cell);
+        if load {
+            state.request_load(columns, cell);
+        } else {
+            state.request_save(columns, rows, cell);
+        }
         return;
     }
     if let Some(value) = result {
@@ -3434,20 +3504,7 @@ fn viewer(
                 });
                 return;
             };
-            // A row at a time, those in view (#284).
-            let height = ui.text_style_height(&egui::TextStyle::Monospace);
-            egui::ScrollArea::both().auto_shrink(false).show_rows(
-                ui,
-                height,
-                starts.len(),
-                |ui, shown| {
-                    for row in shown {
-                        let end = starts.get(row + 1).copied().unwrap_or(text.len());
-                        let line = text[starts[row]..end].trim_end_matches(['\n', '\r']);
-                        ui.add(egui::Label::new(RichText::new(line).monospace()).extend());
-                    }
-                },
-            );
+            text_in_rows(ui, text, starts);
         });
     if !open {
         state.viewer = None;
@@ -3456,6 +3513,21 @@ fn viewer(
     } else if save {
         state.request_save(columns, rows, (r, c));
     }
+}
+
+/// A long text in the rows that start at `starts` ([`text_rows`]), laid
+/// out a row at a time, those in view (#284).
+fn text_in_rows(ui: &mut Ui, text: &str, starts: &[usize]) {
+    let height = ui.text_style_height(&egui::TextStyle::Monospace);
+    egui::ScrollArea::both()
+        .auto_shrink(false)
+        .show_rows(ui, height, starts.len(), |ui, shown| {
+            for row in shown {
+                let end = starts.get(row + 1).copied().unwrap_or(text.len());
+                let line = text[starts[row]..end].trim_end_matches(['\n', '\r']);
+                ui.add(egui::Label::new(RichText::new(line).monospace()).extend());
+            }
+        });
 }
 
 /// What a cell shows of a value: its first line, at most [`SHOWN_CHARS`] of
@@ -5487,6 +5559,141 @@ mod tests {
         }
     }
 
+    /// The dialog editing a cell keeps up with a text of megabytes, fetched
+    /// or loaded from a file (#356): it laid all of it out in a text field
+    /// on every frame and again for each letter typed, 3 s for the first
+    /// frame, 0.4 s for each after it and 3 s for a letter with 10 MB on one
+    /// line in a test build (7 frames: 7.4 s). A text over 100,000
+    /// characters shows in rows, as the viewer shows it, all of it to
+    /// scroll through, not to edit: Save to file… and Load from file… take
+    /// it to a file and back. One of 100,000 still edits, in a field that
+    /// scrolls: the dialog grew with its text, Apply off the screen.
+    #[test]
+    fn the_value_editor_of_a_huge_value_keeps_up() {
+        let columns = vec![Column {
+            name: "T".into(),
+            type_name: "text".into(),
+            numeric: false,
+        }];
+        let line = format!("{}the end", "word ".repeat(2 << 20));
+        let lines = format!("{}the end", "line\n".repeat(2 << 20));
+        let ctx = egui::Context::default();
+        for (value, loaded) in [(&line, false), (&lines, false), (&line, true)] {
+            let rows = vec![vec![Some(if loaded { "x".into() } else { value.clone() })]];
+            let mut state = GridState {
+                dialect: Dialect::POSTGRES,
+                value_files: true,
+                ..Default::default()
+            };
+            state.set_editable(None);
+            if loaded {
+                let text = Loaded::Text(value.as_str().into());
+                state.load_value(&rows, RowRef::Existing(0), 0, text);
+            }
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let started = std::time::Instant::now();
+            state.open_value_editor(&rows, (0, 0));
+            // A window is laid out unseen first.
+            frame(&ctx, &columns, &rows, &mut state, vec![]);
+            let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            for _ in 0..5 {
+                frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            assert!(elapsed < 2.0, "loaded {loaded}: 7 frames took {elapsed} s");
+            let shown = texts(&drawn);
+            assert!(
+                shown.iter().any(|t| t.starts_with("Too long to edit here")),
+                "{shown:?}"
+            );
+            let at = |drawn: &[(String, egui::Pos2)], text: &str| {
+                drawn
+                    .iter()
+                    .find(|(t, _)| t == text)
+                    .unwrap_or_else(|| panic!("{text} not in {:?}", texts(drawn)))
+                    .1
+            };
+            // Scrolled to the end, the end shows.
+            let save = at(&drawn, "Save to file…");
+            let wheel = egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -1e9),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let above = save + egui::vec2(0.0, -100.0);
+            frame(
+                &ctx,
+                &columns,
+                &rows,
+                &mut state,
+                vec![egui::Event::PointerMoved(above)],
+            );
+            frame(&ctx, &columns, &rows, &mut state, vec![wheel]);
+            let mut drawn = Vec::new();
+            for _ in 0..3 {
+                drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+            }
+            assert!(
+                drawn.iter().any(|(t, _)| t.ends_with("the end")),
+                "loaded {loaded}: {:?}",
+                texts(&drawn)
+            );
+            // Save to file… and Load from file… take it out and in.
+            for (button, save) in [("Save to file…", true), ("Load from file…", false)] {
+                click(&ctx, &columns, &rows, &mut state, button, 1);
+                match state.take_file_request() {
+                    Some(FileRequest::Save(_)) if save => {}
+                    Some(FileRequest::Load { .. }) if !save => {}
+                    other => panic!("{button}: {other:?}"),
+                }
+            }
+            assert_eq!(state.value_editor.as_ref().unwrap().text, *value);
+        }
+        // 100,000 characters still edit.
+        let value = "word ".repeat(20_000);
+        let rows = vec![vec![Some(value.clone())]];
+        let mut state = GridState {
+            dialect: Dialect::POSTGRES,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.open_value_editor(&rows, (0, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert!(texts(&drawn).contains(&value.as_str()), "no text field");
+        // Into the field, above the buttons.
+        let apply = drawn.iter().find(|(t, _)| t == "Apply");
+        let apply = apply.expect("Apply, in view").1;
+        let pos = apply + egui::vec2(0.0, -60.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &columns,
+            &rows,
+            &mut state,
+            vec![egui::Event::PointerMoved(pos)],
+        );
+        frame(&ctx, &columns, &rows, &mut state, vec![button(true)]);
+        frame(&ctx, &columns, &rows, &mut state, vec![button(false)]);
+        frame(
+            &ctx,
+            &columns,
+            &rows,
+            &mut state,
+            vec![egui::Event::Text("z".into())],
+        );
+        let text = &state.value_editor.as_ref().unwrap().text;
+        assert_eq!(text.len(), value.len() + 1);
+        assert_eq!(text.matches('z').count(), 1);
+    }
+
     /// A sort or a filter keeps the selection, the cursor, the cell being
     /// edited, the viewer and the dialog editing a cell on their rows
     /// (#296). They stayed at their places in the view, on other rows: Set
@@ -5879,6 +6086,30 @@ mod tests {
     /// What a cell holds of a file's value, as each database shows binary
     /// values: cut short past 4000 bytes, with the size the grid reads
     /// back (#293).
+    /// A load whose request the owner never took, another one asked for
+    /// before it did, is forgotten (#361).
+    #[test]
+    fn a_load_asked_for_again_is_forgotten() {
+        let columns = vec![col_of("ID", "INTEGER"), col_of("IMG", "BLOB")];
+        let rows = vec![vec![Some("1".into()), Some("X'CAFE'".into())]];
+        let mut state = GridState {
+            dialect: Dialect::SQLITE,
+            value_files: true,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        state.sync(&rows, &columns);
+        state.request_load(&columns, (0, 1));
+        state.request_load(&columns, (0, 1));
+        assert_eq!(state.loads_in_progress(), 1);
+        state.request_save(&columns, &rows, (0, 1));
+        assert_eq!(state.loads_in_progress(), 0);
+        assert!(matches!(
+            state.take_file_request(),
+            Some(FileRequest::Save(_))
+        ));
+    }
+
     /// A file loaded into a new row goes into that row where it is when the
     /// file comes, or into none where the row went (#344): the row's place
     /// among the new rows changes while the file is chosen and read. It

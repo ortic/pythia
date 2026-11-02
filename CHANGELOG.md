@@ -1148,6 +1148,30 @@ All notable changes to Pythia are documented here. The format follows
   trigger has its comments (#354), a view's columns' too, as a table's
   and a materialized view's have since #301, and a table's has its
   `serial` sequences'. Run elsewhere, a copy came without them.
+- *Edit in dialog…* no longer freezes Pythia on a text of megabytes
+  (#356), fetched or loaded from a file: its text field laid all of it
+  out on every frame and for each letter typed, seconds for 10 MB. A
+  text over 100,000 characters now shows in rows, as *View value…* shows
+  it, to read but not to edit there: *Save to file…* writes it and *Load
+  from file…* takes it back. A shorter text scrolls in its field, where
+  one of some thousand characters made the dialog taller than the
+  screen and put *Apply* out of reach.
+- A *Load from file…* that ends without a file is forgotten (#361): one
+  chosen while another file dialog was open, which does nothing, and one
+  whose file can't be read stayed among the result's loads in progress
+  for as long as it was shown.
+- PostgreSQL: completion follows a search path set with `set_config`
+  (#362), as it follows one set with `SET` since #320: after `select
+  set_config('search_path', 'sales', false)` it went on offering the
+  names of the path before, and so after a `set_config('role', …)`,
+  which changes the schema `"$user"` names. A function that sets the
+  path in its body, without a `SET` clause, still changes it unseen.
+- SQLite: a database in memory named by a `file:` URI, `file::memory:`
+  or `file:scratch?mode=memory`, is one for all the connection's
+  sessions, as `:memory:` is (#364). Each session had one of its own:
+  the object browser and completion showed an empty database, and
+  another window had none of a window's tables. `cache=private` keeps
+  one for each.
 
 ## [0.10.0] - 2026-10-30
 

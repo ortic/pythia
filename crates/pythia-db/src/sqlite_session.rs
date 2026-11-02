@@ -164,7 +164,7 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
                     path.display()
                 )));
             }
-            uri.clone()
+            shared_memory(uri)
         }
         File::Path(path) => {
             if target.create && !target.read_only {
@@ -294,6 +294,24 @@ pub fn sqlite_without_create(connect_string: &str) -> String {
         }
     }
     connect_string.to_owned()
+}
+
+/// `uri` with `cache=shared` where it names a database in memory without a
+/// `cache=` (#364): SQLite gives each connection to such a URI a database
+/// of its own, and each session is one, so the object browser, completion
+/// and the other windows had none of a window's tables. As with `:memory:`
+/// ([`SHARED_MEMORY`]), the sessions share it; `cache=private` keeps one
+/// for each.
+fn shared_memory(uri: &str) -> String {
+    let name = uri.strip_prefix("file:").unwrap_or_default();
+    let name = &name[..name.find(['?', '#']).unwrap_or(name.len())];
+    let memory = uri_param(uri, "mode") == Some("memory") || name == ":memory:";
+    if !memory || uri_param(uri, "cache").is_some() || uri_param(uri, "vfs").is_some() {
+        return uri.to_owned();
+    }
+    let (main, fragment) = uri.split_at(uri.find('#').unwrap_or(uri.len()));
+    let with = if main.contains('?') { '&' } else { '?' };
+    format!("{main}{with}cache=shared{fragment}")
 }
 
 /// The value of a `file:` URI's parameter `key`, as written.
@@ -984,6 +1002,30 @@ mod tests {
             ("file:x.db?vfs=memdb", None),
         ] {
             assert_eq!(uri_file(uri), file.map(PathBuf::from), "{uri}");
+        }
+    }
+
+    /// A URI of a database in memory is shared by the sessions unless it
+    /// says how (#364); a file's stays as written.
+    #[test]
+    fn memory_uris_are_shared() {
+        for (uri, opened) in [
+            ("file::memory:", "file::memory:?cache=shared"),
+            (
+                "file:scratch?mode=memory",
+                "file:scratch?mode=memory&cache=shared",
+            ),
+            ("file:s?mode=memory#x", "file:s?mode=memory&cache=shared#x"),
+            ("file::memory:?cache=private", "file::memory:?cache=private"),
+            (
+                "file:s?mode=memory&cache=shared",
+                "file:s?mode=memory&cache=shared",
+            ),
+            ("file:/s?vfs=memdb", "file:/s?vfs=memdb"),
+            ("file:x.db", "file:x.db"),
+            ("file:x.db?mode=ro", "file:x.db?mode=ro"),
+        ] {
+            assert_eq!(shared_memory(uri), opened, "{uri}");
         }
     }
 

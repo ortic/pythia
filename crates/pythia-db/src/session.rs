@@ -634,7 +634,7 @@ const LONGEST_INLINE: usize = 32767;
 
 #[cfg(feature = "thick")]
 impl ::oracle::sql_type::ToSql for Bound<'_> {
-    fn oratype(&self, conn: &Connection) -> ::oracle::Result<OracleType> {
+    fn oratype(&self, conn: &::oracle::Connection) -> ::oracle::Result<OracleType> {
         match self.0 {
             Bind::Text(value) => value.oratype(conn),
             Bind::Bytes(bytes) if bytes.len() > LONGEST_INLINE => Ok(OracleType::LongRaw),

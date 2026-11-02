@@ -778,7 +778,9 @@ impl Worker {
 
 /// Whether `sql` may change the schemas of the search path (#320): SET
 /// and RESET, a transaction's end (SET LOCAL), DISCARD, a DO block or CALL
-/// that sets it, a schema made, dropped or renamed.
+/// that sets it, a schema made, dropped or renamed; set_config anywhere in
+/// a statement, as SET does, of the path or of the role "$user" names
+/// (#362). A function's own SET search_path is undone when it returns.
 fn changes_path(sql: &str) -> bool {
     let words = leading_words(sql);
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -788,7 +790,8 @@ fn changes_path(sql: &str) -> bool {
             "SET" | "RESET" | "DISCARD" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "DO" | "CALL",
             ..
         ] | ["CREATE" | "DROP" | "ALTER", "SCHEMA"]
-    )
+            | ["PREPARE", "TRANSACTION"]
+    ) || has_word(sql, &["SET_CONFIG"])
 }
 
 /// What [`Worker::fetch`] reads.
@@ -1285,6 +1288,31 @@ mod tests {
             privilege: Default::default(),
             init_sql: Vec::new(),
             ssh: None,
+        }
+    }
+
+    /// The statements after which the session reads its search path again
+    /// (#320): set_config anywhere in one too (#362), not in a string or a
+    /// comment.
+    #[test]
+    fn statements_that_may_change_the_path() {
+        for sql in [
+            "set search_path = a",
+            "commit",
+            "prepare transaction 't'",
+            "create schema s",
+            "select set_config('search_path', 'a', false)",
+            "select 1, pg_catalog.Set_Config('role', 'r', false)",
+        ] {
+            assert!(changes_path(sql), "{sql}");
+        }
+        for sql in [
+            "select 1",
+            "select 'set_config(' as t -- set_config(",
+            "prepare p as select 1",
+            "create table t (a int)",
+        ] {
+            assert!(!changes_path(sql), "{sql}");
         }
     }
 

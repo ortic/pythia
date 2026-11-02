@@ -8669,8 +8669,7 @@ fn completion_in_the_windows_context() {
             },
         )
     };
-    let servers = [
-        mysql("PYTHIA_TEST_MYSQL_DBA"),
+    let postgres = |change: &str| {
         (
             "PYTHIA_TEST_POSTGRES",
             DbKind::Postgres,
@@ -8680,7 +8679,7 @@ fn completion_in_the_windows_context() {
                         drop table if exists r75_t;\ncreate table r75_t (id int, in_default int);\n\
                         commit"
                     .into(),
-                change: "set search_path to r75_s".into(),
+                change: change.into(),
                 undo: None,
                 table: "r75_t",
                 temporary: "create temp table r75_tmp (id int, note text)",
@@ -8690,7 +8689,13 @@ fn completion_in_the_windows_context() {
                 cleanup: "drop schema r75_s cascade;\ndrop table r75_t;\ncommit".into(),
                 oracle: false,
             },
-        ),
+        )
+    };
+    let servers = [
+        mysql("PYTHIA_TEST_MYSQL_DBA"),
+        postgres("set search_path to r75_s"),
+        // As SET does (#362).
+        postgres("select set_config('search_path', 'r75_s', false)"),
         (
             "PYTHIA_TEST_MSSQL",
             DbKind::SqlServer,
@@ -8925,6 +8930,77 @@ fn completed(h: &mut Ui, text: &str) -> Vec<String> {
         };
     }
     completion_closed(h)
+}
+
+/// A SQLite database in memory is the connection's, as a file is: its
+/// windows, its object browser and completion all have a window's table.
+/// `:memory:` is one database for all of them; a `file:` URI of memory
+/// without `cache=` made one for each session (#364), so the browser and
+/// completion looked at the empty one of the connection's main session,
+/// and another window at one of its own: "no such table".
+#[test]
+fn memory_databases_are_the_connections() {
+    use pythia_db::ObjectType;
+    for (n, memory) in [":memory:", "file::memory:", "file:r85_memory?mode=memory"]
+        .into_iter()
+        .enumerate()
+    {
+        let connection = format!("r85-memory-{n}");
+        let profile = ConnectionProfile {
+            name: connection.clone(),
+            kind: pythia_config::DbKind::Sqlite,
+            connect_string: memory.into(),
+            ..Default::default()
+        };
+        let mut h = harness(true);
+        h.state_mut().test_connect(profile, String::new());
+        wait_until(&mut h, "connection", |app| app.test_connected());
+        let open = |h: &mut Ui| {
+            h.state_mut().test_open(OpenRequest::Sql {
+                connection: connection.clone(),
+                text: String::new(),
+                run: false,
+            });
+            h.run_steps(2);
+        };
+        open(&mut h);
+        run_in_window(
+            &mut h,
+            "create table r85_m (id integer primary key, in_window text)",
+        );
+        // Another window.
+        open(&mut h);
+        h.state_mut()
+            .test_sql_window()
+            .editor
+            .set_text("select count(*) from r85_m");
+        h.state_mut().test_execute_focused();
+        wait_until(&mut h, "the other window", |app| !app.test_focused_busy());
+        let w = h.state().test_sql_window_ref().unwrap();
+        let other: Vec<String> = w.state.messages.iter().map(|m| m.text.clone()).collect();
+        // Completion, from the main session.
+        let labels = completed(&mut h, "select * from r85_m c where c");
+        // The browser, also the main session's.
+        h.state_mut().test_expand_browser(&[ObjectType::Table]);
+        h.state_mut().test_refresh_browser();
+        wait_until(&mut h, "browser", |app| !app.test_browser_loading());
+        h.run_steps(3);
+        let listed = h.query_by_label("r85_m").is_some();
+        run_in_window(&mut h, "drop table if exists r85_m");
+        let seen = (
+            other.iter().any(|m| m.contains("1 row selected")),
+            labels.iter().any(|l| l == "in_window"),
+            listed,
+        );
+        assert_eq!(
+            seen,
+            (true, true, true),
+            "{memory}: another window, completion, the browser: {other:?}, {labels:?}"
+        );
+        h.state_mut().test_close_focused();
+        h.state_mut().test_close_focused();
+        h.run_steps(2);
+    }
 }
 
 /// A lone `;` is no statement (#313): `select 1;;` sent `;` to the
@@ -14634,6 +14710,67 @@ fn a_file_loads_into_its_own_row_or_none() {
     );
     h.state_mut().test_close_focused();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A load that ends without a file leaves nothing behind in the grid
+/// (#361): one asked for while the dialog of another is open, which is
+/// refused, and one whose file can't be read. Each kept its cell among the
+/// grid's loads in progress for as long as the result was there.
+#[test]
+fn loads_without_a_file_are_forgotten() {
+    let (mut h, _db) = sqlite_file("r85-loads.db");
+    run_script(
+        &mut h,
+        "r85-loads.db",
+        "create table r85_lob (id integer primary key, img blob);\n\
+         insert into r85_lob values (1, X'CAFE'), (2, X'BEEF');\n\
+         commit;\n",
+    );
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: "r85-loads.db".into(),
+        text: "select id, img from r85_lob".into(),
+        run: true,
+    });
+    wait_until(&mut h, "query", |app| !app.test_focused_busy());
+    h.state_mut()
+        .test_on_sql_window(|w, cx| w.start_editing(0, cx));
+    wait_until(&mut h, "editing", |app| !app.test_focused_busy());
+    let loads = |h: &mut Harness<'_, PythiaApp>| first_result(h).grid.loads_in_progress();
+    // The dialog for row 1, kept open; row 2's meanwhile.
+    h.state_mut().test_sql_window().state.value_files.held = true;
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (0, 1));
+    }
+    wait_until(&mut h, "the dialog", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.state.value_files.is_busy())
+    });
+    {
+        let r = first_result(&mut h);
+        r.grid.request_load(&r.columns, (1, 1));
+    }
+    h.run_steps(3);
+    let refused = loads(&mut h);
+    // Row 1's file can't be read.
+    let missing = std::env::temp_dir().join(format!("pythia-r85-{}-none", std::process::id()));
+    let before = message_count(&mut h);
+    let answer = h
+        .state_mut()
+        .test_sql_window()
+        .state
+        .value_files
+        .answer
+        .take();
+    answer.expect("the dialog").send(Some(missing)).unwrap();
+    let said = file_done(&mut h, before);
+    assert!(said.starts_with("Load from file failed"), "{said}");
+    assert_eq!(
+        (refused, loads(&mut h)),
+        (1, 0),
+        "after refused, after failed"
+    );
+    h.state_mut().test_close_focused();
 }
 
 /// *Load from file…* (#293), from the context menu and the value editor of

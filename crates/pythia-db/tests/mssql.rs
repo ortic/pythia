@@ -479,8 +479,11 @@ fn queries_see_commits_and_lock_nothing() {
     a.ok("drop table fresh_t");
 }
 
+/// The next statement closes a result with rows left, and runs once the
+/// driver has read the rest off the wire: SQL Server isn't stopped, as
+/// MySQL's server is by KILL QUERY.
 #[test]
-fn closing_an_open_result_stops_the_server() {
+fn closing_an_open_result_reads_the_rest_off_the_wire() {
     let Some(mut h) = Harness::connect() else {
         return;
     };
@@ -1318,7 +1321,8 @@ fn xml_spatial_and_ordered_indexes() {
 
 /// A database of the test's own, made afresh by `dba` and set up with
 /// `setup` (`{db}` is its name); the harness is connected to it, in
-/// autocommit.
+/// autocommit. `name` is the checkout's own ([`own`]): two checkouts' runs
+/// at once dropped each other's database under the same name.
 fn own_database(dba: &mut Harness, name: &str, setup: &[&str]) -> Harness {
     drop_database(dba, name);
     dba.ok(&format!("create database [{name}]"));
@@ -1385,7 +1389,8 @@ fn dictionary_at_compatibility_level_100() {
     };
     let mut dba = Harness::with(params);
     dba.session.send(DbRequest::SetAutocommit(true));
-    let mut h = own_database(&mut dba, "r63_compat", &[]);
+    let db = own("r63_", "r63_compat");
+    let mut h = own_database(&mut dba, &db, &[]);
     for sql in [
         "create table r63_dept (deptno int constraint r63_dept_pk primary key, \
          site int not null, name varchar(30) not null, \
@@ -1468,7 +1473,7 @@ fn dictionary_at_compatibility_level_100() {
         assert_eq!(read(&mut h), expected, "at {level}");
     }
     drop(h);
-    drop_database(&mut dba, "r63_compat");
+    drop_database(&mut dba, &db);
 }
 
 /// The indexes of `tables` in `owner` as the catalog has them, and whether
@@ -1530,9 +1535,10 @@ fn memory_optimized_tables() {
     };
     let mut dba = Harness::with(params);
     dba.session.send(DbRequest::SetAutocommit(true));
+    let db = own("r63_", "r63_mem");
     let mut h = own_database(
         &mut dba,
-        "r63_mem",
+        &db,
         &[
             "alter database [{db}] add filegroup [{db}_mo] contains memory_optimized_data",
             "declare @path nvarchar(400) = \
@@ -1614,7 +1620,7 @@ fn memory_optimized_tables() {
     }
     assert_eq!(catalog_indexes(&mut h, "r63_copy", &tables), before);
     drop(h);
-    drop_database(&mut dba, "r63_mem");
+    drop_database(&mut dba, &db);
 }
 
 /// A table's DDL creates its selective XML indexes, with their namespaces
@@ -1781,9 +1787,10 @@ fn index_options_and_storage() {
     };
     let mut dba = Harness::with(params);
     dba.session.send(DbRequest::SetAutocommit(true));
+    let db = own("r63_", "r63_opts");
     let mut h = own_database(
         &mut dba,
-        "r63_opts",
+        &db,
         &[
             "alter database [{db}] add filegroup [r63_fg]",
             "declare @path nvarchar(400) = \
@@ -1916,7 +1923,7 @@ fn index_options_and_storage() {
     }
     assert_eq!(catalog_storage(&mut h, "r63_copy", "r63_", xml), before);
     drop(h);
-    drop_database(&mut dba, "r63_opts");
+    drop_database(&mut dba, &db);
 }
 /// A table's DDL, as `MetaQuery::Ddl` reads it.
 fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
@@ -2590,12 +2597,15 @@ fn filters_match_any_letters_without_case() {
     };
     let mut d = Harness::with(dba.clone());
     d.session.send(DbRequest::SetAutocommit(true));
-    d.ok("drop database if exists r62_cs");
-    d.ok("create database r62_cs collate Latin1_General_100_CS_AS_SC");
+    let db = own("r62_", "r62_cs");
+    d.ok(&format!("drop database if exists {db}"));
+    d.ok(&format!(
+        "create database {db} collate Latin1_General_100_CS_AS_SC"
+    ));
     let connect_string = {
         let (server, _) = dba.connect_string.split_once('/').expect("a database");
         let options = dba.connect_string.split_once('?').map_or("", |(_, o)| o);
-        format!("{server}/r62_cs?{options}")
+        format!("{server}/{db}?{options}")
     };
     let mut c = Harness::with(ConnectParams {
         connect_string,
@@ -2609,7 +2619,7 @@ fn filters_match_any_letters_without_case() {
     );
     check(&mut c);
     drop(c);
-    d.ok("drop database r62_cs");
+    d.ok(&format!("drop database {db}"));
 }
 
 /// Waits for a session's connect to fail.
