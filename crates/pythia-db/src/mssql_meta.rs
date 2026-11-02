@@ -503,7 +503,9 @@ fn ddl(
 /// and its period comes last (#324). Sparse columns and a column set are
 /// declared so (#325), masked columns with their masks (#348): their
 /// functions keep their quotes doubled in the catalog, as they go between
-/// quotes. What CREATE TABLE can't give follows the table: its
+/// quotes. A typed XML column names its schema collection, which is made
+/// apart, as a foreign key's table is (#349). What CREATE TABLE can't give
+/// follows the table: its
 /// lock escalation, foreign keys and checks that aren't trusted, disabled
 /// ones disabled, and disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
@@ -514,6 +516,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                         then 'as ' + cc.definition \
                              + case when cc.is_persisted = 1 then ' persisted' else '' end \
                         else {COLUMN_TYPE} \
+                             + coalesce('(' + case when c.is_xml_document = 1 then 'document ' \
+                                                   else 'content ' end \
+                                        + quotename(schema_name(xs.schema_id)) + '.' \
+                                        + quotename(xs.name) + ')', '') \
                              + case when c.collation_name collate database_default \
                                          <> cast(databasepropertyex(db_name(), 'Collation') \
                                                  as sysname) collate database_default \
@@ -546,6 +552,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                 and dc.parent_column_id = c.column_id \
                left join sys.masked_columns m on m.object_id = c.object_id \
                 and m.column_id = c.column_id and m.is_masked = 1 \
+               left join sys.xml_schema_collections xs on xs.xml_collection_id = c.xml_collection_id \
+                and c.xml_collection_id > 0 \
               where c.object_id = object_id(@P1) \
               order by c.column_id"
         ),

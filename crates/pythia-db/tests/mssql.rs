@@ -2627,6 +2627,76 @@ fn masked_columns() {
     drop_tables(&mut h, &schema, "r82_m");
 }
 
+/// A table's DDL types its XML columns with their schema collections, as
+/// content or document (#349): run elsewhere, the copy's columns take only
+/// the XML the collection allows, as the original's.
+#[test]
+fn typed_xml_columns() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_x", "r82_x");
+    h.ok("drop schema if exists r82_copy_x");
+    drop_tables(&mut h, &schema, "r82_x");
+    h.ok(
+        "if exists (select 1 from sys.xml_schema_collections where name = 'r82_xs') \
+         drop xml schema collection r82_xs",
+    );
+    h.ok("create xml schema collection r82_xs as \
+         N'<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\
+           <xs:element name=\"a\" type=\"xs:int\"/></xs:schema>'");
+    h.ok(
+        "create table r82_x (id int, d xml(document r82_xs) not null, c xml(content r82_xs), \
+         p xml(r82_xs), u xml)",
+    );
+    let ddl = table_ddl(&mut h, &schema, "r82_x");
+    let xs = format!("[{schema}].[r82_xs]");
+    assert_eq!(
+        ddl,
+        format!(
+            "create table [{schema}].[r82_x] (\n    \
+               [id] int null,\n    \
+               [d] xml(document {xs}) not null,\n    \
+               [c] xml(content {xs}) null,\n    \
+               [p] xml(content {xs}) null,\n    \
+               [u] xml null\n\
+             );\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', c.name, x.name, c.is_xml_document) \
+                               collate database_default, '; ') \
+                      within group (order by c.column_id) \
+               from sys.columns c \
+               left join sys.xml_schema_collections x on x.xml_collection_id = c.xml_collection_id \
+                and c.xml_collection_id > 0 \
+              where c.object_id = object_id('[{owner}].[r82_x]')"
+        ))
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_x");
+    run_ddl_in(&mut h, &ddl, &schema, "r82_copy_x", &["r82_x"]);
+    assert_eq!(catalog(&mut h, "r82_copy_x"), before);
+    // The copy validates its XML as the original does.
+    for owner in [schema.as_str(), "r82_copy_x"] {
+        let t = format!("[{owner}].[r82_x]");
+        h.ok(&format!(
+            "insert into {t} (id, d, c) values (1, '<a>1</a>', '<a>2</a><a>3</a>')"
+        ));
+        h.fails(&format!("insert into {t} (id, d) values (2, '<b/>')"));
+        h.fails(&format!(
+            "insert into {t} (id, d) values (3, '<a>1</a><a>2</a>')"
+        ));
+    }
+    drop_tables(&mut h, "r82_copy_x", "r82_x");
+    h.ok("drop schema r82_copy_x");
+    drop_tables(&mut h, &schema, "r82_x");
+    h.ok("drop xml schema collection r82_xs");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.

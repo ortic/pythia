@@ -1117,6 +1117,11 @@ All notable changes to Pythia are documented here. The format follows
   *Edit* or a script made from the DDL masked nothing: a user without
   UNMASK read there the e-mail addresses, numbers and dates the masks
   hide in the original.
+- SQL Server: a table's DDL keeps a typed XML column's schema
+  collection (#349), as `xml(document [schema].[collection])` or
+  `xml(content …)`. The column was plain `xml`: a copy took any XML the
+  original rejects. The collection itself isn't made by the table's
+  DDL, as a foreign key's table isn't.
 
 ## [0.10.0] - 2026-10-30
 
