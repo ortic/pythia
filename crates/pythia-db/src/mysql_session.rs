@@ -173,6 +173,13 @@ impl Worker {
     fn on_connect(&mut self, init_sql: &[String]) -> Result<(ServerInfo, Vec<String>), DbError> {
         // Whatever the server's default: see `Transaction`.
         self.conn.query_drop("set autocommit = 1")?;
+        // The server's utf8mb4 collation, as its own client has: the driver
+        // asks for utf8mb4_general_ci, which a column's collation or a user
+        // variable's didn't mix with (1267), and *Edit* made routines under
+        // it (#452). The login script may set another.
+        if let Err(e) = self.conn.query_drop("set names utf8mb4") {
+            warn!("set names utf8mb4: {e}");
+        }
         let mut failed = Vec::new();
         for sql in init_sql {
             if let Err(e) = self.conn.query_drop(sql) {

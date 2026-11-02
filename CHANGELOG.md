@@ -403,6 +403,9 @@ All notable changes to Pythia are documented here. The format follows
   with a notice, and a value that isn't UTF-8 fails its statement: the
   window hung for ever at the first non-ASCII value, and text written
   was stored garbled (#451).
+- MySQL: sessions use the server's utf8mb4 collation, not the driver's
+  `utf8mb4_general_ci`, which a column's didn't mix with (1267), and
+  *Edit* makes a routine or trigger again under its own collation (#452).
 
 ## [0.11.0] - 2026-11-02
 

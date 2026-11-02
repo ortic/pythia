@@ -2119,8 +2119,10 @@ pub fn replace_script(dialect: Dialect, o: &ObjectRef, ddl: &str, mariadb: bool)
             let inner = replace_script(dialect, o, rest, mariadb);
             let inner = inner.strip_prefix(&database).unwrap_or(&inner);
             format!(
-                "{database}set @pythia_sql_mode = @@session.sql_mode;\n{mode}\n\n{inner}\
-                 set session sql_mode = @pythia_sql_mode;\n"
+                "{database}set @pythia_sql_mode = @@session.sql_mode, \
+                 @pythia_collation = @@session.collation_connection;\n{mode}\n\n{inner}\
+                 set session sql_mode = @pythia_sql_mode, \
+                 collation_connection = @pythia_collation;\n"
             )
         }
         (pythia_db::DbKind::MySql, _) if mariadb => {
@@ -3270,15 +3272,19 @@ mod tests {
                      CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s";
         assert_eq!(
             replace_script(Dialect::MYSQL, &trigger, moded, true),
-            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode;\n\
+            "use shop;\n\nset @pythia_sql_mode = @@session.sql_mode, \
+             @pythia_collation = @@session.collation_connection;\n\
              set session sql_mode = 'PIPES_AS_CONCAT';\n\n\
              CREATE or replace TRIGGER t BEFORE INSERT ON o FOR EACH ROW SET new.s = 'p' || new.s\n/\n\
-             set session sql_mode = @pythia_sql_mode;\n"
+             set session sql_mode = @pythia_sql_mode, collation_connection = @pythia_collation;\n"
         );
         let script = replace_script(Dialect::MYSQL, &trigger, moded, false);
         assert!(
             script.contains("set session sql_mode = 'PIPES_AS_CONCAT';\n\n-- MySQL can't")
-                && script.ends_with("/\nset session sql_mode = @pythia_sql_mode;\n"),
+                && script.ends_with(
+                    "/\nset session sql_mode = @pythia_sql_mode, \
+                     collation_connection = @pythia_collation;\n"
+                ),
             "{script}"
         );
         // MariaDB keeps IF NOT EXISTS, which OR REPLACE can't go with.
