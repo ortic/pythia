@@ -450,6 +450,9 @@ All notable changes to Pythia are documented here. The format follows
   or left out (#467).
 - PostgreSQL: a dollar quote's tag may have letters past ASCII
   (`$função$`), where a script was split inside its body (#468).
+- The editor offers PL/SQL snippets (`func`, `proc`, `begin`, …) in
+  Oracle's windows only, not in other databases', which refused them
+  (#469).
 
 ## [0.11.0] - 2026-11-02
 

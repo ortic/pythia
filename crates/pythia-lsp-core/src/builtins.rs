@@ -638,6 +638,9 @@ pub fn after_expression(clause: Option<pythia_plsql::ast::Clause>) -> &'static [
 }
 
 /// Snippets offered at the start of a statement: (label, text, caret offset).
+/// The [`SNIPPETS`] of PL/SQL, offered on Oracle only (#469).
+pub const PLSQL_SNIPPETS: &[&str] = &["beg", "dec", "proc", "func", "pkg", "forr"];
+
 pub const SNIPPETS: &[(&str, &str, &str)] = &[
     ("sel", "SELECT * FROM |", "SELECT * FROM table"),
     (

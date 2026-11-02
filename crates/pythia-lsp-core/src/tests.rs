@@ -689,6 +689,20 @@ fn statement_start() {
     assert_eq!(snippet.caret, Some(14));
     let l = labels("select 1 from dual;\nupd¦");
     assert_eq!(l[0], "update");
+    // PL/SQL's are Oracle's (#469).
+    let snippets = |syntax| -> Vec<String> {
+        let (text, offset) = split("¦");
+        Analysis::new_in(&text, syntax)
+            .complete(offset, &hr())
+            .items
+            .into_iter()
+            .filter(|i| i.kind == CompletionKind::Snippet)
+            .map(|i| i.label)
+            .collect()
+    };
+    assert!(snippets(pythia_plsql::Syntax::Oracle).contains(&"beg".to_owned()));
+    let postgres = snippets(pythia_plsql::Syntax::Postgres);
+    assert!(postgres.contains(&"sel".to_owned()) && !postgres.contains(&"beg".to_owned()));
 }
 
 #[test]

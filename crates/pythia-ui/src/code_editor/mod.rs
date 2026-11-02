@@ -761,6 +761,12 @@ impl CodeEditor {
 
     // ----- snippets ---------------------------------------------------------
 
+    /// Whether the editor's language has `snippet`: PL/SQL's are Oracle's.
+    fn offers(&self, snippet: &Snippet) -> bool {
+        self.state.highlighter.syntax() == pythia_plsql::Syntax::Oracle
+            || !snippet::PLSQL_TRIGGERS.contains(&snippet.trigger.as_str())
+    }
+
     pub fn snippets(&self) -> &[Snippet] {
         &self.snippets
     }
@@ -792,6 +798,7 @@ impl CodeEditor {
         let unit = self.state.indent_unit();
         self.snippets
             .iter()
+            .filter(|s| self.offers(s))
             .filter(|s| s.trigger.to_lowercase().starts_with(&prefix))
             .map(|s| CompletionEntry {
                 label: s.trigger.clone(),
@@ -822,6 +829,7 @@ impl CodeEditor {
         let Some(body) = self
             .snippets
             .iter()
+            .filter(|s| self.offers(s))
             .find(|s| s.trigger.eq_ignore_ascii_case(&word))
             .map(|s| s.body.clone())
         else {
@@ -881,6 +889,18 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_is_plain_text() {
+        // PL/SQL's snippets are Oracle's (#469).
+        let mut postgres = CodeEditor::new("");
+        postgres.set_syntax(pythia_plsql::Syntax::Postgres);
+        let offered = |e: &CodeEditor, prefix: &str| -> Vec<String> {
+            e.snippet_completions(prefix)
+                .into_iter()
+                .map(|c| c.label)
+                .collect()
+        };
+        assert_eq!(offered(&postgres, "fun"), Vec::<String>::new());
+        assert_eq!(offered(&postgres, "sel"), ["sel", "selc"]);
+        assert_eq!(offered(&CodeEditor::new(""), "fun"), ["func"]);
         let editor = CodeEditor::new("select 1\nfrom dual");
         let json = serde_json::to_string(&editor).unwrap();
         assert_eq!(json, "\"select 1\\nfrom dual\"");

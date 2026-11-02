@@ -142,6 +142,13 @@ impl Analysis {
         }
         let tracker = Tracker::new(catalog);
         let mut completion = complete::complete(&self.sema(&tracker), offset, options);
+        // PL/SQL's blocks and units are Oracle's (#469).
+        if self.syntax != Syntax::Oracle {
+            completion.items.retain(|i| {
+                i.kind != complete::CompletionKind::Snippet
+                    || !builtins::PLSQL_SNIPPETS.contains(&i.label.as_str())
+            });
+        }
         completion.missing = tracker.into_missing();
         completion
     }

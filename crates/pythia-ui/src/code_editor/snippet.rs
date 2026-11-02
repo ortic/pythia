@@ -163,6 +163,13 @@ impl Session {
     }
 }
 
+/// The [`default_snippets`] of PL/SQL, Oracle's: other databases' editors
+/// don't offer them, which their server refused (#469).
+pub const PLSQL_TRIGGERS: &[&str] = &[
+    "begin", "decl", "if", "ifel", "elsif", "case", "loop", "whilel", "fori", "forc", "cur", "exc",
+    "rae", "dbms", "proc", "func", "pkg", "pkgb", "trg", "rec",
+];
+
 /// Built-in SQL and PL/SQL snippets.
 pub fn default_snippets() -> Vec<Snippet> {
     vec![
@@ -344,6 +351,9 @@ mod tests {
     #[test]
     fn default_snippets_are_well_formed() {
         let all = default_snippets();
+        for trigger in PLSQL_TRIGGERS {
+            assert!(all.iter().any(|s| s.trigger == *trigger), "{trigger}");
+        }
         let mut triggers: Vec<&str> = all.iter().map(|s| s.trigger.as_str()).collect();
         triggers.sort_unstable();
         triggers.dedup();
