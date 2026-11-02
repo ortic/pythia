@@ -4,7 +4,7 @@
 //! `temp` when it has objects, those of `ATTACH`). Names keep their case and
 //! are compared without it, as SQLite does.
 
-use pythia_plsql::{Syntax, TokenKind, tokenize};
+use pythia_plsql::{Syntax, Token, TokenKind, tokenize_in};
 use rusqlite::Connection;
 
 use crate::dialect::Dialect;
@@ -454,9 +454,43 @@ fn constraints(conn: &Connection, owner: &str, name: &str) -> Result<MetaResult,
 }
 
 /// `BEFORE INSERT`, `AFTER UPDATE OF name`, `INSTEAD OF DELETE`: the words
-/// between a trigger's name and `ON` in its `CREATE TRIGGER`.
+/// between a trigger's name and `ON` in its `CREATE TRIGGER`. The name is
+/// skipped first: it may be an event word itself (`create trigger "delete"
+/// after insert on t`).
 fn trigger_event(sql: &str) -> String {
-    let words = words(sql);
+    let tokens: Vec<Token> = tokenize_in(sql, Syntax::Sqlite)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let is = |i: usize, keyword: &str| {
+        tokens
+            .get(i)
+            .is_some_and(|t| t.kind.is_word() && sql[t.span.clone()].eq_ignore_ascii_case(keyword))
+    };
+    // CREATE [TEMP | TEMPORARY] TRIGGER [IF NOT EXISTS] [schema.]name
+    let mut i = 0;
+    if is(i, "CREATE") {
+        i += 1;
+        if is(i, "TEMP") || is(i, "TEMPORARY") {
+            i += 1;
+        }
+        if is(i, "TRIGGER") {
+            i += 1;
+            if is(i, "IF") && is(i + 1, "NOT") && is(i + 2, "EXISTS") {
+                i += 3;
+            }
+            i += 1;
+            if tokens.get(i).is_some_and(|t| t.kind == TokenKind::Dot) {
+                i += 2;
+            }
+        }
+    }
+    let words: Vec<String> = tokens
+        .get(i..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| word(sql, t))
+        .collect();
     let start = words
         .iter()
         .position(|w| {
@@ -493,24 +527,27 @@ fn event_word(word: &str) -> bool {
 /// The words and names of a statement (quotes taken off), not those in its
 /// strings or comments.
 fn words(sql: &str) -> Vec<String> {
-    tokenize(sql)
-        .into_iter()
-        .filter_map(|t| {
-            let text = &sql[t.span];
-            match t.kind {
-                TokenKind::QuotedIdent => {
-                    let inner = &text[1..text.len().saturating_sub(1).max(1)];
-                    Some(match text.chars().next() {
-                        Some('`') => inner.replace("``", "`"),
-                        Some('[') => inner.to_owned(),
-                        _ => inner.replace("\"\"", "\""),
-                    })
-                }
-                TokenKind::Ident | TokenKind::Keyword => Some(text.to_owned()),
-                _ => None,
-            }
-        })
+    tokenize_in(sql, Syntax::Sqlite)
+        .iter()
+        .filter_map(|t| word(sql, t))
         .collect()
+}
+
+/// A word or name (quotes taken off); `None` for other tokens.
+fn word(sql: &str, token: &Token) -> Option<String> {
+    let text = &sql[token.span.clone()];
+    match token.kind {
+        TokenKind::QuotedIdent => {
+            let inner = &text[1..text.len().saturating_sub(1).max(1)];
+            Some(match text.chars().next() {
+                Some('`') => inner.replace("``", "`"),
+                Some('[') => inner.to_owned(),
+                _ => inner.replace("\"\"", "\""),
+            })
+        }
+        TokenKind::Ident | TokenKind::Keyword => Some(text.to_owned()),
+        _ => None,
+    }
 }
 
 /// `(name, type)` of the schema's objects.
@@ -737,6 +774,19 @@ mod tests {
         assert_eq!(
             trigger_event("create trigger \"Ins\" insert on t begin end"),
             "INSERT"
+        );
+        // A name that is an event word, also qualified.
+        assert_eq!(
+            trigger_event("create trigger \"delete\" after insert on t begin end"),
+            "AFTER INSERT"
+        );
+        assert_eq!(
+            trigger_event("CREATE TRIGGER after before update ON t BEGIN END"),
+            "BEFORE UPDATE"
+        );
+        assert_eq!(
+            trigger_event("create trigger main.[after] after delete on t begin end"),
+            "AFTER DELETE"
         );
     }
 

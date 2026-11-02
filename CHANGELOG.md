@@ -6,6 +6,12 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- SQLite: the Triggers tab shows a trigger's event right when the
+  trigger's name is an event word itself (#386): `create trigger
+  "delete" after insert …` showed as `DELETE AFTER INSERT`. A
+  `[bracketed]` name is unquoted too.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added
