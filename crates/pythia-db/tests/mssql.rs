@@ -334,6 +334,51 @@ fn values_types_and_binds() {
     );
 }
 
+/// An nvarchar that isn't valid UTF-16, a lone surrogate as SQL Server
+/// keeps it, reads with U+FFFD in its place (#371), as do the next values
+/// and rows: the result failed with a protocol error, and the connection
+/// was opened again, without the transaction.
+#[test]
+fn invalid_utf16_reads_lossily() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r82_utf16");
+    h.ok("create table r82_utf16 (id int, v nvarchar(10), t ntext)");
+    assert!(h.ok(
+        "insert into r82_utf16 values (1, cast(0x00d8 as nvarchar(1)) + N'a', \
+         cast(cast(0x00dc6200 as nvarchar(2)) as ntext)), (2, N'ok', N'ok')"
+    ));
+    let DbEvent::QueryStarted { .. } = h.run(1, "select id, v, t from r82_utf16 order by id")
+    else {
+        panic!("expected QueryStarted")
+    };
+    let DbEvent::Rows { rows, more, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert!(!more);
+    assert_eq!(
+        rows,
+        [
+            [
+                Some("1".into()),
+                Some("\u{fffd}a".into()),
+                Some("\u{fffd}b".into())
+            ],
+            [Some("2".into()), Some("ok".into()), Some("ok".into())],
+        ]
+    );
+    // The transaction is still there.
+    assert!(h.settle());
+    h.session.send(DbRequest::Rollback);
+    assert!(!h.settle());
+    assert_eq!(
+        h.scalar("select count(*) from r82_utf16").as_deref(),
+        Some("0")
+    );
+    h.ok("drop table r82_utf16");
+}
+
 /// A float keeps its exponent (#261): 2e-20 came as
 /// 0.00000000000000000002, and 1e-300 as 302 characters, which the grid
 /// shows cut short as `0.0000…`.

@@ -128,6 +128,12 @@ All notable changes to Pythia are documented here. The format follows
   where it isn't `pg_catalog`. Run elsewhere, the copy's columns took
   their type's collation, mostly the database's, and sorted and compared
   otherwise: the copy of a column collated `"C"` sorted `a` before `B`.
+- SQL Server: an `nvarchar`, `nchar` or `ntext` value that isn't valid
+  UTF-16 reads with U+FFFD in its place (#371). SQL Server doesn't check
+  them, as in the names of incremental statistics' objects in
+  `sys.all_objects`: the result failed with "Protocol error: nvarchar:
+  invalid UTF-16 sequence", and the connection was opened again, which
+  rolled back the transaction.
 
 ## [0.11.0] - 2026-11-02
 
