@@ -50,6 +50,12 @@ All notable changes to Pythia are documented here. The format follows
   edit saved single bytes into them. The encoding in the status bar
   saves the file in another one, which a Windows-1252 file needs for a
   character it can't hold.
+- Oracle's forms for materialized views, indexes and database links
+  drop the object to create it again for some changes (#395). When the
+  create failed (an index made unique over duplicates), the object was
+  gone and the next Apply tried the drop again. Now the message says it
+  was dropped, and Apply creates it. A materialized view's new query is
+  checked before the drop.
 
 ## [0.11.0] - 2026-11-02
 
