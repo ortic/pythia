@@ -313,6 +313,11 @@ All notable changes to Pythia are documented here. The format follows
   committed (#423). After a failed savepoint statement (`release
   savepoint` with a typo) PostgreSQL had rolled it back, and Commit
   said "Committed".
+- A window whose new session couldn't connect (the server still
+  restarting) answers its next statement (#424); it showed "running" for
+  ever. A failed attempt to open a lost main session again no longer
+  closes the connection with every window's session: the next request
+  tries again.
 
 ## [0.11.0] - 2026-11-02
 

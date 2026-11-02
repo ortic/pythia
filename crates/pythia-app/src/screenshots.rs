@@ -9199,6 +9199,60 @@ fn completed(h: &mut Ui, text: &str) -> Vec<String> {
     completion_closed(h)
 }
 
+/// A window whose session couldn't connect opens a new one for its next
+/// statement (#424): the failed one was kept, its worker gone, and the
+/// window ran for ever. SQLite's file, renamed away and back, stands for a
+/// server that was down.
+#[test]
+fn a_failed_window_session_is_opened_again() {
+    let dir = std::env::temp_dir().join(format!("pythia-r99-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("r99.db");
+    let moved = dir.join("r99-away.db");
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch("create table t (n integer); insert into t values (7);")
+        .unwrap();
+    let connection = "r99-failed-session".to_owned();
+    let profile = ConnectionProfile {
+        name: connection.clone(),
+        kind: pythia_config::DbKind::Sqlite,
+        connect_string: file.display().to_string(),
+        ..Default::default()
+    };
+    let mut h = harness(true);
+    h.state_mut().test_connect(profile, String::new());
+    wait_until(&mut h, "connection", |app| app.test_connected());
+    h.state_mut().test_open(OpenRequest::Sql {
+        connection: connection.clone(),
+        text: "select n from t".into(),
+        run: false,
+    });
+    h.run_steps(2);
+    let run = |h: &mut Ui| {
+        h.state_mut().test_execute_focused();
+        wait_until(h, "the window", |app| !app.test_focused_busy());
+    };
+    std::fs::rename(&file, &moved).unwrap();
+    run(&mut h);
+    let failed = h.state().test_sql_window_ref().unwrap().state.results.len();
+    std::fs::rename(&moved, &file).unwrap();
+    run(&mut h);
+    let w = h.state().test_sql_window_ref().unwrap();
+    let rows: Vec<Vec<Option<String>>> = w
+        .state
+        .results
+        .last()
+        .map(|r| r.rows.clone())
+        .unwrap_or_default();
+    assert_eq!(failed, 0);
+    assert_eq!(rows, [vec![Some("7".to_owned())]]);
+    h.state_mut().test_close_focused();
+    h.run_steps(2);
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A SQLite database in memory is the connection's, as a file is: its
 /// windows, its object browser and completion all have a window's table.
 /// `:memory:` is one database for all of them; a `file:` URI of memory
