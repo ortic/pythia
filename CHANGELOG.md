@@ -430,6 +430,9 @@ All notable changes to Pythia are documented here. The format follows
   without which it failed (Msg 11708) (#461).
 - MySQL: taking a default role's admin option away in the user form
   keeps it enabled at login, which MySQL's REVOKE ended (#462).
+- MariaDB: a new password in the user form keeps the account's other
+  ways to log in (`unix_socket OR mysql_native_password`), which it
+  replaced with the password alone (#463).
 
 ## [0.11.0] - 2026-11-02
 

@@ -295,6 +295,43 @@ fn mysql_privileges_of_each_scope() {
     assert!(!table.iter().any(|p| p == "LOCK TABLES"), "{table:?}");
 }
 
+/// On MariaDB a new password keeps the account's other plugins (#463):
+/// `unix_socket OR mysql_native_password` became the password alone.
+#[test]
+fn mariadb_passwords_keep_other_plugins() {
+    let Some(mut live) = Live::connect("PYTHIA_TEST_MYSQL_DBA", DbKind::MySql) else {
+        return;
+    };
+    if !live.mariadb {
+        return;
+    }
+    live.try_exec("drop user if exists 'pythia_acct_s'@'%'");
+    live.exec(
+        "create user 'pythia_acct_s'@'%' identified via unix_socket or mysql_native_password \
+         using password('Pw-s-1')",
+    );
+    let (loaded, _) = change(&mut live, "pythia_acct_s@%", ObjectType::User, |u| {
+        u.password = "Pw-s-2".into();
+    });
+    assert_eq!(loaded.plugins, ["unix_socket", "mysql_native_password"]);
+    let shown = live
+        .run(|c| {
+            crate::object_editor::accounts::texts(c, "show create user 'pythia_acct_s'@'%'", &[])
+        })
+        .unwrap();
+    assert!(
+        shown[0].contains("VIA unix_socket OR mysql_native_password"),
+        "{shown:?}"
+    );
+    // The new password's hash, which the client can't try over TCP: the
+    // chain asks for unix_socket first.
+    let hash = live
+        .run(|c| crate::object_editor::accounts::texts(c, "select password('Pw-s-2')", &[]))
+        .unwrap();
+    assert!(shown[0].contains(&hash[0]), "{shown:?} {hash:?}");
+    live.try_exec("drop user if exists 'pythia_acct_s'@'%'");
+}
+
 #[test]
 fn mysql_users_and_roles() {
     let Some(mut live) = Live::connect("PYTHIA_TEST_MYSQL_DBA", DbKind::MySql) else {

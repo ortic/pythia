@@ -262,6 +262,17 @@ fn load_account(
                 }
             }
             mariadb_default = Some(text(&row, 2)).filter(|r| !r.is_empty());
+            if mariadb && !role {
+                let shown = texts(
+                    client,
+                    &format!("show create user {}", account(user, host, false, false)),
+                    &[],
+                );
+                def.plugins = shown
+                    .ok()
+                    .and_then(|rows| rows.first().map(|s| plugins(s)))
+                    .unwrap_or_default();
+            }
         }
         Err(e) if no_access(&e) => {
             def.unread.attributes = true;
@@ -378,6 +389,51 @@ fn load_account(
     Ok(def)
 }
 
+/// MariaDB: the plugins of `IDENTIFIED VIA a OR b USING …` in a SHOW
+/// CREATE USER, where the account has another than a password alone.
+fn plugins(create: &str) -> Vec<String> {
+    let Some((_, chain)) = create.split_once(" IDENTIFIED VIA ") else {
+        return Vec::new();
+    };
+    let plugins: Vec<String> = chain
+        .split(" OR ")
+        .filter_map(|part| part.split_whitespace().next())
+        .map(|p| p.trim_matches('`').to_owned())
+        .collect();
+    if plugins == ["mysql_native_password"] {
+        Vec::new()
+    } else {
+        plugins
+    }
+}
+
+/// How a new password is set: `identified by …`, or on MariaDB through the
+/// account's plugins, which `identified by` replaced with the password
+/// alone: root@localhost lost its `unix_socket` login (#463). A plugin that
+/// takes a password gets it; without one, the password is added.
+fn identified(def: &UserDef, plain: bool) -> String {
+    const PASSWORDS: &[&str] = &["mysql_native_password", "ed25519", "parsec"];
+    let password = || format!("using password({})", literal(&def.password, plain));
+    if !def.mariadb || def.plugins.is_empty() {
+        return format!("identified by {}", literal(&def.password, plain));
+    }
+    let mut parts: Vec<String> = def
+        .plugins
+        .iter()
+        .map(|p| {
+            if PASSWORDS.contains(&p.as_str()) {
+                format!("{p} {}", password())
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+    if !def.plugins.iter().any(|p| PASSWORDS.contains(&p.as_str())) {
+        parts.push(format!("mysql_native_password {}", password()));
+    }
+    format!("identified via {}", parts.join(" or "))
+}
+
 /// The privileges of a line of SHOW GRANTS that grants on the server
 /// (`GRANT RELOAD, PROCESS ON *.* TO `r` WITH GRANT OPTION`), and whether
 /// with the grant option.
@@ -421,7 +477,7 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
         Some(o) => {
             let mut clauses = Vec::new();
             if !def.password.is_empty() {
-                clauses.push(format!("identified by {}", literal(&def.password, plain)));
+                clauses.push(identified(def, plain));
             }
             if o.expire && !def.expire && def.password.is_empty() {
                 return Err("An expired password stays expired until a new one is set".to_owned());
@@ -663,6 +719,49 @@ mod tests {
         loaded.mariadb = true;
         changed.mariadb = true;
         assert_eq!(statements(Some(&loaded), &changed).unwrap().len(), 2);
+    }
+
+    /// On MariaDB a new password keeps the account's other plugins (#463).
+    #[test]
+    fn a_new_password_keeps_mariadbs_plugins() {
+        assert_eq!(
+            plugins(
+                "CREATE USER `root`@`localhost` IDENTIFIED VIA unix_socket OR \
+                 mysql_native_password USING '*667F' REQUIRE SSL"
+            ),
+            ["unix_socket", "mysql_native_password"]
+        );
+        assert!(plugins("CREATE USER `a`@`%` IDENTIFIED BY PASSWORD '*F33A'").is_empty());
+        assert!(
+            plugins("CREATE USER `a`@`%` IDENTIFIED VIA mysql_native_password USING '*F'")
+                .is_empty()
+        );
+        let mut loaded = user();
+        loaded.password.clear();
+        loaded.mariadb = true;
+        loaded.plugins = vec!["unix_socket".into(), "mysql_native_password".into()];
+        let changed = UserDef {
+            password: "n'ew".into(),
+            ..loaded.clone()
+        };
+        assert_eq!(
+            statements(Some(&loaded), &changed).unwrap(),
+            [
+                "alter user 'app'@'%' identified via unix_socket or mysql_native_password \
+              using password('n''ew')"
+            ]
+        );
+        let socket_only = UserDef {
+            plugins: vec!["unix_socket".into()],
+            ..changed
+        };
+        assert_eq!(
+            statements(Some(&loaded), &socket_only).unwrap(),
+            [
+                "alter user 'app'@'%' identified via unix_socket or mysql_native_password \
+              using password('n''ew')"
+            ]
+        );
     }
 
     #[test]
