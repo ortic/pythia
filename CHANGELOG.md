@@ -1215,6 +1215,25 @@ All notable changes to Pythia are documented here. The format follows
   `ENABLED`, `DISABLED` or `HYPOTHETICAL`. Disabled and hypothetical
   indexes read like the others, which the *DDL* disables (#326) or
   leaves out (#327).
+- SQL Server: a statement run while a result has rows left no longer
+  waits for the rest of that result (#383). The server sent all of it
+  and the driver read it off the wire first: a table of a hundred
+  million rows took 50 s here before the next statement started, with
+  no message, and Break couldn't stop it. A query is now stopped, as on
+  MySQL and PostgreSQL, and an open transaction stays. A batch that may
+  change something, such as an `insert … output`, a procedure or a
+  `commit` after the query, is still read to its end so that its changes
+  are made, and so is any query in a transaction while `XACT_ABORT` is
+  on, which stopping would roll back.
+- SQL Server: Break keeps the connection and its transaction (#384), as
+  on Oracle, MySQL and PostgreSQL. It opened the connection again, which
+  rolled back the changes that weren't committed and lost the session's
+  temporary tables and settings: the driver gave up reading the server's
+  answer to the cancel, which comes after the end of the stopped batch.
+- SQL Server: Break stops a fetch while rows keep arriving (#385). It was
+  taken only once the session had read all it had asked for, so *Fetch
+  all* of a large table couldn't be stopped and read rows into memory
+  until the table ended.
 
 ## [0.10.0] - 2026-10-30
 

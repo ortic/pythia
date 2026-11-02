@@ -3,13 +3,15 @@
 //!
 //! Statements are batches, each of whose result sets is a result. A
 //! result's rows are read while the worker waits for `FetchMore`s; any
-//! other request closes it, and the driver reads the rest of the batch
-//! before the next request.
+//! other request closes it. A batch that only reads is then stopped with
+//! TDS's attention signal, as MySQL's and PostgreSQL's queries are (#383);
+//! the driver reads the rest of any other before the next request, so that
+//! its changes are made as they would be with no result open.
 //!
-//! Break sends TDS's attention signal, which stops the batch on the server
-//! at once. The server acknowledges it with a reply of its own, which
-//! tiberius (0.13) doesn't read: the connection is out of step afterwards,
-//! so the worker opens it again (see [`Worker::reset`]).
+//! Break sends the attention signal too, which stops the batch on the
+//! server at once. The driver reads the server's acknowledgement; without
+//! one the connection is out of step, and the worker opens it again (see
+//! [`Worker::reset`]).
 //!
 //! Transactions behave like Oracle's: queries see what others committed,
 //! and changes wait for Commit unless the session autocommits (a change
@@ -50,8 +52,9 @@ pub(crate) type Tds = tiberius::Client<Compat<TcpStream>>;
 
 const DEFAULT_PORT: u16 = 1433;
 
-/// How long Break waits for the server to acknowledge the attention signal
-/// (the driver's command timeout before #199).
+/// How long Break, or closing a result (#383), waits for the server to
+/// acknowledge the attention signal (the driver's command timeout before
+/// #199).
 const ATTENTION_WAIT: Duration = Duration::from_secs(30);
 
 /// Session options of SQL Server Management Studio, which scripts expect.
@@ -96,6 +99,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         release: (0, 0),
         autocommit: false,
         pending: false,
+        xact_abort: false,
         context: NameContext::default(),
     };
     match worker.prepare_session() {
@@ -267,6 +271,9 @@ struct Worker {
     autocommit: bool,
     /// The server has an open transaction (`@@TRANCOUNT > 0`).
     pending: bool,
+    /// `SET XACT_ABORT ON`: the attention signal rolls back the open
+    /// transaction (#383).
+    xact_abort: bool,
     /// The database and default schema last reported (#320).
     context: NameContext,
 }
@@ -293,6 +300,8 @@ enum Ran {
     Outcome(Outcome),
     /// Break, with the statement's message: the batch is to be cancelled.
     Break(&'static str),
+    /// Another request closed a query's result with rows left (#383).
+    Closed,
 }
 
 /// Why a statement didn't end well.
@@ -520,11 +529,13 @@ impl Worker {
     }
 
     /// Whether a transaction is open, and the database and default schema,
-    /// reported when they changed (#320): after a USE, an EXECUTE AS.
+    /// reported when they changed (#320): after a USE, an EXECUTE AS. Also
+    /// whether XACT_ABORT is on (#383).
     fn read_state(&mut self) {
-        let row = self
-            .ms()
-            .rows("select @@trancount, db_name(), schema_name()", &[]);
+        let row = self.ms().rows(
+            "select @@trancount, db_name(), schema_name(), @@options & 16384",
+            &[],
+        );
         let mut values = match row {
             Ok(rows) => rows.into_iter().next().unwrap_or_default().into_iter(),
             Err(e) => return warn!("reading the session's state: {e}"),
@@ -532,6 +543,7 @@ impl Worker {
         self.pending = values.next().flatten().is_some_and(|t| t != "0");
         let database = values.next().flatten().unwrap_or_default();
         let schema = values.next().flatten().unwrap_or_default();
+        self.xact_abort = values.next().flatten().is_some_and(|x| x != "0");
         let context = NameContext {
             database,
             ..NameContext::schema(&schema)
@@ -565,6 +577,21 @@ impl Worker {
         match self.stream_statement(sql, binds, fetch, next)? {
             Ran::Outcome(outcome) => Ok(outcome),
             Ran::Break(message) => Err(cancel_running(&self.rt, &mut self.client, message)),
+            Ran::Closed => {
+                // A batch that only reads loses nothing but its rows: it is
+                // stopped, rather than sent in full and read off the wire
+                // before the next request (#383). With XACT_ABORT on, the
+                // attention would roll back the open transaction.
+                let stops = only_reads(sql) && !(self.pending && self.xact_abort);
+                if let Err(why) = stops
+                    .then(|| attention(&self.rt, &mut self.client))
+                    .transpose()
+                {
+                    debug!("closing a result: {why}");
+                    self.reset("Closing a result, SQL Server's batch couldn't be stopped");
+                }
+                Ok(Outcome::Query)
+            }
         }
     }
 
@@ -716,10 +743,9 @@ impl Worker {
                         started = Instant::now();
                     }
                     other => {
-                        // The driver reads the rest before the next request.
                         events.send(DbEvent::QueryClosed { id });
                         *next = Some(other.unwrap_or(DbRequest::Disconnect));
-                        return Ok(Ran::Outcome(Outcome::Query));
+                        return Ok(Ran::Closed);
                     }
                 }
             };
@@ -779,14 +805,16 @@ enum Wait {
     Cancel,
 }
 
-/// The stream's next item, or Break. The stream keeps what it has read of
-/// an item when Break comes first.
+/// The stream's next item, or Break. Break comes first when both are
+/// ready: rows that arrive faster than they are read kept it waiting until
+/// the fetch had all it asked for (#385). The stream keeps what it has
+/// read of an item when Break comes first.
 fn wait(rt: &Runtime, cancel: &Notify, stream: &mut QueryStream<'_>) -> Wait {
     rt.block_on(async {
         tokio::select! {
             biased;
-            item = stream.next() => Wait::Item(item),
             () = cancel.notified() => Wait::Cancel,
+            item = stream.next() => Wait::Item(item),
         }
     })
 }
@@ -800,26 +828,33 @@ fn report_messages(stream: &mut QueryStream<'_>, events: &Events) {
     }
 }
 
-/// Break: the attention signal stops the batch on the server. The server
-/// first ends its reply to the batch, then acknowledges in a reply of its
-/// own, which tiberius doesn't read; then the connection needs opening
-/// again. Statements have no time limit (#199), the wait for that reply
-/// has: without a network it would never end.
+/// Break: the attention signal stops the batch on the server; the
+/// connection needs opening again when it wasn't acknowledged.
 fn cancel_running(rt: &Runtime, client: &mut Tds, message: &'static str) -> Failure {
-    let acknowledged =
-        rt.block_on(async { tokio::time::timeout(ATTENTION_WAIT, client.cancel_query()).await });
-    let reopen = match acknowledged {
-        Ok(Ok(())) => false,
-        Ok(Err(e)) => {
-            debug!("after the attention: {e}");
-            true
-        }
-        Err(_) => {
-            debug!("no reply to the attention within {ATTENTION_WAIT:?}");
+    let reopen = match attention(rt, client) {
+        Ok(()) => false,
+        Err(why) => {
+            debug!("{why}");
             true
         }
     };
     Failure::Cancelled { message, reopen }
+}
+
+/// Sends the attention signal, which stops the batch on the server, and
+/// reads the reply: the server ends the batch's reply, then acknowledges
+/// in a reply of its own, which the driver reads up to (#384). Statements
+/// have no time limit (#199), the wait for the acknowledgement has: without
+/// a network it would never end. An error says why the connection is out
+/// of step.
+fn attention(rt: &Runtime, client: &mut Tds) -> Result<(), String> {
+    match rt.block_on(async { tokio::time::timeout(ATTENTION_WAIT, client.cancel_query()).await }) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("after the attention: {e}")),
+        Err(_) => Err(format!(
+            "no reply to the attention within {ATTENTION_WAIT:?}"
+        )),
+    }
 }
 
 /// A statement's error, placed at its line in the batch.
@@ -922,6 +957,41 @@ impl Client for MsClient<'_> {
 
 fn is_dml(kind: &str) -> bool {
     matches!(kind, "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+}
+
+/// Whether a batch only reads, so that stopping it loses nothing but rows
+/// (#383): a query, maybe after DECLAREs and SETs, with no word that
+/// changes, runs code or ends a transaction. A change with OUTPUT, a
+/// procedure, a SELECT INTO, a COMMIT after the query aren't stopped.
+fn only_reads(sql: &str) -> bool {
+    const WRITES: &[&str] = &[
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "MERGE",
+        "TRUNCATE",
+        "EXEC",
+        "EXECUTE",
+        "BULK",
+        "INTO",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "GRANT",
+        "REVOKE",
+        "DENY",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVE",
+        "USE",
+        "XACT_ABORT",
+    ];
+    let words = leading_words(sql);
+    matches!(
+        words.first().map(String::as_str),
+        Some("SELECT" | "WITH" | "DECLARE" | "SET")
+    ) && !has_word(sql, WRITES)
 }
 
 /// Whether a batch changes or locks rows, so it opens a transaction when
@@ -1326,6 +1396,43 @@ mod tests {
         assert_eq!((t.host.as_str(), t.port), ("::1", Some(1500)));
         assert!(parse_target("h:port").is_err());
         assert!(parse_target("h?compress").is_err());
+    }
+
+    /// Batches that a closed result stops: only those that read (#383).
+    #[test]
+    fn batches_that_only_read() {
+        for sql in [
+            "select * from big",
+            "SELECT a.n FROM a CROSS JOIN b",
+            "with r (n) as (select 1) select n from r",
+            "declare @n int = 5; select top (@n) * from t",
+            "set nocount on; select * from t with (nolock)",
+            "select 'insert into t' as text -- delete",
+            "select 1; select 2",
+        ] {
+            assert!(only_reads(sql), "{sql}");
+        }
+        for sql in [
+            "insert into t output inserted.id select id from s",
+            "update t set a = 1 output deleted.a",
+            "delete from t output deleted.*",
+            "merge t using s on t.id = s.id when matched then delete output $action;",
+            "with c as (select * from t) delete from c output deleted.id",
+            "select * from big; update t set a = 1",
+            "select * into t2 from t",
+            "exec sp_who2",
+            "sp_who2",
+            "select * from t; commit",
+            "select * from t\nrollback",
+            "begin tran; select * from t",
+            "set xact_abort on; select * from t",
+            "select * from t; create table u (a int)",
+            "use other; select * from t",
+            "truncate table t",
+            "",
+        ] {
+            assert!(!only_reads(sql), "{sql}");
+        }
     }
 
     /// Statements have no time limit unless the connection string sets
