@@ -1488,6 +1488,111 @@ fn a_views_ddl_names_its_tables_with_their_schemas() {
     h.ok("drop function r73_vp_f(int)");
 }
 
+/// The DDL of a trigger and of a routine names its tables, functions and
+/// types with their schemas, as a view's does (#329): run with another
+/// search path, by Edit in a window that set one, the trigger stays on its
+/// table and calls its function, and each routine is replaced rather than
+/// made again with other argument types (#350).
+#[test]
+fn the_ddl_of_triggers_and_routines_names_their_schemas() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    h.ok("drop schema if exists r81_sp, r81_sp_other cascade");
+    h.ok("drop table if exists r81_sp_t");
+    h.ok("drop function if exists r81_sp_tf(), r81_sp_g(int)");
+    h.ok("drop domain if exists r81_sp_d");
+    h.ok("create schema r81_sp");
+    h.ok("create schema r81_sp_other");
+    for (owner, n) in [(schema.as_str(), 1), ("r81_sp_other", 2)] {
+        h.ok(&format!("create table {owner}.r81_sp_t (n int)"));
+        h.ok(&format!("create domain {owner}.r81_sp_d as int"));
+        h.ok(&format!(
+            "create function {owner}.r81_sp_g(x int) returns int language sql \
+             as 'select x * {n}'"
+        ));
+        h.ok(&format!(
+            "create function {owner}.r81_sp_tf() returns trigger language plpgsql \
+             as 'begin return new; end'"
+        ));
+    }
+    // Names the session's path finds.
+    h.ok(
+        "create trigger r81_sp_tr before insert on r81_sp_t for each row \
+          when (r81_sp_g(new.n) > 0) execute function r81_sp_tf()",
+    );
+    h.ok(
+        "create function r81_sp.r81_sp_f(x r81_sp_d) returns r81_sp_d language sql \
+          return r81_sp_g(x)",
+    );
+    h.ok("revoke execute on function r81_sp.r81_sp_f(r81_sp_d) from public");
+    h.ok("create procedure r81_sp.r81_sp_p(x r81_sp_d) language sql \
+          begin atomic insert into r81_sp_t values (r81_sp_g(x)); end");
+    let trigger = ddl_of(&mut h, &schema, "r81_sp_tr", ObjectType::Trigger);
+    assert_eq!(
+        trigger,
+        format!(
+            "CREATE TRIGGER r81_sp_tr BEFORE INSERT ON {schema}.r81_sp_t FOR EACH ROW \
+             WHEN ({schema}.r81_sp_g(new.n) > 0) EXECUTE FUNCTION {schema}.r81_sp_tf();"
+        )
+    );
+    let function = ddl_of(&mut h, "r81_sp", "r81_sp_f", ObjectType::Function);
+    for part in [
+        format!("r81_sp.r81_sp_f(x {schema}.r81_sp_d)\n RETURNS {schema}.r81_sp_d\n"),
+        format!("RETURN {schema}.r81_sp_g("),
+        format!("revoke execute on function r81_sp.r81_sp_f(x {schema}.r81_sp_d) from public;"),
+    ] {
+        assert!(function.contains(&part), "{function}");
+    }
+    let procedure = ddl_of(&mut h, "r81_sp", "r81_sp_p", ObjectType::Procedure);
+    for part in [
+        format!("r81_sp.r81_sp_p(IN x {schema}.r81_sp_d)\n"),
+        format!("INSERT INTO {schema}.r81_sp_t"),
+        format!("{schema}.r81_sp_g("),
+    ] {
+        assert!(procedure.contains(&part), "{procedure}");
+    }
+    // As Edit runs them.
+    h.ok(&format!("set search_path = r81_sp_other, {schema}"));
+    run_ddl(
+        &mut h,
+        &trigger.replacen("CREATE TRIGGER", "CREATE OR REPLACE TRIGGER", 1),
+        "",
+        "",
+    );
+    run_ddl(&mut h, &function, "", "");
+    run_ddl(&mut h, &procedure, "", "");
+    h.ok("reset search_path");
+    assert_eq!(
+        h.scalar(
+            "select string_agg(c.relnamespace::regnamespace || '.' || c.relname || ' ' \
+                               || p.pronamespace::regnamespace || '.' || p.proname, ', ') \
+               from pg_trigger t join pg_class c on c.oid = t.tgrelid \
+               join pg_proc p on p.oid = t.tgfoid \
+              where t.tgname = 'r81_sp_tr'"
+        ),
+        Some(format!("{schema}.r81_sp_t {schema}.r81_sp_tf")),
+        "{trigger}"
+    );
+    assert_eq!(
+        h.scalar(
+            "select string_agg(p.proname || '(' || t.typnamespace::regnamespace || ')', ', ' \
+                               order by p.proname, t.typnamespace::regnamespace::text) \
+               from pg_proc p join pg_type t on t.oid = p.proargtypes[0] \
+              where p.pronamespace = 'r81_sp'::regnamespace"
+        ),
+        Some(format!("r81_sp_f({schema}), r81_sp_p({schema})")),
+        "{function}\n\n{procedure}"
+    );
+    assert_eq!(h.scalar("select r81_sp.r81_sp_f(3)").as_deref(), Some("3"));
+    h.ok("drop schema r81_sp, r81_sp_other cascade");
+    h.ok("drop table r81_sp_t");
+    h.ok("drop function r81_sp_tf(), r81_sp_g(int)");
+    h.ok("drop domain r81_sp_d");
+}
+
 /// A materialized view's DDL makes it as it is: owned by its owner where
 /// that isn't the role reading it, without data where it has none, with
 /// its storage parameters, tablespace and access method. Run in another

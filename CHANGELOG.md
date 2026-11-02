@@ -1112,6 +1112,13 @@ All notable changes to Pythia are documented here. The format follows
   the statement's, or the fetch's, as one without rows first is. An error
   after a result of a statement with several, which comes the same way
   on MySQL, PostgreSQL and SQL Server, is too.
+- PostgreSQL: the DDL of a trigger, function or procedure names every
+  table, function and type with its schema (#350), as a view's does
+  since #329. It left the schema out where the connection's search path
+  found them, `ON t … EXECUTE FUNCTION tf()` for `public.t`, so that
+  *Edit* in a SQL window whose search path finds another `t` first made
+  the trigger on that table, and a routine whose argument types it finds
+  elsewhere was made again beside the one edited, with those types.
 
 ## [0.10.0] - 2026-10-30
 

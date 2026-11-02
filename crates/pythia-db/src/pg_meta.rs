@@ -513,50 +513,14 @@ fn ddl(
         ObjectType::View | ObjectType::MaterializedView => {
             on_path(pg, "", || view_ddl(pg, owner, name, object_type, end))?.ok_or_else(missing)
         }
-        // Each overload with its grants (#331).
+        // A routine's and a trigger's too: its argument and return types,
+        // its body's tables and functions, a trigger's table and function
+        // (#350).
         ObjectType::Function | ObjectType::Procedure => {
-            let rows = pg.rows(
-                "select pg_get_functiondef(p.oid), p.oid, \
-                        case p.prokind when 'p' then 'procedure ' else 'function ' end \
-                        || quote_ident(n.nspname) || '.' || quote_ident(p.proname) \
-                        || '(' || pg_get_function_identity_arguments(p.oid) || ')' \
-                   from pg_proc p \
-                   join pg_namespace n on n.oid = p.pronamespace \
-                  where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
-                  order by p.oid",
-                &[owner, name],
-            )?;
-            let mut overloads = Vec::new();
-            for row in rows {
-                if let [Some(definition), Some(oid), Some(on)] = row.as_slice() {
-                    let mut rest = String::new();
-                    grants(pg, &mut rest, Privileges::Routine, oid, on)?;
-                    overloads.push(followed(definition.trim_end(), &rest, end));
-                }
-            }
-            if overloads.is_empty() {
-                return Err(missing());
-            }
-            Ok(overloads.join("\n\n"))
+            on_path(pg, "", || routine_ddl(pg, owner, name, end))?.ok_or_else(missing)
         }
         ObjectType::Trigger => {
-            let rows = pg.rows(
-                "select pg_get_triggerdef(t.oid, true) from pg_trigger t \
-                   join pg_class c on c.oid = t.tgrelid \
-                   join pg_namespace n on n.oid = c.relnamespace \
-                  where n.nspname = $1 and t.tgname = $2 and not t.tgisinternal \
-                  order by c.relname",
-                &[owner, name],
-            )?;
-            let triggers: Vec<String> = rows
-                .into_iter()
-                .filter_map(first)
-                .map(|t| format!("{t}{end}"))
-                .collect();
-            if triggers.is_empty() {
-                return Err(missing());
-            }
-            Ok(triggers.join("\n\n"))
+            on_path(pg, "", || trigger_ddl(pg, owner, name, end))?.ok_or_else(missing)
         }
         ObjectType::Sequence => {
             let (owner, name) = stored(pg, owner, name)?;
@@ -581,6 +545,49 @@ fn followed(ddl: &str, rest: &str, end: &str) -> String {
     } else {
         format!("{ddl};{rest}")
     }
+}
+
+/// Each overload of a function or procedure with its grants (#331), if
+/// there is one.
+fn routine_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+    let rows = pg.rows(
+        "select pg_get_functiondef(p.oid), p.oid, \
+                case p.prokind when 'p' then 'procedure ' else 'function ' end \
+                || quote_ident(n.nspname) || '.' || quote_ident(p.proname) \
+                || '(' || pg_get_function_identity_arguments(p.oid) || ')' \
+           from pg_proc p \
+           join pg_namespace n on n.oid = p.pronamespace \
+          where n.nspname = $1 and p.proname = $2 and p.prokind in ('f', 'p') \
+          order by p.oid",
+        &[owner, name],
+    )?;
+    let mut overloads = Vec::new();
+    for row in rows {
+        if let [Some(definition), Some(oid), Some(on)] = row.as_slice() {
+            let mut rest = String::new();
+            grants(pg, &mut rest, Privileges::Routine, oid, on)?;
+            overloads.push(followed(definition.trim_end(), &rest, end));
+        }
+    }
+    Ok((!overloads.is_empty()).then(|| overloads.join("\n\n")))
+}
+
+/// The triggers of the name on the schema's tables, if there is one.
+fn trigger_ddl(pg: &Pg<'_>, owner: &str, name: &str, end: &str) -> Result<Option<String>, DbError> {
+    let rows = pg.rows(
+        "select pg_get_triggerdef(t.oid, true) from pg_trigger t \
+           join pg_class c on c.oid = t.tgrelid \
+           join pg_namespace n on n.oid = c.relnamespace \
+          where n.nspname = $1 and t.tgname = $2 and not t.tgisinternal \
+          order by c.relname",
+        &[owner, name],
+    )?;
+    let triggers: Vec<String> = rows
+        .into_iter()
+        .filter_map(first)
+        .map(|t| format!("{t}{end}"))
+        .collect();
+    Ok((!triggers.is_empty()).then(|| triggers.join("\n\n")))
 }
 
 /// A relation's storage parameters, then its TOAST table's as `toast.…`, as
