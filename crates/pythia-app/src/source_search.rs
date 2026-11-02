@@ -133,12 +133,17 @@ impl SourceSearch {
         self.state.pending.is_some()
     }
 
+    /// What is searched for: the text as typed, blanks too (#438), none
+    /// if it is only blanks.
+    fn pattern(&self) -> Option<String> {
+        Some(self.query.clone()).filter(|q| !q.trim().is_empty())
+    }
+
     pub fn search(&mut self) -> Effects {
         let mut effects = Effects::default();
-        let pattern = self.query.trim().to_owned();
-        if pattern.is_empty() || self.is_busy() {
+        let Some(pattern) = self.pattern().filter(|_| !self.is_busy()) else {
             return effects;
-        }
+        };
         let (regex, match_case, include_oracle, kind) =
             (self.regex, self.match_case, self.include_oracle, self.kind);
         // As Oracle reads it: `"my_schema"` as written (#337).
@@ -571,6 +576,20 @@ fn line_matcher(pattern: &str, regex: bool, match_case: bool) -> Box<dyn Fn(&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The text is searched as typed: ` end` doesn't find `append`, and
+    /// ` +$` stays a regular expression (#438).
+    #[test]
+    fn the_pattern_keeps_its_blanks() {
+        let search = |query: &str| SourceSearch {
+            query: query.into(),
+            ..SourceSearch::default()
+        };
+        assert_eq!(search(" end").pattern().as_deref(), Some(" end"));
+        assert_eq!(search(" +$").pattern().as_deref(), Some(" +$"));
+        assert_eq!(search("  ").pattern(), None);
+        assert!(!line_matcher(" end", false, false)("x := append(y);"));
+    }
 
     #[test]
     fn line_matching() {

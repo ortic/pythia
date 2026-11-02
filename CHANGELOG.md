@@ -351,6 +351,8 @@ All notable changes to Pythia are documented here. The format follows
   text, and Edit changes rows that have one (#436).
 - Oracle: Find in Source finds text past the first 4000 bytes of a view
   (#437).
+- Find in Source searches the text as typed, blanks around it too
+  (#438).
 
 ## [0.11.0] - 2026-11-02
 
