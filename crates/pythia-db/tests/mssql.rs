@@ -4229,3 +4229,37 @@ fn renamed_modules_keep_their_names() {
     );
     cleanup(&mut h);
 }
+
+/// A batch that starts with a SELECT and changes rows further on runs in
+/// the window's transaction (#454): it was committed at once, and Rollback
+/// undid nothing.
+#[test]
+fn a_select_batch_that_changes_waits_for_commit() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.ok("drop table if exists r101_batch");
+    h.ok("create table r101_batch (n int)");
+    h.ok("insert into r101_batch values (1)");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+    h.execute(
+        0,
+        "select n from r101_batch\nupdate r101_batch set n = 2",
+        10,
+    );
+    let pending = loop {
+        match h.next() {
+            DbEvent::Transaction { pending } => break pending,
+            DbEvent::Failed { error, .. } => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(pending);
+    h.session.send(DbRequest::Rollback);
+    h.settle();
+    assert_eq!(h.scalar("select n from r101_batch").as_deref(), Some("1"));
+    h.ok("drop table r101_batch");
+    h.session.send(DbRequest::Commit);
+    h.settle();
+}

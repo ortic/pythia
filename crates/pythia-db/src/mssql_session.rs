@@ -1010,10 +1010,11 @@ fn changes(sql: &str) -> bool {
         "UPDATE" if second == "STATISTICS" => false,
         _ if CHANGES.contains(&first) => true,
         "BEGIN" if matches!(second, "TRAN" | "TRANSACTION" | "DISTRIBUTED") => false,
-        "SELECT" => has_word(sql, LOCKS),
-        "WITH" | "DECLARE" | "BEGIN" | "IF" | "WHILE" | "SET" => {
-            has_word(sql, CHANGES) || has_word(sql, LOCKS)
-        }
+        // A batch may go on after its first statement without a `;`:
+        // `select …` and an `update …` on the next line changed rows outside
+        // a transaction, committed at once (#454).
+        "WITH" | "DECLARE" | "BEGIN" | "IF" | "WHILE" | "SET" | "SELECT" | "PRINT" | "USE"
+        | "WAITFOR" | "RAISERROR" | "THROW" => has_word(sql, CHANGES) || has_word(sql, LOCKS),
         _ => false,
     }
 }
@@ -1498,6 +1499,11 @@ mod tests {
                 false,
             ),
             ("if exists (select 1 from t) delete from t", true),
+            // Changes later in the batch (#454).
+            ("select * from t\nupdate t set a = 1", true),
+            ("print 'archiving'\ndelete from t where old = 1", true),
+            ("use shop\ninsert into t values (1)", true),
+            ("select 'update' as what from t -- delete", false),
         ] {
             assert_eq!(changes(sql), changes_rows, "{sql}");
         }

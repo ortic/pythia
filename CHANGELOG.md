@@ -408,6 +408,8 @@ All notable changes to Pythia are documented here. The format follows
   *Edit* makes a routine or trigger again under its own collation (#452).
 - MySQL: `WITH … UPDATE` and `WITH … DELETE` wait for Commit, as UPDATE
   and DELETE do: they were committed at once (#453).
+- SQL Server: a batch that starts with a SELECT, PRINT or USE and changes
+  rows further on waits for Commit: it was committed at once (#454).
 
 ## [0.11.0] - 2026-11-02
 
