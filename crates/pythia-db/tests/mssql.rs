@@ -2039,6 +2039,42 @@ fn index_options_and_storage() {
     drop(h);
     drop_database(&mut dba, &db);
 }
+/// A foreign key to the table's own unique index (one no constraint
+/// makes) is added after that index: in the create, it failed with
+/// Msg 1776, "There are no primary or candidate keys in the referenced
+/// table".
+#[test]
+fn a_key_to_the_tables_own_unique_index_runs_again() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    for schema in ["r95_s", "r95_c"] {
+        h.ok(&format!("drop table if exists {schema}.r95_tree"));
+        h.ok(&format!("drop schema if exists {schema}"));
+        h.ok(&format!("create schema {schema}"));
+    }
+    h.ok(
+        "create table r95_s.r95_tree (id int primary key, code nvarchar(10) not null, \
+           parent_code nvarchar(10), parent_id int constraint r95_up references r95_s.r95_tree)",
+    );
+    h.ok("create unique index r95_code on r95_s.r95_tree (code)");
+    h.ok(
+        "alter table r95_s.r95_tree add constraint r95_parent foreign key (parent_code) \
+           references r95_s.r95_tree (code)",
+    );
+    let ddl = table_ddl(&mut h, "r95_s", "r95_tree");
+    let at = |text: &str| ddl.find(text).unwrap_or_else(|| panic!("{text}: {ddl}"));
+    assert!(at("[r95_code]") < at("constraint [r95_parent]"), "{ddl}");
+    assert!(at("constraint [r95_up]") < at("[r95_code]"), "{ddl}");
+    run_ddl_in(&mut h, &ddl, "r95_s", "r95_c", &["r95_tree"]);
+    h.ok("insert into r95_c.r95_tree values (1, 'a', null, null), (2, 'b', 'a', 1)");
+    for schema in ["r95_c", "r95_s"] {
+        h.ok(&format!("drop table {schema}.r95_tree"));
+        h.ok(&format!("drop schema {schema}"));
+    }
+}
+
 /// A table's DDL, as `MetaQuery::Ddl` reads it.
 fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
     let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {

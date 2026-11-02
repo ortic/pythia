@@ -1533,6 +1533,40 @@ fn ddl_of(h: &mut Harness, owner: &str, name: &str, object_type: ObjectType) -> 
     ddl
 }
 
+/// A foreign key to the table's own unique index (one no constraint
+/// makes) comes after that index in the DDL, which kept the index out
+/// and put the key in the create: run, it failed with "there is no unique
+/// constraint matching given keys".
+#[test]
+fn a_key_to_the_tables_own_unique_index_runs_again() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r95_tree, r95_tree_copy cascade");
+    h.ok("create schema r95_tree");
+    h.ok("create schema r95_tree_copy");
+    h.ok(
+        "create table r95_tree.tree (id int primary key, code text not null, \
+           parent_code text, parent_id int constraint tree_up references r95_tree.tree)",
+    );
+    h.ok("create unique index tree_code on r95_tree.tree (code)");
+    h.ok(
+        "alter table r95_tree.tree add constraint tree_parent foreign key (parent_code) \
+           references r95_tree.tree (code)",
+    );
+    let ddl = ddl_of(&mut h, "r95_tree", "tree", ObjectType::Table);
+    assert!(ddl.contains("CREATE UNIQUE INDEX tree_code"), "{ddl}");
+    let index = ddl.find("CREATE UNIQUE INDEX tree_code").unwrap();
+    let key = ddl.find("constraint tree_parent").expect(&ddl);
+    assert!(index < key, "{ddl}");
+    // A key to the primary key stays in the create.
+    assert!(ddl.find("constraint tree_up").unwrap() < index, "{ddl}");
+    run_ddl(&mut h, &ddl, "r95_tree.", "r95_tree_copy.");
+    h.ok("insert into r95_tree_copy.tree values (1, 'a', null, null), (2, 'b', 'a', 1)");
+    h.ok("drop schema r95_tree, r95_tree_copy cascade");
+}
+
 /// A view's DDL names its tables and functions with their schemas, as a
 /// table's does (#226): run with another search path, by Edit in a window
 /// that set one, the view reads the same tables as before (#329).

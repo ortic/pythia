@@ -924,6 +924,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .collect();
     // pg_get_constraintdef leaves out the storage parameters of a key's
     // index and the tablespace of a key's or exclusion constraint's (#352).
+    // A foreign key to the table's own unique index that no constraint
+    // makes goes after the index, which the create can't have yet: last.
     let constraints = pg.rows(
         &format!(
             "select 'constraint ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid, true), \
@@ -931,7 +933,11 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
                            ' USING INDEX TABLESPACE ' || quote_ident(t.spcname)), \
                     concat(' WHERE (' || pg_get_expr(i.indpred, i.indrelid, true) || ')', \
                            case when k.condeferrable then ' DEFERRABLE' end, \
-                           case when k.condeferred then ' INITIALLY DEFERRED' end) \
+                           case when k.condeferred then ' INITIALLY DEFERRED' end), \
+                    k.contype = 'f' and k.confrelid = k.conrelid \
+                      and not exists (select 1 from pg_constraint u \
+                                       where u.conindid = k.conindid and u.conrelid = k.conrelid \
+                                         and u.contype in ('p', 'u')) \
                from pg_constraint k \
                left join pg_index i on i.indexrelid = k.conindid and k.contype in ('p', 'u', 'x') \
                left join pg_class c on c.oid = i.indexrelid \
@@ -941,11 +947,21 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         ),
         &[],
     )?;
-    lines.extend(constraints.into_iter().filter_map(|row| {
+    let mut late = Vec::new();
+    for row in constraints {
         let mut values = row.into_iter().map(Option::unwrap_or_default);
-        let (definition, index, tail) = (values.next()?, values.next()?, values.next()?);
-        Some(inserted(&definition, &index, &tail))
-    }));
+        let (Some(definition), Some(index), Some(tail), Some(after)) =
+            (values.next(), values.next(), values.next(), values.next())
+        else {
+            continue;
+        };
+        let constraint = inserted(&definition, &index, &tail);
+        if after == "t" {
+            late.push(constraint);
+        } else {
+            lines.push(constraint);
+        }
+    }
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
     let mut notes = Vec::new();
@@ -976,6 +992,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         ddl.push_str(&format!("\n\nalter table {qualified} owner to {role};"));
     }
     indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
+    for constraint in late {
+        ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
+    }
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
@@ -1007,7 +1026,7 @@ fn indexes_and_comments(
                left join pg_tablespace t on t.oid = c.reltablespace \
               where i.indrelid = {oid} \
                 and not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid \
-                                   and k.conrelid = i.indrelid) \
+                                   and k.conrelid = i.indrelid and k.contype in ('p', 'u', 'x')) \
               order by 1"
         ),
         &[],

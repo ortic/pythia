@@ -56,6 +56,10 @@ All notable changes to Pythia are documented here. The format follows
   gone and the next Apply tried the drop again. Now the message says it
   was dropped, and Apply creates it. A materialized view's new query is
   checked before the drop.
+- PostgreSQL and SQL Server: a table's DDL runs again when a foreign
+  key references the table's own unique index (#396). PostgreSQL's left
+  that index out, and both put the key in the CREATE TABLE, before the
+  index it needs; it is added after the indexes now.
 
 ## [0.11.0] - 2026-11-02
 

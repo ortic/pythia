@@ -784,6 +784,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                          else '' end, null, \
                   case when f.is_disabled = 1 then 2 \
                        when f.is_not_trusted = 1 and f.is_not_for_replication = 0 then 1 \
+                       when f.referenced_object_id = f.parent_object_id \
+                        and not exists (select 1 from sys.key_constraints kc \
+                                         where kc.parent_object_id = f.referenced_object_id \
+                                           and kc.unique_index_id = f.key_index_id) then 3 \
                        else 0 end, \
                   3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
@@ -808,7 +812,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .filter_map(first)
         .collect();
     // The constraints that aren't trusted are added after the table and its
-    // indexes, WITH NOCHECK, and the disabled ones disabled.
+    // indexes, WITH NOCHECK, and the disabled ones disabled. So is a foreign
+    // key to the table's own unique index that no constraint makes, which
+    // the create can't have yet.
     let mut nocheck = Vec::new();
     for row in constraints {
         let mut values = row.into_iter();
@@ -837,6 +843,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                     nocheck.push(format!("alter table {object} nocheck constraint {quoted};"));
                 }
             }
+            Some("3") => nocheck.push(format!("alter table {object} add {constraint};")),
             _ => lines.push(constraint),
         }
     }
