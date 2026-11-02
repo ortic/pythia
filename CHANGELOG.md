@@ -63,6 +63,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: *Edit* of a constraint trigger opens a script that drops
   and creates it in one block (#397); the plain CREATE it opened failed,
   the trigger being there, and PostgreSQL has no OR REPLACE for one.
+- PostgreSQL: an array slice's bounds (`a[1:n]`, `a[1:2]`) are no bind
+  variables (#398): the window asked for a value of `n`, and Explain
+  plan sent `a[1$1]`, a syntax error.
 
 ## [0.11.0] - 2026-11-02
 

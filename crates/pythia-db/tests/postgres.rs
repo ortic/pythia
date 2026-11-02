@@ -1001,6 +1001,13 @@ fn dictionary() {
             .any(|r| r[4].as_deref().is_some_and(|o| o.starts_with("meta_"))),
         "{rows:?}"
     );
+    // An array slice's bounds are no binds: explained as written.
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::ExplainPlan {
+        sql: "select (array[1,2,3])[1:2] from meta_emp".into(),
+    }) else {
+        panic!("expected a plan")
+    };
+    assert!(!rows.is_empty());
 
     h.ok("drop view meta_v");
     h.ok("drop table meta_emp");

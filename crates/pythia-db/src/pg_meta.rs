@@ -1179,16 +1179,21 @@ fn explain_plan(pg: &Pg<'_>, sql: &str) -> Result<MetaResult, DbError> {
 }
 
 /// Replaces `:name` binds by `$1`, `$2`, … (the same name, the same
-/// number); returns how many names there were.
+/// number); returns how many names there were. Read as PostgreSQL reads
+/// it, as the window finds its binds: `:1` is none, nor is an array
+/// slice's `a[1:n]`.
 fn numbered_binds(sql: &str) -> (String, usize) {
     let mut names: Vec<String> = Vec::new();
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
-    for token in pythia_plsql::tokenize(sql) {
+    for token in pythia_plsql::tokenize_in(sql, pythia_plsql::Syntax::Postgres) {
         if token.kind != pythia_plsql::TokenKind::BindVar {
             continue;
         }
         let name = sql[token.span.start + 1..token.span.end].to_lowercase();
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
         let n = match names.iter().position(|n| *n == name) {
             Some(i) => i + 1,
             None => {
@@ -1347,5 +1352,8 @@ mod tests {
                 2
             )
         );
+        // Array slices and `:1` aren't binds, nor is a `:x` in an `E'…'`.
+        let slices = r"select (array[1,2,3])[1:2], a[2:n], E'\' :x' from t where b = :b";
+        assert_eq!(numbered_binds(slices), (slices.replace(":b", "$1"), 1));
     }
 }
