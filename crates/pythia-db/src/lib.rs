@@ -89,7 +89,8 @@ fn take_test_lock(path: &std::path::Path) -> Option<std::fs::File> {
 /// with the `thick` feature the `oracle` crate itself (ODPI-C, needs the
 /// Oracle Instant Client).
 #[cfg(feature = "thick")]
-pub use ::oracle;
+#[path = "thick.rs"]
+pub mod oracle;
 #[cfg(not(feature = "thick"))]
 #[path = "thin.rs"]
 pub mod oracle;
