@@ -495,20 +495,20 @@ fn ddl(
     })
 }
 
-/// `CREATE TABLE` with its columns and constraints, then its other indexes;
-/// a memory-optimized table declares its indexes in it. A column's
-/// collation is written where it isn't the database's (#323), so that run
-/// elsewhere the others take that database's, as they were made. A
-/// temporal table's period columns are `generated always`, hidden or not,
-/// and its period comes last (#324). Sparse columns and a column set are
-/// declared so (#325), masked columns with their masks (#348): their
-/// functions keep their quotes doubled in the catalog, as they go between
-/// quotes. A typed XML column names its schema collection, which is made
-/// apart, as a foreign key's table is (#349). ROWGUIDCOL, a persisted
-/// computed column's NOT NULL and NOT FOR REPLICATION are kept (#355). What
-/// CREATE TABLE can't give follows the table: its lock escalation, foreign
-/// keys and checks that aren't trusted, disabled ones disabled, and
-/// disabled indexes (#326).
+/// `CREATE TABLE` with its columns and constraints, then its other indexes
+/// and its statistics (#357); a memory-optimized table declares its indexes
+/// in it. A column's collation is written where it isn't the database's
+/// (#323), so that run elsewhere the others take that database's, as they
+/// were made. A temporal table's period columns are `generated always`,
+/// hidden or not, and its period comes last (#324). Sparse columns and a
+/// column set are declared so (#325), masked columns with their masks
+/// (#348): their functions keep their quotes doubled in the catalog, as
+/// they go between quotes. A typed XML column names its schema collection,
+/// which is made apart, as a foreign key's table is (#349). ROWGUIDCOL, a
+/// persisted computed column's NOT NULL and NOT FOR REPLICATION are kept
+/// (#355). What CREATE TABLE can't give follows the table: its lock
+/// escalation, foreign keys and checks that aren't trusted, disabled ones
+/// disabled, and disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
@@ -570,14 +570,16 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         return Err(DbError::new(format!("No table {object}")));
     }
     // Catalog columns of later versions: a columnstore index's ORDER
-    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022) and
-    // a temporal table's HISTORY_RETENTION_PERIOD (2017).
+    // (2022), OPTIMIZE_FOR_SEQUENTIAL_KEY (2019), XML_COMPRESSION (2022), a
+    // temporal table's HISTORY_RETENTION_PERIOD (2017) and the AUTO_DROP of
+    // statistics (2022).
     let later = ms
         .rows(
             "select col_length('sys.index_columns', 'column_store_order_ordinal'), \
                     col_length('sys.indexes', 'optimize_for_sequential_key'), \
                     col_length('sys.partitions', 'xml_compression'), \
-                    col_length('sys.tables', 'history_retention_period')",
+                    col_length('sys.tables', 'history_retention_period'), \
+                    col_length('sys.stats', 'auto_drop')",
             &[],
         )?
         .into_iter()
@@ -944,10 +946,71 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .into_iter()
         .filter_map(first)
         .map(|index| format!("alter index {index} on {object} disable;"));
-    for statement in indexes.into_iter().chain(nocheck).chain(disabled) {
+    let statistics = statistics(ms, object, has(4))?;
+    for statement in indexes
+        .into_iter()
+        .chain(statistics)
+        .chain(nocheck)
+        .chain(disabled)
+    {
         ddl.push_str(&format!("\n\n{statement}"));
     }
     Ok(ddl)
+}
+
+/// The statistics made on the table, after its indexes, with their filters
+/// and the options that aren't the defaults (#357); those of its indexes,
+/// and the ones SQL Server made itself, aren't. `auto_drop` tells whether
+/// the catalog has AUTO_DROP (2022). A persisted sample percent isn't kept
+/// by CREATE STATISTICS on a table without rows.
+fn statistics(ms: &mut Ms<'_>, object: &str, auto_drop: bool) -> Result<Vec<String>, DbError> {
+    let columns = Lists::read(
+        ms,
+        "select s.name, 'columns', quotename(col_name(sc.object_id, sc.column_id)), \
+                sc.stats_column_id \
+           from sys.stats s \
+           join sys.stats_columns sc on sc.object_id = s.object_id and sc.stats_id = s.stats_id \
+          where s.object_id = object_id(@P1) and s.user_created = 1 \
+          order by 4",
+        object,
+    )?;
+    let auto_drop = if auto_drop { "s.auto_drop" } else { "0" };
+    let rows = ms.rows(
+        &format!(
+            "select s.name, quotename(s.name), coalesce(' where ' + s.filter_definition, ''), \
+                    s.no_recompute, s.is_incremental, {auto_drop} \
+               from sys.stats s \
+              where s.object_id = object_id(@P1) and s.user_created = 1 and s.is_temporary = 0 \
+              order by s.name"
+        ),
+        &[object],
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let get = |i: usize| row.get(i).cloned().flatten();
+            let on = |i: usize| get(i).as_deref() == Some("1");
+            let (name, quoted) = (get(0)?, get(1)?);
+            let options: Vec<&str> = [
+                (on(3), "norecompute"),
+                (on(4), "incremental = on"),
+                (on(5), "auto_drop = on"),
+            ]
+            .into_iter()
+            .filter_map(|(on, option)| on.then_some(option))
+            .collect();
+            let with = if options.is_empty() {
+                String::new()
+            } else {
+                format!(" with {}", options.join(", "))
+            };
+            Some(format!(
+                "create statistics {quoted} on {object}{}{}{with};",
+                columns.clause(" ", &name, "columns"),
+                get(2).unwrap_or_default()
+            ))
+        })
+        .collect())
 }
 
 /// What an index has that isn't the default: its options, for `with (…)`,

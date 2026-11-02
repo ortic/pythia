@@ -1128,6 +1128,11 @@ All notable changes to Pythia are documented here. The format follows
   column rejects, and its foreign keys and checks, added `with nocheck`
   as SQL Server never trusts one not for replication, checked the rows
   replication puts in.
+- SQL Server: a table's DDL makes its statistics (#357): those made
+  with `create statistics` follow its indexes, with their `where` and
+  `norecompute`, `incremental = on` and `auto_drop = on`. A copy had
+  none of them, and SQL Server makes no statistics on several columns
+  or with a filter by itself.
 
 ## [0.10.0] - 2026-10-30
 

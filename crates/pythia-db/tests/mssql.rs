@@ -2815,6 +2815,109 @@ fn rowguidcol_not_null_and_not_for_replication() {
     drop_tables(&mut h, &schema, "r82_r");
 }
 
+/// A table's DDL makes the statistics made on it, with their filters and
+/// options (#357); those of its indexes and the ones SQL Server makes
+/// itself are left out. Run elsewhere, the copy has the same statistics.
+/// In a database of its own: SQL Server lists the objects of incremental
+/// statistics in sys.all_objects with names that aren't UTF-16, which fail
+/// other tests' queries of it.
+#[test]
+fn user_statistics() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let mut h = own_database(&mut dba, "r82_stats", &[]);
+    let schema = "dbo";
+    let major = h
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    // AUTO_DROP came with SQL Server 2022.
+    let auto_drop = major >= 16;
+    for sql in [
+        "create partition function r82_st_pf (int) as range right for values (100)",
+        "create partition scheme r82_st_ps as partition r82_st_pf all to ([primary])",
+        "create table r82_st (id int constraint r82_st_pk primary key, a int, b varchar(10), \
+         c int)",
+        "create index r82_st_b on r82_st (b)",
+        "create statistics r82_st_ab on r82_st (a, b)",
+        "create statistics r82_st_f on r82_st (c) where c > 10 with norecompute",
+        "create table r82_stp (id int not null, v int) on r82_st_ps (id)",
+        "create statistics r82_stp_v on r82_stp (v, id) with incremental = on, norecompute",
+    ] {
+        h.ok(sql);
+    }
+    if auto_drop {
+        h.ok("create statistics r82_st_ad on r82_st (a) with auto_drop = on");
+    }
+    let st = table_ddl(&mut h, schema, "r82_st");
+    let t = format!("[{schema}].[r82_st]");
+    let ad = if auto_drop {
+        format!("create statistics [r82_st_ad] on {t} ([a]) with auto_drop = on;\n\n")
+    } else {
+        String::new()
+    };
+    assert!(
+        st.ends_with(&format!(
+            ");\n\n\
+             create nonclustered index [r82_st_b] on {t} ([b]);\n\n\
+             create statistics [r82_st_ab] on {t} ([a], [b]);\n\n\
+             {ad}\
+             create statistics [r82_st_f] on {t} ([c]) where ([c]>(10)) with norecompute;\nGO\n"
+        )),
+        "{st}"
+    );
+    let stp = table_ddl(&mut h, schema, "r82_stp");
+    let t = format!("[{schema}].[r82_stp]");
+    assert!(
+        stp.ends_with(&format!(
+            ") on [r82_st_ps] ([id]);\n\n\
+             create statistics [r82_stp_v] on {t} ([v], [id]) \
+               with norecompute, incremental = on;\nGO\n"
+        )),
+        "{stp}"
+    );
+    let catalog = |h: &mut Harness, owner: &str| {
+        h.scalar(&format!(
+            "select string_agg(concat_ws(' ', object_name(s.object_id), s.name, s.user_created, \
+                                         s.has_filter, s.filter_definition, s.no_recompute, \
+                                         s.is_incremental, c.names) \
+                               collate database_default, '; ') \
+                      within group (order by object_name(s.object_id), s.name) \
+               from sys.stats s \
+              outer apply (select string_agg(col_name(sc.object_id, sc.column_id), ',') \
+                                    within group (order by sc.stats_column_id) as names \
+                             from sys.stats_columns sc \
+                            where sc.object_id = s.object_id and sc.stats_id = s.stats_id) c \
+              where s.object_id in (select object_id from sys.tables \
+                                     where schema_id = schema_id('{owner}') \
+                                       and name like 'r82_st%') \
+                and s.name not like '[_]WA[_]Sys[_]%' \
+                and s.name not like 'PK[_][_]%'"
+        ))
+    };
+    let before = catalog(&mut h, schema);
+    h.ok("create schema r82_copy_st");
+    for ddl in [&st, &stp] {
+        run_ddl_in(&mut h, ddl, schema, "r82_copy_st", &["r82_st", "r82_stp"]);
+    }
+    assert_eq!(catalog(&mut h, "r82_copy_st"), before);
+    if auto_drop {
+        assert_eq!(
+            h.scalar(
+                "select auto_drop from sys.stats \
+                  where object_id = object_id('r82_copy_st.r82_st') and name = 'r82_st_ad'"
+            )
+            .as_deref(),
+            Some("1")
+        );
+    }
+    drop(h);
+    drop_database(&mut dba, "r82_stats");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.
