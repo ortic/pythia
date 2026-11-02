@@ -248,6 +248,10 @@ All notable changes to Pythia are documented here. The format follows
   only a number it holds, a date only a day Oracle reads (1500-02-29
   is one, by the Julian calendar); a CLOB is compared with
   `dbms_lob.compare`.
+- SQL Server: a ledger table's history table's DDL says that its ledger
+  table's DDL makes it (#381). It was a plain table's, which, run before
+  the ledger table's DDL, made that fail with Msg 37355, and run alone
+  made a table no ledger keeps.
 
 ## [0.11.0] - 2026-11-02
 

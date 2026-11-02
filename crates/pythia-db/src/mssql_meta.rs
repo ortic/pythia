@@ -543,6 +543,23 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .next()
         .unwrap_or_default();
     let has = |i: usize| later.get(i).is_some_and(Option::is_some);
+    // A ledger history table is made by its ledger table's DDL (#366),
+    // which fails where one was made before (#381).
+    if has(7)
+        && let Some(ledger) = ms
+            .rows(
+                "select quotename(schema_name(t.schema_id)) + '.' + quotename(t.name) \
+                   from sys.tables t \
+                  where t.history_table_id = object_id(@P1) and t.ledger_type = 2",
+                &[object],
+            )?
+            .into_iter()
+            .find_map(first)
+    {
+        return Ok(format!(
+            "-- The ledger history table of {ledger}, made by that table's DDL."
+        ));
+    }
     let graph = has(5);
     let graph_type = if graph { "c.graph_type" } else { "null" };
     // Each column and whether SQL Server added it to a graph table: those

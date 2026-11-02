@@ -3580,6 +3580,46 @@ fn ledger_tables() {
     drop_database(&mut dba, "r82_ledger");
 }
 
+/// A ledger table's history table says that the ledger table's DDL makes
+/// it (#381), as one made before fails that DDL (SQL Server 2022).
+#[test]
+fn ledger_history_tables() {
+    let Some(params) = dba_params() else {
+        return;
+    };
+    let mut dba = Harness::with(params);
+    dba.session.send(DbRequest::SetAutocommit(true));
+    let major = dba
+        .scalar("select cast(serverproperty('ProductMajorVersion') as int)")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_default();
+    if major < 16 {
+        return;
+    }
+    let mut h = own_database(&mut dba, "r82_ledger_h", &[]);
+    for sql in [
+        "create table r82_lu (id int constraint r82_lu_pk primary key, v varchar(10)) \
+         with (system_versioning = on, ledger = on)",
+        "create table r82_ln (id int) with (system_versioning = on \
+           (history_table = dbo.r82_ln_hist), ledger = on)",
+    ] {
+        h.ok(sql);
+    }
+    let history = h
+        .scalar("select object_name(history_table_id) from sys.tables where name = 'r82_lu'")
+        .expect("the history table");
+    assert_eq!(
+        table_ddl(&mut h, "dbo", &history),
+        "-- The ledger history table of [dbo].[r82_lu], made by that table's DDL.\nGO\n"
+    );
+    assert_eq!(
+        table_ddl(&mut h, "dbo", "r82_ln_hist"),
+        "-- The ledger history table of [dbo].[r82_ln], made by that table's DDL.\nGO\n"
+    );
+    drop(h);
+    drop_database(&mut dba, "r82_ledger_h");
+}
+
 /// A table's DDL keeps its Always Encrypted columns encrypted (#367), with
 /// their column encryption key, encryption type and algorithm: run
 /// elsewhere, the copy takes no plain values into them, as the original
