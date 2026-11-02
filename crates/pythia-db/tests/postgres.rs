@@ -1868,6 +1868,71 @@ fn ddl_keeps_rules_replica_identity_and_column_settings() {
     h.ok("drop schema r100_set, r100_set_copy cascade");
 }
 
+/// A statement that sets client_encoding to another than UTF8 is
+/// followed by UTF8 again, with a notice (#451): the server sent text that
+/// isn't UTF-8, on which the session's worker panicked, its window running
+/// for ever, and read what Pythia wrote in it, storing `München` as
+/// `MĂĽnchen`. A row that isn't UTF-8 fails its statement.
+#[test]
+fn client_encoding_stays_utf8() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop table if exists r101_enc");
+    h.ok("create table r101_enc (s text)");
+    let notices = |h: &mut Harness, sql: &str| {
+        h.execute(0, sql, 100);
+        let mut notices = Vec::new();
+        loop {
+            match h.next() {
+                DbEvent::Notice(text) => notices.push(text),
+                DbEvent::Transaction { .. } => return notices,
+                DbEvent::Failed { error, .. } => panic!("{sql}: {error}"),
+                _ => {}
+            }
+        }
+    };
+    let said = notices(&mut h, "set client_encoding = 'LATIN1'");
+    assert!(
+        said.iter()
+            .any(|n| n.contains("client_encoding is UTF8 again")),
+        "{said:?}"
+    );
+    assert_eq!(
+        h.scalar("select current_setting('client_encoding')")
+            .as_deref(),
+        Some("UTF8")
+    );
+    h.ok("insert into r101_enc values ('München')");
+    assert_eq!(
+        h.scalar("select encode(convert_to(s, 'UTF8'), 'hex') from r101_enc")
+            .as_deref(),
+        Some("4dc3bc6e6368656e")
+    );
+    // Set and sent in one statement: it fails, and the session goes on.
+    h.execute(
+        1,
+        "select set_config('client_encoding', 'LATIN1', false), s from r101_enc",
+        10,
+    );
+    let mut failed = None;
+    loop {
+        match h.next() {
+            DbEvent::Failed { error, .. } => failed = Some(error.message),
+            DbEvent::Transaction { .. } => break,
+            _ => {}
+        }
+    }
+    let failed = failed.expect("the statement fails");
+    assert!(failed.contains("isn't UTF-8"), "{failed}");
+    assert_eq!(
+        h.scalar("select s from r101_enc").as_deref(),
+        Some("München")
+    );
+    h.ok("drop table r101_enc");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.

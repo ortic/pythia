@@ -399,6 +399,10 @@ All notable changes to Pythia are documented here. The format follows
 - SQL Server: a renamed or moved view, routine or trigger has DDL under
   its name of now, and a trigger under its table's: *Edit* made it again
   under its old name, beside the renamed one (#450).
+- PostgreSQL: a `SET client_encoding` to anything but UTF8 is undone
+  with a notice, and a value that isn't UTF-8 fails its statement: the
+  window hung for ever at the first non-ASCII value, and text written
+  was stored garbled (#451).
 
 ## [0.11.0] - 2026-11-02
 
