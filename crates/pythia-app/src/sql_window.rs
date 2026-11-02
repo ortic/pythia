@@ -1367,11 +1367,11 @@ impl SqlWindow {
         let Some(result) = self.state.results.get(index) else {
             return Effects::default();
         };
-        let Some(table) = crate::data_edit::single_table(&result.sql) else {
+        let Some(table) = crate::data_edit::single_table(cx.dialect, &result.sql) else {
             self.warn("Only results of a single-table query can be edited");
             return Effects::default();
         };
-        if !crate::data_edit::can_edit(&result.sql) {
+        if !crate::data_edit::can_edit(cx.dialect, &result.sql) {
             self.warn("Results of DISTINCT, GROUP BY or aggregate queries can't be edited");
             return Effects::default();
         }
@@ -1915,16 +1915,29 @@ impl SqlWindow {
                 };
                 result.grid.dialect = cx.dialect;
                 result.grid.value_files = true;
-                result.grid.table = crate::data_edit::single_table(&result.sql);
+                result.grid.table = crate::data_edit::single_table(cx.dialect, &result.sql);
                 result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
+                let mut unkeyed = None;
                 if let Some(Internal::EditQuery { edit, replaces }) =
+                    running.and_then(|r| r.internal.as_ref())
+                    && !crate::data_edit::has_key_columns(edit, &result.columns)
+                {
+                    // The key didn't come at the end, as the query was
+                    // to have it (the select list misread): rows can't be
+                    // told apart, so none are written.
+                    result.sql = edit.source.clone();
+                    replace = replaces
+                        .and_then(|old| self.state.results.iter().position(|r| r.id == old));
+                    unkeyed = Some(edit.table.clone());
+                } else if let Some(Internal::EditQuery { edit, replaces }) =
                     running.and_then(|r| r.internal.as_ref())
                 {
                     let key_start = result.columns.len().saturating_sub(edit.key.width());
                     result.grid.set_editable(Some(key_start));
                     // Only the table's columns as they are (#218).
-                    let plain = crate::data_edit::plain_columns(&edit.source, key_start);
+                    let plain =
+                        crate::data_edit::plain_columns(cx.dialect, &edit.source, key_start);
                     result
                         .grid
                         .lock_columns((0..key_start).filter(|&c| !plain[c]));
@@ -1962,9 +1975,17 @@ impl SqlWindow {
                     }
                 };
                 self.state.bottom = BottomTab::Result(index);
+                if let Some(table) = unkeyed {
+                    self.state.queue.clear();
+                    self.warn(format!(
+                        "The rows of {table} can't be edited: the query's select list couldn't \
+                         be read to add the key columns that find them"
+                    ));
+                    self.state.bottom = BottomTab::Messages;
+                }
                 if cx.dialect.supports(Feature::FollowKeys)
                     && let Some(table) =
-                        crate::data_edit::single_table(&self.state.results[index].sql)
+                        crate::data_edit::single_table(cx.dialect, &self.state.results[index].sql)
                 {
                     let task_id = request_id();
                     self.state.relation_requests.insert(task_id, id);
@@ -2642,7 +2663,7 @@ impl SqlWindow {
                             if idle
                                 && !cx.read_only
                                 && cx.dialect.supports(Feature::EditResults)
-                                && crate::data_edit::can_edit(&result.sql)
+                                && crate::data_edit::can_edit(cx.dialect, &result.sql)
                                 && labelled(ui, Icon::Edit, "Edit")
                                     .on_hover_text(
                                         "Edit the rows of this result. Rows are not locked; conflicting \

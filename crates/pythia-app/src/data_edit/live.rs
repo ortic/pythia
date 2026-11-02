@@ -14,7 +14,7 @@ use pythia_db::{
 };
 use pythia_ui::{Changes, Loaded, RowRef};
 
-use super::{Editable, RowKey, dml, edit_query, row_key, same};
+use super::{Editable, RowKey, dml, edit_query, has_key_columns, row_key, same};
 
 struct Live {
     session: Session,
@@ -336,6 +336,16 @@ fn mysql_keys() {
     assert!(db.key("pythia_live_v").is_empty());
     assert!(db.key("pythia_live_n").is_empty());
     assert!(db.key("pythia_live_missing").is_empty());
+    // A `#` comment after the select list: the key columns come before it,
+    // where the server reads them.
+    let edit = Editable {
+        table: "pythia_live_k".into(),
+        source: "select id, code # the columns\nfrom pythia_live_k".into(),
+        key: RowKey::Columns(vec!["id".into()]),
+    };
+    let sql = edit_query(db.dialect, &edit).expect("an editable query");
+    let (columns, _) = db.query(&sql);
+    assert!(has_key_columns(&edit, &columns), "{sql}");
     db.script(&[
         "drop temporary table pythia_live_t, pythia_live_tn",
         "drop view pythia_live_v",

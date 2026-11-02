@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use pythia_data::literal;
 use pythia_db::{Bind, Cell, Client, Column, DbError, DbKind, Dialect};
-use pythia_plsql::{TokenKind, tokenize};
+use pythia_plsql::{TokenKind, tokenize, tokenize_in};
 use pythia_ui::{Changes, Loaded, RowRef};
 
 /// Name of the ROWID column added to editable queries.
@@ -89,7 +89,7 @@ pub fn editable_query(sql: &str) -> String {
 /// quoted the way of `dialect`. `None` unless [`can_edit`].
 pub fn keyed_query(dialect: Dialect, sql: &str, key: &[String]) -> Option<String> {
     let sql = sql.trim().trim_end_matches(';');
-    let query = parse(sql).filter(|q| !q.grouped)?;
+    let query = parse(dialect, sql).filter(|q| !q.grouped)?;
     let columns: Vec<String> = key
         .iter()
         .map(|k| {
@@ -106,6 +106,27 @@ pub fn keyed_query(dialect: Dialect, sql: &str, key: &[String]) -> Option<String
         columns.join(", "),
         &sql[query.list_end..]
     ))
+}
+
+/// Whether `columns`, the result of [`edit_query`], end with the key
+/// columns it added: with a select list misread (a comment the lexer
+/// didn't know), they may be missing, and the columns before them would
+/// be taken for the key.
+pub fn has_key_columns(edit: &Editable, columns: &[Column]) -> bool {
+    let names: Vec<String> = match &edit.key {
+        RowKey::Rowid => vec![ROWID_COLUMN.to_owned()],
+        RowKey::Columns(key) => key.iter().map(|k| format!("pythia${k}")).collect(),
+    };
+    // PostgreSQL cuts a long name at 63 bytes.
+    let is = |column: &str, name: &str| {
+        let (column, name) = (column.to_lowercase(), name.to_lowercase());
+        column.starts_with("pythia$") && name.starts_with(&column)
+    };
+    columns.len() >= names.len()
+        && columns[columns.len() - names.len()..]
+            .iter()
+            .zip(&names)
+            .all(|(column, name)| is(&column.name, name))
 }
 
 /// The query fetching the rows of `edit` with what identifies them, in
@@ -214,9 +235,12 @@ fn quoted_names(sql: &str) -> std::borrow::Cow<'_, str> {
         .into()
 }
 
-fn parse(sql: &str) -> Option<Query> {
+/// `sql` lexed as `dialect` reads it: MySQL's `#` starts a comment, which
+/// what is added after the select list must not land in; SQL Server's
+/// `#t` is a name.
+fn parse(dialect: Dialect, sql: &str) -> Option<Query> {
     let lexed = quoted_names(sql);
-    let tokens: Vec<_> = tokenize(&lexed)
+    let tokens: Vec<_> = tokenize_in(&lexed, dialect.syntax())
         .into_iter()
         .filter(|t| !t.kind.is_trivia())
         .collect();
@@ -402,14 +426,14 @@ fn parse(sql: &str) -> Option<Query> {
 }
 
 /// The table a simple single-table query reads from, as written.
-pub fn single_table(sql: &str) -> Option<String> {
-    parse(sql).map(|q| q.table)
+pub fn single_table(dialect: Dialect, sql: &str) -> Option<String> {
+    parse(dialect, sql).map(|q| q.table)
 }
 
 /// Whether the rows of `sql`'s result are rows of one table, so they can
 /// be edited.
-pub fn can_edit(sql: &str) -> bool {
-    parse(sql).is_some_and(|q| !q.grouped)
+pub fn can_edit(dialect: Dialect, sql: &str) -> bool {
+    parse(dialect, sql).is_some_and(|q| !q.grouped)
 }
 
 /// Which of the first `count` result columns of `sql` are columns of its
@@ -417,8 +441,8 @@ pub fn can_edit(sql: &str) -> bool {
 /// Editing writes a cell to the column of its name, which a column renamed
 /// (`description as name`) or an expression isn't (#218). None is when the
 /// select list doesn't match `count` columns.
-pub fn plain_columns(sql: &str, count: usize) -> Vec<bool> {
-    let items = parse(sql.trim().trim_end_matches(';'))
+pub fn plain_columns(dialect: Dialect, sql: &str, count: usize) -> Vec<bool> {
+    let items = parse(dialect, sql.trim().trim_end_matches(';'))
         .map(|q| q.items)
         .unwrap_or_default();
     let stars = items.iter().filter(|i| **i == Item::Star).count();
@@ -1219,7 +1243,7 @@ pub fn dml(
     let table = &edit.table;
     let key_start = columns.len().saturating_sub(edit.key.width());
     // Written under their names: the table's columns as they are (#218).
-    let plain = plain_columns(&edit.source, key_start);
+    let plain = plain_columns(dialect, &edit.source, key_start);
     let editable = |c: usize| plain.get(c).copied().unwrap_or(false);
     let row_is = |row: &[Cell]| row_is(dialect, edit, columns, row);
 
@@ -1332,50 +1356,71 @@ mod tests {
     #[test]
     fn single_tables() {
         assert_eq!(
-            single_table("select * from emp where x = 1"),
+            single_table(Dialect::ORACLE, "select * from emp where x = 1"),
             Some("emp".into())
         );
         assert_eq!(
-            single_table("select e.* from hr.emp e order by 1"),
+            single_table(Dialect::ORACLE, "select e.* from hr.emp e order by 1"),
             Some("hr.emp".into())
         );
         assert_eq!(
-            single_table("select (select 1 from dual) x from \"Mixed\" t"),
+            single_table(
+                Dialect::ORACLE,
+                "select (select 1 from dual) x from \"Mixed\" t"
+            ),
             Some("\"Mixed\"".into())
         );
         assert_eq!(
-            single_table("select * from `shop`.`order` o"),
+            single_table(Dialect::MYSQL, "select * from `shop`.`order` o"),
             Some("`shop`.`order`".into())
         );
         assert_eq!(
-            single_table("select * from emp e join dept d on d.id = e.dept"),
+            single_table(
+                Dialect::ORACLE,
+                "select * from emp e join dept d on d.id = e.dept"
+            ),
             None
         );
-        assert_eq!(single_table("select * from emp, dept"), None);
+        assert_eq!(
+            single_table(Dialect::ORACLE, "select * from emp, dept"),
+            None
+        );
         // A doubled quote is part of the name, not the start of an alias.
         assert_eq!(
-            single_table("select * from s.\"a\"\"b\" x"),
+            single_table(Dialect::ORACLE, "select * from s.\"a\"\"b\" x"),
             Some("s.\"a\"\"b\"".into())
         );
-        assert_eq!(single_table("select * from emp straight_join dept"), None);
-        assert_eq!(single_table("update emp set x = 1"), None);
+        assert_eq!(
+            single_table(Dialect::ORACLE, "select * from emp straight_join dept"),
+            None
+        );
+        assert_eq!(single_table(Dialect::ORACLE, "update emp set x = 1"), None);
         // A part named like a keyword: PostgreSQL's public, as the object
         // browser queries a table, a MySQL table named user (#237). A word
         // before `(` is no table: Oracle's TABLE(…).
         assert_eq!(
-            single_table("select * from public.\"guidelines-division\""),
+            single_table(
+                Dialect::ORACLE,
+                "select * from public.\"guidelines-division\""
+            ),
             Some("public.\"guidelines-division\"".into())
         );
         assert_eq!(
-            single_table("select * from public.orders o where o.id = 1"),
+            single_table(
+                Dialect::ORACLE,
+                "select * from public.orders o where o.id = 1"
+            ),
             Some("public.orders".into())
         );
-        assert!(can_edit("select * from public.orders"));
+        assert!(can_edit(Dialect::ORACLE, "select * from public.orders"));
         assert_eq!(
-            single_table("select * from shop.user"),
+            single_table(Dialect::ORACLE, "select * from shop.user"),
             Some("shop.user".into())
         );
-        assert_eq!(single_table("select * from table(f())"), None);
+        assert_eq!(
+            single_table(Dialect::ORACLE, "select * from table(f())"),
+            None
+        );
     }
 
     /// Names that are words of Oracle's, which other databases have as
@@ -1384,22 +1429,25 @@ mod tests {
     #[test]
     fn single_tables_named_like_keywords() {
         assert_eq!(
-            single_table("select * from public.\"Orders\""),
+            single_table(Dialect::POSTGRES, "select * from public.\"Orders\""),
             Some("public.\"Orders\"".into())
         );
         assert_eq!(
-            single_table("select * from public.session s where s.id = 1"),
+            single_table(
+                Dialect::POSTGRES,
+                "select * from public.session s where s.id = 1"
+            ),
             Some("public.session".into())
         );
         assert_eq!(
-            single_table("select * from comment"),
+            single_table(Dialect::POSTGRES, "select * from comment"),
             Some("comment".into())
         );
         assert_eq!(
-            single_table("select c.* from shop.type c order by 1"),
+            single_table(Dialect::POSTGRES, "select c.* from shop.type c order by 1"),
             Some("shop.type".into())
         );
-        assert!(can_edit("select * from public.emp"));
+        assert!(can_edit(Dialect::POSTGRES, "select * from public.emp"));
         assert_eq!(
             keyed_query(
                 Dialect::POSTGRES,
@@ -1409,14 +1457,23 @@ mod tests {
             Some("select *, id as pythia$id from public.emp".into())
         );
         assert_eq!(
-            plain_columns("select id, level from public.session", 2),
+            plain_columns(Dialect::POSTGRES, "select id, level from public.session", 2),
             [true, true]
         );
         // What follows FROM without being a table.
-        assert_eq!(single_table("select * from table(f(1))"), None);
-        assert_eq!(single_table("select * from only emp"), None);
         assert_eq!(
-            single_table("select * from public.emp join type t on t.id = 1"),
+            single_table(Dialect::POSTGRES, "select * from table(f(1))"),
+            None
+        );
+        assert_eq!(
+            single_table(Dialect::POSTGRES, "select * from only emp"),
+            None
+        );
+        assert_eq!(
+            single_table(
+                Dialect::POSTGRES,
+                "select * from public.emp join type t on t.id = 1"
+            ),
             None
         );
     }
@@ -1426,27 +1483,48 @@ mod tests {
     #[test]
     fn single_tables_on_sql_server() {
         assert_eq!(
-            single_table("select [order], t.[x y] from [dbo].[a]]b] t where n = ']'"),
+            single_table(
+                Dialect::SQLSERVER,
+                "select [order], t.[x y] from [dbo].[a]]b] t where n = ']'"
+            ),
             Some("[dbo].[a]]b]".into())
         );
         assert_eq!(
-            single_table("select top 10 * from shop.dbo.orders with (nolock)"),
+            single_table(
+                Dialect::SQLSERVER,
+                "select top 10 * from shop.dbo.orders with (nolock)"
+            ),
             Some("shop.dbo.orders".into())
         );
         assert_eq!(
-            single_table("select * from shop..orders"),
+            single_table(Dialect::SQLSERVER, "select * from shop..orders"),
             Some("shop..orders".into())
         );
         assert_eq!(
-            single_table("select * from [it's \"odd\"] -- [x]"),
+            single_table(Dialect::SQLSERVER, "select * from [it's \"odd\"] -- [x]"),
             Some("[it's \"odd\"]".into())
         );
+        // A temporary table.
+        assert_eq!(
+            single_table(Dialect::SQLSERVER, "select * from #orders o"),
+            Some("#orders".into())
+        );
+        assert_eq!(
+            single_table(Dialect::SQLSERVER, "select * from ##orders"),
+            Some("##orders".into())
+        );
         // A linked server's table, a name cut short.
-        assert_eq!(single_table("select * from srv.shop.dbo.orders"), None);
-        assert_eq!(single_table("select * from dbo."), None);
+        assert_eq!(
+            single_table(Dialect::SQLSERVER, "select * from srv.shop.dbo.orders"),
+            None
+        );
+        assert_eq!(single_table(Dialect::SQLSERVER, "select * from dbo."), None);
         // PostgreSQL's arrays aren't names.
-        assert_eq!(single_table("select a[1], b[2:3] from t"), Some("t".into()));
-        assert!(can_edit("select a[1] from t"));
+        assert_eq!(
+            single_table(Dialect::POSTGRES, "select a[1], b[2:3] from t"),
+            Some("t".into())
+        );
+        assert!(can_edit(Dialect::POSTGRES, "select a[1] from t"));
     }
 
     #[test]
@@ -1459,8 +1537,8 @@ mod tests {
             "select dept from emp group by dept having count(*) > 1",
             "select * from emp group by id with rollup",
         ] {
-            assert!(!can_edit(sql), "{sql}");
-            assert!(single_table(sql).is_some(), "{sql}");
+            assert!(!can_edit(Dialect::ORACLE, sql), "{sql}");
+            assert!(single_table(Dialect::ORACLE, sql).is_some(), "{sql}");
         }
         for sql in [
             "select * from emp",
@@ -1469,7 +1547,7 @@ mod tests {
             "select extract(year from hired) from emp where id in (select id from x group by id)",
             "select * from emp where name = 'distinct' -- count(*)",
         ] {
-            assert!(can_edit(sql), "{sql}");
+            assert!(can_edit(Dialect::ORACLE, sql), "{sql}");
         }
     }
 
@@ -1478,40 +1556,66 @@ mod tests {
     #[test]
     fn plain_columns_of_select_lists() {
         assert_eq!(
-            plain_columns("select id, description as name, name as title from t", 3),
+            plain_columns(
+                Dialect::ORACLE,
+                "select id, description as name, name as title from t",
+                3
+            ),
             [true, false, false]
         );
         assert_eq!(
-            plain_columns("select t.id, t.\"Name\", s.t.x, [a b], `c` from s.t t", 5),
+            plain_columns(
+                Dialect::ORACLE,
+                "select t.id, t.\"Name\", s.t.x, [a b], `c` from s.t t",
+                5
+            ),
             [true; 5]
         );
         assert_eq!(
-            plain_columns("select *, upper(name) u from t", 4),
+            plain_columns(Dialect::ORACLE, "select *, upper(name) u from t", 4),
             [true, true, true, false]
         );
         assert_eq!(
-            plain_columns("select t.*, 1, t.* from t;", 5),
+            plain_columns(Dialect::ORACLE, "select t.*, 1, t.* from t;", 5),
             [true, true, false, true, true]
         );
         assert_eq!(
-            plain_columns("select top (5) percent with ties name from t", 1),
+            plain_columns(
+                Dialect::ORACLE,
+                "select top (5) percent with ties name from t",
+                1
+            ),
             [true]
         );
         assert_eq!(
-            plain_columns("select /*+ full(t) */ distinct name, id from t", 2),
+            plain_columns(
+                Dialect::ORACLE,
+                "select /*+ full(t) */ distinct name, id from t",
+                2
+            ),
             [true, true]
         );
         assert_eq!(
             plain_columns(
+                Dialect::POSTGRES,
                 "select name n, -id, (id), id::text, null, t.id + 1, a[1], name = x from t",
                 8
             ),
             [false; 8]
         );
         // A select list that doesn't match the result: none.
-        assert_eq!(plain_columns("select id, name from t", 3), [false; 3]);
-        assert_eq!(plain_columns("select *, *, x from t", 4), [false; 4]);
-        assert_eq!(plain_columns("update t set x = 1", 1), [false]);
+        assert_eq!(
+            plain_columns(Dialect::ORACLE, "select id, name from t", 3),
+            [false; 3]
+        );
+        assert_eq!(
+            plain_columns(Dialect::ORACLE, "select *, *, x from t", 4),
+            [false; 4]
+        );
+        assert_eq!(
+            plain_columns(Dialect::ORACLE, "update t set x = 1", 1),
+            [false]
+        );
     }
 
     #[test]
@@ -1541,6 +1645,21 @@ mod tests {
         assert_eq!(
             keyed_query(Dialect::MYSQL, "select count(*) from emp", &key(&["id"])),
             None
+        );
+        // MySQL's `#` comment ends at the line's end: the key goes before
+        // it, not into it. `--x` is no comment there: `- -x`.
+        assert_eq!(
+            keyed_query(
+                Dialect::MYSQL,
+                "select id, parent_id # the columns\nfrom t",
+                &key(&["id"])
+            )
+            .as_deref(),
+            Some("select id, parent_id, id as pythia$id # the columns\nfrom t")
+        );
+        assert_eq!(
+            keyed_query(Dialect::MYSQL, "select a --x\nfrom t", &key(&["id"])).as_deref(),
+            Some("select a --x, id as pythia$id\nfrom t")
         );
         // Each database quotes its own way.
         assert_eq!(
@@ -1625,6 +1744,44 @@ mod tests {
             type_name: t.into(),
             numeric,
         }
+    }
+
+    /// A result edited must end with the key columns its query added.
+    #[test]
+    fn key_columns_at_the_end() {
+        let edit = |key: RowKey| Editable {
+            table: "t".into(),
+            source: "select id, parent_id from t".into(),
+            key,
+        };
+        let id = edit(RowKey::Columns(vec!["id".into()]));
+        let columns =
+            |names: &[&str]| -> Vec<Column> { names.iter().map(|n| col(n, "INT", true)).collect() };
+        assert!(has_key_columns(
+            &id,
+            &columns(&["id", "parent_id", "pythia$id"])
+        ));
+        // The key added inside a comment: the last column isn't it.
+        assert!(!has_key_columns(&id, &columns(&["id", "parent_id"])));
+        assert!(!has_key_columns(&id, &columns(&[])));
+        let both = edit(RowKey::Columns(vec!["Order Id".into(), "line".into()]));
+        assert!(has_key_columns(
+            &both,
+            &columns(&["x", "pythia$Order Id", "pythia$line"])
+        ));
+        assert!(!has_key_columns(
+            &both,
+            &columns(&["pythia$line", "pythia$Order Id"])
+        ));
+        let rowid = edit(RowKey::Rowid);
+        assert!(has_key_columns(&rowid, &columns(&["ID", "PYTHIA$ROWID"])));
+        // PostgreSQL's names end at 63 bytes.
+        let long = "k".repeat(60);
+        let cut = format!("pythia${long}")[..63].to_owned();
+        assert!(has_key_columns(
+            &edit(RowKey::Columns(vec![long])),
+            &columns(&["x", &cut])
+        ));
     }
 
     #[test]

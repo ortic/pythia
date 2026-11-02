@@ -22,6 +22,13 @@ All notable changes to Pythia are documented here. The format follows
   temporary table that hides a table of its name got that table's key.
 - SQL Server: a `numeric` or `decimal` of scale 0 shows as `123`, no
   longer as `123.0` (#389), in the grid and in exports.
+- MySQL: *Edit* on a query whose select list ends with a `#` comment
+  deleted the wrong rows (#390). The key columns it adds went into the
+  comment, and the result's last column was taken for the key: a Delete
+  removed the row whose key was that column's value. The select list is
+  now read with the database's comments (and SQL Server's `#temp`
+  names), and a result is editable only when it ends with the key
+  columns that were added.
 
 ## [0.11.0] - 2026-11-02
 
