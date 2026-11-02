@@ -2075,6 +2075,46 @@ fn a_key_to_the_tables_own_unique_index_runs_again() {
     }
 }
 
+/// A table's DDL adds the descriptions of the table and its columns that
+/// the Columns tab shows: run again, the table has them.
+#[test]
+fn the_ddl_keeps_the_descriptions() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop table if exists dbo.r97_described");
+    h.ok("create table dbo.r97_described (id int primary key, [the name] nvarchar(10))");
+    for (value, column) in [("It's a table", None), ("Grüße [x]", Some("the name"))] {
+        let column = column
+            .map(|c| format!(", @level2type = N'COLUMN', @level2name = N'{c}'"))
+            .unwrap_or_default();
+        h.ok(&format!(
+            "exec sys.sp_addextendedproperty @name = N'MS_Description', \
+               @value = N'{}', @level0type = N'SCHEMA', @level0name = N'dbo', \
+               @level1type = N'TABLE', @level1name = N'r97_described'{column}",
+            value.replace('\'', "''")
+        ));
+    }
+    let described = |h: &mut Harness| {
+        h.scalar(
+            "select string_agg(concat(p.minor_id, '=', cast(p.value as nvarchar(100))), '; ') \
+                    within group (order by p.minor_id) \
+               from sys.extended_properties p \
+              where p.major_id = object_id('dbo.r97_described') and p.name = 'MS_Description'",
+        )
+    };
+    let before = described(&mut h);
+    assert_eq!(before.as_deref(), Some("0=It's a table; 2=Grüße [x]"));
+    let ddl = table_ddl(&mut h, "dbo", "r97_described");
+    h.ok("drop table dbo.r97_described");
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::TSql) {
+        h.ok(statement.text(&ddl));
+    }
+    assert_eq!(described(&mut h), before, "{ddl}");
+    h.ok("drop table dbo.r97_described");
+}
+
 /// A table's DDL, as `MetaQuery::Ddl` reads it.
 fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
     let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {

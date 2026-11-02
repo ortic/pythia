@@ -98,6 +98,8 @@ All notable changes to Pythia are documented here. The format follows
   `x.ddl.sql`, over the DDL of table `X`.
 - PostgreSQL: a foreign table's DDL makes a foreign table, on its server
   with its and its columns' options (#409); it was a plain CREATE TABLE.
+- SQL Server: a table's DDL keeps the descriptions (`MS_Description`) of
+  the table and its columns (#410), as `sp_addextendedproperty` calls.
 
 ## [0.11.0] - 2026-11-02
 
