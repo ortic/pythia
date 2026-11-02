@@ -4166,3 +4166,66 @@ fn trigger_ddl_keeps_its_order() {
     assert_eq!(order(&mut h), before);
     h.ok("drop table r100_ord");
 }
+
+/// A renamed trigger, on a renamed table, and a view moved to another
+/// schema have DDL under the names they have now (#450): their source
+/// kept the old ones, and made again from it, the trigger was a second one
+/// on the table, firing twice, and the view went back to its old schema.
+#[test]
+fn renamed_modules_keep_their_names() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    let cleanup = |h: &mut Harness| {
+        h.ok("drop view if exists r101_other.r101_v");
+        h.ok("drop view if exists dbo.r101_v");
+        h.ok("drop schema if exists r101_other");
+        h.ok("drop table if exists r101_t_new");
+        h.ok("drop table if exists r101_t");
+        h.ok("drop table if exists r101_log");
+    };
+    cleanup(&mut h);
+    for sql in [
+        "create table r101_t (id int)",
+        "create table r101_log (id int)",
+        "create trigger r101_tr_old on r101_t after insert as \
+           insert into r101_log select id from inserted",
+        "exec sp_rename 'r101_tr_old', 'r101_tr_new'",
+        "exec sp_rename 'r101_t', 'r101_t_new'",
+        "create schema r101_other",
+        "create view dbo.r101_v as select 1 as x",
+        "alter schema r101_other transfer dbo.r101_v",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = |h: &mut Harness, owner: &str, name: &str, object_type: ObjectType| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: owner.into(),
+            name: name.into(),
+            object_type,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let trigger = ddl(&mut h, &schema, "r101_tr_new", ObjectType::Trigger);
+    let expected =
+        format!("create trigger [{schema}].[r101_tr_new] on [{schema}].[r101_t_new] after insert");
+    assert!(trigger.starts_with(&expected), "{trigger}");
+    // As Edit makes it again: altered, not a second trigger.
+    let script = trigger.replacen("create trigger", "create or alter trigger", 1);
+    h.ok(script.trim_end().trim_end_matches("GO").trim_end());
+    h.ok("insert into r101_t_new values (1)");
+    assert_eq!(
+        h.scalar("select count(*) from r101_log").as_deref(),
+        Some("1")
+    );
+    let view = ddl(&mut h, "r101_other", "r101_v", ObjectType::View);
+    assert!(
+        view.starts_with("create view [r101_other].[r101_v] as"),
+        "{view}"
+    );
+    cleanup(&mut h);
+}

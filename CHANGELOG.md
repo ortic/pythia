@@ -396,6 +396,9 @@ All notable changes to Pythia are documented here. The format follows
   an alias is written with `AS` or is a keyword, or a table has SQL
   Server's `WITH (NOLOCK)`: another table's cells were written to the
   first table (#449).
+- SQL Server: a renamed or moved view, routine or trigger has DDL under
+  its name of now, and a trigger under its table's: *Edit* made it again
+  under its old name, beside the renamed one (#450).
 
 ## [0.11.0] - 2026-11-02
 

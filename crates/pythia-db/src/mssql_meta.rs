@@ -119,6 +119,102 @@ fn first(row: Vec<Cell>) -> Option<String> {
     row.into_iter().next().flatten()
 }
 
+/// A module's source with the name it has now (#450): `sp_rename` and
+/// `ALTER SCHEMA … TRANSFER` leave `object_definition` as it was written,
+/// and its DDL, and *Edit*, made the object again under its old name, next
+/// to the renamed one (a trigger fired twice) or over another one called
+/// so. A trigger's table, renamed or moved, is named as it is now too. A
+/// name written as it is stays as written.
+fn named_as_now(
+    source: &str,
+    (owner, name): (&str, &str),
+    table: Option<(String, String)>,
+) -> String {
+    use pythia_plsql::TokenKind;
+    let tokens: Vec<_> = pythia_plsql::tokenize_in(source, pythia_plsql::Syntax::TSql)
+        .into_iter()
+        .filter(|t| !t.kind.is_trivia())
+        .collect();
+    let word = |i: usize, words: &[&str]| {
+        tokens.get(i).is_some_and(|t| {
+            t.kind.is_word()
+                && words
+                    .iter()
+                    .any(|w| source[t.span.clone()].eq_ignore_ascii_case(w))
+        })
+    };
+    // The parts of the name at `i`, as SQL Server reads them, and where it
+    // ends (the index after it, and the byte).
+    let parts = |mut i: usize| {
+        let mut parts = Vec::new();
+        let start = tokens.get(i)?.span.start;
+        loop {
+            let t = tokens.get(i)?;
+            if !matches!(
+                t.kind,
+                TokenKind::Ident | TokenKind::QuotedIdent | TokenKind::Keyword
+            ) {
+                return None;
+            }
+            parts.push(unquoted(&source[t.span.clone()]));
+            if tokens.get(i + 1).is_some_and(|t| t.kind == TokenKind::Dot) {
+                i += 2;
+            } else {
+                return Some((parts, start..t.span.end, i + 1));
+            }
+        }
+    };
+    // `CREATE [OR ALTER] VIEW|PROC|PROCEDURE|FUNCTION|TRIGGER name`.
+    let mut i = 0;
+    if !word(i, &["CREATE"]) {
+        return source.to_owned();
+    }
+    i += 1;
+    if word(i, &["OR"]) && word(i + 1, &["ALTER"]) {
+        i += 2;
+    }
+    if !word(i, &["VIEW", "PROC", "PROCEDURE", "FUNCTION", "TRIGGER"]) {
+        return source.to_owned();
+    }
+    let Some((written, span, after)) = parts(i + 1) else {
+        return source.to_owned();
+    };
+    // Each name as it is now, where it is written otherwise: the last part
+    // the name, a part before it the schema.
+    let stale = |written: &[String], schema: &str, name: &str| {
+        written.last().map(String::as_str) != Some(name)
+            || written.len() > 1 && written[written.len() - 2] != schema
+    };
+    let mut edits = Vec::new();
+    if stale(&written, owner, name) {
+        edits.push((span, bracketed(owner, name)));
+    }
+    if let Some((schema, table)) = table
+        && let Some(on) = (after..tokens.len()).find(|&j| word(j, &["ON"]))
+        && !word(on + 1, &["DATABASE", "ALL"])
+        && let Some((written, span, _)) = parts(on + 1)
+        && stale(&written, &schema, &table)
+    {
+        edits.push((span, bracketed(&schema, &table)));
+    }
+    let mut out = source.to_owned();
+    for (span, name) in edits.into_iter().rev() {
+        out.replace_range(span, &name);
+    }
+    out
+}
+
+/// A name as written, without its brackets or double quotes.
+fn unquoted(text: &str) -> String {
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        inner.replace("]]", "]")
+    } else if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        inner.replace("\"\"", "\"")
+    } else {
+        text.to_owned()
+    }
+}
+
 /// `[schema].[name]`, for `object_id()`.
 fn bracketed(owner: &str, name: &str) -> String {
     format!(
@@ -468,18 +564,36 @@ fn ddl(
     };
     let text = match object_type {
         ObjectType::Table => table_ddl(ms, &object)?,
-        ObjectType::View | ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger => ms
-            .rows("select object_definition(object_id(@P1))", &[&object])?
-            .into_iter()
-            .find_map(first)
-            .ok_or_else(|| {
-                DbError::new(format!(
-                    "No source for {owner}.{name}: it is encrypted, or it takes the VIEW \
-                     DEFINITION permission to see it"
-                ))
-            })?
-            .trim()
-            .to_owned(),
+        ObjectType::View | ObjectType::Procedure | ObjectType::Function | ObjectType::Trigger => {
+            let source = ms
+                .rows("select object_definition(object_id(@P1))", &[&object])?
+                .into_iter()
+                .find_map(first)
+                .ok_or_else(|| {
+                    DbError::new(format!(
+                        "No source for {owner}.{name}: it is encrypted, or it takes the VIEW \
+                         DEFINITION permission to see it"
+                    ))
+                })?;
+            // A trigger's table, which may have been renamed too.
+            let table = if object_type == ObjectType::Trigger {
+                ms.rows(
+                    "select schema_name(p.schema_id), p.name from sys.triggers t \
+                       join sys.objects p on p.object_id = t.parent_id \
+                      where t.object_id = object_id(@P1)",
+                    &[&object],
+                )?
+                .into_iter()
+                .next()
+                .and_then(|row| match row.as_slice() {
+                    [Some(schema), Some(table)] => Some((schema.clone(), table.clone())),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            named_as_now(source.trim(), (owner, name), table)
+        }
         ObjectType::Sequence => {
             let row = ms
                 .rows(
@@ -1744,6 +1858,46 @@ fn object_name(object: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module renamed or moved is made under the name it has now; one
+    /// written as it is stays as written (#450).
+    #[test]
+    fn modules_are_named_as_now() {
+        let now = |source: &str| named_as_now(source, ("dbo", "v_new"), None);
+        assert_eq!(
+            now("create view v_new as select 1 x"),
+            "create view v_new as select 1 x"
+        );
+        assert_eq!(
+            now("CREATE VIEW [dbo].[v_new] AS SELECT 1 x"),
+            "CREATE VIEW [dbo].[v_new] AS SELECT 1 x"
+        );
+        assert_eq!(
+            now("-- note\ncreate or alter view v_old as select 1 x"),
+            "-- note\ncreate or alter view [dbo].[v_new] as select 1 x"
+        );
+        assert_eq!(
+            now("create view old_schema.v_new as select 1 x"),
+            "create view [dbo].[v_new] as select 1 x"
+        );
+        let table = Some(("sales".to_owned(), "orders".to_owned()));
+        assert_eq!(
+            named_as_now(
+                "create trigger tr_old on [dbo].[orders_old] after insert as select 1",
+                ("sales", "tr"),
+                table.clone()
+            ),
+            "create trigger [sales].[tr] on [sales].[orders] after insert as select 1"
+        );
+        assert_eq!(
+            named_as_now(
+                "create trigger tr on orders after insert as select 1",
+                ("sales", "tr"),
+                table
+            ),
+            "create trigger tr on orders after insert as select 1"
+        );
+    }
 
     #[test]
     fn compression_by_partition() {
