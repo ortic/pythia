@@ -145,11 +145,11 @@ pub fn query(relation: &Relation, columns: &[Column], row: &[Cell]) -> String {
         .map(|(ours, theirs)| {
             let i = columns.iter().position(|c| c.name == *ours);
             let value = i.and_then(|i| row.get(i).cloned().flatten());
-            let numeric = i.is_some_and(|i| columns[i].numeric);
-            let literal = match value {
-                Some(v) if numeric && v.parse::<f64>().is_ok() => v,
-                Some(v) => format!("'{}'", v.replace('\'', "''")),
-                None => "null".into(),
+            // As its type writes it: a DATE with to_date, which a string in
+            // the session's NLS_DATE_FORMAT isn't (ORA-01861, #426).
+            let literal = match (i, value) {
+                (Some(i), Some(v)) => pythia_data::sql_literal(&columns[i], Some(&v)),
+                _ => "null".into(),
             };
             format!("{} = {literal}", quote_ident(theirs))
         })
@@ -219,6 +219,21 @@ mod tests {
         );
         assert!(
             sql.ends_with("from HR.DEPARTMENTS\n where DEPARTMENT_ID = 20"),
+            "{sql}"
+        );
+        // A date as a date, whatever the session's NLS_DATE_FORMAT.
+        let dated = Relation {
+            pairs: vec![("D".into(), "D".into())],
+            ..relations[0].clone()
+        };
+        let columns = [Column {
+            name: "D".into(),
+            type_name: "DATE".into(),
+            numeric: false,
+        }];
+        let sql = query(&dated, &columns, &[Some("2024-01-01 00:00:00".into())]);
+        assert!(
+            sql.ends_with("where D = to_date('2024-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"),
             "{sql}"
         );
     }

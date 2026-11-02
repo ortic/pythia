@@ -320,6 +320,9 @@ All notable changes to Pythia are documented here. The format follows
   tries again.
 - SQLite: a text with a NUL character can be changed in a result and
   written as INSERT statements (#425); its literal ended at the NUL.
+- Oracle: *Follow foreign keys* over a key with a DATE or TIMESTAMP
+  column opens the related rows (#426); its query wrote the date as a
+  string, ORA-01861.
 
 ## [0.11.0] - 2026-11-02
 
