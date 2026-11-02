@@ -504,17 +504,20 @@ fn ddl(
 /// declared so (#325), masked columns with their masks (#348): their
 /// functions keep their quotes doubled in the catalog, as they go between
 /// quotes. A typed XML column names its schema collection, which is made
-/// apart, as a foreign key's table is (#349). What CREATE TABLE can't give
-/// follows the table: its
-/// lock escalation, foreign keys and checks that aren't trusted, disabled
-/// ones disabled, and disabled indexes (#326).
+/// apart, as a foreign key's table is (#349). ROWGUIDCOL, a persisted
+/// computed column's NOT NULL and NOT FOR REPLICATION are kept (#355). What
+/// CREATE TABLE can't give follows the table: its lock escalation, foreign
+/// keys and checks that aren't trusted, disabled ones disabled, and
+/// disabled indexes (#326).
 fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     let columns = ms.rows(
         &format!(
             "select quotename(c.name) + ' ' \
                     + case when c.is_computed = 1 \
                         then 'as ' + cc.definition \
-                             + case when cc.is_persisted = 1 then ' persisted' else '' end \
+                             + case when cc.is_persisted = 0 then '' \
+                                    when c.is_nullable = 1 then ' persisted' \
+                                    else ' persisted not null' end \
                         else {COLUMN_TYPE} \
                              + coalesce('(' + case when c.is_xml_document = 1 then 'document ' \
                                                    else 'content ' end \
@@ -533,7 +536,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                         + ''')', '') \
                              + case when ic.object_id is not null \
                                  then ' identity(' + cast(ic.seed_value as varchar(40)) + ', ' \
-                                      + cast(ic.increment_value as varchar(40)) + ')' else '' end \
+                                      + cast(ic.increment_value as varchar(40)) + ')' \
+                                      + case when ic.is_not_for_replication = 1 \
+                                             then ' not for replication' else '' end \
+                                 else '' end \
                              + case when c.generated_always_type in (1, 2) \
                                  then ' generated always as row ' \
                                       + case c.generated_always_type when 1 then 'start' \
@@ -541,6 +547,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                                       + case when c.is_hidden = 1 then ' hidden' else '' end \
                                  else '' end \
                              + case when c.is_nullable = 1 then ' null' else ' not null' end \
+                             + case when c.is_rowguidcol = 1 then ' rowguidcol' else '' end \
                              + coalesce(' constraint ' + quotename(dc.name) + ' default ' \
                                         + dc.definition, '') end \
                from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
@@ -664,7 +671,8 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
     // Each constraint as (name, its line up to the columns, what follows
     // them: a foreign key's REFERENCES and its actions, a key's index), and
     // whether a foreign key or check isn't trusted (1), as WITH NOCHECK
-    // makes it, or is disabled too (2) (#326).
+    // makes it, or is disabled too (2) (#326). One NOT FOR REPLICATION is
+    // never trusted, however it is made (#355).
     let constraints = ms.rows(
         "select name, line, refs, actions, ix, untrusted, quotename(name) from ( \
            select k.name, 'constraint ' + quotename(k.name) \
@@ -684,14 +692,22 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                        else '' end \
                   + case f.update_referential_action when 1 then ' on update cascade' \
                          when 2 then ' on update set null' when 3 then ' on update set default' \
+                         else '' end \
+                  + case when f.is_not_for_replication = 1 then ' not for replication' \
                          else '' end, null, \
-                  case when f.is_disabled = 1 then 2 when f.is_not_trusted = 1 then 1 else 0 end, \
+                  case when f.is_disabled = 1 then 2 \
+                       when f.is_not_trusted = 1 and f.is_not_for_replication = 0 then 1 \
+                       else 0 end, \
                   3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
            union all \
-           select c.name, 'constraint ' + quotename(c.name) + ' check ' + c.definition, null, '', \
-                  null, \
-                  case when c.is_disabled = 1 then 2 when c.is_not_trusted = 1 then 1 else 0 end, \
+           select c.name, 'constraint ' + quotename(c.name) + ' check ' \
+                  + case when c.is_not_for_replication = 1 then 'not for replication ' \
+                         else '' end \
+                  + c.definition, null, '', null, \
+                  case when c.is_disabled = 1 then 2 \
+                       when c.is_not_trusted = 1 and c.is_not_for_replication = 0 then 1 \
+                       else 0 end, \
                   4 \
              from sys.check_constraints c where c.parent_object_id = object_id(@P1) \
          ) x order by ord, name",

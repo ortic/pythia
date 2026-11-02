@@ -2697,6 +2697,124 @@ fn typed_xml_columns() {
     h.ok("drop xml schema collection r82_xs");
 }
 
+/// A table's DDL keeps ROWGUIDCOL, a persisted computed column's NOT NULL,
+/// and NOT FOR REPLICATION of identities, foreign keys and checks (#355),
+/// which SQL Server never trusts: run elsewhere, the copy's columns and
+/// constraints are the original's.
+#[test]
+fn rowguidcol_not_null_and_not_for_replication() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.schema.clone();
+    drop_tables(&mut h, "r82_copy_r", "r82_r");
+    h.ok("drop schema if exists r82_copy_r");
+    drop_tables(&mut h, &schema, "r82_r");
+    for sql in [
+        "create table r82_rp (id int identity(1, 1) not for replication \
+           constraint r82_rp_pk primary key, \
+         g uniqueidentifier rowguidcol not null constraint r82_rp_g default newid(), \
+         a int, c as (a * 2) persisted not null, v as (a + 1) persisted)",
+        "create table r82_rc (id int identity(5, 2), pid int, \
+         constraint r82_rc_fk foreign key (pid) references r82_rp (id) on delete cascade \
+           not for replication, \
+         constraint r82_rc_ck check not for replication (id > 0))",
+        "alter table r82_rc add constraint r82_rc_off check not for replication (pid <> 0)",
+        "alter table r82_rc nocheck constraint r82_rc_off",
+    ] {
+        h.ok(sql);
+    }
+    let rp = table_ddl(&mut h, &schema, "r82_rp");
+    let t = format!("[{schema}].[r82_rp]");
+    assert_eq!(
+        rp,
+        format!(
+            "create table {t} (\n    \
+               [id] int identity(1, 1) not for replication not null,\n    \
+               [g] uniqueidentifier not null rowguidcol constraint [r82_rp_g] default (newid()),\n    \
+               [a] int null,\n    \
+               [c] as ([a]*(2)) persisted not null,\n    \
+               [v] as ([a]+(1)) persisted,\n    \
+               constraint [r82_rp_pk] primary key clustered ([id])\n\
+             );\nGO\n"
+        )
+    );
+    let rc = table_ddl(&mut h, &schema, "r82_rc");
+    let p = t;
+    let t = format!("[{schema}].[r82_rc]");
+    assert_eq!(
+        rc,
+        format!(
+            "create table {t} (\n    \
+               [id] int identity(5, 2) not null,\n    \
+               [pid] int null,\n    \
+               constraint [r82_rc_fk] foreign key ([pid]) references {p} ([id]) \
+                 on delete cascade not for replication,\n    \
+               constraint [r82_rc_ck] check not for replication ([id]>(0))\n\
+             );\n\n\
+             alter table {t} with nocheck add constraint [r82_rc_off] \
+               check not for replication ([pid]<>(0));\n\n\
+             alter table {t} nocheck constraint [r82_rc_off];\nGO\n"
+        )
+    );
+    let catalog = |h: &mut Harness, owner: &str| -> Vec<Option<String>> {
+        let tables = format!(
+            "select object_id from sys.tables where schema_id = schema_id('{owner}') \
+                and name like 'r82_r%'"
+        );
+        [
+            format!(
+                "select string_agg(concat_ws(' ', object_name(c.object_id), c.name, \
+                                             c.is_rowguidcol, c.is_nullable, cc.is_persisted, \
+                                             i.is_not_for_replication) \
+                                   collate database_default, '; ') \
+                          within group (order by object_name(c.object_id), c.column_id) \
+                   from sys.columns c \
+                   left join sys.computed_columns cc on cc.object_id = c.object_id \
+                    and cc.column_id = c.column_id \
+                   left join sys.identity_columns i on i.object_id = c.object_id \
+                    and i.column_id = c.column_id \
+                  where c.object_id in ({tables})"
+            ),
+            format!(
+                "select string_agg(x.line collate database_default, '; ') \
+                          within group (order by x.line) \
+                   from (select concat_ws(' ', name, is_not_for_replication, is_disabled, \
+                                          is_not_trusted, delete_referential_action) as line \
+                           from sys.foreign_keys where parent_object_id in ({tables}) \
+                         union all \
+                         select concat_ws(' ', name, is_not_for_replication, is_disabled, \
+                                          is_not_trusted, definition) \
+                           from sys.check_constraints where parent_object_id in ({tables})) x"
+            ),
+        ]
+        .iter()
+        .map(|sql| h.scalar(sql))
+        .collect()
+    };
+    let before = catalog(&mut h, &schema);
+    h.ok("create schema r82_copy_r");
+    for ddl in [&rp, &rc] {
+        run_ddl_in(&mut h, ddl, &schema, "r82_copy_r", &["r82_rp", "r82_rc"]);
+    }
+    assert_eq!(catalog(&mut h, "r82_copy_r"), before);
+    // The copy takes no NULL for the computed column, and has a $rowguid.
+    for owner in [schema.as_str(), "r82_copy_r"] {
+        h.ok(&format!("insert into [{owner}].[r82_rp] (a) values (1)"));
+        h.fails(&format!("insert into [{owner}].[r82_rp] (a) values (null)"));
+        assert_eq!(
+            h.scalar(&format!("select count($rowguid) from [{owner}].[r82_rp]"))
+                .as_deref(),
+            Some("1"),
+            "{owner}"
+        );
+    }
+    drop_tables(&mut h, "r82_copy_r", "r82_r");
+    h.ok("drop schema r82_copy_r");
+    drop_tables(&mut h, &schema, "r82_r");
+}
+
 /// Object filters and Find find names without case, non-ASCII letters too,
 /// in the test database and, as a DBA, in one with a case-sensitive
 /// collation.

@@ -1122,6 +1122,12 @@ All notable changes to Pythia are documented here. The format follows
   `xml(content …)`. The column was plain `xml`: a copy took any XML the
   original rejects. The collection itself isn't made by the table's
   DDL, as a foreign key's table isn't.
+- SQL Server: a table's DDL keeps ROWGUIDCOL, a persisted computed
+  column's NOT NULL, and NOT FOR REPLICATION of identities, foreign keys
+  and checks (#355). A copy had no `$rowguid`, took NULLs its computed
+  column rejects, and its foreign keys and checks, added `with nocheck`
+  as SQL Server never trusts one not for replication, checked the rows
+  replication puts in.
 
 ## [0.10.0] - 2026-10-30
 
