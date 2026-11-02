@@ -380,6 +380,9 @@ All notable changes to Pythia are documented here. The format follows
   (#382).
 - PostgreSQL: a table's DDL has the comments on its indexes and its
   constraints, a materialized view's on its indexes (#379).
+- PostgreSQL: a table's DDL has its rules, its replica identity and its
+  columns' storage, compression, statistics targets and options, a
+  materialized view's its columns' (#378).
 
 ## [0.11.0] - 2026-11-02
 

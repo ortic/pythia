@@ -1781,6 +1781,93 @@ fn ddl_keeps_comments_on_indexes_and_constraints() {
     h.ok("drop schema r100_cm, r100_cm_copy cascade");
 }
 
+/// A table's DDL has what is set on it after its CREATE (#378): its
+/// columns' storage, compression, statistics targets and options, its
+/// replica identity and its rules, a disabled one disabled; a materialized
+/// view's columns' settings too. A copy had none of them: its `delete`
+/// deleted the rows a rule kept.
+#[test]
+fn ddl_keeps_rules_replica_identity_and_column_settings() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r100_set, r100_set_copy cascade");
+    h.ok("create schema r100_set");
+    h.ok("create schema r100_set_copy");
+    for sql in [
+        "create table r100_set.t (id int primary key, s text, n int, u int not null)",
+        "create table r100_set.log (id int)",
+        "alter table r100_set.t alter column s set storage external",
+        "alter table r100_set.t alter column s set compression pglz",
+        "alter table r100_set.t alter column n set statistics 1000",
+        "alter table r100_set.t alter column n set (n_distinct = -0.5)",
+        "create unique index t_u on r100_set.t (u)",
+        "alter table r100_set.t replica identity using index t_u",
+        "create rule keep as on delete to r100_set.t do instead nothing",
+        "create rule logged as on insert to r100_set.t do also \
+           insert into r100_set.log values (new.id)",
+        "alter table r100_set.t disable rule logged",
+        "create table r100_set.f (id int)",
+        "alter table r100_set.f replica identity full",
+        "create materialized view r100_set.mv as select id, s from r100_set.t",
+        "alter materialized view r100_set.mv alter column s set statistics 50",
+    ] {
+        h.ok(sql);
+    }
+    for (name, object_type) in [
+        ("log", ObjectType::Table),
+        ("t", ObjectType::Table),
+        ("f", ObjectType::Table),
+        ("mv", ObjectType::MaterializedView),
+    ] {
+        let ddl = ddl_of(&mut h, "r100_set", name, object_type);
+        run_ddl(&mut h, &ddl, "r100_set.", "r100_set_copy.");
+    }
+    let settings = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(c.relname || '.' || a.attname || ' ' || a.attstorage::text || ' ' \
+                               || a.attcompression::text || ' ' || coalesce(a.attstattarget, -1) \
+                               || ' ' || coalesce(array_to_string(a.attoptions, ','), ''), \
+                               '; ' order by c.relname, a.attnum) \
+                    || ' | ' || (select string_agg(c.relname || ' ' || c.relreplident::text, ', ' \
+                                                   order by c.relname) \
+                                   from pg_class c \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                    and c.relkind = 'r') \
+                    || ' | ' || (select string_agg(w.rulename || ' ' || w.ev_enabled::text, ', ' \
+                                                   order by w.rulename) \
+                                   from pg_rewrite w join pg_class c on c.oid = w.ev_class \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                    and w.rulename <> '_RETURN') \
+               from pg_attribute a join pg_class c on c.oid = a.attrelid \
+              where c.relnamespace = '{schema}'::regnamespace and c.relkind in ('r', 'm') \
+                and a.attnum > 0 and (a.attstorage = 'e' or a.attcompression <> '' \
+                                      or a.attstattarget >= 0 or a.attoptions is not null)"
+        ))
+    };
+    let original = settings(&mut h, "r100_set");
+    assert_eq!(
+        original.as_deref(),
+        Some(
+            "mv.s x  50 ; t.s e p -1 ; t.n p  1000 n_distinct=-0.5 \
+             | f f, log d, t i | keep O, logged D"
+        )
+    );
+    assert_eq!(settings(&mut h, "r100_set_copy"), original);
+    h.ok("insert into r100_set_copy.t values (1, 'a', 1, 1)");
+    h.ok("delete from r100_set_copy.t");
+    assert_eq!(
+        h.scalar(
+            "select count(*) || ' ' || (select count(*) from r100_set_copy.log) \
+                    from r100_set_copy.t"
+        )
+        .as_deref(),
+        Some("1 0")
+    );
+    h.ok("drop schema r100_set, r100_set_copy cascade");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.

@@ -765,6 +765,9 @@ fn view_ddl(
     if let Some(role) = role {
         rest.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
+    if object_type == ObjectType::MaterializedView {
+        column_settings(pg, &mut rest, &oid, &kind, &qualified)?;
+    }
     // A view's comments and grants too, for a copy: Edit's CREATE OR
     // REPLACE keeps them anyway (#331, #354). A view has no indexes.
     indexes_and_comments(pg, &mut rest, &oid, &kind, (&owner, &qualified), comment)?;
@@ -1071,11 +1074,16 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     if let Some(role) = role {
         ddl.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
+    column_settings(pg, &mut ddl, &oid, kind, &qualified)?;
     indexes_and_comments(pg, &mut ddl, &oid, kind, (&owner, &qualified), comment)?;
     for constraint in late {
         ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
     }
     constraint_comments(pg, &mut ddl, &oid, &qualified)?;
+    if !foreign {
+        replica_identity(pg, &mut ddl, &oid, &qualified)?;
+    }
+    rules(pg, &mut ddl, &oid, kind, &qualified)?;
     row_security(pg, &mut ddl, &oid, &qualified, secure, forced)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
@@ -1240,6 +1248,130 @@ fn indexes_and_comments(
                 Dialect::POSTGRES.qualified(owner, index),
                 literal(comment)
             ));
+        }
+    }
+    Ok(())
+}
+
+/// What is set on the columns of a table or materialized view `oid` after
+/// its CREATE (#378): a storage that isn't the type's, a compression (14
+/// and later), a statistics target and options (`n_distinct`), as
+/// `alter {kind} … alter column …`.
+fn column_settings(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    kind: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let compression = pg
+        .first(
+            "select current_setting('server_version_num')::int >= 140000",
+            &[],
+        )?
+        .and_then(first)
+        .as_deref()
+        == Some("t");
+    let compression = if compression {
+        "case a.attcompression when 'p' then 'pglz' when 'l' then 'lz4' end"
+    } else {
+        "null"
+    };
+    // A statistics target is -1, or NULL from 17 on, where it is unset.
+    let rows = pg.rows(
+        &format!(
+            "select quote_ident(a.attname), \
+                    case when a.attstorage <> t.typstorage then \
+                         case a.attstorage when 'p' then 'plain' when 'e' then 'external' \
+                                           when 'm' then 'main' when 'x' then 'extended' end end, \
+                    {compression}, \
+                    case when a.attstattarget >= 0 then a.attstattarget::text end, \
+                    array_to_string(a.attoptions, ', ') \
+               from pg_attribute a join pg_type t on t.oid = a.atttypid \
+              where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
+              order by a.attnum"
+        ),
+        &[],
+    )?;
+    for row in rows {
+        let [Some(column), storage, compression, statistics, options] = row.as_slice() else {
+            continue;
+        };
+        let settings = [
+            storage.as_ref().map(|s| format!("set storage {s}")),
+            compression.as_ref().map(|c| format!("set compression {c}")),
+            statistics.as_ref().map(|n| format!("set statistics {n}")),
+            options
+                .as_ref()
+                .filter(|o| !o.is_empty())
+                .map(|o| format!("set ({o})")),
+        ];
+        for setting in settings.into_iter().flatten() {
+            ddl.push_str(&format!(
+                "\n\nalter {kind} {qualified} alter column {column} {setting};"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A table's replica identity where it isn't its key (#378): `full`,
+/// `nothing` or one of its unique indexes, which logical replication sends
+/// old rows by.
+fn replica_identity(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let identity = pg
+        .first(
+            &format!(
+                "select case c.relreplident when 'f' then 'full' when 'n' then 'nothing' \
+                        when 'i' then (select 'using index ' || quote_ident(x.relname) \
+                                         from pg_index i join pg_class x on x.oid = i.indexrelid \
+                                        where i.indrelid = c.oid and i.indisreplident) end \
+                   from pg_class c where c.oid = {oid}"
+            ),
+            &[],
+        )?
+        .and_then(first);
+    if let Some(identity) = identity {
+        ddl.push_str(&format!(
+            "\n\nalter table {qualified} replica identity {identity};"
+        ));
+    }
+    Ok(())
+}
+
+/// A table's rules (#378), as `pg_get_ruledef` writes them, and their
+/// state where they don't fire as usual.
+fn rules(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    kind: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let rules = pg.rows(
+        &format!(
+            "select pg_get_ruledef(w.oid, true), quote_ident(w.rulename), \
+                    case w.ev_enabled when 'D' then 'disable' when 'R' then 'enable replica' \
+                                      when 'A' then 'enable always' end \
+               from pg_rewrite w \
+              where w.ev_class = {oid} and w.rulename <> '_RETURN' \
+              order by w.rulename"
+        ),
+        &[],
+    )?;
+    for row in rules {
+        let [Some(rule), Some(name), state] = row.as_slice() else {
+            continue;
+        };
+        let rule = rule.trim_end().trim_end_matches(';');
+        ddl.push_str(&format!("\n\n{rule};"));
+        if let Some(state) = state {
+            ddl.push_str(&format!("\nalter {kind} {qualified} {state} rule {name};"));
         }
     }
     Ok(())
