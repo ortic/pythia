@@ -1724,6 +1724,63 @@ fn a_child_tables_ddl_inherits() {
     h.ok("drop schema r99_inh, r99_inh_copy cascade");
 }
 
+/// A table's DDL has the comments on its indexes, a key's too, and on its
+/// constraints, a foreign key made after the indexes too; a materialized
+/// view's on its indexes (#379): a copy had none.
+#[test]
+fn ddl_keeps_comments_on_indexes_and_constraints() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r100_cm, r100_cm_copy cascade");
+    h.ok("create schema r100_cm");
+    h.ok("create schema r100_cm_copy");
+    for sql in [
+        "create table r100_cm.t (id int constraint t_pk primary key, \
+           n int constraint positive check (n > 0), up int)",
+        "create unique index t_up on r100_cm.t (up)",
+        "alter table r100_cm.t add constraint t_up_fk foreign key (id) references r100_cm.t (up)",
+        "create index t_n on r100_cm.t (n)",
+        "comment on constraint t_pk on r100_cm.t is 'The key'",
+        "comment on index r100_cm.t_pk is 'The key''s index'",
+        "comment on constraint positive on r100_cm.t is 'Positive'",
+        "comment on constraint t_up_fk on r100_cm.t is 'Up'",
+        "comment on index r100_cm.t_n is 'By n'",
+        "create materialized view r100_cm.mv as select id from r100_cm.t",
+        "create index mv_id on r100_cm.mv (id)",
+        "comment on index r100_cm.mv_id is 'By id'",
+    ] {
+        h.ok(sql);
+    }
+    let table = ddl_of(&mut h, "r100_cm", "t", ObjectType::Table);
+    let view = ddl_of(&mut h, "r100_cm", "mv", ObjectType::MaterializedView);
+    run_ddl(&mut h, &table, "r100_cm.", "r100_cm_copy.");
+    run_ddl(&mut h, &view, "r100_cm.", "r100_cm_copy.");
+    let comments = |h: &mut Harness, schema: &str| {
+        h.scalar(&format!(
+            "select string_agg(d.description, ', ' order by d.description) \
+               from pg_description d \
+              where d.objoid in (select c.oid from pg_class c \
+                                  where c.relnamespace = '{schema}'::regnamespace \
+                                  union all \
+                                 select k.oid from pg_constraint k \
+                                  where k.connamespace = '{schema}'::regnamespace)"
+        ))
+    };
+    let original = comments(&mut h, "r100_cm");
+    assert_eq!(
+        original.as_deref(),
+        Some("By id, By n, Positive, The key, The key's index, Up")
+    );
+    assert_eq!(
+        comments(&mut h, "r100_cm_copy"),
+        original,
+        "{table}\n{view}"
+    );
+    h.ok("drop schema r100_cm, r100_cm_copy cascade");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.

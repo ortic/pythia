@@ -378,6 +378,8 @@ All notable changes to Pythia are documented here. The format follows
 - SQL Server: dropped ledger tables, their history tables and views,
   which SQL Server keeps under names of its own, aren't listed or found
   (#382).
+- PostgreSQL: a table's DDL has the comments on its indexes and its
+  constraints, a materialized view's on its indexes (#379).
 
 ## [0.11.0] - 2026-11-02
 

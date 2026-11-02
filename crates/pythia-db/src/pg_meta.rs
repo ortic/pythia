@@ -767,7 +767,7 @@ fn view_ddl(
     }
     // A view's comments and grants too, for a copy: Edit's CREATE OR
     // REPLACE keeps them anyway (#331, #354). A view has no indexes.
-    indexes_and_comments(pg, &mut rest, &oid, &kind, &qualified, comment)?;
+    indexes_and_comments(pg, &mut rest, &oid, &kind, (&owner, &qualified), comment)?;
     grants(pg, &mut rest, Privileges::Relation, &oid, &qualified)?;
     Ok(Some(followed(&ddl, &rest, end)))
 }
@@ -1071,10 +1071,11 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     if let Some(role) = role {
         ddl.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    indexes_and_comments(pg, &mut ddl, &oid, kind, &qualified, comment)?;
+    indexes_and_comments(pg, &mut ddl, &oid, kind, (&owner, &qualified), comment)?;
     for constraint in late {
         ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
     }
+    constraint_comments(pg, &mut ddl, &oid, &qualified)?;
     row_security(pg, &mut ddl, &oid, &qualified, secure, forced)?;
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
@@ -1182,7 +1183,7 @@ fn indexes_and_comments(
     ddl: &mut String,
     oid: &str,
     kind: &str,
-    qualified: &str,
+    (owner, qualified): (&str, &str),
     comment: Option<String>,
 ) -> Result<(), DbError> {
     let indexes = pg.rows(
@@ -1218,6 +1219,53 @@ fn indexes_and_comments(
         if let [Some(column), Some(comment)] = row.as_slice() {
             ddl.push_str(&format!(
                 "\ncomment on column {qualified}.{column} is {};",
+                literal(comment)
+            ));
+        }
+    }
+    // Its indexes', a key's index's too (#379), which are in its schema.
+    let comments = pg.rows(
+        &format!(
+            "select c.relname, obj_description(c.oid, 'pg_class') \
+               from pg_index i join pg_class c on c.oid = i.indexrelid \
+              where i.indrelid = {oid} and obj_description(c.oid, 'pg_class') is not null \
+              order by c.relname"
+        ),
+        &[],
+    )?;
+    for row in comments {
+        if let [Some(index), Some(comment)] = row.as_slice() {
+            ddl.push_str(&format!(
+                "\ncomment on index {} is {};",
+                Dialect::POSTGRES.qualified(owner, index),
+                literal(comment)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The comments on a table's constraints (#379), which come after the
+/// constraints added after its indexes.
+fn constraint_comments(
+    pg: &Pg<'_>,
+    ddl: &mut String,
+    oid: &str,
+    qualified: &str,
+) -> Result<(), DbError> {
+    let comments = pg.rows(
+        &format!(
+            "select quote_ident(k.conname), obj_description(k.oid, 'pg_constraint') \
+               from pg_constraint k \
+              where k.conrelid = {oid} and obj_description(k.oid, 'pg_constraint') is not null \
+              order by k.conname"
+        ),
+        &[],
+    )?;
+    for row in comments {
+        if let [Some(constraint), Some(comment)] = row.as_slice() {
+            ddl.push_str(&format!(
+                "\ncomment on constraint {constraint} on {qualified} is {};",
                 literal(comment)
             ));
         }
