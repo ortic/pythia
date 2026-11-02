@@ -2317,6 +2317,25 @@ fn create_or(ddl: &str, words: &str, next: &str) -> String {
                 && !ddl[after.span.clone()].eq_ignore_ascii_case("or")
                 && (next.is_empty() || ddl[after.span.clone()].eq_ignore_ascii_case(next)) =>
         {
+            // OR REPLACE can't go with IF NOT EXISTS, which MariaDB keeps in
+            // a trigger's DDL (#420): it goes from the statement's head.
+            let head: Vec<&pythia_plsql::Token> = tokens
+                .iter()
+                .filter(|t| !t.kind.is_trivia())
+                .take(12)
+                .collect();
+            let is = |i: usize, word: &str| {
+                head.get(i)
+                    .is_some_and(|t| ddl[t.span.clone()].eq_ignore_ascii_case(word))
+            };
+            let mut ddl = ddl.to_owned();
+            if let Some(i) =
+                (0..head.len()).find(|&i| is(i, "IF") && is(i + 1, "NOT") && is(i + 2, "EXISTS"))
+            {
+                let end = head[i + 2].span.end;
+                let end = end + ddl[end..].len() - ddl[end..].trim_start().len();
+                ddl.replace_range(head[i].span.start..end, "");
+            }
             format!(
                 "{} {words}{}",
                 &ddl[..create.span.end],
@@ -3232,6 +3251,14 @@ mod tests {
         assert!(
             replace_script(Dialect::MYSQL, &trigger, ddl, true)
                 .starts_with("use shop;\n\nCREATE or replace DEFINER=`app`@`%` TRIGGER t ")
+        );
+        // MariaDB keeps IF NOT EXISTS, which OR REPLACE can't go with.
+        let kept = "CREATE DEFINER=`app`@`%` trigger if not exists t before insert on o \
+                    for each row set new.n = 1";
+        assert_eq!(
+            replace_script(Dialect::MYSQL, &trigger, kept, true),
+            "use shop;\n\nCREATE or replace DEFINER=`app`@`%` trigger t before insert on o \
+             for each row set new.n = 1\n/\n"
         );
     }
 

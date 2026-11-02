@@ -302,6 +302,9 @@ All notable changes to Pythia are documented here. The format follows
   table on Linux; and `straße` became `STRASSE` with identifier case
   Upper. Only ASCII letters change case, and on MySQL only reserved
   words.
+- MariaDB: *Edit* of a trigger created with `IF NOT EXISTS` opens a
+  script that runs (#420); it failed with "Incorrect usage of OR REPLACE
+  and IF NOT EXISTS".
 
 ## [0.11.0] - 2026-11-02
 
