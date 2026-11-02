@@ -370,6 +370,8 @@ All notable changes to Pythia are documented here. The format follows
 - Import reads CSV files in Windows-1252 and UTF-16 (with its byte order
   mark), as the editor opens them, not as UTF-8 that lost their accented
   characters (#446).
+- MySQL: completion offers a table's own columns where another table's
+  name differs from it only in case, not both tables' (#447).
 
 ## [0.11.0] - 2026-11-02
 

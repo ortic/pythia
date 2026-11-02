@@ -784,7 +784,8 @@ mod dictionary {
                   select routine_schema, routine_name, routine_type \
                     from information_schema.routines",
         first_row: "limit 1",
-        columns: "select column_name, column_type, is_nullable, nullif(column_comment, '') \
+        columns: "select column_name, column_type, is_nullable, nullif(column_comment, ''), \
+                         table_schema, table_name \
                     from information_schema.columns \
                    where lower(table_schema) = lower(?) and lower(table_name) = lower(?) \
                    order by ordinal_position",
@@ -925,8 +926,23 @@ mod dictionary {
             }
             CatalogRequest::Columns { owner, name } => {
                 let rows = client.query(&of(sql.columns), &[&owner, &name])?;
+                // MySQL's names are found in any case, and two tables may
+                // differ only in it (lower_case_table_names = 0): the
+                // columns are those of the one named so exactly, else of
+                // the first (#447).
+                let table =
+                    |r: &Vec<Cell>| (r.get(4).cloned().flatten(), r.get(5).cloned().flatten());
+                let exact = |(schema, table): &(Option<String>, Option<String>)| {
+                    u8::from(schema.as_deref() == Some(owner.as_str()))
+                        + u8::from(table.as_deref() == Some(name.as_str()))
+                };
+                let best = rows
+                    .iter()
+                    .map(table)
+                    .min_by_key(|t| std::cmp::Reverse(exact(t)));
                 let columns = rows
                     .into_iter()
+                    .filter(|r| best.as_ref().is_none_or(|best| table(r) == *best))
                     .filter_map(|mut r| {
                         let comment = r.get_mut(3).and_then(Option::take);
                         Some(CatalogColumn {
@@ -2184,6 +2200,36 @@ mod dictionary_live {
             assert!(has(&items, "Customer", "Customer"), "{table}: {items:?}");
             assert!(has(&items, "order", "`order`"), "{table}: {items:?}");
         }
+    }
+
+    /// Two MySQL tables whose names differ only in case each complete
+    /// their own columns (#447), which were both tables' together.
+    #[test]
+    fn mysql_tables_differing_in_case() {
+        let Some((mut live, server)) = connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+            return;
+        };
+        live.run("drop table if exists `FdCase`");
+        live.run("drop table if exists `fdcase`");
+        live.run("create table `FdCase` (upper_id int)");
+        // With lower_case_table_names set, MySQL has one table of the name.
+        if live.first("select @@lower_case_table_names").as_deref() != Some("0") {
+            live.run("drop table `FdCase`");
+            return;
+        }
+        live.run("create table `fdcase` (lower_id int)");
+        for (table, column) in [("`FdCase`", "upper_id"), ("`fdcase`", "lower_id")] {
+            let items = complete_on(
+                &mut live,
+                server.current_schema.clone(),
+                NameStyle::Backticks,
+                table,
+            );
+            let labels: Vec<&str> = items.iter().map(|(label, _)| label.as_str()).collect();
+            assert_eq!(labels, [column], "{table}");
+        }
+        live.run("drop table `FdCase`");
+        live.run("drop table `fdcase`");
     }
 
     /// MariaDB's sequences complete as sequences (#270): in an expression,
