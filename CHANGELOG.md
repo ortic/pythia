@@ -453,6 +453,8 @@ All notable changes to Pythia are documented here. The format follows
 - The editor offers PL/SQL snippets (`func`, `proc`, `begin`, …) in
   Oracle's windows only, not in other databases', which refused them
   (#469).
+- PostgreSQL: a partitioned table's DDL makes its partitions too, which a
+  copy needed to take any row (#470).
 
 ## [0.11.0] - 2026-11-02
 

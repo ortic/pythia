@@ -1933,6 +1933,47 @@ fn client_encoding_stays_utf8() {
     h.ok("drop table r101_enc");
 }
 
+/// A partitioned table's DDL makes its partitions too, sub-partitions and
+/// the default one (#470): a copy made from it took no row.
+#[test]
+fn a_partitioned_tables_ddl_has_its_partitions() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r101_part, r101_part_copy cascade");
+    h.ok("create schema r101_part");
+    h.ok("create schema r101_part_copy");
+    for sql in [
+        "create table r101_part.t (id int, region text) partition by range (id)",
+        "create table r101_part.t_low partition of r101_part.t for values from (0) to (100) \
+           partition by list (region)",
+        "create table r101_part.t_low_eu partition of r101_part.t_low for values in ('eu')",
+        "create table r101_part.t_low_other partition of r101_part.t_low default",
+        "create table r101_part.t_high partition of r101_part.t for values from (100) to (200)",
+    ] {
+        h.ok(sql);
+    }
+    let ddl = ddl_of(&mut h, "r101_part", "t", ObjectType::Table);
+    assert!(
+        ddl.contains(
+            "create table r101_part.t_low partition of r101_part.t \
+             FOR VALUES FROM (0) TO (100) partition by LIST (region);"
+        ),
+        "{ddl}"
+    );
+    run_ddl(&mut h, &ddl, "r101_part.", "r101_part_copy.");
+    h.ok("insert into r101_part_copy.t values (1, 'eu'), (2, 'us'), (150, 'eu')");
+    assert_eq!(
+        h.scalar(
+            "select string_agg(tableoid::regclass::text, ', ' order by id) from r101_part_copy.t"
+        )
+        .as_deref(),
+        Some("r101_part_copy.t_low_eu, r101_part_copy.t_low_other, r101_part_copy.t_high")
+    );
+    h.ok("drop schema r101_part, r101_part_copy cascade");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.
