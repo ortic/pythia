@@ -3655,7 +3655,7 @@ fn is_binary(dialect: Dialect, col: &Column) -> bool {
                 || t.starts_with("LONG RAW")
                 || t == "BFILE"
         }
-        DbKind::MySql => matches!(t, "BLOB" | "BINARY" | "VARBINARY"),
+        DbKind::MySql => matches!(t, "BLOB" | "BINARY" | "VARBINARY" | "VECTOR"),
         DbKind::SqlServer => matches!(t, "binary" | "varbinary" | "image"),
         DbKind::Postgres => t == "bytea",
         DbKind::Sqlite => t.to_ascii_uppercase().contains("BLOB"),

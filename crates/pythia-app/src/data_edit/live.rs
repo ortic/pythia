@@ -974,6 +974,45 @@ fn mysql_bits() {
     db.ok("drop table r41_bits");
 }
 
+/// MySQL's VECTOR values, shown as the hex of their floats (#436) like the
+/// other binary values, not as their bytes read as text: typed again they
+/// find their row, and a new one is written as those bytes.
+#[test]
+fn mysql_vectors() {
+    let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+        return;
+    };
+    db.ok("drop table if exists fd_vectors");
+    // Before MySQL 9 and on MariaDB, no VECTOR.
+    if db
+        .run("create table fd_vectors (id int primary key, v vector(3))")
+        .is_err()
+    {
+        return;
+    }
+    db.ok("insert into fd_vectors values (1, string_to_vector('[1,2.5,3]')), (2, null)");
+    assert!(db.rewrite_all("fd_vectors", "id", &[]).is_empty());
+    let (edit, columns, rows) = db.editable("fd_vectors", "id");
+    assert_eq!(rows[0][1].as_deref(), Some("0000803F0000204000004040"));
+    let changes = Changes {
+        updates: BTreeMap::from([(1, BTreeMap::from([(1, Some("0000803F00000040".into()))]))]),
+        ..Changes::default()
+    };
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    assert_eq!(
+        db.count("select vector_to_string(v) from fd_vectors where id = 2"),
+        "[1.00000e+00,2.00000e+00]"
+    );
+    db.ok("drop table fd_vectors");
+}
+
 /// A binary value typed as the grid shows it, `0x171066e1`, is those four
 /// bytes (#256), also the one past 0x7f: MySQL, PostgreSQL and SQLite
 /// stored the text's ten (`0x30783137…`).

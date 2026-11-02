@@ -347,6 +347,8 @@ All notable changes to Pythia are documented here. The format follows
   or JSON (#434); it failed with the library's error only.
 - Oracle: a numbered substitution variable, `&1`, is substituted in code
   too, not only in strings (#435).
+- MySQL: a `VECTOR` is shown as the hex of its bytes, not as garbled
+  text, and Edit changes rows that have one (#436).
 
 ## [0.11.0] - 2026-11-02
 

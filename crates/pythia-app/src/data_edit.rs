@@ -1098,7 +1098,7 @@ fn mysql_digest(name: &str, type_name: &str, value: &str) -> String {
     use sha2::{Digest, Sha256};
     let binary = matches!(
         type_name,
-        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
+        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY" | "VECTOR"
     );
     let hex =
         binary && value.len().is_multiple_of(2) && value.bytes().all(|b| b.is_ascii_hexdigit());
@@ -1207,6 +1207,8 @@ fn same(dialect: Dialect, name: &str, col: &Column, value: Option<&str>) -> Opti
         }
         // A string compares with JSON as a JSON string.
         (DbKind::MySql, "JSON") => format!("{name} = cast({lit} as json)"),
+        // A VECTOR has no `=` (1210), its bytes have.
+        (DbKind::MySql, "VECTOR") => format!("cast({name} as binary) = {lit}"),
         (DbKind::Postgres, t) if POSTGRES_EQUAL.contains(&t) => format!("{name} = {lit}"),
         // The others compare as the text that was shown: json, xml and
         // points have no `=`, a real compared with a number is widened to

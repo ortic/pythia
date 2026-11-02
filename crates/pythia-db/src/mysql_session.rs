@@ -936,19 +936,21 @@ fn type_name(c: &mysql::Column) -> String {
 fn is_binary(c: &mysql::Column) -> bool {
     use ColumnType::*;
     const BINARY_CHARSET: u16 = 63;
-    c.character_set() == BINARY_CHARSET
-        && matches!(
-            c.column_type(),
-            MYSQL_TYPE_STRING
-                | MYSQL_TYPE_VAR_STRING
-                | MYSQL_TYPE_VARCHAR
-                | MYSQL_TYPE_TINY_BLOB
-                | MYSQL_TYPE_MEDIUM_BLOB
-                | MYSQL_TYPE_LONG_BLOB
-                | MYSQL_TYPE_BLOB
-                | MYSQL_TYPE_BIT
-                | MYSQL_TYPE_GEOMETRY
-        )
+    // A VECTOR is its floats' bytes, whatever character set it is sent in.
+    c.column_type() == MYSQL_TYPE_VECTOR
+        || c.character_set() == BINARY_CHARSET
+            && matches!(
+                c.column_type(),
+                MYSQL_TYPE_STRING
+                    | MYSQL_TYPE_VAR_STRING
+                    | MYSQL_TYPE_VARCHAR
+                    | MYSQL_TYPE_TINY_BLOB
+                    | MYSQL_TYPE_MEDIUM_BLOB
+                    | MYSQL_TYPE_LONG_BLOB
+                    | MYSQL_TYPE_BLOB
+                    | MYSQL_TYPE_BIT
+                    | MYSQL_TYPE_GEOMETRY
+            )
 }
 
 /// A value as text; binary values cut short unless `whole`.
@@ -1293,6 +1295,19 @@ mod tests {
     /// Types as DDL names them, with UNSIGNED only on numbers (#221): MariaDB
     /// flags a TIMESTAMP, an INET6 (a string to the client), a YEAR and a
     /// BIT unsigned too.
+    /// A VECTOR is shown as the hex of its floats, not as their bytes
+    /// read as text (#436).
+    #[test]
+    fn vectors_are_hex() {
+        let column = mysql::Column::new(ColumnType::MYSQL_TYPE_VECTOR).with_character_set(63);
+        let floats = [1.0f32, 2.5].map(f32::to_le_bytes).concat();
+        assert_eq!(
+            cell(&Value::Bytes(floats), &column, true).as_deref(),
+            Some("0000803F00002040")
+        );
+        assert_eq!(type_name(&column), "VECTOR");
+    }
+
     #[test]
     fn type_names() {
         use ColumnFlags as F;

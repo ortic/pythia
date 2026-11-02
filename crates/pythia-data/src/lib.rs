@@ -1021,7 +1021,7 @@ fn mysql_literal(col: &Column, value: Option<&str>) -> String {
     }
     let binary = matches!(
         col.type_name.as_str(),
-        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY"
+        "BINARY" | "VARBINARY" | "BLOB" | "BIT" | "GEOMETRY" | "VECTOR"
     );
     let typed = typed_hex(v).filter(|_| binary);
     let v = typed.as_deref().unwrap_or(v);
