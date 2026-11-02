@@ -933,6 +933,41 @@ pub fn sqlite_number(text: &str) -> bool {
             .is_ok_and(|f| f.is_finite() && format!("{f:?}") == text)
 }
 
+/// An amount as a plain decimal, written with a currency and digit groups
+/// as PostgreSQL's `money` is, by the server's `lc_monetary`: `$1,234.56`
+/// is `1234.56`, `-1.234,56 €` is `-1234.56`, `($5.00)` is `-5.00`,
+/// `CHF 1'234.50` is `1234.50`. Of `.` and `,`, the last is the decimal
+/// point, unless it is the only one and three digits follow it (a group:
+/// `¥1,234`). `None` without digits.
+pub fn amount(text: &str) -> Option<String> {
+    let text = text.trim();
+    let negative = text.contains('-') || text.starts_with('(') && text.ends_with(')');
+    let kept: Vec<char> = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || matches!(c, '.' | ','))
+        .collect();
+    if !kept.iter().any(char::is_ascii_digit) {
+        return None;
+    }
+    let point = kept
+        .iter()
+        .rposition(|c| matches!(c, '.' | ','))
+        .filter(|&at| {
+            let both = kept.contains(&'.') && kept.contains(&',');
+            let alone = kept.iter().filter(|&&c| c == kept[at]).count() == 1;
+            both || alone && kept.len() - at - 1 != 3
+        });
+    let mut out = String::from(if negative { "-" } else { "" });
+    for (i, c) in kept.iter().enumerate() {
+        if c.is_ascii_digit() {
+            out.push(*c);
+        } else if Some(i) == point {
+            out.push('.');
+        }
+    }
+    Some(out)
+}
+
 /// Compares two numbers written as plain decimals (`-12.50`, `.5`, `007`)
 /// exactly, digit by digit, whatever their size; `None` if one isn't such
 /// a number (`1e300`, `NaN`, text). A double holds 15 to 17 of their
@@ -1245,6 +1280,25 @@ mod tests {
     use std::cell::Cell as Counter;
 
     use super::*;
+
+    /// PostgreSQL's money as `lc_monetary` writes it, as a plain decimal.
+    #[test]
+    fn amounts() {
+        for (text, plain) in [
+            ("$1,234.56", "1234.56"),
+            ("-$5.00", "-5.00"),
+            ("($5.00)", "-5.00"),
+            ("-1.234.567,89 €", "-1234567.89"),
+            ("CHF 1'234.50", "1234.50"),
+            ("¥1,234", "1234"),
+            ("1,234,567", "1234567"),
+            ("12.5", "12.5"),
+            ("$0.00", "0.00"),
+        ] {
+            assert_eq!(amount(text).as_deref(), Some(plain), "{text}");
+        }
+        assert_eq!(amount("n/a"), None);
+    }
 
     /// The bytes each thread allocates, for the tests of what a write
     /// copies.

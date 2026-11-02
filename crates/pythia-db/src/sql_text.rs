@@ -1,7 +1,7 @@
 //! Reading statement text, for the backends that aren't Oracle: what a
 //! statement is, its bind variables, and values rendered as text.
 
-use pythia_plsql::{Syntax, TokenKind, tokenize};
+use pythia_plsql::{Syntax, TokenKind, tokenize, tokenize_in};
 
 use crate::compat::Release;
 use crate::types::Bind;
@@ -69,16 +69,18 @@ pub(crate) fn has_inner_semicolon(sql: &str) -> bool {
 
 /// Replaces the `:name` bind variables that have a value (names match
 /// without case, as Oracle's do) by what `replace` makes of the value's
-/// position (from 1) and value.
+/// position (from 1) and value. `sql` is read in `syntax`: a `:name` in
+/// MySQL's `'it\'s :name'` or PostgreSQL's `E'…'` is in a string.
 pub(crate) fn replace_binds(
     sql: &str,
+    syntax: Syntax,
     binds: &[(String, Bind)],
     mut replace: impl FnMut(usize, &Bind) -> String,
 ) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
     let mut position = 0;
-    for token in tokenize(sql) {
+    for token in tokenize_in(sql, syntax) {
         if token.kind != TokenKind::BindVar {
             continue;
         }
@@ -238,12 +240,34 @@ mod tests {
         ];
         let sql = replace_binds(
             "select * from t where id = :ID or :n is null and x = ':id' and y = :other",
+            Syntax::Oracle,
             &binds,
             |i, v| format!("${i}{}", if *v == Bind::Text(None) { "" } else { "v" }),
         );
         assert_eq!(
             sql,
             "select * from t where id = $1v or $2 is null and x = ':id' and y = :other"
+        );
+        // In a string as the database reads it: MySQL's `\'`, PostgreSQL's
+        // `E'…'` and array slices.
+        let mark = |_: usize, _: &Bind| "?".to_owned();
+        assert_eq!(
+            replace_binds(
+                r"select 'it\'s :id' from t where a = :id",
+                Syntax::MySql,
+                &binds,
+                mark
+            ),
+            r"select 'it\'s :id' from t where a = ?"
+        );
+        assert_eq!(
+            replace_binds(
+                r"select E'it\'s :id', a[1:n] from t where a = :id",
+                Syntax::Postgres,
+                &binds,
+                mark
+            ),
+            r"select E'it\'s :id', a[1:n] from t where a = ?"
         );
     }
 

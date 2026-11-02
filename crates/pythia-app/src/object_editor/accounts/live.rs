@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use pythia_db::{Client, ConnectParams, DbError, DbEvent, DbKind, DbRequest, ObjectType, Session};
 
-use super::{Grant, Login, RoleGrant, Scope, UserDef};
+use super::{Grant, Login, RoleGrant, Scope, ScopeKind, UserDef};
 use crate::documents::{Effects, ObjectRef};
 use crate::object_editor::{EditTarget, ObjectEditor};
 
@@ -209,6 +209,90 @@ fn change(
 
 fn grant() -> RoleGrant {
     RoleGrant::default()
+}
+
+/// Whether `user` logs in with `password` where `env`'s account does.
+fn logs_in(env: &str, kind: DbKind, user: &str, password: &str) -> bool {
+    let spec = std::env::var(env).unwrap();
+    let (_, connect_string) = spec.rsplit_once('@').unwrap();
+    let (tx, wake) = mpsc::channel();
+    let session = Session::connect(
+        ConnectParams {
+            kind,
+            username: user.into(),
+            password: password.into(),
+            connect_string: connect_string.into(),
+            privilege: Default::default(),
+            init_sql: Vec::new(),
+            ssh: None,
+        },
+        move || {
+            let _ = tx.send(());
+        },
+    );
+    loop {
+        match session.try_recv() {
+            Some(DbEvent::Connected(_)) => return true,
+            Some(DbEvent::ConnectFailed(_)) => return false,
+            Some(_) => {}
+            None => {
+                wake.recv_timeout(Duration::from_secs(60))
+                    .expect("timed out");
+            }
+        }
+    }
+}
+
+/// A password with a `\` is the one typed, also where the session's
+/// sql_mode has NO_BACKSLASH_ESCAPES: there `'a\\b'` was `a\\b`.
+#[test]
+fn mysql_passwords_keep_their_backslashes() {
+    let env = "PYTHIA_TEST_MYSQL_DBA";
+    let Some(mut live) = Live::connect(env, DbKind::MySql) else {
+        return;
+    };
+    let name = "pythia_acct_bs";
+    live.try_exec(&format!("drop user if exists '{name}'@'%'"));
+    create(&mut live, ObjectType::User, |u| {
+        u.name = name.into();
+        u.password = r"a\b".into();
+        u.privileges.insert(
+            (Scope::Database("pythia".into()), "SELECT".into()),
+            Grant::Plain,
+        );
+    });
+    assert!(logs_in(env, DbKind::MySql, name, r"a\b"));
+    live.exec("set session sql_mode = concat(@@session.sql_mode, ',NO_BACKSLASH_ESCAPES')");
+    change(&mut live, &format!("{name}@%"), ObjectType::User, |u| {
+        u.password = r"c\d".into();
+    });
+    let typed = logs_in(env, DbKind::MySql, name, r"c\d");
+    live.try_exec(&format!("drop user if exists '{name}'@'%'"));
+    assert!(typed, "the password isn't the one typed");
+}
+
+/// What can be granted on a database or a table is what the server says,
+/// MariaDB's DELETE HISTORY too, not only the privileges MySQL has.
+#[test]
+fn mysql_privileges_of_each_scope() {
+    let Some(mut live) = Live::connect("PYTHIA_TEST_MYSQL_DBA", DbKind::MySql) else {
+        return;
+    };
+    let mariadb = live.mariadb;
+    let (_, _, choices) = live.run(|c| super::mysql::load(c, None, false)).unwrap();
+    for scope in [ScopeKind::Database, ScopeKind::Object] {
+        let list = &choices.privileges[&scope];
+        assert!(list.iter().any(|p| p == "SELECT"), "{scope:?}: {list:?}");
+        assert_eq!(
+            list.iter().any(|p| p == "DELETE HISTORY"),
+            mariadb,
+            "{scope:?}: {list:?}"
+        );
+    }
+    let database = &choices.privileges[&ScopeKind::Database];
+    assert!(database.iter().any(|p| p == "LOCK TABLES"), "{database:?}");
+    let table = &choices.privileges[&ScopeKind::Object];
+    assert!(!table.iter().any(|p| p == "LOCK TABLES"), "{table:?}");
 }
 
 #[test]

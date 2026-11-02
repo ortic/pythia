@@ -119,7 +119,9 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
     // Where `lexer` started: it starts again after a token MySQL or
     // PostgreSQL ends elsewhere.
     let mut base = 0;
-    let mut tokens = Vec::new();
+    let mut tokens: Vec<Token> = Vec::new();
+    // `[` open in PostgreSQL's syntax, where they're no names.
+    let mut brackets = 0usize;
     while let Some(result) = lexer.next() {
         let mut span = base + lexer.span().start..base + lexer.span().end;
         let mut kind = match result {
@@ -165,6 +167,42 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
             last.span.end = span.end;
             continue;
         }
+        if syntax == Syntax::Postgres && kind == TokenKind::Error {
+            for c in src[span.clone()].chars() {
+                match c {
+                    '[' => brackets += 1,
+                    ']' => brackets = brackets.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        // PostgreSQL's array slice, `a[1:n]`: its bound is no bind variable.
+        // One after `[`, `,` or an operator still is (`array[:x, :y]`).
+        if syntax == Syntax::Postgres
+            && kind == TokenKind::BindVar
+            && brackets > 0
+            && tokens
+                .iter()
+                .rev()
+                .find(|t| !t.kind.is_trivia())
+                .is_some_and(|t| ends_operand(src, t))
+        {
+            tokens.push(Token {
+                kind: TokenKind::Operator,
+                span: span.start..span.start + 1,
+            });
+            let bound = span.start + 1..span.end;
+            let text = &src[bound.clone()];
+            let kind = if text.starts_with(|c: char| c.is_ascii_digit()) {
+                TokenKind::Number
+            } else if is_keyword(text) {
+                TokenKind::Keyword
+            } else {
+                TokenKind::Ident
+            };
+            tokens.push(Token { kind, span: bound });
+            continue;
+        }
         // Merge consecutive error bytes into one token.
         if kind == TokenKind::Error
             && let Some(last) = tokens
@@ -177,6 +215,21 @@ pub fn tokenize_in(src: &str, syntax: Syntax) -> Vec<Token> {
         tokens.push(Token { kind, span });
     }
     tokens
+}
+
+/// Whether `token` can end an operand, as the lower bound of a slice
+/// before its `:`.
+fn ends_operand(src: &str, token: &Token) -> bool {
+    match token.kind {
+        TokenKind::Ident
+        | TokenKind::QuotedIdent
+        | TokenKind::Keyword
+        | TokenKind::Number
+        | TokenKind::String
+        | TokenKind::RParen => true,
+        TokenKind::Error => src[token.span.clone()].ends_with(']'),
+        _ => false,
+    }
 }
 
 /// What starts the name of a T-SQL temporary table: `#` or `##`, and the
@@ -299,10 +352,47 @@ fn is_directive(dollars: &str, word: &str) -> bool {
 }
 
 /// Consumes a block comment body up to and including `*/` (or end of input).
+/// PostgreSQL and SQL Server nest them: `/* a /* b */ c */` is one comment.
 fn block_comment(lex: &mut logos::Lexer<TokenKind>) {
     let rest = lex.remainder();
-    let len = rest.find("*/").map_or(rest.len(), |i| i + 2);
+    let len = comment_body(rest, lex.extras).unwrap_or(rest.len());
     lex.bump(len);
+}
+
+/// The length of a block comment's body in `rest`, the text after its
+/// `/*`, up to and including the `*/` that closes it; or, if `rest` ends
+/// first, how many comments are still open there. Only PostgreSQL and SQL
+/// Server count a `/*` inside.
+fn comment_body(rest: &str, syntax: Syntax) -> Result<usize, usize> {
+    let nests = matches!(syntax, Syntax::Postgres | Syntax::TSql);
+    let bytes = rest.as_bytes();
+    let (mut depth, mut i) = (1, 0);
+    while i + 1 < bytes.len() {
+        match &bytes[i..i + 2] {
+            b"/*" if nests => {
+                depth += 1;
+                i += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                i += 2;
+                if depth == 0 || !nests {
+                    return Ok(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Err(depth)
+}
+
+/// How many block comments are still open at the end of `comment`, a
+/// block comment token's text (with its `/*`): 0 when it is closed.
+/// Comments nest in PostgreSQL's and SQL Server's syntax.
+pub fn open_comments(comment: &str, syntax: Syntax) -> usize {
+    comment
+        .strip_prefix("/*")
+        .map_or(0, |body| comment_body(body, syntax).err().unwrap_or(0))
 }
 
 /// Consumes a string body after the opening quote, honouring `''` escapes.
@@ -453,6 +543,58 @@ mod tests {
         );
         assert_eq!(kinds("q'[abc"), vec![(TokenKind::QString, "q'[abc")]);
         assert_eq!(kinds("$$ ab;c"), vec![(TokenKind::String, "$$ ab;c")]);
+    }
+
+    /// The bounds of PostgreSQL's array slices aren't bind variables;
+    /// a `:name` as an element is one.
+    #[test]
+    fn postgres_slices_have_no_binds() {
+        let src = "select a[1:2], a[i:n], a[f(x):n], b[1][2:3], array[:x, :y], a[1 + :z] from t \
+                   where c = :w";
+        let binds: Vec<&str> = tokenize_in(src, Syntax::Postgres)
+            .into_iter()
+            .filter(|t| t.kind == TokenKind::BindVar)
+            .map(|t| &src[t.span])
+            .collect();
+        assert_eq!(binds, [":x", ":y", ":z", ":w"]);
+        // Elsewhere they are.
+        let oracle = tokenize("select a[i:n] from t");
+        assert!(oracle.iter().any(|t| t.kind == TokenKind::BindVar));
+    }
+
+    /// PostgreSQL and SQL Server nest block comments; Oracle, MySQL and
+    /// SQLite end one at the first `*/`.
+    #[test]
+    fn nested_block_comments() {
+        let src = "/* off /* step 2 */ delete from t; */ select 1";
+        let first = |syntax| {
+            let t = &tokenize_in(src, syntax)[0];
+            (t.kind, &src[t.span.clone()])
+        };
+        for syntax in [Syntax::Postgres, Syntax::TSql] {
+            assert_eq!(
+                first(syntax),
+                (
+                    TokenKind::BlockComment,
+                    "/* off /* step 2 */ delete from t; */"
+                ),
+                "{syntax:?}"
+            );
+        }
+        for syntax in [Syntax::Oracle, Syntax::MySql, Syntax::Sqlite] {
+            assert_eq!(
+                first(syntax),
+                (TokenKind::BlockComment, "/* off /* step 2 */"),
+                "{syntax:?}"
+            );
+        }
+        assert_eq!(open_comments("/* a /* b */", Syntax::Postgres), 1);
+        assert_eq!(open_comments("/* a /* b", Syntax::TSql), 2);
+        assert_eq!(open_comments("/* a /* b */ */", Syntax::TSql), 0);
+        assert_eq!(open_comments("/* a /* b */", Syntax::Oracle), 0);
+        assert_eq!(open_comments("/* a /* b", Syntax::Oracle), 1);
+        assert_eq!(open_comments("/**/", Syntax::Postgres), 0);
+        assert_eq!(open_comments("/*/", Syntax::Postgres), 1);
     }
 
     fn mysql_kinds(src: &str) -> Vec<(TokenKind, &str)> {

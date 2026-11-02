@@ -6,6 +6,105 @@ All notable changes to Pythia are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- SQLite: the Triggers tab shows a trigger's event right when the
+  trigger's name is an event word itself (#386): `create trigger
+  "delete" after insert …` showed as `DELETE AFTER INSERT`. A
+  `[bracketed]` name is unquoted too.
+- MySQL: a column's default expression with a string in it shows as
+  SHOW CREATE TABLE writes it (#387): `default ('it''s')` showed as
+  `_utf8mb4\'it\\\'s\'`, escaped once more as `information_schema`
+  gives it.
+- MySQL and SQL Server: *Edit* works on a result of a temporary table
+  (#388), which it refused as having no key: the key came from
+  `information_schema` on MySQL, which lists no temporary tables, and on
+  SQL Server from the database instead of `tempdb`. On MySQL, a
+  temporary table that hides a table of its name got that table's key.
+- SQL Server: a `numeric` or `decimal` of scale 0 shows as `123`, no
+  longer as `123.0` (#389), in the grid and in exports.
+- MySQL: *Edit* on a query whose select list ends with a `#` comment
+  deleted the wrong rows (#390). The key columns it adds went into the
+  comment, and the result's last column was taken for the key: a Delete
+  removed the row whose key was that column's value. The select list is
+  now read with the database's comments (and SQL Server's `#temp`
+  names), and a result is editable only when it ends with the key
+  columns that were added.
+- PostgreSQL and SQL Server: block comments nest, as the servers read
+  them (#391). In `/* off /* step 2 */ delete from t; */`, Pythia ended
+  the comment at the first `*/` and ran the `delete`, which the server
+  would have left commented out. The editor highlights it as comment too.
+- The value editor shows a binary value the grid holds cut short (its
+  first 4000 bytes) read-only (#392), with *Save to file…* and *Load
+  from file…*. Editing that text was either dropped without a word or,
+  with its `… (N bytes)` ending deleted, written as the whole value,
+  truncating it. Apply says how many cut values (pasted, say) it leaves
+  out.
+- PostgreSQL: `key=value` connect strings are read as libpq reads them
+  (#393): a `?` in a value no longer makes the string a URL, quoted
+  values keep their spaces, and `sslmode = require` with spaces is
+  taken. An `sslmode` that the driver read but Pythia didn't was turned
+  into `prefer`, which falls back to a connection without TLS.
+- Script files in UTF-16 (with its byte order mark, as SQL Server
+  Management Studio and Windows PowerShell write them) open as text and
+  are saved as UTF-16 (#394). They were read as Windows-1252, and an
+  edit saved single bytes into them. The encoding in the status bar
+  saves the file in another one, which a Windows-1252 file needs for a
+  character it can't hold.
+- Oracle's forms for materialized views, indexes and database links
+  drop the object to create it again for some changes (#395). When the
+  create failed (an index made unique over duplicates), the object was
+  gone and the next Apply tried the drop again. Now the message says it
+  was dropped, and Apply creates it. A materialized view's new query is
+  checked before the drop.
+- PostgreSQL and SQL Server: a table's DDL runs again when a foreign
+  key references the table's own unique index (#396). PostgreSQL's left
+  that index out, and both put the key in the CREATE TABLE, before the
+  index it needs; it is added after the indexes now.
+- PostgreSQL: *Edit* of a constraint trigger opens a script that drops
+  and creates it in one block (#397); the plain CREATE it opened failed,
+  the trigger being there, and PostgreSQL has no OR REPLACE for one.
+- PostgreSQL: an array slice's bounds (`a[1:n]`, `a[1:2]`) are no bind
+  variables (#398): the window asked for a value of `n`, and Explain
+  plan sent `a[1$1]`, a syntax error.
+- MySQL and PostgreSQL: a `:name` in a string with `\'` (or `E'…'`) is
+  no longer replaced by a bind variable's value (#399), which broke the
+  statement; binds are put in as the database reads its strings.
+- MySQL: Explain plan of a statement with bind variables says it takes
+  none (#400), instead of a syntax error from the server.
+- Oracle: *Follow foreign keys* keeps the columns of a key together when
+  tables of the same name in two schemas have keys of the same name
+  (#401); each became one relation per column, whose link found too many
+  rows. A table in another schema is named with it.
+- MySQL: the user form sets the password typed when it has a `\` and
+  the session's `sql_mode` has `NO_BACKSLASH_ESCAPES` (#402); the
+  backslash was doubled, which that mode keeps.
+- MariaDB: the user and role forms can grant `DELETE HISTORY` on a
+  database or a table (#403): those scopes' privileges add what the
+  server lists for tables.
+- A `--` comment at the end of a data compare's filter or query, a
+  trigger form's WHEN or an import column's expression no longer
+  comments out what follows it (#404), which failed with ORA-00907 or
+  the like.
+- A new row's cell set to NULL (*Set NULL*, Delete) is inserted as NULL
+  (#405); it got the column's default, as a cell left alone does.
+- MySQL and SQL Server: an address with `user:password@` in it is
+  refused with a message saying where they go (#406); it was taken for
+  the host, and the connect error showed the password.
+- PostgreSQL: `money` sorts by its amount, and the selection's summary
+  and charts count it (#407); written as `$1,234.56`, it sorted as text
+  and was left out.
+- Export tables and Export schema write a `.` in an object's name as
+  `%2E` in its file's name (#408): `"X.DDL"`'s rows went to
+  `x.ddl.sql`, over the DDL of table `X`.
+- PostgreSQL: a foreign table's DDL makes a foreign table, on its server
+  with its and its columns' options (#409); it was a plain CREATE TABLE.
+- SQL Server: a table's DDL keeps the descriptions (`MS_Description`) of
+  the table and its columns (#410), as `sp_addextendedproperty` calls.
+- A SQL window's file that changed on disk (a `git pull` while Pythia
+  was closed) is read again when Pythia starts, unless the window has
+  changes of its own; saving over such a file asks first (#411). The
+  window restored its old text, and Save wrote it over the change.
+
 ## [0.11.0] - 2026-11-02
 
 ### Added

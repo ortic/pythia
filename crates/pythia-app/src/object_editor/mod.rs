@@ -311,6 +311,9 @@ enum ListRequest {
 pub struct ApplyError {
     pub statement: String,
     pub error: DbError,
+    /// A statement before the one that failed dropped the object, to
+    /// create it again: it is gone now.
+    pub dropped: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -555,10 +558,18 @@ impl ObjectEditor {
                     }
                     Err(e) => {
                         self.locate_error(&e);
-                        self.state.outcome = Some((
-                            format!("{}\n\nin: {}", e.error.text(), first_line(&e.statement)),
-                            false,
-                        ));
+                        let mut message =
+                            format!("{}\n\nin: {}", e.error.text(), first_line(&e.statement));
+                        if e.dropped {
+                            // Nothing to change any more: the next Apply
+                            // creates it as the form has it.
+                            message.push_str(
+                                "\n\nIt was dropped to be created again, and isn't there now: \
+                                 Apply creates it",
+                            );
+                            self.state.original = None;
+                        }
+                        self.state.outcome = Some((message, false));
                     }
                 },
                 Ok(Err(_)) => self.state.outcome = Some(("unexpected result".into(), false)),
@@ -1282,6 +1293,7 @@ fn apply_client(
         client.execute(s).map_err(|error| ApplyError {
             statement: s.clone(),
             error,
+            dropped: false,
         })?;
     }
     Ok(Vec::new())
@@ -1323,11 +1335,14 @@ fn apply(
     statements: &[String],
     view: Option<(String, String)>,
 ) -> Result<Vec<String>, ApplyError> {
+    let mut dropped = false;
     for s in statements {
         conn.execute(s, &[]).map_err(|e| ApplyError {
             statement: s.clone(),
             error: e.into(),
+            dropped,
         })?;
+        dropped |= s.trim_start().to_ascii_lowercase().starts_with("drop ");
     }
     let mut warnings = Vec::new();
     if let Some((owner, name)) = view
@@ -1711,6 +1726,32 @@ mod tests {
         let reloaded = index::load(&conn, &owner, "PYTHIA_OE_IX").unwrap();
         assert!(reloaded.unique);
         assert_eq!(reloaded.columns[0].expr, "CREATED");
+        // Made unique on a column with duplicates: the drop runs, the
+        // create fails, and the error says the index is gone (the form
+        // then only creates it).
+        conn.execute(
+            "insert into pythia_oe_t values (1, 'twin', sysdate - 1)",
+            &[],
+        )
+        .unwrap();
+        conn.execute("insert into pythia_oe_t values (2, 'twin', sysdate)", &[])
+            .unwrap();
+        let mut twins = reloaded.clone();
+        twins.columns.truncate(0);
+        twins.columns.push(index::IndexColumn {
+            expr: "name".into(),
+            desc: false,
+        });
+        let e = apply(
+            &conn,
+            &index::statements(&owner, Some(&reloaded), &twins).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.dropped && e.error.code == Some(1452), "{e:?}");
+        twins.unique = false;
+        run(index::statements(&owner, None, &twins).unwrap());
+        assert!(!index::load(&conn, &owner, "PYTHIA_OE_IX").unwrap().unique);
 
         // Grants to PUBLIC: add with grant option is refused for PUBLIC, so
         // grant plain select and revoke it again.
@@ -1844,6 +1885,21 @@ mod tests {
                 .to_lowercase(),
             "select status from pythia_ob_t"
         );
+        // A mistake in a new query fails before the drop: the view stays.
+        let mut broken = requery.clone();
+        broken.query = "select nope from pythia_ob_t".into();
+        let e = apply(
+            &conn,
+            &mview::statements(&owner, Some(&requery), &broken).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            !e.dropped && e.statement.contains("where 1 = 0"),
+            "{}",
+            e.statement
+        );
+        assert!(mview::load(&conn, &owner, "PYTHIA_OB_MV").is_ok());
 
         // Triggers: on the table (row, statement, compound) and the view.
         let mut t = trigger::TriggerDef::on("PYTHIA_OB_T", false);

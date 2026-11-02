@@ -622,7 +622,7 @@ impl Worker {
                 Box::pin(client.simple_query(sql))
             } else {
                 let mut values = Vec::new();
-                let sql = replace_binds(sql, binds, |n, value| {
+                let sql = replace_binds(sql, pythia_plsql::Syntax::TSql, binds, |n, value| {
                     values.push(value.clone());
                     format!("@P{n}")
                 });
@@ -1120,6 +1120,13 @@ fn parse_target(text: &str) -> Result<Target, DbError> {
         .find_map(|prefix| text.strip_prefix(prefix))
         .unwrap_or(text);
     let (address, query) = text.split_once('?').unwrap_or((text, ""));
+    // `user:password@host`: not taken, and not shown back in the error,
+    // which would show the password.
+    if address.contains('@') {
+        return Err(DbError::new(
+            "The address is host[:port][/database]: the user and password go in their own fields",
+        ));
+    }
     let (host_port, database) = match address.split_once('/') {
         Some((host_port, db)) => (host_port, Some(db.trim()).filter(|d| !d.is_empty())),
         None => (address, None),
@@ -1258,7 +1265,11 @@ fn cell(data: &ColumnData<'_>, whole: bool) -> Cell {
         ColumnData::String(v) => v.as_deref()?.to_owned(),
         ColumnData::Guid(v) => v.as_ref()?.to_string().to_uppercase(),
         ColumnData::Binary(v) => format!("0x{}", hex(v.as_deref()?, whole)),
-        ColumnData::Numeric(v) => v.as_ref()?.to_string(),
+        // The driver writes a scale of 0 as `123.0`.
+        ColumnData::Numeric(v) => match v.as_ref()? {
+            n if n.scale() == 0 => n.value().to_string(),
+            n => n.to_string(),
+        },
         ColumnData::Xml(v) => v.as_deref()?.to_string(),
         ColumnData::DateTime(v) => {
             let v = v.as_ref()?;
@@ -1396,6 +1407,8 @@ mod tests {
         assert_eq!((t.host.as_str(), t.port), ("::1", Some(1500)));
         assert!(parse_target("h:port").is_err());
         assert!(parse_target("h?compress").is_err());
+        let e = parse_target("sqlserver://sa:secret@db:1433/shop").unwrap_err();
+        assert!(!e.message.contains("secret"), "{}", e.message);
     }
 
     /// Batches that a closed result stops: only those that read (#383).

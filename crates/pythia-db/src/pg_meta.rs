@@ -900,7 +900,9 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .ok_or_else(|| DbError::new(format!("No table {owner}.{name}")))?;
     let mut table = table.into_iter();
     let oid = table.next().flatten().unwrap_or_default();
-    let partitions = table.nth(1).flatten();
+    // A foreign table (`f`) is made with its server and options (#409).
+    let foreign = table.next().flatten().as_deref() == Some("f");
+    let partitions = table.next().flatten();
     let comment = table.next().flatten();
     let unlogged = table.next().flatten().as_deref() == Some("t");
     let options = table.next().flatten().unwrap_or_default();
@@ -909,13 +911,15 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .rows(
             &format!(
                 "select quote_ident(a.attname) || ' ' || format_type(a.atttypid, a.atttypmod) \
+                        || coalesce(' options (' || {} || ')', '') \
                         || coalesce(case when a.attidentity <> '' or a.attgenerated <> '' \
                                          then ' ' else ' default ' end || {DEFAULT}, '') \
                         || case when a.attnotnull then ' not null' else '' end \
                    from pg_attribute a \
                    left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
                   where a.attrelid = {oid} and a.attnum > 0 and not a.attisdropped \
-                  order by a.attnum"
+                  order by a.attnum",
+                fdw_options("a.attfdwoptions")
             ),
             &[],
         )?
@@ -924,6 +928,8 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         .collect();
     // pg_get_constraintdef leaves out the storage parameters of a key's
     // index and the tablespace of a key's or exclusion constraint's (#352).
+    // A foreign key to the table's own unique index that no constraint
+    // makes goes after the index, which the create can't have yet: last.
     let constraints = pg.rows(
         &format!(
             "select 'constraint ' || quote_ident(k.conname) || ' ' || pg_get_constraintdef(k.oid, true), \
@@ -931,7 +937,11 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
                            ' USING INDEX TABLESPACE ' || quote_ident(t.spcname)), \
                     concat(' WHERE (' || pg_get_expr(i.indpred, i.indrelid, true) || ')', \
                            case when k.condeferrable then ' DEFERRABLE' end, \
-                           case when k.condeferred then ' INITIALLY DEFERRED' end) \
+                           case when k.condeferred then ' INITIALLY DEFERRED' end), \
+                    k.contype = 'f' and k.confrelid = k.conrelid \
+                      and not exists (select 1 from pg_constraint u \
+                                       where u.conindid = k.conindid and u.conrelid = k.conrelid \
+                                         and u.contype in ('p', 'u')) \
                from pg_constraint k \
                left join pg_index i on i.indexrelid = k.conindid and k.contype in ('p', 'u', 'x') \
                left join pg_class c on c.oid = i.indexrelid \
@@ -941,11 +951,21 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         ),
         &[],
     )?;
-    lines.extend(constraints.into_iter().filter_map(|row| {
+    let mut late = Vec::new();
+    for row in constraints {
         let mut values = row.into_iter().map(Option::unwrap_or_default);
-        let (definition, index, tail) = (values.next()?, values.next()?, values.next()?);
-        Some(inserted(&definition, &index, &tail))
-    }));
+        let (Some(definition), Some(index), Some(tail), Some(after)) =
+            (values.next(), values.next(), values.next(), values.next())
+        else {
+            continue;
+        };
+        let constraint = inserted(&definition, &index, &tail);
+        if after == "t" {
+            late.push(constraint);
+        } else {
+            lines.push(constraint);
+        }
+    }
     let sequences = owned_sequences(pg, &oid)?;
     let mut ddl = String::new();
     let mut notes = Vec::new();
@@ -957,9 +977,18 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
     }
     ddl.push_str(&format!(
         "create {}table {qualified} (\n    {}\n)",
-        if unlogged { "unlogged " } else { "" },
+        if foreign {
+            "foreign "
+        } else if unlogged {
+            "unlogged "
+        } else {
+            ""
+        },
         lines.join(",\n    ")
     ));
+    if foreign && let Some(server) = foreign_server(pg, &oid)? {
+        ddl.push_str(&server);
+    }
     if let Some(key) = partitions {
         ddl.push_str(&format!(" partition by {key}"));
     }
@@ -972,10 +1001,15 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             Dialect::POSTGRES.quote_ident(column)
         ));
     }
+    // ALTER TABLE and COMMENT ON TABLE refuse a foreign table.
+    let kind = if foreign { "foreign table" } else { "table" };
     if let Some(role) = role {
-        ddl.push_str(&format!("\n\nalter table {qualified} owner to {role};"));
+        ddl.push_str(&format!("\n\nalter {kind} {qualified} owner to {role};"));
     }
-    indexes_and_comments(pg, &mut ddl, &oid, "table", &qualified, comment)?;
+    indexes_and_comments(pg, &mut ddl, &oid, kind, &qualified, comment)?;
+    for constraint in late {
+        ddl.push_str(&format!("\n\nalter table {qualified} add {constraint};"));
+    }
     grants(pg, &mut ddl, Privileges::Relation, &oid, &qualified)?;
     for ((sequence_oid, sequence, _), note) in sequences.iter().zip(notes) {
         let on = format!("sequence {}", Dialect::POSTGRES.qualified(&owner, sequence));
@@ -983,6 +1017,32 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         grants(pg, &mut ddl, Privileges::Relation, sequence_oid, &on)?;
     }
     Ok(ddl)
+}
+
+/// SQL listing the options in `options`, a `text[]` of `key=value` as
+/// PostgreSQL keeps a foreign table's or column's: `key 'value', …`; NULL
+/// for none.
+fn fdw_options(options: &str) -> String {
+    format!(
+        "(select string_agg(quote_ident(split_part(o, '=', 1)) || ' ' \
+                            || quote_literal(substr(o, strpos(o, '=') + 1)), ', ') \
+            from unnest({options}) o)"
+    )
+}
+
+/// ` server … options (…)` of the foreign table `oid`.
+fn foreign_server(pg: &Pg<'_>, oid: &str) -> Result<Option<String>, DbError> {
+    let row = pg.first(
+        &format!(
+            "select ' server ' || quote_ident(s.srvname) \
+                    || coalesce(' options (' || {} || ')', '') \
+               from pg_foreign_table f join pg_foreign_server s on s.oid = f.ftserver \
+              where f.ftrelid = {oid}",
+            fdw_options("f.ftoptions")
+        ),
+        &[],
+    )?;
+    Ok(row.and_then(first))
 }
 
 /// The relation's indexes that no constraint makes, then the comments on
@@ -1007,7 +1067,7 @@ fn indexes_and_comments(
                left join pg_tablespace t on t.oid = c.reltablespace \
               where i.indrelid = {oid} \
                 and not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid \
-                                   and k.conrelid = i.indrelid) \
+                                   and k.conrelid = i.indrelid and k.contype in ('p', 'u', 'x')) \
               order by 1"
         ),
         &[],
@@ -1160,16 +1220,21 @@ fn explain_plan(pg: &Pg<'_>, sql: &str) -> Result<MetaResult, DbError> {
 }
 
 /// Replaces `:name` binds by `$1`, `$2`, … (the same name, the same
-/// number); returns how many names there were.
+/// number); returns how many names there were. Read as PostgreSQL reads
+/// it, as the window finds its binds: `:1` is none, nor is an array
+/// slice's `a[1:n]`.
 fn numbered_binds(sql: &str) -> (String, usize) {
     let mut names: Vec<String> = Vec::new();
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
-    for token in pythia_plsql::tokenize(sql) {
+    for token in pythia_plsql::tokenize_in(sql, pythia_plsql::Syntax::Postgres) {
         if token.kind != pythia_plsql::TokenKind::BindVar {
             continue;
         }
         let name = sql[token.span.start + 1..token.span.end].to_lowercase();
+        if name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
         let n = match names.iter().position(|n| *n == name) {
             Some(i) => i + 1,
             None => {
@@ -1328,5 +1393,8 @@ mod tests {
                 2
             )
         );
+        // Array slices and `:1` aren't binds, nor is a `:x` in an `E'…'`.
+        let slices = r"select (array[1,2,3])[1:2], a[2:n], E'\' :x' from t where b = :b";
+        assert_eq!(numbered_binds(slices), (slices.replace(":b", "$1"), 1));
     }
 }

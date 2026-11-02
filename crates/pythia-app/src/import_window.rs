@@ -83,6 +83,9 @@ impl Transform {
         let expression = self.expression.trim();
         if expression.is_empty() {
             base
+        } else if expression.contains("--") {
+            // A `--` comment at its end would take the next value with it.
+            format!("{}\n", replace_value(expression, &base))
         } else {
             replace_value(expression, &base)
         }
@@ -907,6 +910,12 @@ mod transform_tests {
             "trunc(to_date(:2, 'DD.MM.YYYY'), 'MM')"
         );
         assert_eq!(t.value(Some("  x "), None).as_deref(), Some("x"));
+        // A `--` comment ends with the line, not with the next value.
+        let commented = Transform {
+            expression: "upper(:value) -- in capitals".into(),
+            ..Transform::default()
+        };
+        assert_eq!(commented.bind_expr(1, None), "upper(:1) -- in capitals\n");
         assert_eq!(t.value(Some("   "), None), None);
     }
 

@@ -784,6 +784,10 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                          else '' end, null, \
                   case when f.is_disabled = 1 then 2 \
                        when f.is_not_trusted = 1 and f.is_not_for_replication = 0 then 1 \
+                       when f.referenced_object_id = f.parent_object_id \
+                        and not exists (select 1 from sys.key_constraints kc \
+                                         where kc.parent_object_id = f.referenced_object_id \
+                                           and kc.unique_index_id = f.key_index_id) then 3 \
                        else 0 end, \
                   3 \
              from sys.foreign_keys f where f.parent_object_id = object_id(@P1) \
@@ -808,7 +812,9 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .filter_map(first)
         .collect();
     // The constraints that aren't trusted are added after the table and its
-    // indexes, WITH NOCHECK, and the disabled ones disabled.
+    // indexes, WITH NOCHECK, and the disabled ones disabled. So is a foreign
+    // key to the table's own unique index that no constraint makes, which
+    // the create can't have yet.
     let mut nocheck = Vec::new();
     for row in constraints {
         let mut values = row.into_iter();
@@ -837,6 +843,7 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
                     nocheck.push(format!("alter table {object} nocheck constraint {quoted};"));
                 }
             }
+            Some("3") => nocheck.push(format!("alter table {object} add {constraint};")),
             _ => lines.push(constraint),
         }
     }
@@ -1058,15 +1065,55 @@ fn table_ddl(ms: &mut Ms<'_>, object: &str) -> Result<String, DbError> {
         .filter_map(first)
         .map(|index| format!("alter index {index} on {object} disable;"));
     let statistics = statistics(ms, object, has(4), graph)?;
+    let descriptions = descriptions(ms, object)?;
     for statement in indexes
         .into_iter()
         .chain(statistics)
         .chain(nocheck)
         .chain(disabled)
+        .chain(descriptions)
     {
         ddl.push_str(&format!("\n\n{statement}"));
     }
     Ok(ddl)
+}
+
+/// The descriptions (`MS_Description`) of the table `object` and of its
+/// columns, which the Columns tab shows, as the statements that add them
+/// (#410): a copy kept none.
+fn descriptions(ms: &mut Ms<'_>, object: &str) -> Result<Vec<String>, DbError> {
+    let rows = ms.rows(
+        "select object_schema_name(p.major_id), object_name(p.major_id), \
+                col_name(p.major_id, nullif(p.minor_id, 0)), cast(p.value as nvarchar(max)) \
+           from sys.extended_properties p \
+          where p.class = 1 and p.major_id = object_id(@P1) and p.name = 'MS_Description' \
+          order by p.minor_id",
+        &[object],
+    )?;
+    let n = |text: &str| format!("N'{}'", text.replace('\'', "''"));
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let mut values = row.into_iter();
+            let (schema, table, column, value) = (
+                values.next()??,
+                values.next()??,
+                values.next()?,
+                values.next()??,
+            );
+            let column = column
+                .map(|c| format!(", @level2type = N'COLUMN', @level2name = {}", n(&c)))
+                .unwrap_or_default();
+            Some(format!(
+                "exec sys.sp_addextendedproperty @name = N'MS_Description', @value = {}, \
+                 @level0type = N'SCHEMA', @level0name = {}, @level1type = N'TABLE', \
+                 @level1name = {}{column};",
+                n(&value),
+                n(&schema),
+                n(&table)
+            ))
+        })
+        .collect())
 }
 
 /// `ledger = on` of a ledger table of `kind`, updatable (2) or append-only
@@ -1535,7 +1582,7 @@ fn binds_as_variables(sql: &str) -> String {
     let mut names: Vec<String> = Vec::new();
     let mut out = String::with_capacity(sql.len());
     let mut last = 0;
-    for token in pythia_plsql::tokenize(sql) {
+    for token in pythia_plsql::tokenize_in(sql, pythia_plsql::Syntax::TSql) {
         if token.kind != pythia_plsql::TokenKind::BindVar {
             continue;
         }

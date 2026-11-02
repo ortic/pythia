@@ -14,7 +14,7 @@ use pythia_db::{
 };
 use pythia_ui::{Changes, Loaded, RowRef};
 
-use super::{Editable, RowKey, dml, edit_query, row_key, same};
+use super::{Editable, RowKey, dml, edit_query, has_key_columns, row_key, same};
 
 struct Live {
     session: Session,
@@ -300,6 +300,59 @@ fn random_floats(n: usize) -> Vec<(f64, f32)> {
     values
 }
 
+/// MySQL: the key of the table the query read, also a temporary table,
+/// which information_schema doesn't list and which hides a table of its
+/// name.
+#[test]
+fn mysql_keys() {
+    let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+        return;
+    };
+    db.script(&[
+        "drop view if exists pythia_live_v",
+        "drop table if exists pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t",
+        "create table pythia_live_k (id int primary key, code varchar(10) not null unique)",
+        "create view pythia_live_v as select * from pythia_live_k",
+        "create table pythia_live_u (n int, e varchar(10) not null, x int not null, \
+           unique key pythia_live_u_a (n), unique key pythia_live_u_c (x))",
+        "create table pythia_live_n (x int)",
+        "create table pythia_live_t (id int primary key)",
+        "create temporary table pythia_live_t (t int not null, u varchar(5) not null, \
+           unique key (u), primary key (t))",
+        "create temporary table pythia_live_tn (x int)",
+    ]);
+    // A functional key part (MySQL 8.0.13; MariaDB has none).
+    if !db.count("select version()").contains("MariaDB") {
+        db.ok("alter table pythia_live_u add unique key pythia_live_u_b ((lower(e)))");
+    }
+    assert_eq!(db.key("pythia_live_k"), ["id"]);
+    assert_eq!(db.key("pythia.pythia_live_k"), ["id"]);
+    assert_eq!(db.key("`pythia_live_k`"), ["id"]);
+    // Not on a NULL or an expression.
+    assert_eq!(db.key("pythia_live_u"), ["x"]);
+    // The temporary table, not the table it hides.
+    assert_eq!(db.key("pythia_live_t"), ["t"]);
+    assert!(db.key("pythia_live_tn").is_empty());
+    assert!(db.key("pythia_live_v").is_empty());
+    assert!(db.key("pythia_live_n").is_empty());
+    assert!(db.key("pythia_live_missing").is_empty());
+    // A `#` comment after the select list: the key columns come before it,
+    // where the server reads them.
+    let edit = Editable {
+        table: "pythia_live_k".into(),
+        source: "select id, code # the columns\nfrom pythia_live_k".into(),
+        key: RowKey::Columns(vec!["id".into()]),
+    };
+    let sql = edit_query(db.dialect, &edit).expect("an editable query");
+    let (columns, _) = db.query(&sql);
+    assert!(has_key_columns(&edit, &columns), "{sql}");
+    db.script(&[
+        "drop temporary table pythia_live_t, pythia_live_tn",
+        "drop view pythia_live_v",
+        "drop table pythia_live_k, pythia_live_u, pythia_live_n, pythia_live_t",
+    ]);
+}
+
 #[test]
 fn postgres_keys() {
     let Some(mut db) = Live::connect("PYTHIA_TEST_POSTGRES", DbKind::Postgres) else {
@@ -429,7 +482,15 @@ fn sqlserver_keys() {
         "create unique index pythia_live_u_c on pythia_live_u (v)",
         "create unique index pythia_live_u_d on pythia_live_u (x) include (n)",
         "create table pythia_live_n (x int)",
+        "create table #pythia_live_t (t int not null primary key, u int not null unique)",
+        "create table ##pythia_live_g (g int not null unique)",
     ]);
+    // A temporary table, local or global, is found in tempdb.
+    assert_eq!(db.key("#pythia_live_t"), ["t"]);
+    assert_eq!(db.key("[#pythia_live_t]"), ["t"]);
+    assert_eq!(db.key("##pythia_live_g"), ["g"]);
+    assert!(db.key("#pythia_live_missing").is_empty());
+    db.ok("drop table #pythia_live_t, ##pythia_live_g");
     // The primary key comes first; the default schema and the collation
     // find the table as the query did.
     assert_eq!(db.key("pythia_live_k"), ["id"]);

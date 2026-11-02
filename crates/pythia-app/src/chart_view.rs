@@ -81,6 +81,8 @@ pub fn parse_number(cell: &Cell) -> Option<f64> {
     s.parse::<f64>()
         .ok()
         .or_else(|| s.replace(',', ".").parse().ok())
+        // PostgreSQL's money, `$1,234.56`.
+        .or_else(|| pythia_data::amount(s)?.parse().ok())
         .filter(|v: &f64| v.is_finite())
 }
 

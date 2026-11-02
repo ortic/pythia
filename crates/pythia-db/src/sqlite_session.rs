@@ -805,7 +805,7 @@ fn positional(sql: &str, binds: &[(String, Bind)]) -> (String, Vec<Value>) {
         return (sql.to_owned(), Vec::new());
     }
     let mut values = Vec::new();
-    let sql = replace_binds(sql, binds, |_, value| {
+    let sql = replace_binds(sql, pythia_plsql::Syntax::Sqlite, binds, |_, value| {
         values.push(match value {
             Bind::Text(Some(v)) => bind_value(v),
             Bind::Text(None) => Value::Null,

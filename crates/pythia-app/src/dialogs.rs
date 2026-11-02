@@ -1567,6 +1567,8 @@ pub enum ConfirmAction {
     /// Make this the active connection, committing (yes) or rolling back
     /// (other) the transactions of the SQL windows that move.
     Activate(String),
+    /// Save a SQL window's file, which changed on disk since it was read.
+    Overwrite(DocId),
 }
 
 pub struct Confirm {

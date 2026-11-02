@@ -67,33 +67,41 @@ fn no_access(e: &DbError) -> bool {
     matches!(e.code, Some(1142 | 1143 | 1146))
 }
 
-/// A string literal, also with `\` in it.
-pub fn literal(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+/// A string literal, also with `\` in it: doubled, unless the session's
+/// `sql_mode` has `NO_BACKSLASH_ESCAPES` (`plain`), where it stands for
+/// itself. A password can't be a hex literal, which reads the same in
+/// both.
+pub fn literal(s: &str, plain: bool) -> String {
+    let s = if plain {
+        s.to_owned()
+    } else {
+        s.replace('\\', "\\\\")
+    };
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// `'user'@'host'`; a role on its usual host (`%` on MySQL, none on
 /// MariaDB) by its name alone.
-fn account(user: &str, host: &str, role: bool) -> String {
+fn account(user: &str, host: &str, role: bool, plain: bool) -> String {
     if role && matches!(host, "%" | "") {
-        literal(user)
+        literal(user, plain)
     } else {
-        format!("{}@{}", literal(user), literal(host))
+        format!("{}@{}", literal(user, plain), literal(host, plain))
     }
 }
 
 /// A role as listed (`role`, or `role@host`) as written in GRANT.
-fn role_sql(name: &str) -> String {
+fn role_sql(name: &str, plain: bool) -> String {
     match name.rsplit_once('@') {
-        Some((user, host)) => format!("{}@{}", literal(user), literal(host)),
-        None => literal(name),
+        Some((user, host)) => format!("{}@{}", literal(user, plain), literal(host, plain)),
+        None => literal(name, plain),
     }
 }
 
-fn roles_sql(roles: &[&String]) -> String {
+fn roles_sql(roles: &[&String], plain: bool) -> String {
     roles
         .iter()
-        .map(|r| role_sql(r))
+        .map(|r| role_sql(r, plain))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -135,14 +143,31 @@ pub(super) fn load(
         .next()
         .unwrap_or_default();
     let mariadb = version.contains("MariaDB");
-    let mut global: Vec<String> = client
+    let no_backslash_escapes = texts(client, "select @@session.sql_mode", &[])?
+        .first()
+        .is_some_and(|mode| mode.to_uppercase().contains("NO_BACKSLASH_ESCAPES"));
+    // Privilege, Context, Comment.
+    let privileges: Vec<(String, String)> = client
         .query("show privileges", &[])?
         .iter()
-        .map(|row| text(row, 0).to_uppercase())
-        .filter(|p| !matches!(p.as_str(), "USAGE" | "PROXY" | GRANT_OPTION))
+        .map(|row| (text(row, 0).to_uppercase(), text(row, 1)))
+        .filter(|(p, _)| !matches!(p.as_str(), "USAGE" | "PROXY" | GRANT_OPTION))
         .collect();
+    let mut global: Vec<String> = privileges.iter().map(|(p, _)| p.clone()).collect();
     global.push(GRANT_OPTION.to_owned());
     global.sort();
+    // The lists above, and what else the server says is for tables (or
+    // databases), such as MariaDB's DELETE HISTORY.
+    let scoped = |known: &[&str], contexts: &[&str]| {
+        let mut list: BTreeSet<String> = known.iter().map(|p| (*p).to_owned()).collect();
+        list.extend(
+            privileges
+                .iter()
+                .filter(|(_, context)| context.split(',').any(|c| contexts.contains(&c.trim())))
+                .map(|(p, _)| p.clone()),
+        );
+        list.into_iter().collect::<Vec<_>>()
+    };
     let mut roles = accounts(client, ObjectType::Role)?;
     if !role && let Some(name) = name {
         roles.retain(|r| r != name);
@@ -153,12 +178,9 @@ pub(super) fn load(
             (ScopeKind::Global, global),
             (
                 ScopeKind::Database,
-                DATABASE.iter().map(|p| (*p).to_owned()).collect(),
+                scoped(DATABASE, &["Databases", "Tables"]),
             ),
-            (
-                ScopeKind::Object,
-                TABLE.iter().map(|p| (*p).to_owned()).collect(),
-            ),
+            (ScopeKind::Object, scoped(TABLE, &["Tables"])),
         ]),
         databases: texts(client, "show databases", &[])?,
         ..Choices::default()
@@ -170,9 +192,14 @@ pub(super) fn load(
         }
         None => None,
     };
-    let start = original
+    let mut start = original
         .clone()
         .unwrap_or_else(|| UserDef::new(DbKind::MySql, role, mariadb));
+    let original = original.map(|def| UserDef {
+        no_backslash_escapes,
+        ..def
+    });
+    start.no_backslash_escapes = no_backslash_escapes;
     Ok((original, start, choices))
 }
 
@@ -193,7 +220,7 @@ fn load_account(
     let missing = || {
         DbError::new(format!(
             "The {what} {} doesn't exist",
-            account(user, host, role)
+            account(user, host, role, false)
         ))
     };
     let attributes = if mariadb {
@@ -333,7 +360,8 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
         "" if !(def.role && def.mariadb) => "%",
         host => host,
     };
-    let acct = account(name, host, def.role);
+    let plain = def.no_backslash_escapes;
+    let acct = account(name, host, def.role, plain);
     let mut out = Vec::new();
     match original {
         None if def.role => out.push(format!("create role {acct}")),
@@ -343,7 +371,7 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
             }
             let mut create = format!(
                 "create user {acct} identified by {}",
-                literal(&def.password)
+                literal(&def.password, plain)
             );
             if def.expire {
                 create.push_str(" password expire");
@@ -357,7 +385,7 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
         Some(o) => {
             let mut clauses = Vec::new();
             if !def.password.is_empty() {
-                clauses.push(format!("identified by {}", literal(&def.password)));
+                clauses.push(format!("identified by {}", literal(&def.password, plain)));
             }
             if o.expire && !def.expire && def.password.is_empty() {
                 return Err("An expired password stays expired until a new one is set".to_owned());
@@ -384,10 +412,10 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
     role_changes(
         &before.roles,
         &def.roles,
-        |roles| format!("revoke {} from {acct}", roles_sql(roles)),
+        |roles| format!("revoke {} from {acct}", roles_sql(roles, plain)),
         |roles, admin| {
             let option = if admin { " with admin option" } else { "" };
-            format!("grant {} to {acct}{option}", roles_sql(roles))
+            format!("grant {} to {acct}{option}", roles_sql(roles, plain))
         },
         &mut out,
     );
@@ -406,7 +434,7 @@ pub(super) fn statements(original: Option<&UserDef>, def: &UserDef) -> Result<Ve
             let roles = if after.is_empty() {
                 "none".to_owned()
             } else {
-                roles_sql(&refs)
+                roles_sql(&refs, plain)
             };
             if def.mariadb {
                 if after.len() > 1 {
@@ -649,6 +677,8 @@ mod tests {
             split("reader", true, true),
             ("reader".into(), String::new())
         );
-        assert_eq!(account("a\\b", "%", false), "'a\\\\b'@'%'");
+        assert_eq!(account("a\\b", "%", false, false), "'a\\\\b'@'%'");
+        // With NO_BACKSLASH_ESCAPES a `\` stands for itself.
+        assert_eq!(account("a\\b", "%", false, true), "'a\\b'@'%'");
     }
 }

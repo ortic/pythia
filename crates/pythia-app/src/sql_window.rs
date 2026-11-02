@@ -468,6 +468,30 @@ impl SqlWindow {
         self.path.is_some() && self.editor.text() != self.saved_text
     }
 
+    /// The file as it is on disk where its text isn't what the window read
+    /// or saved last: something else changed it since (a `git pull`, an
+    /// editor). `None` if it is the same or can't be read.
+    pub fn changed_on_disk(&self) -> Option<crate::text_file::TextFile> {
+        let file = crate::text_file::read(self.path.as_ref()?).ok()?;
+        (file.text != self.saved_text).then_some(file)
+    }
+
+    /// Reads the file again where it changed on disk and the window has
+    /// no changes of its own; whether it did.
+    pub fn reload_if_clean(&mut self) -> bool {
+        if self.is_dirty() {
+            return false;
+        }
+        let Some(file) = self.changed_on_disk() else {
+            return false;
+        };
+        self.editor.set_text(file.text.clone());
+        self.saved_text = file.text;
+        self.encoding = file.encoding;
+        self.line_ending = file.line_ending;
+        true
+    }
+
     /// Writes the text to `path` and makes it the window's file.
     pub fn save_to(&mut self, path: std::path::PathBuf) -> std::io::Result<()> {
         crate::text_file::write(&path, self.editor.text(), self.encoding, self.line_ending)?;
@@ -931,6 +955,13 @@ impl SqlWindow {
             self.info("Explain plan works for SQL statements only");
             return effects;
         }
+        // MySQL's EXPLAIN takes no parameters, and a value in their place
+        // would change the plan (NULL makes it "no matching row").
+        if syntax == Syntax::MySql && !find_binds(&stmt.sql, syntax).is_empty() {
+            self.warn("Explain plan doesn't take bind variables on MySQL; use literals");
+            self.state.bottom = BottomTab::Messages;
+            return effects;
+        }
         // Their sessions read one result at a time: the plan's query ends
         // the one with rows left, whose FetchMore would then find none.
         if self.state.syntax != Syntax::Oracle
@@ -1367,11 +1398,11 @@ impl SqlWindow {
         let Some(result) = self.state.results.get(index) else {
             return Effects::default();
         };
-        let Some(table) = crate::data_edit::single_table(&result.sql) else {
+        let Some(table) = crate::data_edit::single_table(cx.dialect, &result.sql) else {
             self.warn("Only results of a single-table query can be edited");
             return Effects::default();
         };
-        if !crate::data_edit::can_edit(&result.sql) {
+        if !crate::data_edit::can_edit(cx.dialect, &result.sql) {
             self.warn("Results of DISTINCT, GROUP BY or aggregate queries can't be edited");
             return Effects::default();
         }
@@ -1488,6 +1519,16 @@ impl SqlWindow {
         });
         self.state.messages.clear();
         self.state.message_rows = TextRows::default();
+        let cut = result.grid.changes().map_or(0, |changes| {
+            crate::data_edit::cut_changes(&edit, &result.columns, changes)
+        });
+        if cut > 0 {
+            self.warn(format!(
+                "{cut} value{} not written: a binary value the grid holds cut short isn't the \
+                 value (Load from file… sets one whole)",
+                if cut == 1 { "" } else { "s" }
+            ));
+        }
         for dml in statements {
             self.state.queue.push_back(PendingStatement {
                 origin: None,
@@ -1915,16 +1956,29 @@ impl SqlWindow {
                 };
                 result.grid.dialect = cx.dialect;
                 result.grid.value_files = true;
-                result.grid.table = crate::data_edit::single_table(&result.sql);
+                result.grid.table = crate::data_edit::single_table(cx.dialect, &result.sql);
                 result.grid.time_zone = self.state.time_zone.clone();
                 let mut replace = None;
+                let mut unkeyed = None;
                 if let Some(Internal::EditQuery { edit, replaces }) =
+                    running.and_then(|r| r.internal.as_ref())
+                    && !crate::data_edit::has_key_columns(edit, &result.columns)
+                {
+                    // The key didn't come at the end, as the query was
+                    // to have it (the select list misread): rows can't be
+                    // told apart, so none are written.
+                    result.sql = edit.source.clone();
+                    replace = replaces
+                        .and_then(|old| self.state.results.iter().position(|r| r.id == old));
+                    unkeyed = Some(edit.table.clone());
+                } else if let Some(Internal::EditQuery { edit, replaces }) =
                     running.and_then(|r| r.internal.as_ref())
                 {
                     let key_start = result.columns.len().saturating_sub(edit.key.width());
                     result.grid.set_editable(Some(key_start));
                     // Only the table's columns as they are (#218).
-                    let plain = crate::data_edit::plain_columns(&edit.source, key_start);
+                    let plain =
+                        crate::data_edit::plain_columns(cx.dialect, &edit.source, key_start);
                     result
                         .grid
                         .lock_columns((0..key_start).filter(|&c| !plain[c]));
@@ -1962,9 +2016,17 @@ impl SqlWindow {
                     }
                 };
                 self.state.bottom = BottomTab::Result(index);
+                if let Some(table) = unkeyed {
+                    self.state.queue.clear();
+                    self.warn(format!(
+                        "The rows of {table} can't be edited: the query's select list couldn't \
+                         be read to add the key columns that find them"
+                    ));
+                    self.state.bottom = BottomTab::Messages;
+                }
                 if cx.dialect.supports(Feature::FollowKeys)
                     && let Some(table) =
-                        crate::data_edit::single_table(&self.state.results[index].sql)
+                        crate::data_edit::single_table(cx.dialect, &self.state.results[index].sql)
                 {
                     let task_id = request_id();
                     self.state.relation_requests.insert(task_id, id);
@@ -2642,7 +2704,7 @@ impl SqlWindow {
                             if idle
                                 && !cx.read_only
                                 && cx.dialect.supports(Feature::EditResults)
-                                && crate::data_edit::can_edit(&result.sql)
+                                && crate::data_edit::can_edit(cx.dialect, &result.sql)
                                 && labelled(ui, Icon::Edit, "Edit")
                                     .on_hover_text(
                                         "Edit the rows of this result. Rows are not locked; conflicting \
@@ -4278,6 +4340,50 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A file changed on disk since the window read it is told apart:
+    /// read again where the window has no changes of its own, and saving
+    /// over it is asked first (the app does).
+    #[test]
+    fn files_changed_on_disk() {
+        let dir = std::env::temp_dir().join(format!("pythia-changed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.sql");
+        std::fs::write(&path, "select 1 from dual;\n").unwrap();
+        let file = crate::text_file::read(&path).unwrap();
+        let mut w = SqlWindow::from_file(path.clone(), file);
+        assert!(w.changed_on_disk().is_none());
+        std::fs::write(&path, "select 2 from dual;\r\n").unwrap();
+        assert!(w.changed_on_disk().is_some());
+        // With changes of its own, it isn't read again.
+        w.editor.set_text("select 3 from dual;\n");
+        assert!(!w.reload_if_clean());
+        w.editor.set_text("select 1 from dual;\n");
+        assert!(w.reload_if_clean());
+        assert_eq!(w.editor.text(), "select 2 from dual;\n");
+        assert_eq!(w.line_ending, crate::text_file::LineEnding::CrLf);
+        assert!(w.changed_on_disk().is_none() && !w.is_dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// MySQL's EXPLAIN takes no bind variables: it says so rather than
+    /// sending `:id`, a syntax error. Other databases explain them.
+    #[test]
+    fn explain_with_binds_on_mysql() {
+        let mut w = SqlWindow::new("t".into(), "select * from t where id = :id".into());
+        assert_eq!(explained(&w.explain()), ["select * from t where id = :id"]);
+        w.state.syntax = Syntax::MySql;
+        assert!(explained(&w.explain()).is_empty());
+        assert!(
+            w.state
+                .messages
+                .last()
+                .is_some_and(|m| m.text.contains("doesn't take bind variables on MySQL")),
+        );
+        // A `:` in a string is none.
+        w.editor.set_text("select ':id' from t");
+        assert_eq!(explained(&w.explain()), ["select ':id' from t"]);
     }
 
     /// Explain plan runs in the window's own session (#269), so not while

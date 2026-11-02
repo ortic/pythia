@@ -269,7 +269,8 @@ fn values_types_and_binds() {
                 cast('2024-02-29 13:45:01 +01:30' as datetimeoffset(0)) dto, \
                 cast('13:45:01.5' as time(1)) tm, \
                 cast('6F9619FF-8B86-D011-B42D-00C04FC964FF' as uniqueidentifier) g, \
-                cast(2.5 as float) f",
+                cast(2.5 as float) f, cast(-123 as numeric(18,0)) z, \
+                cast(-0.05 as decimal(5,2)) nd",
     ) else {
         panic!("expected QueryStarted")
     };
@@ -293,6 +294,8 @@ fn values_types_and_binds() {
             Some("13:45:01.5".into()),
             Some("6F9619FF-8B86-D011-B42D-00C04FC964FF".into()),
             Some("2.5".into()),
+            Some("-123".into()),
+            Some("-0.05".into()),
         ]
     );
     h.settle();
@@ -2036,6 +2039,82 @@ fn index_options_and_storage() {
     drop(h);
     drop_database(&mut dba, &db);
 }
+/// A foreign key to the table's own unique index (one no constraint
+/// makes) is added after that index: in the create, it failed with
+/// Msg 1776, "There are no primary or candidate keys in the referenced
+/// table".
+#[test]
+fn a_key_to_the_tables_own_unique_index_runs_again() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    for schema in ["r95_s", "r95_c"] {
+        h.ok(&format!("drop table if exists {schema}.r95_tree"));
+        h.ok(&format!("drop schema if exists {schema}"));
+        h.ok(&format!("create schema {schema}"));
+    }
+    h.ok(
+        "create table r95_s.r95_tree (id int primary key, code nvarchar(10) not null, \
+           parent_code nvarchar(10), parent_id int constraint r95_up references r95_s.r95_tree)",
+    );
+    h.ok("create unique index r95_code on r95_s.r95_tree (code)");
+    h.ok(
+        "alter table r95_s.r95_tree add constraint r95_parent foreign key (parent_code) \
+           references r95_s.r95_tree (code)",
+    );
+    let ddl = table_ddl(&mut h, "r95_s", "r95_tree");
+    let at = |text: &str| ddl.find(text).unwrap_or_else(|| panic!("{text}: {ddl}"));
+    assert!(at("[r95_code]") < at("constraint [r95_parent]"), "{ddl}");
+    assert!(at("constraint [r95_up]") < at("[r95_code]"), "{ddl}");
+    run_ddl_in(&mut h, &ddl, "r95_s", "r95_c", &["r95_tree"]);
+    h.ok("insert into r95_c.r95_tree values (1, 'a', null, null), (2, 'b', 'a', 1)");
+    for schema in ["r95_c", "r95_s"] {
+        h.ok(&format!("drop table {schema}.r95_tree"));
+        h.ok(&format!("drop schema {schema}"));
+    }
+}
+
+/// A table's DDL adds the descriptions of the table and its columns that
+/// the Columns tab shows: run again, the table has them.
+#[test]
+fn the_ddl_keeps_the_descriptions() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop table if exists dbo.r97_described");
+    h.ok("create table dbo.r97_described (id int primary key, [the name] nvarchar(10))");
+    for (value, column) in [("It's a table", None), ("Grüße [x]", Some("the name"))] {
+        let column = column
+            .map(|c| format!(", @level2type = N'COLUMN', @level2name = N'{c}'"))
+            .unwrap_or_default();
+        h.ok(&format!(
+            "exec sys.sp_addextendedproperty @name = N'MS_Description', \
+               @value = N'{}', @level0type = N'SCHEMA', @level0name = N'dbo', \
+               @level1type = N'TABLE', @level1name = N'r97_described'{column}",
+            value.replace('\'', "''")
+        ));
+    }
+    let described = |h: &mut Harness| {
+        h.scalar(
+            "select string_agg(concat(p.minor_id, '=', cast(p.value as nvarchar(100))), '; ') \
+                    within group (order by p.minor_id) \
+               from sys.extended_properties p \
+              where p.major_id = object_id('dbo.r97_described') and p.name = 'MS_Description'",
+        )
+    };
+    let before = described(&mut h);
+    assert_eq!(before.as_deref(), Some("0=It's a table; 2=Grüße [x]"));
+    let ddl = table_ddl(&mut h, "dbo", "r97_described");
+    h.ok("drop table dbo.r97_described");
+    for statement in pythia_plsql::split_statements_in(&ddl, pythia_plsql::Syntax::TSql) {
+        h.ok(statement.text(&ddl));
+    }
+    assert_eq!(described(&mut h), before, "{ddl}");
+    h.ok("drop table dbo.r97_described");
+}
+
 /// A table's DDL, as `MetaQuery::Ddl` reads it.
 fn table_ddl(h: &mut Harness, owner: &str, table: &str) -> String {
     let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {

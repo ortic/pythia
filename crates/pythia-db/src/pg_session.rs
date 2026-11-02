@@ -13,6 +13,7 @@
 //! transaction every statement gets a savepoint, so a failing statement is
 //! undone alone instead of aborting the whole transaction.
 
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
@@ -377,13 +378,18 @@ impl Worker {
         let sql = if binds.is_empty() {
             sql.to_owned()
         } else {
-            replace_binds(sql, binds, |_, value| match value {
-                Bind::Text(text) => text.as_deref().map_or_else(|| "null".into(), literal),
-                whole => {
-                    params.push(whole.clone());
-                    format!("${}", params.len())
-                }
-            })
+            replace_binds(
+                sql,
+                pythia_plsql::Syntax::Postgres,
+                binds,
+                |_, value| match value {
+                    Bind::Text(text) => text.as_deref().map_or_else(|| "null".into(), literal),
+                    whole => {
+                        params.push(whole.clone());
+                        format!("${}", params.len())
+                    }
+                },
+            )
         };
         let effect = TxEffect::of(&sql);
         // Changes wait for Commit: they get a transaction of their own.
@@ -1064,20 +1070,25 @@ impl Transaction {
 pub(crate) fn config(params: &ConnectParams) -> Result<(Config, MakeRustlsConnect), DbError> {
     let text = params.connect_string.trim();
     let mut ssl = None;
-    let mut take_ssl = |option: &str| match option.strip_prefix("sslmode=") {
-        Some(mode) => {
-            ssl = Some(mode.to_ascii_lowercase());
-            false
+    let spec = if let Some(pairs) = conninfo_pairs(text) {
+        // `sslmode` taken out (the last one counts, as in libpq), the
+        // rest as written: a quoted value keeps its spaces.
+        let mut spec = text.to_owned();
+        for (range, key, value) in pairs.iter().rev() {
+            if key == "sslmode" {
+                ssl.get_or_insert_with(|| value.to_ascii_lowercase());
+                spec.replace_range(range.clone(), "");
+            }
         }
-        None => true,
-    };
-    let pairs = !text.contains("://") && !text.contains('?') && text.contains('=');
-    let spec = if pairs {
-        text.split_whitespace()
-            .filter(|o| take_ssl(o))
-            .collect::<Vec<_>>()
-            .join(" ")
+        spec
     } else {
+        let mut take_ssl = |option: &str| match option.strip_prefix("sslmode=") {
+            Some(mode) => {
+                ssl = Some(mode.to_ascii_lowercase());
+                false
+            }
+            None => true,
+        };
         let (address, query) = text.split_once('?').unwrap_or((text, ""));
         let options: Vec<&str> = query
             .split('&')
@@ -1110,7 +1121,9 @@ pub(crate) fn config(params: &ConnectParams) -> Result<(Config, MakeRustlsConnec
         config.connect_timeout(Duration::from_secs(15));
     }
     let (mode, verify) = match ssl.as_deref() {
-        None | Some("prefer" | "allow") => (SslMode::Prefer, false),
+        // As the driver read the string, if it found a mode Pythia didn't.
+        None => (config.get_ssl_mode(), false),
+        Some("prefer" | "allow") => (SslMode::Prefer, false),
         Some("disable") => (SslMode::Disable, false),
         Some("require") => (SslMode::Require, false),
         Some("verify-ca" | "verify-full") => (SslMode::Require, true),
@@ -1125,6 +1138,61 @@ pub(crate) fn config(params: &ConnectParams) -> Result<(Config, MakeRustlsConnec
         config = through(&config, tunnel)?;
     }
     Ok((config, tls(verify)))
+}
+
+/// libpq's `key = value` pairs, when all of `text` is such pairs with
+/// words for keys: each with where it is in `text`, its key and its value.
+/// A value may be quoted (`'a b'`), and `\` takes the next character as it
+/// is, as libpq reads them.
+fn conninfo_pairs(text: &str) -> Option<Vec<(Range<usize>, String, String)>> {
+    let mut chars = text.char_indices().peekable();
+    let mut pairs = Vec::new();
+    let skip_spaces = |chars: &mut std::iter::Peekable<std::str::CharIndices>| {
+        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+    };
+    loop {
+        skip_spaces(&mut chars);
+        let Some(&(start, _)) = chars.peek() else {
+            break;
+        };
+        let mut key = String::new();
+        while let Some((_, c)) = chars.next_if(|(_, c)| !c.is_whitespace() && *c != '=') {
+            key.push(c);
+        }
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        skip_spaces(&mut chars);
+        chars.next_if(|(_, c)| *c == '=')?;
+        skip_spaces(&mut chars);
+        let mut value = String::new();
+        let mut end = text.len();
+        if chars.next_if(|(_, c)| *c == '\'').is_some() {
+            loop {
+                match chars.next()? {
+                    (_, '\\') => value.push(chars.next()?.1),
+                    (i, '\'') => {
+                        end = i + 1;
+                        break;
+                    }
+                    (_, c) => value.push(c),
+                }
+            }
+        } else {
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => value.extend(chars.next().map(|(_, c)| c)),
+                    c if c.is_whitespace() => {
+                        end = i;
+                        break;
+                    }
+                    c => value.push(c),
+                }
+            }
+        }
+        pairs.push((start..end, key, value));
+    }
+    (!pairs.is_empty()).then_some(pairs)
 }
 
 /// `config` through an SSH tunnel: TCP goes to the local end of a forward
@@ -1336,6 +1404,40 @@ mod tests {
         assert_eq!(c.get_dbname(), Some("d"));
         assert_eq!(c.get_user(), Some("app"));
         assert!(parse("h?sslmode=sometimes").is_err());
+        // Pairs as libpq reads them: a `?` in a value doesn't make a URL,
+        // a quoted value keeps its spaces, spaces may surround `=`.
+        let c = parse("host=h user=u password='Pa?s  s' dbname=shop").unwrap();
+        assert_eq!(c.get_password(), Some(&b"secret"[..]));
+        assert_eq!(c.get_dbname(), Some("shop"));
+        let mut quoted = params("host=h password='a  b\\'c' dbname=x");
+        quoted.password.clear();
+        let c = config(&quoted).unwrap().0;
+        assert_eq!(c.get_password(), Some(&b"a  b'c"[..]));
+        let c = parse("host = h sslmode = require dbname = x").unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::Require);
+        assert_eq!(c.get_dbname(), Some("x"));
+        let c = parse("host=h sslmode='verify-full'").unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::Require);
+        // A mode the driver read itself isn't weakened to prefer.
+        let c = parse("postgresql://u:pa?ss@h/d?sslmode=require").unwrap();
+        assert_eq!(c.get_ssl_mode(), SslMode::Require);
+        assert_eq!(
+            conninfo_pairs("a=1  b = 'x y' c=\\ d"),
+            Some(vec![
+                (0..3, "a".into(), "1".into()),
+                (5..14, "b".into(), "x y".into()),
+                (15..20, "c".into(), " d".into()),
+            ])
+        );
+        for text in [
+            "localhost",
+            "h:5432/db?sslmode=require",
+            "a=1 b",
+            "a='x",
+            "=1",
+        ] {
+            assert_eq!(conninfo_pairs(text), None, "{text}");
+        }
     }
 
     #[test]

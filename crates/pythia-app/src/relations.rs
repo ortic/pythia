@@ -16,6 +16,8 @@ pub struct Relation {
     pub pairs: Vec<(String, String)>,
     /// The related table references the queried one (child rows).
     pub child: bool,
+    /// In another schema than the queried table: named with it.
+    pub other_schema: bool,
 }
 
 /// The foreign keys from and to `table` (as written in the query: optionally
@@ -49,20 +51,27 @@ select 'C', c.constraint_name, c.owner, c.table_name, rc.column_name, cc.column_
   join all_cons_columns rc on rc.owner = r.owner and rc.constraint_name = r.constraint_name
                           and rc.position = cc.position
  where r.owner = :1 and r.table_name = :2 and r.constraint_type in ('P', 'U')
- order by 1, 4, 2, 7";
+ order by 1, 3, 4, 2, 7";
     let mut out: Vec<Relation> = Vec::new();
     for row in conn
         .query_as::<(String, String, String, String, String, String, i64)>(sql, &[&owner, &name])?
     {
-        let (kind, constraint, owner, table, ours, theirs, _) = row?;
+        let (kind, constraint, their_owner, table, ours, theirs, _) = row?;
         let child = kind == "C";
+        // A key's columns come one after another, by owner first: tables
+        // and keys of the same names in two schemas don't mix (#401).
         match out.last_mut() {
-            Some(last) if last.constraint == constraint && last.owner == owner => {
+            Some(last)
+                if last.constraint == constraint
+                    && last.owner == their_owner
+                    && last.child == child =>
+            {
                 last.pairs.push((ours, theirs));
             }
             _ => out.push(Relation {
                 constraint,
-                owner,
+                other_schema: their_owner != owner,
+                owner: their_owner,
                 table,
                 pairs: vec![(ours, theirs)],
                 child,
@@ -107,11 +116,16 @@ pub fn links(relations: &[Relation], columns: &[Column]) -> (Vec<GridLink>, Vec<
             .collect();
         let Some(cols) = cols else { continue };
         let keys: Vec<&str> = r.pairs.iter().map(|(_, theirs)| theirs.as_str()).collect();
+        let table = if r.other_schema {
+            format!("{}.{}", r.owner, r.table)
+        } else {
+            r.table.clone()
+        };
         let label = if r.child {
-            format!("{} ({})", r.table, keys.join(", "))
+            format!("{table} ({})", keys.join(", "))
         } else {
             let ours: Vec<&str> = r.pairs.iter().map(|(ours, _)| ours.as_str()).collect();
-            format!("{} via {}", r.table, ours.join(", "))
+            format!("{table} via {}", ours.join(", "))
         };
         links.push(GridLink {
             label,
@@ -181,6 +195,7 @@ mod tests {
                 table: "DEPARTMENTS".into(),
                 pairs: vec![("DEPARTMENT_ID".into(), "DEPARTMENT_ID".into())],
                 child: false,
+                other_schema: false,
             },
             Relation {
                 constraint: "X_FK".into(),
@@ -188,6 +203,7 @@ mod tests {
                 table: "X".into(),
                 pairs: vec![("NOT_SELECTED".into(), "ID".into())],
                 child: true,
+                other_schema: false,
             },
         ];
         let columns = [col("NAME", false), col("DEPARTMENT_ID", true)];
@@ -251,6 +267,51 @@ mod tests {
             children[0].pairs,
             vec![("A".into(), "PA".into()), ("B".into(), "PB".into())]
         );
+        // A table and key of the same names in another schema: its own
+        // relation, named with its schema, not mixed column by column.
+        if let Ok(dba) = std::env::var("PYTHIA_TEST_DB_DBA") {
+            let _accounts = crate::test_db::ACCOUNTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (cred, db) = dba.rsplit_once('@').unwrap();
+            let (user, pw) = cred.split_once('/').unwrap();
+            let dba = oracle::Connection::connect(user, pw, db).unwrap();
+            let owner = conn
+                .query_row_as::<String>("select user from dual", &[])
+                .unwrap();
+            let _ = dba.execute("drop user pythia_rel_o cascade", &[]);
+            for sql in [
+                "create user pythia_rel_o identified by \"Rel_o_1\" quota unlimited on users"
+                    .to_owned(),
+                format!("grant references on {owner}.pythia_rel_p to pythia_rel_o"),
+                format!(
+                    "create table pythia_rel_o.pythia_rel_c (id number primary key, pa number,
+                       pb number, constraint pythia_rel_fk foreign key (pa, pb)
+                       references {owner}.pythia_rel_p)"
+                ),
+                format!("grant select on pythia_rel_o.pythia_rel_c to {owner}"),
+            ] {
+                dba.execute(&sql, &[])
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            }
+            let children = load(&conn, "pythia_rel_p").unwrap();
+            dba.execute("drop user pythia_rel_o cascade", &[]).unwrap();
+            assert_eq!(children.len(), 2, "{children:?}");
+            for child in &children {
+                assert_eq!(child.pairs.len(), 2, "{child:?}");
+            }
+            let other = children.iter().find(|c| c.owner == "PYTHIA_REL_O").unwrap();
+            assert!(other.other_schema);
+            let columns = [col("A", true), col("B", true)];
+            let (links, _) = links(&children, &columns);
+            assert!(
+                links
+                    .iter()
+                    .any(|l| l.label == "PYTHIA_REL_O.PYTHIA_REL_C (PA, PB)"),
+                "{:?}",
+                links.iter().map(|l| &l.label).collect::<Vec<_>>()
+            );
+        }
         conn.execute("drop table pythia_rel_c purge", &[]).unwrap();
         conn.execute("drop table pythia_rel_p purge", &[]).unwrap();
     }

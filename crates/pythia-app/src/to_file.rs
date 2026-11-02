@@ -57,7 +57,8 @@ impl Sink {
             path: path.to_owned(),
             format: format_for(path),
             options: Options {
-                table: crate::data_edit::single_table(sql).unwrap_or(defaults.table.clone()),
+                table: crate::data_edit::single_table(dialect, sql)
+                    .unwrap_or(defaults.table.clone()),
                 dialect,
                 time_zone,
                 ..defaults

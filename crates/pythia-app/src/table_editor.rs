@@ -771,6 +771,7 @@ fn run(conn: &Connection, owner: &str, statements: &[String]) -> Result<(), Appl
         conn.execute(s, &[]).map_err(|e| ApplyError {
             statement: s.clone(),
             error: e.into(),
+            dropped: false,
         })?;
     }
     Ok(())

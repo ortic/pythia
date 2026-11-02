@@ -158,6 +158,10 @@ struct ValueEditor {
     /// A text over [`VIEWER_CHARS`], which isn't edited in a text field: a
     /// letter typed laid it out whole again, seconds for megabytes (#356).
     long: Option<LongText>,
+    /// The size of a binary value the grid holds cut short: its first
+    /// bytes aren't the value, and an edit of them would be written as it,
+    /// or not at all.
+    cut: Option<u64>,
 }
 
 /// A text the value editor shows in rows, as the viewer shows it.
@@ -173,11 +177,13 @@ impl ValueEditor {
             chars: text.chars().count(),
             rows: text_rows(&text),
         });
+        let cut = pythia_db::cut_size(&text);
         Self {
             view_row,
             col,
             text,
             long,
+            cut,
         }
     }
 }
@@ -204,6 +210,10 @@ pub struct Changes {
     /// Values loaded from files, by row and column (#293). The new value
     /// in `updates` or `inserts` is what the grid shows of one.
     pub loaded: BTreeMap<(RowRef, usize), Loaded>,
+    /// Cells of new rows (row, column) set to NULL on purpose (*Set NULL*,
+    /// Delete): written as NULL, where a cell left alone or pasted empty is
+    /// left out of the INSERT and gets the column's default (#262).
+    pub nulls: BTreeSet<(usize, usize)>,
 }
 
 /// A value loaded from a file into a cell (#293): held whole until Apply
@@ -1132,6 +1142,8 @@ impl GridState {
                     .get_mut(i)
                     .and_then(|row| row.get_mut(col))
                 {
+                    // Set NULL on purpose again by set_null.
+                    edit.changes.nulls.remove(&(i, col));
                     *cell = value;
                 }
             }
@@ -1224,7 +1236,12 @@ impl GridState {
         edit.changes
             .inserts
             .retain(|_| kept_rows.next().is_some_and(Option::is_some));
-        // So do the files loaded into them (#293).
+        // So do the files loaded into them (#293), and their NULLs.
+        let nulls = std::mem::take(&mut edit.changes.nulls);
+        edit.changes.nulls = nulls
+            .into_iter()
+            .filter_map(|(i, col)| Some((kept.get(i).copied()??, col)))
+            .collect();
         let loaded = std::mem::take(&mut edit.changes.loaded);
         edit.changes.loaded = loaded
             .into_iter()
@@ -1243,10 +1260,27 @@ impl GridState {
         self.undoable(|s| {
             for row in r {
                 for &col in &c {
-                    s.set_value(rows, row, col, None);
+                    s.set_null_value(rows, row, col);
                 }
             }
         });
+    }
+
+    /// Sets a cell NULL on purpose: in a new row, the INSERT writes NULL,
+    /// where a cell left alone (or pasted empty) gets the column's default.
+    fn set_null_value(&mut self, rows: &[Vec<Cell>], view_row: usize, col: usize) {
+        self.set_value(rows, view_row, col, None);
+        let row_ref = self.row_ref(view_row);
+        if let (RowRef::New(i), Some(edit)) = (row_ref, self.edit.as_mut())
+            && !edit.is_locked(col)
+            && edit
+                .changes
+                .inserts
+                .get(i)
+                .is_some_and(|row| col < row.len())
+        {
+            edit.changes.nulls.insert((i, col));
+        }
     }
 
     /// Pastes tab separated text (e.g. an Excel range) at the cursor, adding
@@ -2829,18 +2863,25 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
     if cells < 2 {
         return None;
     }
-    let mut numbers = Vec::new();
+    let mut numbers: Vec<std::borrow::Cow<str>> = Vec::new();
     let mut non_null = 0;
     for vr in shown {
         for &ci in &c {
             if let Some(v) = state.value(rows, vr, ci) {
                 non_null += 1;
-                if columns.get(ci).is_some_and(|col| col.numeric) && v.parse::<f64>().is_ok() {
-                    numbers.push(v);
+                if !columns.get(ci).is_some_and(|col| col.numeric) {
+                    continue;
+                }
+                if v.parse::<f64>().is_ok() {
+                    numbers.push(v.into());
+                } else if let Some(amount) = pythia_data::amount(v) {
+                    // PostgreSQL's money, `$1,234.56`.
+                    numbers.push(amount.into());
                 }
             }
         }
     }
+    let numbers: Vec<&str> = numbers.iter().map(|n| n.as_ref()).collect();
     if numbers.is_empty() {
         return Some(format!("{cells} cells · {non_null} not null"));
     }
@@ -2873,6 +2914,10 @@ fn summary(columns: &[Column], rows: &[Vec<Cell>], state: &GridState) -> Option<
 fn compare_numbers(x: &str, y: &str) -> Option<Ordering> {
     pythia_data::compare_decimals(x, y)
         .or_else(|| x.parse::<f64>().ok()?.partial_cmp(&y.parse::<f64>().ok()?))
+        // PostgreSQL's money, `$1,234.56`.
+        .or_else(|| {
+            pythia_data::compare_decimals(&pythia_data::amount(x)?, &pythia_data::amount(y)?)
+        })
 }
 
 /// The sum and the average (with four more decimals) of plain decimals,
@@ -3170,6 +3215,19 @@ fn value_editor(
                 ui.weak(note);
                 ui.separator();
             }
+            if let Some(size) = ed.cut {
+                let mut note = format!(
+                    "The grid holds the first {} bytes of {size}: shown here, not edited",
+                    pythia_db::SHOWN_BYTES
+                );
+                if files {
+                    note.push_str(
+                        ". Save to file… writes the whole value, Load from file… replaces it",
+                    );
+                }
+                ui.weak(note);
+                ui.separator();
+            }
             let height = if date {
                 ui.text_style_height(&egui::TextStyle::Monospace) + 10.0
             } else {
@@ -3186,22 +3244,33 @@ fn value_editor(
                 egui::ScrollArea::vertical()
                     .max_height(height)
                     .show(ui, |ui| {
-                        ui.add_sized(
-                            [ui.available_width(), height],
-                            egui::TextEdit::multiline(&mut ed.text)
-                                .font(egui::TextStyle::Monospace)
-                                .lock_focus(true),
-                        );
+                        if ed.cut.is_some() {
+                            ui.add_sized(
+                                [ui.available_width(), height],
+                                egui::TextEdit::multiline(&mut ed.text.as_str())
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        } else {
+                            ui.add_sized(
+                                [ui.available_width(), height],
+                                egui::TextEdit::multiline(&mut ed.text)
+                                    .font(egui::TextStyle::Monospace)
+                                    .lock_focus(true),
+                            );
+                        }
                     });
             }
             ui.horizontal(|ui| {
-                if ed.long.is_none() && ui.button("Apply").clicked() {
+                if ed.long.is_none() && ed.cut.is_none() && ui.button("Apply").clicked() {
                     result = Some(Some(ed.text.clone()));
                 }
                 if ui.button("Set NULL").clicked() {
                     result = Some(None);
                 }
-                if files && ed.long.is_some() && ui.button("Save to file…").clicked() {
+                if files
+                    && (ed.long.is_some() || ed.cut.is_some())
+                    && ui.button("Save to file…").clicked()
+                {
                     save = true;
                 }
                 if files
@@ -3231,7 +3300,10 @@ fn value_editor(
     if let Some(value) = result {
         let (view_row, col) = (ed.view_row, ed.col);
         state.value_editor = None;
-        state.undoable(|s| s.set_value(rows, view_row, col, value));
+        state.undoable(|s| match value {
+            None => s.set_null_value(rows, view_row, col),
+            value => s.set_value(rows, view_row, col, value),
+        });
     } else if !open {
         state.value_editor = None;
     }
@@ -3865,6 +3937,33 @@ mod tests {
         assert_eq!(
             summary(&c, &r, &s).unwrap(),
             "Count 4 · Sum 19 · Avg 9.5 · Min 9 · Max 10"
+        );
+    }
+
+    /// PostgreSQL's money, as `lc_monetary` writes it, sorts and adds up
+    /// as the amounts it holds: it sorted as text, and the summary left it
+    /// out.
+    #[test]
+    fn money_sorts_and_adds_up() {
+        let c = vec![Column {
+            name: "M".into(),
+            type_name: "money".into(),
+            numeric: true,
+        }];
+        let r: Vec<Vec<Cell>> = ["$1,234.56", "-$5.00", "$999.00", "$1,234,567.89"]
+            .iter()
+            .map(|m| vec![Some((*m).to_owned())])
+            .collect();
+        let mut order: Vec<usize> = (0..r.len()).collect();
+        sort_order(&mut order, &r, 0, true, true);
+        assert_eq!(order, [1, 2, 0, 3]);
+        let mut s = GridState::default();
+        s.sync(&r, &c);
+        s.select((0, 0), false);
+        s.select((3, 0), true);
+        assert_eq!(
+            summary(&c, &r, &s).unwrap(),
+            "Count 4 · Sum 1236796.45 · Avg 309199.1125 · Min -5.00 · Max 1234567.89"
         );
     }
 
@@ -5568,6 +5667,50 @@ mod tests {
     /// scroll through, not to edit: Save to file… and Load from file… take
     /// it to a file and back. One of 100,000 still edits, in a field that
     /// scrolls: the dialog grew with its text, Apply off the screen.
+    /// A binary value the grid holds cut short shows read-only in the
+    /// value editor: its first bytes, edited, were written as the whole
+    /// value (or, with the size left at the end, not at all).
+    #[test]
+    fn cut_values_are_not_edited_in_the_value_editor() {
+        let columns = vec![Column {
+            name: "B".into(),
+            type_name: "BLOB".into(),
+            numeric: false,
+        }];
+        let cut = format!("{}… (10240 bytes)", "AB".repeat(pythia_db::SHOWN_BYTES));
+        assert_eq!(pythia_db::cut_size(&cut), Some(10240));
+        let rows = vec![vec![Some(cut.clone())]];
+        let ctx = egui::Context::default();
+        let mut state = GridState {
+            dialect: Dialect::MYSQL,
+            value_files: true,
+            ..Default::default()
+        };
+        state.set_editable(None);
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.open_value_editor(&rows, (0, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let shown = texts(&drawn);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.starts_with("The grid holds the first 4000 bytes of 10240")),
+            "{shown:?}"
+        );
+        assert!(!shown.contains(&"Apply"), "{shown:?}");
+        for button in ["Save to file…", "Load from file…", "Set NULL"] {
+            assert!(shown.contains(&button), "{button}: {shown:?}");
+        }
+        // A short value still edits.
+        let rows = vec![vec![Some("ABCD".to_owned())]];
+        state.close_value_editor();
+        state.open_value_editor(&rows, (0, 0));
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        let drawn = frame(&ctx, &columns, &rows, &mut state, vec![]);
+        assert!(texts(&drawn).contains(&"Apply"));
+    }
+
     #[test]
     fn the_value_editor_of_a_huge_value_keeps_up() {
         let columns = vec![Column {
@@ -5699,6 +5842,39 @@ mod tests {
     /// (#296). They stayed at their places in the view, on other rows: Set
     /// NULL, Delete, the value typed and the dialog's Apply went into rows
     /// that weren't selected.
+    /// A new row's cell set NULL on purpose is told from one left alone
+    /// or pasted empty, which the INSERT leaves to the column's default.
+    #[test]
+    fn new_rows_know_their_nulls() {
+        let columns = cols();
+        let rows = vec![vec![Some("1".to_owned()), Some("a".to_owned())]];
+        let mut state = GridState::default();
+        state.set_editable(None);
+        let ctx = egui::Context::default();
+        frame(&ctx, &columns, &rows, &mut state, vec![]);
+        state.insert_row(2);
+        state.insert_row(2);
+        let nulls = |state: &GridState| state.changes().unwrap().nulls.clone();
+        state.select((2, 1), false);
+        state.set_null(&rows, 2);
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+        // Typed over: no longer NULL.
+        state.edit_cell(&rows, 2, 1, Some("x".into()));
+        assert!(nulls(&state).is_empty());
+        state.set_null(&rows, 2);
+        // Pasted empty: left to the default.
+        state.cursor = Some((1, 0));
+        state.paste(&rows, 2, "7\t");
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+        // The first new row goes: the second's NULL moves up with it.
+        state.select((1, 0), false);
+        state.delete_rows(2);
+        assert_eq!(nulls(&state), BTreeSet::from([(0, 1)]));
+        // Undone, it is back where it was.
+        state.undo(&rows);
+        assert_eq!(nulls(&state), BTreeSet::from([(1, 1)]));
+    }
+
     #[test]
     fn a_sort_or_a_filter_keeps_the_selection_on_its_rows() {
         let columns = cols();

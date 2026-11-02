@@ -1001,6 +1001,13 @@ fn dictionary() {
             .any(|r| r[4].as_deref().is_some_and(|o| o.starts_with("meta_"))),
         "{rows:?}"
     );
+    // An array slice's bounds are no binds: explained as written.
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::ExplainPlan {
+        sql: "select (array[1,2,3])[1:2] from meta_emp".into(),
+    }) else {
+        panic!("expected a plan")
+    };
+    assert!(!rows.is_empty());
 
     h.ok("drop view meta_v");
     h.ok("drop table meta_emp");
@@ -1531,6 +1538,97 @@ fn ddl_of(h: &mut Harness, owner: &str, name: &str, object_type: ObjectType) -> 
         panic!("expected DDL")
     };
     ddl
+}
+
+/// A foreign key to the table's own unique index (one no constraint
+/// makes) comes after that index in the DDL, which kept the index out
+/// and put the key in the create: run, it failed with "there is no unique
+/// constraint matching given keys".
+#[test]
+fn a_key_to_the_tables_own_unique_index_runs_again() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r95_tree, r95_tree_copy cascade");
+    h.ok("create schema r95_tree");
+    h.ok("create schema r95_tree_copy");
+    h.ok(
+        "create table r95_tree.tree (id int primary key, code text not null, \
+           parent_code text, parent_id int constraint tree_up references r95_tree.tree)",
+    );
+    h.ok("create unique index tree_code on r95_tree.tree (code)");
+    h.ok(
+        "alter table r95_tree.tree add constraint tree_parent foreign key (parent_code) \
+           references r95_tree.tree (code)",
+    );
+    let ddl = ddl_of(&mut h, "r95_tree", "tree", ObjectType::Table);
+    assert!(ddl.contains("CREATE UNIQUE INDEX tree_code"), "{ddl}");
+    let index = ddl.find("CREATE UNIQUE INDEX tree_code").unwrap();
+    let key = ddl.find("constraint tree_parent").expect(&ddl);
+    assert!(index < key, "{ddl}");
+    // A key to the primary key stays in the create.
+    assert!(ddl.find("constraint tree_up").unwrap() < index, "{ddl}");
+    run_ddl(&mut h, &ddl, "r95_tree.", "r95_tree_copy.");
+    h.ok("insert into r95_tree_copy.tree values (1, 'a', null, null), (2, 'b', 'a', 1)");
+    h.ok("drop schema r95_tree, r95_tree_copy cascade");
+}
+
+/// A foreign table's DDL makes a foreign table again, on its server with
+/// its options and its columns', not a plain table: run elsewhere, it made
+/// an empty local one. Needs postgres_fdw, which a superuser can create.
+#[test]
+fn a_foreign_tables_ddl_makes_a_foreign_table() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let installed = h
+        .scalar("select count(*) from pg_extension where extname = 'postgres_fdw'")
+        .as_deref()
+        == Some("1");
+    let superuser = h
+        .scalar("select rolsuper from pg_roles where rolname = current_user")
+        .as_deref()
+        == Some("t");
+    if !installed && !superuser {
+        return;
+    }
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("create extension if not exists postgres_fdw");
+    h.ok("drop schema if exists r96_ft, r96_ft_copy cascade");
+    h.ok("drop server if exists r96_srv cascade");
+    h.ok("create server r96_srv foreign data wrapper postgres_fdw options (dbname 'pythia')");
+    h.ok("create schema r96_ft");
+    h.ok("create schema r96_ft_copy");
+    h.ok(
+        "create foreign table r96_ft.remote (id int options (column_name 'ident') not null, \
+           name text) server r96_srv options (schema_name 'public', table_name 'it''s')",
+    );
+    h.ok("comment on foreign table r96_ft.remote is 'over there'");
+    let ddl = ddl_of(&mut h, "r96_ft", "remote", ObjectType::Table);
+    assert!(
+        ddl.starts_with("create foreign table r96_ft.remote ("),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("id integer options (column_name 'ident') not null"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains(") server r96_srv options (schema_name 'public', table_name 'it''s');"),
+        "{ddl}"
+    );
+    run_ddl(&mut h, &ddl, "r96_ft.", "r96_ft_copy.");
+    assert_eq!(
+        h.scalar(
+            "select c.relkind::text from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+              where n.nspname = 'r96_ft_copy' and c.relname = 'remote'"
+        )
+        .as_deref(),
+        Some("f")
+    );
+    h.ok("drop schema r96_ft, r96_ft_copy cascade");
+    h.ok("drop server r96_srv cascade");
 }
 
 /// A view's DDL names its tables and functions with their schemas, as a

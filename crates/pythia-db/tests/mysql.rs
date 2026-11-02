@@ -316,6 +316,21 @@ fn values_types_and_binds() {
     assert_eq!(rows[0][0].as_deref(), Some("42"));
     assert_eq!(rows[0][1].as_deref(), Some("1"));
     assert_eq!(rows[0][2].as_deref(), Some("41"));
+    h.settle();
+
+    // A `:a` in a string with a `\'` stays in it.
+    h.session.send(DbRequest::Execute {
+        id: 3,
+        sql: r"select 'it\'s :a' as s, :a as v".into(),
+        max_rows: 10,
+        binds: vec![("a".into(), Bind::Text(Some("41".into())))],
+    });
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("it's :a"));
+    assert_eq!(rows[0][1].as_deref(), Some("41"));
 }
 
 /// A float keeps its exponent also in a query with binds (#261), which
@@ -1500,6 +1515,7 @@ fn column_defaults_read_as_sql() {
            b bit(3) default b'101', dd date default '2020-01-01', t time default '12:30:00', \
            ts timestamp null default current_timestamp on update current_timestamp, \
            dt datetime(3) default current_timestamp(3), u varchar(36) default (uuid()), \
+           x text default ('it''s'), j json default (json_object('a', 'b\\\\c')), \
            n varchar(5) default null, nn varchar(5) not null)",
     );
     let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
@@ -1513,10 +1529,24 @@ fn column_defaults_read_as_sql() {
         .iter()
         .map(|c| (c.name.as_str(), c.default.as_deref()))
         .collect();
-    let (now, now3, null) = if mariadb {
-        ("current_timestamp()", "current_timestamp(3)", Some("NULL"))
+    // An expression's strings as SHOW CREATE TABLE writes them, not
+    // escaped once more as MySQL's information_schema gives them.
+    let (now, now3, null, text, json) = if mariadb {
+        (
+            "current_timestamp()",
+            "current_timestamp(3)",
+            Some("NULL"),
+            r"'it\'s'",
+            r"json_object('a','b\\c')",
+        )
     } else {
-        ("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP(3)", None)
+        (
+            "CURRENT_TIMESTAMP",
+            "CURRENT_TIMESTAMP(3)",
+            None,
+            r"_utf8mb4'it\'s'",
+            r"json_object(_utf8mb4'a',_utf8mb4'b\\c')",
+        )
     };
     assert_eq!(
         defaults,
@@ -1536,6 +1566,8 @@ fn column_defaults_read_as_sql() {
             ("ts", Some(now)),
             ("dt", Some(now3)),
             ("u", Some("uuid()")),
+            ("x", Some(text)),
+            ("j", Some(json)),
             ("n", null),
             ("nn", None),
         ]

@@ -151,7 +151,10 @@ pub fn statements(
     };
     let name = qualified(owner, &def.name);
     if query != original.query.trim() {
+        // The query is checked first, without fetching a row: a mistake in
+        // it would otherwise fail the create after the drop.
         return Ok(vec![
+            format!("-- The new query is checked first\nselect 1 from (\n{query}\n) where 1 = 0"),
             format!("drop materialized view {name}"),
             create(owner, def, query),
         ]);
@@ -292,7 +295,11 @@ mod tests {
         );
         edited.query = "select 2 x from dual".into();
         let s = statements("APP", Some(&original), &edited).unwrap();
-        assert_eq!(s[0], "drop materialized view APP.SALES_MV");
-        assert!(s[1].starts_with("create materialized view APP.SALES_MV"));
+        assert_eq!(
+            s[0],
+            "-- The new query is checked first\nselect 1 from (\nselect 2 x from dual\n) where 1 = 0"
+        );
+        assert_eq!(s[1], "drop materialized view APP.SALES_MV");
+        assert!(s[2].starts_with("create materialized view APP.SALES_MV"));
     }
 }

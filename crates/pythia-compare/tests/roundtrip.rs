@@ -105,10 +105,21 @@ fn schema_and_data_roundtrip() {
         eprintln!("{script}");
         run(&conn, &script);
         run(&conn, "commit;");
-        let d = data::compare(&conn, &src, &conn, &tgt, options, |_, _| {})
+        let options_again = || options.clone();
+        let d = data::compare(&conn, &src, &conn, &tgt, options.clone(), |_, _| {})
             .expect("data compare again");
         assert!(d.is_equal(), "{d:?}");
         assert_eq!(d.equal, 3);
+        // A filter and a query that end with a `--` comment.
+        let query = DataSource::Query(format!("select * from {a}.dept -- all of them"));
+        let filtered = DataOptions {
+            key_columns: vec!["ID".into()],
+            filter: "id > 0 -- every one".into(),
+            ..options_again()
+        };
+        let d = data::compare(&conn, &query, &conn, &tgt, filtered, |_, _| {})
+            .expect("data compare with comments");
+        assert_eq!(d.equal, 3, "{d:?}");
     }));
     teardown_schemas(&conn, schemas);
     if let Err(e) = result {

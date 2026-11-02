@@ -67,6 +67,9 @@ pub enum Login {
 pub struct UserDef {
     pub kind: DbKind,
     pub mariadb: bool,
+    /// MySQL: the session's `sql_mode` has `NO_BACKSLASH_ESCAPES`, so a
+    /// `\` in a string stands for itself.
+    pub no_backslash_escapes: bool,
     pub role: bool,
     pub name: String,
     /// MySQL: the host of `'user'@'host'`.
@@ -241,7 +244,10 @@ pub fn masked(statements: &[String], def: &UserDef) -> Vec<String> {
         return statements.to_vec();
     }
     let (secret, hidden) = match def.kind {
-        DbKind::MySql => (mysql::literal(&def.password), "'********'"),
+        DbKind::MySql => (
+            mysql::literal(&def.password, def.no_backslash_escapes),
+            "'********'",
+        ),
         DbKind::Postgres => (postgres::literal(&def.password), "'********'"),
         _ => (sqlserver::literal(&def.password), "N'********'"),
     };

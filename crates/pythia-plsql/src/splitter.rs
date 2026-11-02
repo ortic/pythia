@@ -606,6 +606,24 @@ mod tests {
             .collect()
     }
 
+    /// A statement inside a comment that holds a comment is no statement
+    /// on PostgreSQL and SQL Server, which nest them.
+    #[test]
+    fn nested_comments_hide_statements() {
+        let src = "/* disabled\n/* step 2: purge */\ndelete from t;\n*/\nselect count(*) from t;";
+        for syntax in [Syntax::Postgres, Syntax::TSql] {
+            let statements: Vec<&str> = split_statements_in(src, syntax)
+                .iter()
+                .map(|s| s.text(src))
+                .collect();
+            assert_eq!(statements.len(), 1, "{syntax:?}: {statements:?}");
+            assert!(
+                statements[0].ends_with("select count(*) from t"),
+                "{syntax:?}: {statements:?}"
+            );
+        }
+    }
+
     #[test]
     fn sql_statements() {
         assert_eq!(

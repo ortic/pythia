@@ -281,8 +281,13 @@ fn columns(
 /// function: the value of a text, ENUM, SET, date or time column is
 /// quoted. Numbers and bits (`b'101'`) stay as they are, and so do
 /// expressions, marked DEFAULT_GENERATED; a CURRENT_TIMESTAMP before MySQL
-/// 8.0.13 isn't marked, but is no date.
+/// 8.0.13 isn't marked, but is no date. An expression's strings are
+/// escaped once more (`_utf8mb4\'it\\\'s\'`), as in a key part (#258):
+/// that is undone.
 fn mysql_default(value: String, data_type: &str, extra: &str) -> String {
+    if extra.contains("DEFAULT_GENERATED") && value.contains('\\') {
+        return unescape(&value);
+    }
     let literal = matches!(
         data_type,
         "char"
@@ -304,6 +309,20 @@ fn mysql_default(value: String, data_type: &str, extra: &str) -> String {
         return value;
     }
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+/// `value` with one level of backslash escapes taken off: `\\x` is `x`.
+fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        out.push(if c == '\\' {
+            chars.next().unwrap_or(c)
+        } else {
+            c
+        });
+    }
+    out
 }
 
 /// A key part: its column, or a functional one's expression (MySQL
