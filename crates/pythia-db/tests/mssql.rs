@@ -4288,3 +4288,77 @@ fn numeric_sequences_keep_their_precision() {
     h.ok(ddl.trim_end().trim_end_matches("GO").trim_end());
     h.ok("drop sequence r101_seq");
 }
+
+/// A view's, routine's and trigger's descriptions, and a view's columns'
+/// and a routine's parameters', are in their DDL (#472): run elsewhere, the
+/// copy has them; run again (as Edit does), it keeps them.
+#[test]
+fn module_ddl_keeps_descriptions() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    let schema = h.scalar("select schema_name()").unwrap();
+    let cleanup = |h: &mut Harness| {
+        h.ok("drop view if exists r101_desc_v");
+        h.ok("drop procedure if exists r101_desc_p");
+        h.ok("drop table if exists r101_desc_t");
+    };
+    cleanup(&mut h);
+    let describe = |what: &str| {
+        format!(
+            "exec sys.sp_addextendedproperty @name = N'MS_Description', @value = N'it''s', {what}"
+        )
+    };
+    for sql in [
+        "create table r101_desc_t (n int)".to_owned(),
+        "create view r101_desc_v as select n from r101_desc_t".to_owned(),
+        "create procedure r101_desc_p @x int as select @x".to_owned(),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'VIEW', @level1name = N'r101_desc_v'"
+        )),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'VIEW', @level1name = N'r101_desc_v', @level2type = N'COLUMN', @level2name = N'n'"
+        )),
+        describe(&format!(
+            "@level0type = N'SCHEMA', @level0name = N'{schema}', @level1type = N'PROCEDURE', @level1name = N'r101_desc_p', @level2type = N'PARAMETER', @level2name = N'@x'"
+        )),
+    ] {
+        h.ok(&sql);
+    }
+    let ddl = |h: &mut Harness, name: &str, object_type: ObjectType| {
+        let MetaResult::Text(ddl) = h.meta(MetaQuery::Ddl {
+            owner: schema.clone(),
+            name: name.into(),
+            object_type,
+        }) else {
+            panic!("expected DDL")
+        };
+        ddl
+    };
+    let view = ddl(&mut h, "r101_desc_v", ObjectType::View);
+    let procedure = ddl(&mut h, "r101_desc_p", ObjectType::Procedure);
+    let count = |h: &mut Harness| {
+        h.scalar(
+            "select count(*) from sys.extended_properties \
+              where major_id in (object_id('r101_desc_v'), object_id('r101_desc_p')) \
+                and name = 'MS_Description' and cast(value as nvarchar(10)) = N'it''s'",
+        )
+    };
+    assert_eq!(count(&mut h).as_deref(), Some("3"));
+    // Made again over themselves, as Edit does, and made anew.
+    for round in 0..2 {
+        if round == 1 {
+            h.ok("drop view r101_desc_v");
+            h.ok("drop procedure r101_desc_p");
+        }
+        for script in [&view, &procedure] {
+            let script = script.replacen("create ", "create or alter ", 1);
+            for batch in script.split("\nGO\n").filter(|b| !b.trim().is_empty()) {
+                h.ok(batch);
+            }
+        }
+        assert_eq!(count(&mut h).as_deref(), Some("3"), "round {round}");
+    }
+    cleanup(&mut h);
+}

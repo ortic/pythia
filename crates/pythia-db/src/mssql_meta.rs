@@ -661,7 +661,14 @@ fn ddl(
         } else {
             String::new()
         };
-        format!("{text}\nGO\n{order}")
+        let described = match object_type {
+            ObjectType::View
+            | ObjectType::Procedure
+            | ObjectType::Function
+            | ObjectType::Trigger => module_descriptions(ms, &object, object_type)?,
+            _ => String::new(),
+        };
+        format!("{text}\nGO\n{order}{described}")
     } else {
         text
     })
@@ -1329,6 +1336,97 @@ fn descriptions(ms: &mut Ms<'_>, object: &str) -> Result<Vec<String>, DbError> {
             ))
         })
         .collect())
+}
+
+/// The descriptions (`MS_Description`) of a view, routine or trigger and
+/// of a view's columns and a routine's parameters, in a batch of their own
+/// after its DDL (#472): a copy had none. Each is updated where it is
+/// there, as *Edit*'s `CREATE OR ALTER` keeps it, and added where not.
+fn module_descriptions(
+    ms: &mut Ms<'_>,
+    object: &str,
+    object_type: ObjectType,
+) -> Result<String, DbError> {
+    let rows = ms.rows(
+        "select object_schema_name(o.object_id), o.name, object_name(o.parent_object_id), \
+                case p.class when 1 then col_name(o.object_id, nullif(p.minor_id, 0)) \
+                     else (select x.name from sys.parameters x \
+                            where x.object_id = o.object_id and x.parameter_id = p.minor_id) end, \
+                p.class, cast(p.value as nvarchar(max)) \
+           from sys.extended_properties p join sys.objects o on o.object_id = p.major_id \
+          where p.class in (1, 2) and p.major_id = object_id(@P1) and p.name = 'MS_Description' \
+          order by p.class, p.minor_id",
+        &[object],
+    )?;
+    let n = |text: &str| format!("N'{}'", text.replace('\'', "''"));
+    let mut out = String::new();
+    for row in rows {
+        let [
+            Some(schema),
+            Some(name),
+            parent,
+            part,
+            Some(class),
+            Some(value),
+        ] = row.as_slice()
+        else {
+            continue;
+        };
+        // A trigger is described under its table.
+        let mut levels = vec![("SCHEMA", schema.clone())];
+        match (object_type, parent) {
+            (ObjectType::Trigger, Some(table)) => {
+                levels.push(("TABLE", table.clone()));
+                levels.push(("TRIGGER", name.clone()));
+            }
+            (ObjectType::Trigger, None) => continue,
+            _ => {
+                let kind = match object_type {
+                    ObjectType::View => "VIEW",
+                    ObjectType::Procedure => "PROCEDURE",
+                    _ => "FUNCTION",
+                };
+                levels.push((kind, name.clone()));
+                if let Some(part) = part {
+                    levels.push((
+                        if class == "2" { "PARAMETER" } else { "COLUMN" },
+                        part.clone(),
+                    ));
+                }
+            }
+        }
+        let named: Vec<String> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, name))| {
+                format!("@level{i}type = N'{kind}', @level{i}name = {}", n(name))
+            })
+            .collect();
+        let listed: Vec<String> = (0..3)
+            .flat_map(|i| match levels.get(i) {
+                Some((kind, name)) => [format!("N'{kind}'"), n(name)],
+                None => ["null".to_owned(), "null".to_owned()],
+            })
+            .collect();
+        let call = |procedure: &str| {
+            format!(
+                "exec sys.{procedure} @name = N'MS_Description', @value = {}, {}",
+                n(value),
+                named.join(", ")
+            )
+        };
+        out.push_str(&format!(
+            "if exists (select 1 from sys.fn_listextendedproperty(N'MS_Description', {}))\n  {}\n\
+             else\n  {};\n",
+            listed.join(", "),
+            call("sp_updateextendedproperty"),
+            call("sp_addextendedproperty")
+        ));
+    }
+    if !out.is_empty() {
+        out.push_str("GO\n");
+    }
+    Ok(out)
 }
 
 /// `ledger = on` of a ledger table of `kind`, updatable (2) or append-only

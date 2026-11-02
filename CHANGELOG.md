@@ -458,6 +458,8 @@ All notable changes to Pythia are documented here. The format follows
 - Generate INSERT and UPDATE leave a table's generated columns out, which
   the database refused, and the Columns tab says which are generated, and
   how, on every database (#471).
+- SQL Server: the DDL of a view, routine or trigger has its descriptions,
+  and its columns' and parameters', which a copy lacked (#472).
 
 ## [0.11.0] - 2026-11-02
 
