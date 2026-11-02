@@ -304,6 +304,56 @@ fn query_and_fetch_more() {
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 
+/// A window with rows left to fetch doesn't keep another one from
+/// committing (#185): its open statement held a read lock on the file,
+/// and the other's commit failed after five seconds with "database is
+/// locked". It reads the rest ahead, which ends the statement, and its
+/// fetches get the rows as they were.
+#[test]
+fn rows_left_to_fetch_dont_block_commits() {
+    use std::time::Instant;
+    let db = TempDb::new("rows-left");
+    let mut a = Harness::connect(&db.create());
+    a.session.send(DbRequest::SetAutocommit(true));
+    a.ok("create table t (n integer)");
+    a.ok(
+        "insert into t with recursive s(n) as (select 1 union all select n + 1 from s \
+           where n < 500) select n from s",
+    );
+    let mut b = Harness::connect(&db.path());
+    a.execute(1, "select n from t order by n", 10);
+    assert!(matches!(a.next_result(), DbEvent::QueryStarted { .. }));
+    assert!(matches!(a.next_result(), DbEvent::Rows { more: true, .. }));
+    let started = Instant::now();
+    b.ok("insert into t values (501)");
+    b.session.send(DbRequest::Commit);
+    let mut committed = false;
+    loop {
+        match b.next() {
+            DbEvent::Notice(n) if n == "Committed" => committed = true,
+            DbEvent::Error(e) => panic!("{e}"),
+            DbEvent::Transaction { .. } if committed => break,
+            _ => {}
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    a.session.send(DbRequest::FetchMore {
+        id: 1,
+        max_rows: 1000,
+    });
+    let DbEvent::Rows { rows, more, .. } = a.next_result() else {
+        panic!("expected Rows")
+    };
+    assert_eq!((rows.len(), more), (490, false));
+    assert_eq!(rows[489][0].as_deref(), Some("500"));
+    a.settle();
+    assert_eq!(a.scalar("select count(*) from t").as_deref(), Some("501"));
+}
+
 /// For the grid a blob is cut short with its size; for a file it comes
 /// whole, and a batch ends once it holds 64 MB of text, so rows of large
 /// blobs come a few at a time (#204).

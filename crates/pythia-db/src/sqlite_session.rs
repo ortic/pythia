@@ -12,7 +12,8 @@
 //! committed at once; inside one it waits for Commit too (SQLite's DDL is
 //! transactional). While a session has uncommitted changes, another one that
 //! writes waits up to [`BUSY_TIMEOUT`] for the lock, then fails with
-//! "database is locked". Sessions of a database in a shared cache, as
+//! "database is locked"; one that holds it only for the rest of a result
+//! reads that ahead, which lets it go ([`LOCK_WANTED`]). Sessions of a database in a shared cache, as
 //! `:memory:` is, wait so for each other's table and schema locks too
 //! ([`waiting`]).
 
@@ -39,6 +40,32 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often [`waiting`] tries again.
 const LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// When a session of this app last waited for a lock on a database file
+/// (#185): sessions that hold one only for the rest of a result read it,
+/// which ends their statement and lets the lock go.
+static LOCK_WANTED: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// How long after [`LOCK_WANTED`] a session reads the rest of its result.
+const LOCK_WANTED_FOR: Duration = Duration::from_millis(500);
+
+/// How often a session with rows left looks at [`LOCK_WANTED`].
+const RELEASE_POLL: Duration = Duration::from_millis(20);
+
+/// The most of a result's rest read so (in bytes of its text): beyond it,
+/// the statement keeps its lock and the rows are read as they are fetched.
+const REST_BYTES: usize = 256 << 20;
+
+fn want_lock() {
+    *LOCK_WANTED.lock().expect("lock wanted") = Some(Instant::now());
+}
+
+fn lock_wanted() -> bool {
+    LOCK_WANTED
+        .lock()
+        .expect("lock wanted")
+        .is_some_and(|at| at.elapsed() < LOCK_WANTED_FOR)
+}
 
 /// `:memory:` is one database for all sessions of the app (each would
 /// otherwise get an empty one of its own), kept while one of them is open.
@@ -197,9 +224,15 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
             text.into_owned()
         }
     };
-    let conn = Connection::open_with_flags(&location, flags).map_err(DbError::from)?;
-    // Writing waits for another session's lock instead of failing at once.
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let mut conn = Connection::open_with_flags(&location, flags).map_err(DbError::from)?;
+    // Writing waits for another session's lock instead of failing at once,
+    // and asks this app's sessions that hold one only for the rest of a
+    // result to let it go (#185).
+    conn.busy_handler(Some(|tries: i32| {
+        want_lock();
+        std::thread::sleep(LOCK_POLL);
+        LOCK_POLL * u32::try_from(tries).unwrap_or(u32::MAX) < BUSY_TIMEOUT
+    }))?;
     // Not a database at all: SQLite only notices on the first read.
     waiting(&conn, || {
         conn.query_row("select count(*) from sqlite_schema", [], |_| Ok(()))
@@ -574,6 +607,8 @@ impl Worker {
             started,
             events: &self.events,
             requests,
+            // In a transaction, the lock stays until it ends.
+            release: self.conn.is_autocommit(),
         };
         match run_statement(&self.conn, &sql, values, fetch, &mut next) {
             Ok(Outcome::Query { failed }) => {
@@ -710,9 +745,51 @@ struct Fetch<'a> {
     started: Instant,
     events: &'a Events,
     requests: &'a Requests,
+    /// Whether the statement's end lets its lock on the file go: outside a
+    /// transaction.
+    release: bool,
+}
+
+/// The rest of a result read ahead of its fetches (#185), and how it ended
+/// once it did: with the last row, or failing.
+#[derive(Default)]
+struct Rest {
+    rows: std::collections::VecDeque<Vec<Cell>>,
+    end: Option<Option<DbError>>,
 }
 
 impl Fetch<'_> {
+    /// Reads the rest of `rows` into `rest` for another session that waits
+    /// for the file (#185): read to its end, the statement lets its lock
+    /// go. Up to [`REST_BYTES`]; a larger rest keeps the lock.
+    fn read_rest(&self, rows: &mut Rows<'_>, rest: &mut Rest) {
+        let mut bytes: usize = rest.rows.iter().map(|r| row_bytes(r) + 8 * r.len()).sum();
+        while bytes < REST_BYTES {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let cells: Vec<Cell> = (0..row.as_ref().column_count())
+                        .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null), self.whole))
+                        .collect();
+                    bytes += row_bytes(&cells) + 8 * cells.len();
+                    rest.rows.push_back(cells);
+                }
+                Ok(None) => {
+                    rest.end = Some(None);
+                    debug!(
+                        id = self.id,
+                        rows = rest.rows.len(),
+                        "read ahead: the lock is free"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    rest.end = Some(Some(DbError::from(e)));
+                    return;
+                }
+            }
+        }
+    }
+
     /// Reports the rows; while it may `wait`, none for a lock of another
     /// session of the shared cache on the first one, which reported nothing
     /// and may be tried again.
@@ -728,6 +805,7 @@ impl Fetch<'_> {
         let mut max_rows = self.max_rows;
         let mut started = self.started;
         let mut columns: Option<Vec<Column>> = None;
+        let mut rest = Rest::default();
         loop {
             let mut batch = Vec::with_capacity(max_rows.min(10_000));
             // The value types of the first rows, for columns without a
@@ -737,6 +815,18 @@ impl Fetch<'_> {
             let mut failed = None;
             let mut bytes = 0;
             while batch.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
+                if let Some(cells) = rest.rows.pop_front() {
+                    if self.whole {
+                        bytes += row_bytes(&cells);
+                    }
+                    batch.push(cells);
+                    continue;
+                }
+                if let Some(end) = rest.end.take() {
+                    failed = end;
+                    more = false;
+                    break;
+                }
                 match rows.next() {
                     Ok(Some(row)) => {
                         let mut cells = Vec::with_capacity(names.len());
@@ -796,7 +886,18 @@ impl Fetch<'_> {
             if !more {
                 return Some(Outcome::Query { failed: false });
             }
-            match self.requests.recv() {
+            let request = loop {
+                match self.requests.recv_timeout(RELEASE_POLL) {
+                    Ok(request) => break Ok(request),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if self.release && rest.end.is_none() && lock_wanted() {
+                            self.read_rest(&mut rows, &mut rest);
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err(()),
+                }
+            };
+            match request {
                 Ok(DbRequest::FetchMore {
                     id: wanted,
                     max_rows: n,

@@ -383,6 +383,9 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: a table's DDL has its rules, its replica identity and its
   columns' storage, compression, statistics targets and options, a
   materialized view's its columns' (#378).
+- SQLite: a window with rows left to fetch doesn't keep another from
+  committing: it reads the rest ahead, up to 256 MB, which lets its lock
+  on the file go (#185).
 
 ## [0.11.0] - 2026-11-02
 
