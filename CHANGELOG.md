@@ -20,6 +20,8 @@ All notable changes to Pythia are documented here. The format follows
   `information_schema` on MySQL, which lists no temporary tables, and on
   SQL Server from the database instead of `tempdb`. On MySQL, a
   temporary table that hides a table of its name got that table's key.
+- SQL Server: a `numeric` or `decimal` of scale 0 shows as `123`, no
+  longer as `123.0` (#389), in the grid and in exports.
 
 ## [0.11.0] - 2026-11-02
 

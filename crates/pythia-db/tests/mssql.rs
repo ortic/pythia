@@ -269,7 +269,8 @@ fn values_types_and_binds() {
                 cast('2024-02-29 13:45:01 +01:30' as datetimeoffset(0)) dto, \
                 cast('13:45:01.5' as time(1)) tm, \
                 cast('6F9619FF-8B86-D011-B42D-00C04FC964FF' as uniqueidentifier) g, \
-                cast(2.5 as float) f",
+                cast(2.5 as float) f, cast(-123 as numeric(18,0)) z, \
+                cast(-0.05 as decimal(5,2)) nd",
     ) else {
         panic!("expected QueryStarted")
     };
@@ -293,6 +294,8 @@ fn values_types_and_binds() {
             Some("13:45:01.5".into()),
             Some("6F9619FF-8B86-D011-B42D-00C04FC964FF".into()),
             Some("2.5".into()),
+            Some("-123".into()),
+            Some("-0.05".into()),
         ]
     );
     h.settle();

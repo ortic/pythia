@@ -1258,7 +1258,11 @@ fn cell(data: &ColumnData<'_>, whole: bool) -> Cell {
         ColumnData::String(v) => v.as_deref()?.to_owned(),
         ColumnData::Guid(v) => v.as_ref()?.to_string().to_uppercase(),
         ColumnData::Binary(v) => format!("0x{}", hex(v.as_deref()?, whole)),
-        ColumnData::Numeric(v) => v.as_ref()?.to_string(),
+        // The driver writes a scale of 0 as `123.0`.
+        ColumnData::Numeric(v) => match v.as_ref()? {
+            n if n.scale() == 0 => n.value().to_string(),
+            n => n.to_string(),
+        },
         ColumnData::Xml(v) => v.as_deref()?.to_string(),
         ColumnData::DateTime(v) => {
             let v = v.as_ref()?;
