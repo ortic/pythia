@@ -264,6 +264,15 @@ impl<W: Write> StreamWriter<W> {
         })
     }
 
+    /// The columns are of these types after all, for the rows written
+    /// next: SQLite's, typed from the first rows (#482). The same columns,
+    /// in the same order; others are ignored.
+    pub fn retype(&mut self, columns: Vec<Column>) {
+        if columns.len() == self.columns.len() {
+            self.columns = columns;
+        }
+    }
+
     pub fn write(&mut self, rows: &[Vec<Cell>]) -> Result<()> {
         check_whole(&self.columns, rows)?;
         let options = Options {
@@ -1757,6 +1766,34 @@ mod tests {
     /// bytes on every database (#256), as on SQL Server; a text column
     /// keeps it as text. An odd number of digits reads as MySQL's `0x…`
     /// does, with a 0 in front.
+    /// Rows written after the columns are typed again take their new
+    /// types: a SQLite column of text with blobs later (#482).
+    #[test]
+    fn streamed_rows_take_new_types() {
+        let column = |t: &str| Column {
+            name: "v".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let options = Options {
+            dialect: Dialect::SQLITE,
+            table: "m".into(),
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        let mut writer =
+            StreamWriter::new(Format::Insert, vec![column("TEXT")], options, &mut out).unwrap();
+        writer.write(&[vec![Some("00FF".into())]]).unwrap();
+        writer.retype(vec![column("BLOB")]);
+        writer.write(&[vec![Some("00FF".into())]]).unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("('00FF')") && text.contains("(X'00FF')"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn binary_values_typed_as_shown() {
         let col = |t: &str| Column {

@@ -83,6 +83,13 @@ impl Sink {
         Ok(())
     }
 
+    /// The columns' types changed, for the rows that come next (#482).
+    pub fn retype(&mut self, columns: &[Column]) {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.retype(columns.to_vec());
+        }
+    }
+
     /// Writes rows; returns how many were written so far.
     pub fn rows(&mut self, rows: &[Vec<Cell>]) -> Result<u64, DbError> {
         let Some(writer) = self.writer.as_mut() else {

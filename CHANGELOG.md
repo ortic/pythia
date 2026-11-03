@@ -500,6 +500,10 @@ All notable changes to Pythia are documented here. The format follows
   says why it fails and how to read the text: `column::bytea` shows its
   bytes, `convert_from(convert(column::bytea, 'WIN1252', 'UTF8'),
   'SQL_ASCII')` reads them as Windows-1252 (#487).
+- SQLite: a result column typed from its first rows is typed again when
+  later rows have blobs in it: they were shown in hex in a column of
+  text, which INSERT exports wrote as text (`'00FF'`) and Edit's check
+  took for a conflict (#482).
 
 ## [0.11.0] - 2026-11-02
 

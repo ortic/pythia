@@ -184,6 +184,14 @@ pub enum DbEvent {
         more: bool,
         elapsed: Duration,
     },
+    /// The columns of statement `id`'s result are of these types after
+    /// all, from the rows that come next on: SQLite's, whose values have
+    /// types of their own, typed from the first rows, had blobs later in
+    /// a column of text (#482). The same columns, in the same order.
+    Retyped {
+        id: u64,
+        columns: Vec<Column>,
+    },
     /// Statement `id` returns another result after the rows that come
     /// next, the last of the one before: MySQL's CALL of a procedure with
     /// several SELECTs, or statements in one text (#290). Another

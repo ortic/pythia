@@ -304,6 +304,55 @@ fn query_and_fetch_more() {
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 
+/// A column typed from its first rows is typed again when later ones
+/// have blobs (#482): blobs that came after a fetch were shown in hex in a
+/// column of text, which exports wrote as text and Edit's check took for
+/// a conflict. Whether declared TEXT or without a type.
+#[test]
+fn blobs_after_the_first_rows_retype_their_column() {
+    let db = TempDb::new("retype");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table m (id integer primary key, v, t text)");
+    h.ok(
+        "insert into m values (1, 'one', 'a'), (2, 'two', 'b'), (3, 'three', 'c'), \
+          (4, x'00ff', x'cafe'), (5, 'five', 'e')",
+    );
+    h.execute(1, "select v, t from m order by id", 2);
+    let DbEvent::QueryStarted { columns, .. } = h.next_result() else {
+        panic!("expected QueryStarted")
+    };
+    let types = |columns: &[pythia_db::Column]| -> Vec<String> {
+        columns.iter().map(|c| c.type_name.clone()).collect()
+    };
+    assert_eq!(types(&columns), ["TEXT", "TEXT"]);
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::FetchMore { id: 1, max_rows: 1 });
+    // No blob yet: the types stay.
+    let DbEvent::Rows {
+        rows, more: true, ..
+    } = h.next_result()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("three"));
+    h.session.send(DbRequest::FetchMore {
+        id: 1,
+        max_rows: 10,
+    });
+    let DbEvent::Retyped { id: 1, columns } = h.next_result() else {
+        panic!("expected Retyped")
+    };
+    assert_eq!(types(&columns), ["BLOB", "BLOB"]);
+    let DbEvent::Rows {
+        rows, more: false, ..
+    } = h.next_result()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0], vec![Some("00FF".into()), Some("CAFE".into())]);
+    h.settle();
+}
+
 /// A window with rows left to fetch doesn't keep another one from
 /// committing (#185): its open statement held a read lock on the file,
 /// and the other's commit failed after five seconds with "database is

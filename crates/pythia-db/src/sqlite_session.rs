@@ -756,6 +756,8 @@ struct Fetch<'a> {
 struct Rest {
     rows: std::collections::VecDeque<Vec<Cell>>,
     end: Option<Option<DbError>>,
+    /// The value types of `rows`, which type the columns (#482).
+    seen: Vec<Seen>,
 }
 
 impl Fetch<'_> {
@@ -767,8 +769,14 @@ impl Fetch<'_> {
         while bytes < REST_BYTES {
             match rows.next() {
                 Ok(Some(row)) => {
-                    let cells: Vec<Cell> = (0..row.as_ref().column_count())
-                        .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null), self.whole))
+                    let count = row.as_ref().column_count();
+                    rest.seen.resize(count, Seen::default());
+                    let cells: Vec<Cell> = (0..count)
+                        .map(|i| {
+                            let value = row.get_ref(i).unwrap_or(ValueRef::Null);
+                            rest.seen[i].note(value);
+                            cell(value, self.whole)
+                        })
                         .collect();
                     bytes += row_bytes(&cells) + 8 * cells.len();
                     rest.rows.push_back(cells);
@@ -806,16 +814,19 @@ impl Fetch<'_> {
         let mut started = self.started;
         let mut columns: Option<Vec<Column>> = None;
         let mut rest = Rest::default();
+        // The value types of the rows so far, which type the columns: a
+        // later batch's may change them (#482).
+        let mut seen = vec![Seen::default(); names.len()];
         loop {
             let mut batch = Vec::with_capacity(max_rows.min(10_000));
-            // The value types of the first rows, for columns without a
-            // declared type.
-            let mut seen = vec![Seen::default(); if columns.is_none() { names.len() } else { 0 }];
             let mut more = true;
             let mut failed = None;
             let mut bytes = 0;
             while batch.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 if let Some(cells) = rest.rows.pop_front() {
+                    for (seen, theirs) in seen.iter_mut().zip(std::mem::take(&mut rest.seen)) {
+                        seen.merge(theirs);
+                    }
                     if self.whole {
                         bytes += row_bytes(&cells);
                     }
@@ -856,19 +867,26 @@ impl Fetch<'_> {
                     }
                 }
             }
-            if columns.is_none() {
-                let described: Vec<Column> = names
-                    .iter()
-                    .zip(declared)
-                    .zip(&seen)
-                    .map(|((name, declared), seen)| column(name, declared.as_deref(), seen))
-                    .collect();
-                self.events.send(DbEvent::QueryStarted {
+            let described: Vec<Column> = names
+                .iter()
+                .zip(declared)
+                .zip(&seen)
+                .map(|((name, declared), seen)| column(name, declared.as_deref(), seen))
+                .collect();
+            match &columns {
+                None => self.events.send(DbEvent::QueryStarted {
                     id,
                     columns: described.clone(),
-                });
-                columns = Some(described);
+                }),
+                Some(before) if !same_types(before, &described) => {
+                    self.events.send(DbEvent::Retyped {
+                        id,
+                        columns: described.clone(),
+                    })
+                }
+                Some(_) => {}
             }
+            columns = Some(described);
             if let Some(error) = failed {
                 self.events.send(DbEvent::Failed {
                     id,
@@ -937,6 +955,14 @@ impl Seen {
         }
     }
 
+    /// Adds the kinds `other` saw.
+    fn merge(&mut self, other: Seen) {
+        self.integer |= other.integer;
+        self.real |= other.real;
+        self.text |= other.text;
+        self.blob |= other.blob;
+    }
+
     /// Only numbers (and NULLs), at least one.
     fn numbers(self) -> bool {
         (self.integer || self.real) && !self.text && !self.blob
@@ -981,6 +1007,14 @@ fn column(name: &str, declared: Option<&str>, seen: &Seen) -> Column {
         type_name,
         numeric,
     }
+}
+
+/// Whether columns are of the same types, shown alike.
+fn same_types(a: &[Column], b: &[Column]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.type_name == b.type_name && a.numeric == b.numeric)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

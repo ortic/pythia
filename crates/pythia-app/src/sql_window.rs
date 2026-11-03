@@ -837,6 +837,10 @@ impl SqlWindow {
         };
         let failed = match event {
             DbEvent::QueryStarted { columns, .. } => sink.columns(&columns).err(),
+            DbEvent::Retyped { columns, .. } => {
+                sink.retype(&columns);
+                None
+            }
             DbEvent::Rows { rows, more, .. } => match sink.rows(&rows) {
                 Ok(written) => {
                     job.rows
@@ -1941,6 +1945,7 @@ impl SqlWindow {
         };
         let streamed = match &event {
             DbEvent::QueryStarted { id, .. }
+            | DbEvent::Retyped { id, .. }
             | DbEvent::Rows { id, .. }
             | DbEvent::QueryClosed { id }
             | DbEvent::Executed { id, .. }
@@ -2211,6 +2216,18 @@ impl SqlWindow {
                     self.state.fetching = None;
                 }
                 self.query_closed(id, "its query was closed by what ran after it");
+            }
+            // Later rows had blobs in a column of text (SQLite, #482):
+            // exports and Edit take its values as what they are.
+            DbEvent::Retyped { id, columns } => {
+                if let Some(result) = self.state.results.iter_mut().rev().find(|r| r.id == id)
+                    && result.columns.len() == columns.len()
+                {
+                    for (column, retyped) in result.columns.iter_mut().zip(columns) {
+                        column.type_name = retyped.type_name;
+                        column.numeric = retyped.numeric;
+                    }
+                }
             }
             DbEvent::Rows {
                 id,
@@ -4590,6 +4607,49 @@ mod tests {
         // A `:` in a string is none.
         w.editor.set_text("select ':id' from t");
         assert_eq!(explained(&w.explain()), ["select ':id' from t"]);
+    }
+
+    /// A result's columns take the types its session says later rows
+    /// have (SQLite, #482): a column of text with blobs after the first
+    /// fetch is a BLOB one, which exports and Edit write as `X'…'`.
+    #[test]
+    fn results_are_retyped() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "select v from m".into());
+        let id = sent(&w.execute(false, &cx))[0].0;
+        let column = |type_name: &str| pythia_db::Column {
+            name: "v".into(),
+            type_name: type_name.into(),
+            numeric: false,
+        };
+        let columns = vec![column("TEXT")];
+        w.on_event(DbEvent::QueryStarted { id, columns }, &cx);
+        let rows = |w: &mut SqlWindow, value: &str, more| {
+            w.on_event(
+                DbEvent::Rows {
+                    id,
+                    rows: vec![vec![Some(value.into())]],
+                    more,
+                    elapsed: Duration::ZERO,
+                },
+                &cx,
+            )
+        };
+        rows(&mut w, "one", true);
+        let columns = vec![column("BLOB")];
+        w.on_event(DbEvent::Retyped { id, columns }, &cx);
+        rows(&mut w, "00FF", false);
+        let result = &w.state.results[0];
+        assert_eq!(result.columns[0].type_name, "BLOB");
+        assert_eq!(
+            pythia_data::literal(
+                pythia_db::Dialect::SQLITE,
+                &result.columns[0],
+                result.rows[1][0].as_deref()
+            ),
+            "X'00FF'"
+        );
     }
 
     /// Explain plan runs in the window's own session (#269), so not while
