@@ -580,6 +580,18 @@ fn columns(
     } else {
         "cast(null as number)"
     };
+    // An identity column's default is its sequence's NEXTVAL: how it is
+    // generated says more (#485). Identity columns came with 12.1.
+    let identity = if crate::compat::at_least(conn, 12, 1)? {
+        "(select 'generated ' || decode(i.generation_type, 'ALWAYS', 'always', 'by default') \
+                 || decode(x.default_on_null, 'YES', ' on null', '') || ' as identity' \
+            from all_tab_identity_cols i join all_tab_cols x on x.owner = i.owner \
+                 and x.table_name = i.table_name and x.column_name = i.column_name \
+           where i.owner = c.owner and i.table_name = c.table_name \
+             and i.column_name = c.column_name)"
+    } else {
+        "cast(null as varchar2(1))"
+    };
     let sql = format!(
         "select c.column_name, \
                 case \
@@ -593,7 +605,8 @@ fn columns(
                   else c.data_type end, \
                 c.nullable, c.data_default, cc.comments, {pk}, \
                 (select x.virtual_column from all_tab_cols x where x.owner = c.owner \
-                    and x.table_name = c.table_name and x.column_name = c.column_name) \
+                    and x.table_name = c.table_name and x.column_name = c.column_name), \
+                {identity} \
                from all_tab_columns c \
                left join all_col_comments cc \
                  on cc.owner = c.owner and cc.table_name = c.table_name and cc.column_name = c.column_name \
@@ -612,9 +625,12 @@ fn columns(
             Option<u32>,
         ) = row.get_as()?;
         let generated = row.get::<_, Option<String>>(6)?.as_deref() == Some("YES");
-        let default = default
-            .map(|d| d.trim().to_owned())
-            .filter(|d| !d.is_empty());
+        let identity: Option<String> = row.get(7)?;
+        let default = identity.or_else(|| {
+            default
+                .map(|d| d.trim().to_owned())
+                .filter(|d| !d.is_empty())
+        });
         out.push(TableColumn {
             name,
             data_type,

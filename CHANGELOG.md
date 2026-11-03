@@ -474,6 +474,8 @@ All notable changes to Pythia are documented here. The format follows
   which another server read otherwise (#475).
 - MySQL: the Constraints tab names a foreign key's referenced table with
   its database where that isn't the table's (#477).
+- Oracle: the Columns tab says how an identity column is generated
+  (`generated always as identity`), not its sequence's NEXTVAL (#485).
 
 ## [0.11.0] - 2026-11-02
 
