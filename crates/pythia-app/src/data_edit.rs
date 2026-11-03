@@ -511,13 +511,8 @@ pub fn plain_columns(dialect: Dialect, sql: &str, count: usize) -> Vec<bool> {
 /// The columns that identify a row of `table` (as written in a query):
 /// its primary key, or else a unique key on NOT NULL columns. Empty if it
 /// has neither, or isn't a table (a view's indexes don't count).
-#[cfg(test)]
-pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbError> {
-    edit_key(client, table).map(|(key, _)| key)
-}
-
-/// [`row_key`], with the key columns found by their instant: MySQL's
-/// TIMESTAMP ones (#474).
+/// With them, the key columns found by their instant: MySQL's TIMESTAMP
+/// ones (#474).
 pub fn edit_key(
     client: &mut dyn Client,
     table: &str,
@@ -1480,7 +1475,7 @@ pub fn cut_changes(edit: &Editable, columns: &[Column], changes: &Changes) -> us
 
 /// Where a fetched `row` of `edit`'s result is the row of its table, by
 /// the key in its last columns; `None` without its key (the key
-/// [`row_key`] picks can always be compared).
+/// [`edit_key`] picks can always be compared).
 fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -> Option<String> {
     let key_start = columns.len().saturating_sub(edit.key.width());
     match &edit.key {

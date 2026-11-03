@@ -316,7 +316,8 @@ fn columns(pg: &Pg<'_>, owner: &str, table: &str, keys: bool) -> Result<Vec<Tabl
     let rows = pg.rows(
         &format!(
             "select a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, {DEFAULT}, \
-                    col_description(c.oid, a.attnum), {pk}, a.attgenerated <> '' \
+                    col_description(c.oid, a.attnum), {pk}, \
+                    a.attgenerated <> '' or a.attidentity = 'a' \
                from pg_attribute a \
                join pg_class c on c.oid = a.attrelid \
                join pg_namespace n on n.oid = c.relnamespace \

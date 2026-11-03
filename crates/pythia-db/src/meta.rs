@@ -624,8 +624,10 @@ fn columns(
             Option<String>,
             Option<u32>,
         ) = row.get_as()?;
-        let generated = row.get::<_, Option<String>>(6)?.as_deref() == Some("YES");
         let identity: Option<String> = row.get(7)?;
+        // An identity GENERATED ALWAYS takes no value either (#490).
+        let always = identity.as_deref() == Some("generated always as identity");
+        let generated = row.get::<_, Option<String>>(6)?.as_deref() == Some("YES");
         let default = identity.or_else(|| {
             default
                 .map(|d| d.trim().to_owned())
@@ -643,7 +645,7 @@ fn columns(
             },
             comment,
             pk_position: pk,
-            generated,
+            generated: generated || always,
         });
     }
     Ok(out)

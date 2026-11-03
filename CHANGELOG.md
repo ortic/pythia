@@ -476,6 +476,9 @@ All notable changes to Pythia are documented here. The format follows
   its database where that isn't the table's (#477).
 - Oracle: the Columns tab says how an identity column is generated
   (`generated always as identity`), not its sequence's NEXTVAL (#485).
+- Generate INSERT leaves out identity columns that take no value
+  (Oracle's and PostgreSQL's ALWAYS, SQL Server's), and Generate UPDATE
+  keeps a generated key for its WHERE (#490).
 
 ## [0.11.0] - 2026-11-02
 

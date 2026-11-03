@@ -14,7 +14,7 @@ use pythia_db::{
 };
 use pythia_ui::{Changes, Loaded, RowRef};
 
-use super::{Editable, RowKey, dml, edit_query, has_key_columns, row_key, same};
+use super::{Editable, RowKey, dml, edit_query, has_key_columns, same};
 
 struct Live {
     session: Session,
@@ -160,7 +160,7 @@ impl Live {
         rows[0][0].clone().unwrap_or_default()
     }
 
-    /// The key `row_key` finds for `table`, on the session as the window's
+    /// The key `edit_key` finds for `table`, on the session as the window's
     /// own lookup runs.
     fn key(&mut self, table: &str) -> Vec<String> {
         self.edit_key(table).0

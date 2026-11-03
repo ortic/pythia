@@ -2697,12 +2697,22 @@ fn bind_names(cols: &[TableColumn]) -> Vec<String> {
 /// Oracle's names are written in lowercase; MySQL's keep their case.
 fn template(dialect: Dialect, kind: Template, object: &ObjectRef, cols: &[TableColumn]) -> String {
     // An INSERT or UPDATE gives a generated column no value (#471).
+    // An UPDATE keeps a generated key for its WHERE (#490).
     let written_cols: Vec<TableColumn>;
-    let cols = if matches!(kind, Template::Insert | Template::Update) {
-        written_cols = cols.iter().filter(|c| !c.generated).cloned().collect();
-        &written_cols[..]
-    } else {
-        cols
+    let cols = match kind {
+        Template::Insert => {
+            written_cols = cols.iter().filter(|c| !c.generated).cloned().collect();
+            &written_cols[..]
+        }
+        Template::Update => {
+            written_cols = cols
+                .iter()
+                .filter(|c| !c.generated || c.pk_position.is_some())
+                .cloned()
+                .collect();
+            &written_cols[..]
+        }
+        _ => cols,
     };
     let name = |c: &TableColumn| written(dialect, &c.name);
     let table = written_qualified(dialect, &object.owner, &object.name);
@@ -3085,10 +3095,13 @@ mod tests {
         // A generated column takes no value (#471).
         let mut twice = col("twice", None);
         twice.generated = true;
-        let cols = [col("id", Some(1)), col("n", None), twice];
+        // An identity that takes no value, the key (#490).
+        let mut id = col("id", Some(1));
+        id.generated = true;
+        let cols = [id, col("n", None), twice];
         assert_eq!(
             template(Dialect::MYSQL, Template::Insert, &object, &cols),
-            "insert into shop.`Order`\n  (id, n)\nvalues\n  (:id, :n)"
+            "insert into shop.`Order`\n  (n)\nvalues\n  (:n)"
         );
         assert_eq!(
             template(Dialect::MYSQL, Template::Update, &object, &cols),
@@ -3141,6 +3154,8 @@ mod tests {
                     .map(|c| c.default.as_deref().unwrap_or_default())
                     .collect();
                 assert_eq!(defaults, expected);
+                // ALWAYS takes no value (#490).
+                assert_eq!(columns[0].generated, expected[0].contains("always"));
             }
             c.execute("drop table r101_ident purge").unwrap();
         });

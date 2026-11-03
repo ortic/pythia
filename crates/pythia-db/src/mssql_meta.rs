@@ -331,7 +331,9 @@ fn columns(
                          then 'as ' + cc.definition \
                               + case when cc.is_persisted = 1 then ' persisted' else '' end \
                          else object_definition(c.default_object_id) end, \
-                    cast(p.value as nvarchar(4000)), {pk}, c.is_computed \
+                    cast(p.value as nvarchar(4000)), {pk}, \
+                    case when c.is_computed = 1 or c.is_identity = 1 \
+                              or c.system_type_id = 189 then 1 else 0 end \
                from sys.columns c join sys.types t on t.user_type_id = c.user_type_id \
                left join sys.computed_columns cc \
                  on cc.object_id = c.object_id and cc.column_id = c.column_id \
