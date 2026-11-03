@@ -738,11 +738,18 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             format!("to_timestamp({quoted}, 'YYYY-MM-DD HH24:MI:SS.FF')")
         }
         Kind::Timestamp => format!("to_timestamp({quoted}, 'YYYY-MM-DD HH24:MI:SS')"),
-        // TZR takes an offset (`+02:00`) or a region (`Europe/Zurich`).
-        Kind::TimestampTz if v.contains('.') => {
-            format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS.FF TZR')")
+        // TZR takes an offset (`+02:00`) or a region (`Europe/Zurich`); a
+        // region's time in the hour that repeats has its abbreviation too,
+        // TZD (#481).
+        Kind::TimestampTz => {
+            let fraction = if v.contains('.') { ".FF" } else { "" };
+            let tzd = if v.split_whitespace().count() == 4 {
+                " TZD"
+            } else {
+                ""
+            };
+            format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS{fraction} TZR{tzd}')")
         }
-        Kind::TimestampTz => format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS TZR')"),
         // Typed as the grid shows it, `0x…`, a value is the bytes of its
         // digits (#256, #271).
         Kind::Binary => match typed_hex(v) {
@@ -1689,6 +1696,12 @@ mod tests {
             sql_literal(&tz, Some("2026-07-01 12:00:00.000000 Europe/Zurich")),
             "to_timestamp_tz('2026-07-01 12:00:00.000000 Europe/Zurich', \
              'YYYY-MM-DD HH24:MI:SS.FF TZR')"
+        );
+        // The hour that repeats has its abbreviation (#481).
+        assert_eq!(
+            sql_literal(&tz, Some("2026-10-25 02:30:00.000000 Europe/Zurich CEST")),
+            "to_timestamp_tz('2026-10-25 02:30:00.000000 Europe/Zurich CEST', \
+             'YYYY-MM-DD HH24:MI:SS.FF TZR TZD')"
         );
         assert_eq!(
             sql_literal(&tz, Some("2026-07-01 12:00:00 +02:00")),

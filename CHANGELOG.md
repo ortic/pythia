@@ -465,6 +465,10 @@ All notable changes to Pythia are documented here. The format follows
 - MySQL: Edit finds a row by a TIMESTAMP key by its instant: in the hour
   that repeats when the clocks go back, two rows showed the same, and the
   other one was changed (#474).
+- Oracle: a TIMESTAMP WITH TIME ZONE in a region shows its abbreviation
+  (`Europe/Zurich CEST`) in the hour that repeats when the clocks go back,
+  and INSERT statements and Edit write it: read back without it, it was
+  an hour off (#481).
 
 ## [0.11.0] - 2026-11-02
 
