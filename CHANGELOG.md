@@ -482,6 +482,9 @@ All notable changes to Pythia are documented here. The format follows
 - Oracle 23ai: a VECTOR column keeps its dimensions and format in table
   copies, Schema Compare and the Columns tab, which read it as `VECTOR`
   (#486).
+- Oracle: the table builder refuses a foreign key on a new temporary
+  table before anything runs; Oracle refused it after the table was made
+  (#489).
 
 ## [0.11.0] - 2026-11-02
 

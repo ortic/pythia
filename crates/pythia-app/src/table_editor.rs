@@ -362,6 +362,7 @@ impl TableEditor {
         validate(edited, self.creating, release)?;
         let def = named(to_dictionary(edited), max_name_length(release));
         if self.creating {
+            no_foreign_keys_if_temporary(&def, self.state.options.temporary)?;
             let key = &self.state.partition_key;
             if let Some(p) = &self.state.partitioning {
                 let columns: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
@@ -952,6 +953,26 @@ fn named(mut def: TableDef, max: usize) -> TableDef {
 }
 
 /// What keeps the form from becoming a script, as a hint for the user.
+/// A global temporary table takes no foreign key (ORA-14455), which failed
+/// after the table was made, leaving it without its comments (#489).
+fn no_foreign_keys_if_temporary(def: &TableDef, temporary: Temporary) -> Result<(), String> {
+    let foreign = def
+        .constraints
+        .iter()
+        .find(|c| c.kind == ConstraintKind::Foreign);
+    match (temporary, foreign) {
+        (Temporary::No, _) | (_, None) => Ok(()),
+        (_, Some(key)) => Err(format!(
+            "A temporary table can't have foreign keys: remove {}",
+            if key.name.trim().is_empty() {
+                "the foreign key".to_owned()
+            } else {
+                key.name.clone()
+            }
+        )),
+    }
+}
+
 fn validate(
     def: &TableDef,
     creating: bool,
@@ -1979,6 +2000,26 @@ mod tests {
         set_primary(&mut def, "ID", false);
         set_primary(&mut def, "CODE", false);
         assert!(primary_key(&def).is_none());
+    }
+
+    /// A temporary table takes no foreign key (#489).
+    #[test]
+    fn temporary_tables_take_no_foreign_keys() {
+        let mut def = new_table();
+        def.name = "T".into();
+        assert!(no_foreign_keys_if_temporary(&def, Temporary::DeleteRows).is_ok());
+        def.constraints.push(ConstraintDef {
+            name: "T_FK".into(),
+            kind: ConstraintKind::Foreign,
+            columns: vec!["ID".into()],
+            references: Some(("P".into(), vec!["ID".into()])),
+            on_delete: None,
+            condition: None,
+            generated: false,
+        });
+        assert!(no_foreign_keys_if_temporary(&def, Temporary::No).is_ok());
+        let refused = no_foreign_keys_if_temporary(&def, Temporary::PreserveRows);
+        assert!(refused.is_err_and(|e| e.contains("T_FK")));
     }
 
     #[test]
