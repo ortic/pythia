@@ -472,6 +472,8 @@ All notable changes to Pythia are documented here. The format follows
 - PostgreSQL: sessions show and write dates as ISO, whatever DateStyle a
   server, database or role sets: INSERT statements wrote `04/03/2024`,
   which another server read otherwise (#475).
+- MySQL: the Constraints tab names a foreign key's referenced table with
+  its database where that isn't the table's (#477).
 
 ## [0.11.0] - 2026-11-02
 

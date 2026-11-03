@@ -1638,6 +1638,42 @@ fn sessions_use_the_servers_collation() {
     h.ok("drop table r101_coll");
 }
 
+/// A foreign key to a table of another database names that database in
+/// the Constraints tab (#477): it read as a table of its own.
+#[test]
+fn foreign_keys_to_other_databases_name_them() {
+    let Some(params) = std::env::var("PYTHIA_TEST_MYSQL_DBA")
+        .ok()
+        .and_then(|spec| mysql_params(&spec))
+    else {
+        return;
+    };
+    let mut h = Harness::with(params);
+    let schema = h.schema.clone();
+    h.ok("drop table if exists r101_orders");
+    h.ok("drop database if exists r101_other");
+    h.ok("create database r101_other");
+    h.ok("create table r101_other.customers (id int primary key)");
+    h.ok(
+        "create table r101_orders (id int primary key, customer int, \
+           constraint r101_orders_fk foreign key (customer) references r101_other.customers (id))",
+    );
+    let MetaResult::Table { rows, .. } = h.meta(MetaQuery::Details {
+        owner: schema,
+        name: "r101_orders".into(),
+        detail: Detail::Constraints,
+    }) else {
+        panic!("expected a table")
+    };
+    let fk = rows
+        .iter()
+        .find(|r| r[0].as_deref() == Some("r101_orders_fk"))
+        .expect("the foreign key");
+    assert_eq!(fk[3].as_deref(), Some("r101_other.customers"));
+    h.ok("drop table r101_orders");
+    h.ok("drop database r101_other");
+}
+
 /// A trigger's DDL keeps its place among its table's triggers of the same
 /// timing and event (`PRECEDES` the next one) and the sql_mode it was
 /// made under, where the session's isn't it: dropped and made again from

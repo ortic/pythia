@@ -400,7 +400,9 @@ fn details(
                       where k.constraint_schema = t.constraint_schema \
                         and k.constraint_name = t.constraint_name \
                         and k.table_name = t.table_name) as COLUMNS, \
-                    r.referenced_table_name as `REFERENCES`, \
+                    case when r.unique_constraint_schema <> t.table_schema \
+                         then concat(r.unique_constraint_schema, '.', r.referenced_table_name) \
+                         else r.referenced_table_name end as `REFERENCES`, \
                     r.delete_rule as DELETE_RULE, r.update_rule as UPDATE_RULE \
                from information_schema.table_constraints t \
                left join information_schema.referential_constraints r \
