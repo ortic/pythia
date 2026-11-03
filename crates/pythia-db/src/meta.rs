@@ -211,6 +211,8 @@ pub struct DbObject {
     pub valid: bool,
     /// `LAST_DDL_TIME` as `YYYY-MM-DD HH24:MI:SS`.
     pub last_ddl: String,
+    /// What else to say of it, e.g. which table a partition is of (#488).
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +462,7 @@ fn object_rows(
             object_type,
             valid: status == "VALID",
             last_ddl: last_ddl.unwrap_or_default(),
+            note: String::new(),
         });
     }
     Ok(out)

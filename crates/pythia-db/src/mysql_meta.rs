@@ -121,6 +121,7 @@ fn object_rows(rows: Vec<(String, String, String, Option<String>)>) -> Vec<DbObj
                 object_type: ObjectType::from_dictionary(&ty)?,
                 valid: true,
                 last_ddl: last_ddl.unwrap_or_default(),
+                note: String::new(),
             })
         })
         .collect()

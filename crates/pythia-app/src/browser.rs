@@ -1327,10 +1327,15 @@ impl Browser {
                     let response = response.on_hover_ui(|ui| {
                         ui.label(RichText::new(named(self.dialect, &r)).strong());
                         ui.label(object.object_type.dictionary_name().to_lowercase());
+                        if !object.note.is_empty() {
+                            ui.label(&object.note);
+                        }
                         if !object.valid {
                             ui.colored_label(ui.visuals().error_fg_color, "Invalid");
                         }
-                        ui.weak(format!("Last DDL: {}", object.last_ddl));
+                        if !object.last_ddl.is_empty() {
+                            ui.weak(format!("Last DDL: {}", object.last_ddl));
+                        }
                     });
                     if response.clicked() {
                         actions.push(ObjectAction::Select(r.clone()));

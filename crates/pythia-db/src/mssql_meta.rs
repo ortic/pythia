@@ -236,6 +236,7 @@ fn object_rows(rows: Vec<Vec<Cell>>) -> Vec<DbObject> {
                 object_type: ObjectType::from_dictionary(&ty)?,
                 valid: true,
                 last_ddl: values.next().unwrap_or_default(),
+                note: String::new(),
             })
         })
         .collect()

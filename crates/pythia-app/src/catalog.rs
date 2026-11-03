@@ -801,7 +801,7 @@ mod dictionary {
                          case c.relkind when 'v' then 'VIEW' when 'm' then 'MATERIALIZED VIEW' \
                               else 'TABLE' end as type \
                     from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-                   where c.relkind in ('r', 'p', 'f', 'v', 'm') and not c.relispartition \
+                   where c.relkind in ('r', 'p', 'f', 'v', 'm') \
                   union \
                   select n.nspname, p.proname, \
                          case p.prokind when 'p' then 'PROCEDURE' else 'FUNCTION' end \
@@ -1136,7 +1136,7 @@ mod dictionary {
                             case c.relkind when 'v' then 'VIEW' else 'TABLE' end \
                        from pg_class c join pg_namespace n on n.oid = c.relnamespace \
                       where c.relnamespace = pg_my_temp_schema() \
-                        and c.relkind in ('r', 'p', 'f', 'v') and not c.relispartition",
+                        and c.relkind in ('r', 'p', 'f', 'v')",
                     &[],
                 )?;
                 OwnAnswer::Temporary(rows.into_iter().filter_map(object).collect())

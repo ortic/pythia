@@ -492,6 +492,10 @@ All notable changes to Pythia are documented here. The format follows
 - Pythia starts while a window's file is on a share that doesn't answer:
   the windows' files are checked for changes on a thread of their own,
   after the window is up (#479).
+- PostgreSQL: a partitioned table's partitions are listed among the
+  tables, in the object browser and completion, and say whose partitions
+  they are; a partition's DDL makes it a partition of its table again
+  (#488).
 
 ## [0.11.0] - 2026-11-02
 

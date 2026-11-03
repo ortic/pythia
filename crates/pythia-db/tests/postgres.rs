@@ -3370,3 +3370,83 @@ fn values_bound_whole() {
     h.ok("rollback");
     h.ok("drop table if exists lob_bound");
 }
+
+/// A partitioned table's partitions are tables of their schema that say
+/// whose partitions they are (#488): the browser and completion left them
+/// out. A partition's DDL makes it a partition of its table again.
+#[test]
+fn partitions_are_tables_that_say_whose() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r101_parts, r101_parts_copy cascade");
+    h.ok("create schema r101_parts");
+    h.ok("create schema r101_parts_copy");
+    for sql in [
+        "create table r101_parts.t (id int primary key, region text not null, n int check (n > 0)) \
+           partition by range (id)",
+        "create table r101_parts.t_low partition of r101_parts.t \
+           (constraint low_small check (id < 50)) for values from (0) to (100)",
+        "create index t_low_region on r101_parts.t_low (region)",
+        "comment on table r101_parts.t_low is 'the low ones'",
+        "create table r101_parts.t_def partition of r101_parts.t default",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Objects(tables) = h.meta(MetaQuery::Objects {
+        owner: "r101_parts".into(),
+        object_type: ObjectType::Table,
+        filter: None,
+    }) else {
+        panic!("expected objects")
+    };
+    let tables: Vec<(&str, &str)> = tables
+        .iter()
+        .map(|o| (o.name.as_str(), o.note.as_str()))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("t", ""),
+            ("t_def", "partition of r101_parts.t DEFAULT"),
+            (
+                "t_low",
+                "partition of r101_parts.t FOR VALUES FROM (0) TO (100)"
+            ),
+        ]
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "t_low".into(),
+        limit: 100,
+    }) else {
+        panic!("expected objects")
+    };
+    assert!(found.iter().any(|o| o.owner == "r101_parts"), "{found:?}");
+    let ddl = ddl_of(&mut h, "r101_parts", "t_low", ObjectType::Table);
+    assert!(
+        ddl.starts_with(
+            "create table r101_parts.t_low partition of r101_parts.t (\n    \
+             constraint low_small CHECK (id < 50)\n)\nFOR VALUES FROM (0) TO (100);"
+        ),
+        "{ddl}"
+    );
+    let table = ddl_of(&mut h, "r101_parts", "t", ObjectType::Table);
+    run_ddl(&mut h, &table, "r101_parts.", "r101_parts_copy.");
+    h.ok("drop table r101_parts_copy.t_low");
+    run_ddl(&mut h, &ddl, "r101_parts.", "r101_parts_copy.");
+    h.ok("insert into r101_parts_copy.t values (1, 'eu', 1)");
+    assert_eq!(
+        h.scalar("select tableoid::regclass::text from r101_parts_copy.t")
+            .as_deref(),
+        Some("r101_parts_copy.t_low")
+    );
+    h.fails("insert into r101_parts_copy.t values (60, 'eu', 1)");
+    assert_eq!(
+        ddl_of(&mut h, "r101_parts", "t_def", ObjectType::Table)
+            .lines()
+            .next(),
+        Some("create table r101_parts.t_def partition of r101_parts.t")
+    );
+    h.ok("drop schema r101_parts, r101_parts_copy cascade");
+}

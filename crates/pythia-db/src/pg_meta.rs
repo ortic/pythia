@@ -18,22 +18,28 @@ const SCHEMAS: &str = "select nspname from pg_namespace \
                         order by nspname";
 
 /// Tables, views, sequences, routines (not those of extensions) and
-/// triggers as `(owner, name, type)`; overloads and triggers of the same
-/// name on several tables are one row.
+/// triggers as `(owner, name, type, note)`; overloads and triggers of the
+/// same name on several tables are one row. Partitions are tables whose
+/// note names their table and bounds (#488).
 const OBJECTS: &str = "\
     select n.nspname as owner, c.relname as name, \
            case c.relkind when 'v' then 'VIEW' when 'm' then 'MATERIALIZED VIEW' \
-                          when 'S' then 'SEQUENCE' else 'TABLE' end as type \
+                          when 'S' then 'SEQUENCE' else 'TABLE' end as type, \
+           case when c.relispartition then \
+                (select 'partition of ' || i.inhparent::regclass::text || ' ' \
+                        || pg_get_expr(c.relpartbound, c.oid) \
+                   from pg_inherits i where i.inhrelid = c.oid limit 1) end as note \
       from pg_class c join pg_namespace n on n.oid = c.relnamespace \
-     where c.relkind in ('r', 'p', 'f', 'v', 'm', 'S') and not c.relispartition \
+     where c.relkind in ('r', 'p', 'f', 'v', 'm', 'S') \
     union \
-    select n.nspname, p.proname, case p.prokind when 'p' then 'PROCEDURE' else 'FUNCTION' end \
+    select n.nspname, p.proname, case p.prokind when 'p' then 'PROCEDURE' else 'FUNCTION' end, \
+           null \
       from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
      where p.prokind in ('f', 'p') \
        and not exists (select 1 from pg_depend d where d.classid = 'pg_proc'::regclass \
                           and d.objid = p.oid and d.deptype = 'e') \
     union \
-    select n.nspname, t.tgname, 'TRIGGER' \
+    select n.nspname, t.tgname, 'TRIGGER', null \
       from pg_trigger t join pg_class c on c.oid = t.tgrelid \
       join pg_namespace n on n.oid = c.relnamespace \
      where not t.tgisinternal";
@@ -107,7 +113,7 @@ fn first(row: Vec<Cell>) -> Option<String> {
     row.into_iter().next().flatten()
 }
 
-/// Rows of `(owner, name, type)` as objects.
+/// Rows of `(owner, name, type, note)` as objects.
 fn object_rows(rows: Vec<Vec<Cell>>) -> Vec<DbObject> {
     rows.into_iter()
         .filter_map(|row| {
@@ -119,6 +125,7 @@ fn object_rows(rows: Vec<Vec<Cell>>) -> Vec<DbObject> {
                 object_type: ObjectType::from_dictionary(&ty)?,
                 valid: true,
                 last_ddl: String::new(),
+                note: values.next().unwrap_or_default(),
             })
         })
         .collect()
@@ -133,7 +140,7 @@ fn objects(
     let pattern = name_regex(filter.unwrap_or(""));
     let rows = pg.rows(
         &format!(
-            "select owner, name, type from ({OBJECTS}) o \
+            "select owner, name, type, note from ({OBJECTS}) o \
               where owner = $1 and type = $2 and name ~ $3 order by name"
         ),
         &[owner, object_type.dictionary_name(), &pattern],
@@ -185,7 +192,7 @@ fn find(pg: &Pg<'_>, pattern: &str, limit: usize) -> Result<Vec<DbObject>, DbErr
     let pattern = name_regex(pattern);
     let rows = pg.rows(
         &format!(
-            "select owner, name, type from ({OBJECTS}) o where name ~ $1 \
+            "select owner, name, type, note from ({OBJECTS}) o where name ~ $1 \
               order by (owner = current_schema()) desc, length(name), name, owner \
               limit {limit}"
         ),
@@ -1026,8 +1033,16 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
             notes.push(note);
         }
     }
+    // A partition takes its columns from its table: it is made a
+    // partition of it, with its own constraints only (#488).
+    let parent = partition_parent(pg, &oid)?;
+    let body = if parent.is_some() && lines.is_empty() {
+        String::new()
+    } else {
+        format!(" (\n    {}\n)", lines.join(",\n    "))
+    };
     ddl.push_str(&format!(
-        "create {}table {qualified} (\n    {}\n)",
+        "create {}table {qualified}{}{body}{}",
         if foreign {
             "foreign "
         } else if unlogged {
@@ -1035,7 +1050,12 @@ fn table_ddl(pg: &Pg<'_>, owner: &str, name: &str) -> Result<String, DbError> {
         } else {
             ""
         },
-        lines.join(",\n    ")
+        parent
+            .as_ref()
+            .map_or(String::new(), |(of, _)| format!(" partition of {of}")),
+        parent
+            .as_ref()
+            .map_or(String::new(), |(_, bound)| format!("\n{bound}")),
     ));
     if foreign && let Some(server) = foreign_server(pg, &oid)? {
         ddl.push_str(&server);
@@ -1380,6 +1400,26 @@ fn rules(
         }
     }
     Ok(())
+}
+
+/// The table a partition is of, qualified, and its bound: `FOR VALUES …`
+/// or `DEFAULT`. `None` if the table isn't a partition.
+fn partition_parent(pg: &Pg<'_>, oid: &str) -> Result<Option<(String, String)>, DbError> {
+    let row = pg.first(
+        &format!(
+            "select quote_ident(n.nspname) || '.' || quote_ident(p.relname), \
+                    pg_get_expr(c.relpartbound, c.oid) \
+               from pg_inherits i join pg_class c on c.oid = i.inhrelid \
+               join pg_class p on p.oid = i.inhparent \
+               join pg_namespace n on n.oid = p.relnamespace \
+              where i.inhrelid = {oid} and c.relispartition"
+        ),
+        &[],
+    )?;
+    Ok(row.and_then(|row| {
+        let mut values = row.into_iter();
+        Some((values.next()??, values.next()??))
+    }))
 }
 
 /// A partitioned table's partitions, theirs too, each `partition of` its
