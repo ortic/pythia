@@ -2215,9 +2215,10 @@ fn oracle_national_text_past_ascii() {
     };
     let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
     let long = "€".repeat(1000);
+    // Escapes: the UI's fonts have no glyphs for these.
     for (n, c) in [
-        ("€ 10 – 日本 😀 \\ & '", "ü€&'\\x"),
-        ("ŝ 2 – 中文", "ŝŝŝŝŝŝ"),
+        ("€ 10 – \u{65E5}\u{672C} 😀 \\ & '", "ü€&'\\x"),
+        ("ŝ 2 – \u{4E2D}\u{6587}", "ŝŝŝŝŝŝ"),
     ] {
         let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
         let changes = Changes {
