@@ -1735,6 +1735,36 @@ fn trigger_ddl_keeps_order_and_sql_mode() {
     h.ok("drop table r99_ord");
 }
 
+/// The Columns tab shows an AUTO_INCREMENT and a spatial column's SRID
+/// (MySQL 8) (#483).
+#[test]
+fn columns_show_auto_increment_and_srid() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let schema = h.schema.clone();
+    let mysql8 = h
+        .scalar("select version() not like '%MariaDB%' and version() >= '8'")
+        .as_deref()
+        == Some("1");
+    let srid = if mysql8 { " srid 4326" } else { "" };
+    h.ok("drop table if exists r101_cols");
+    h.ok(&format!(
+        "create table r101_cols (id int auto_increment primary key, g point not null{srid})"
+    ));
+    let MetaResult::Columns(columns) = h.meta(MetaQuery::Columns {
+        owner: schema,
+        table: "r101_cols".into(),
+        keys: false,
+    }) else {
+        panic!("expected columns")
+    };
+    assert_eq!(columns[0].default.as_deref(), Some("auto_increment"));
+    let point = if mysql8 { "point SRID 4326" } else { "point" };
+    assert_eq!(columns[1].data_type, point);
+    h.ok("drop table r101_cols");
+}
+
 /// A column's default reads as SQL, as MariaDB gives it and SHOW CREATE
 /// TABLE writes it (#260): MySQL gives a literal's value as it is, so
 /// `DEFAULT ''` read as no default, `'NULL'` as NULL and
@@ -1790,6 +1820,15 @@ fn column_defaults_read_as_sql() {
             r"json_object(_utf8mb4'a',_utf8mb4'b\\c')",
         )
     };
+    // What extra says, beside it (#483).
+    let now_on_update = format!(
+        "{now} {}",
+        if mariadb {
+            "on update current_timestamp()"
+        } else {
+            "on update CURRENT_TIMESTAMP"
+        }
+    );
     assert_eq!(
         defaults,
         [
@@ -1805,7 +1844,7 @@ fn column_defaults_read_as_sql() {
             ("b", Some("b'101'")),
             ("dd", Some("'2020-01-01'")),
             ("t", Some("'12:30:00'")),
-            ("ts", Some(now)),
+            ("ts", Some(now_on_update.as_str())),
             ("dt", Some(now3)),
             ("u", Some("uuid()")),
             ("x", Some(text)),

@@ -485,6 +485,8 @@ All notable changes to Pythia are documented here. The format follows
 - Oracle: the table builder refuses a foreign key on a new temporary
   table before anything runs; Oracle refused it after the table was made
   (#489).
+- MySQL: the Columns tab shows `auto_increment`, `on update
+  CURRENT_TIMESTAMP` and a spatial column's SRID (#483).
 
 ## [0.11.0] - 2026-11-02
 
