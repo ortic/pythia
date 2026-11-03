@@ -295,6 +295,11 @@ impl Worker {
     /// then reads what the server is and its current schema. The
     /// statements' failures come back as notices.
     fn on_connect(&mut self, init_sql: &[String]) -> Result<(ServerInfo, Vec<String>), DbError> {
+        // Dates as ISO writes them, whatever the server, database or role
+        // set: `SQL, DMY`'s `04/03/2024` went into INSERT statements, which
+        // another server read as April 3 (#475). The login script may set
+        // another.
+        self.pg().execute("set datestyle = 'ISO, YMD'")?;
         let mut failed = Vec::new();
         for sql in init_sql {
             if let Err(e) = self.pg().execute(sql) {

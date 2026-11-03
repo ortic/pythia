@@ -469,6 +469,9 @@ All notable changes to Pythia are documented here. The format follows
   (`Europe/Zurich CEST`) in the hour that repeats when the clocks go back,
   and INSERT statements and Edit write it: read back without it, it was
   an hour off (#481).
+- PostgreSQL: sessions show and write dates as ISO, whatever DateStyle a
+  server, database or role sets: INSERT statements wrote `04/03/2024`,
+  which another server read otherwise (#475).
 
 ## [0.11.0] - 2026-11-02
 

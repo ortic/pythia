@@ -1974,6 +1974,44 @@ fn a_partitioned_tables_ddl_has_its_partitions() {
     h.ok("drop schema r101_part, r101_part_copy cascade");
 }
 
+/// A session writes dates as ISO does, whatever a role's DateStyle (#475):
+/// `SQL, DMY` gave `04/03/2024`, which INSERT statements wrote and another
+/// server read as April 3. Its login script may set another.
+#[test]
+fn sessions_write_dates_as_iso() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let superuser = h
+        .scalar("select rolsuper from pg_roles where rolname = current_user")
+        .as_deref()
+        == Some("t");
+    if !superuser {
+        return;
+    }
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop role if exists r101_dmy");
+    h.ok("create role r101_dmy login password 'Pw-dmy-1'");
+    h.ok("alter role r101_dmy set datestyle = 'SQL, DMY'");
+    let mut params = params().unwrap();
+    params.username = "r101_dmy".into();
+    params.password = "Pw-dmy-1".into();
+    let mut dmy = Harness::with(params.clone());
+    assert_eq!(
+        dmy.scalar("select date '2024-03-04'").as_deref(),
+        Some("2024-03-04")
+    );
+    drop(dmy);
+    params.init_sql = vec!["set datestyle = 'German'".into()];
+    let mut german = Harness::with(params);
+    assert_eq!(
+        german.scalar("select date '2024-03-04'").as_deref(),
+        Some("04.03.2024")
+    );
+    drop(german);
+    h.ok("drop role r101_dmy");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.
