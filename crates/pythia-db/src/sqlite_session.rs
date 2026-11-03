@@ -233,6 +233,12 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
         std::thread::sleep(LOCK_POLL);
         LOCK_POLL * u32::try_from(tries).unwrap_or(u32::MAX) < BUSY_TIMEOUT
     }))?;
+    // Another application's collation, which SQLite knows only there, has
+    // a stand-in where nothing is written (#476): an index ordered by it
+    // would be out of order for that application.
+    if target.read_only {
+        conn.collation_needed(stand_in_collation)?;
+    }
     // Not a database at all: SQLite only notices on the first read.
     waiting(&conn, || {
         conn.query_row("select count(*) from sqlite_schema", [], |_| Ok(()))
@@ -1226,13 +1232,31 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+/// A stand-in for collation `name`, which the application that made the
+/// file defines (`WIN32CASE`, Android's `LOCALIZED`): it compares text
+/// without case, as most of them do. Only for read-only connections.
+fn stand_in_collation(conn: &Connection, name: &str) -> rusqlite::Result<()> {
+    conn.create_collation(name, |a: &str, b: &str| {
+        a.chars()
+            .flat_map(char::to_lowercase)
+            .cmp(b.chars().flat_map(char::to_lowercase))
+    })
+}
+
 /// SQLite's message, which says what failed (`UNIQUE constraint failed:
-/// t.id`), and its error code's name.
+/// t.id`), and its error code's name. A collation it doesn't know says
+/// whose it is and how to read its columns (#476).
 fn message(error: rusqlite::ffi::Error, msg: Option<String>) -> String {
     use rusqlite::ffi::ErrorCode;
     let msg = msg.unwrap_or_else(|| error.to_string());
     match error.code {
         ErrorCode::OperationInterrupted => "Cancelled".to_owned(),
+        _ if msg.starts_with("no such collation sequence") => format!(
+            "{msg}\nThe collation is the application's that made the file: SQLite knows it only \
+             there. Connected read-only (?ro), Pythia compares such columns without case. \
+             It doesn't write to the file with a collation of its own, which would put an \
+             index on them out of order for that application."
+        ),
         _ => msg,
     }
 }

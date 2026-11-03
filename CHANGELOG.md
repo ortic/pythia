@@ -504,6 +504,11 @@ All notable changes to Pythia are documented here. The format follows
   later rows have blobs in it: they were shown in hex in a column of
   text, which INSERT exports wrote as text (`'00FF'`) and Edit's check
   took for a conflict (#482).
+- SQLite: a table whose columns use another application's collation
+  (`WIN32CASE`, Android's `LOCALIZED`) can be read, filtered and sorted
+  on a read-only connection (`?ro`), which compares them without case;
+  read-write, the error says whose the collation is and how to read
+  them (#476).
 
 ## [0.11.0] - 2026-11-02
 

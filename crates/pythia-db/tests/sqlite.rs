@@ -1375,3 +1375,52 @@ fn values_bound_whole() {
     assert!(unhex(row[0].as_deref().unwrap()) == second.0, "b");
     assert!(row[1].as_deref() == Some(second.1.as_str()), "t");
 }
+
+/// A table of a collation another application defines (#476): read-only,
+/// its columns compare without case through a stand-in; read-write, the
+/// error says whose the collation is and how to read them, and nothing is
+/// written with a stand-in, which would put the index out of order.
+#[test]
+fn another_applications_collation() {
+    let db = TempDb::new("collation");
+    {
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.create_collation("WIN32CASE", |a: &str, b: &str| {
+            a.to_lowercase().cmp(&b.to_lowercase())
+        })
+        .unwrap();
+        conn.execute_batch(
+            "create table w (id integer primary key, name text collate WIN32CASE);
+             create index w_name on w (name);
+             insert into w (name) values ('b'), ('A'), ('c');",
+        )
+        .unwrap();
+    }
+    let mut h = Harness::connect(&db.path());
+    h.execute(0, "select name from w order by name", 100);
+    let DbEvent::Failed { error, .. } = h.next_result() else {
+        panic!("expected the query to fail")
+    };
+    assert!(error.message.contains("WIN32CASE"), "{error:?}");
+    assert!(error.message.contains("read-only (?ro)"), "{error:?}");
+    h.settle();
+    drop(h);
+
+    let mut h = Harness::connect(&format!("{}?ro", db.path()));
+    h.execute(
+        0,
+        "select group_concat(name, ',') from (select name from w order by name)",
+        100,
+    );
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("A,b,c"));
+    h.settle();
+    assert_eq!(
+        h.scalar("select id from w where name = 'a'").as_deref(),
+        Some("2")
+    );
+    h.fails("update w set name = 'B' where id = 1");
+}

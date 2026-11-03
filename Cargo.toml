@@ -52,7 +52,7 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 # non-ASCII characters (#414).
 # SQLite, compiled in (no library to install); the session workers are
 # synchronous like its API.
-rusqlite = { version = "0.41", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "0.41", features = ["bundled", "collation", "column_decltype"] }
 tiberius = { git = "https://github.com/ortic/tiberius", rev = "31e0164bd48e4a1d81734cfa3b88c57c828e0b38", default-features = false, features = ["tds80", "rustls-ring", "sql-browser-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
