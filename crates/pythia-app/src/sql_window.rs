@@ -1367,7 +1367,7 @@ impl SqlWindow {
                 DbRequest::Run {
                     id,
                     task: Box::new(move |client| {
-                        let key = crate::data_edit::row_key(client, &table)?;
+                        let key = crate::data_edit::edit_key(client, &table)?;
                         Ok(Box::new(key) as Box<dyn std::any::Any + Send>)
                     }),
                 }
@@ -1432,6 +1432,7 @@ impl SqlWindow {
                 table,
                 source,
                 key: crate::data_edit::RowKey::Rowid,
+                instants: Vec::new(),
             };
             self.queue_edit_query(edit, Some(replaces), cx);
         } else {
@@ -2128,12 +2129,12 @@ impl SqlWindow {
                     return effects;
                 };
                 let key = result.and_then(|any| {
-                    any.downcast::<Vec<String>>()
+                    any.downcast::<(Vec<String>, Vec<String>)>()
                         .map(|key| *key)
                         .map_err(|_| DbError::new("unexpected result"))
                 });
                 match key {
-                    Ok(key) if key.is_empty() => {
+                    Ok((key, _)) if key.is_empty() => {
                         self.state.queue.clear();
                         self.warn(format!(
                             "The rows of {table} can't be edited: it has no primary key (or \
@@ -2141,11 +2142,12 @@ impl SqlWindow {
                         ));
                         self.state.bottom = BottomTab::Messages;
                     }
-                    Ok(key) => {
+                    Ok((key, instants)) => {
                         let edit = crate::data_edit::Editable {
                             table,
                             source,
                             key: crate::data_edit::RowKey::Columns(key),
+                            instants,
                         };
                         self.queue_edit_query(edit, Some(replaces), cx);
                         effects.extend(self.run_next(cx));
@@ -3946,6 +3948,7 @@ mod tests {
             table: "t".into(),
             source: "select x from t".into(),
             key: crate::data_edit::RowKey::Columns(vec!["id".into()]),
+            instants: Vec::new(),
         });
         r.grid.set_editable(Some(1));
         let rows = r.rows.clone();

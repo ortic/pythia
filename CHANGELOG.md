@@ -462,6 +462,9 @@ All notable changes to Pythia are documented here. The format follows
   and its columns' and parameters', which a copy lacked (#472).
 - SQL Server: a lookup chosen as a deadlock's victim (Msg 1205), as the
   catalog deadlocks with other sessions' DDL, runs again (#473).
+- MySQL: Edit finds a row by a TIMESTAMP key by its instant: in the hour
+  that repeats when the clocks go back, two rows showed the same, and the
+  other one was changed (#474).
 
 ## [0.11.0] - 2026-11-02
 
