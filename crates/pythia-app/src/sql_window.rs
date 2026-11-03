@@ -487,6 +487,7 @@ impl SqlWindow {
 
     /// Reads the file again where it changed on disk and the window has
     /// no changes of its own; whether it did.
+    #[cfg(test)]
     pub fn reload_if_clean(&mut self) -> bool {
         match self.changed_on_disk() {
             Some(file) => self.reload_from(file),
