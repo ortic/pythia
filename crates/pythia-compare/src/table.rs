@@ -570,9 +570,19 @@ pub fn diff(source: &TableDef, target: &TableDef, drops: bool) -> TableDiff {
                             col.name, old.data_type, col.data_type
                         )
                     });
+                    // Without COLLATE, MODIFY keeps a column's collation
+                    // (#484).
+                    let collation = if collated(&old.data_type) && !collated(&col.data_type) {
+                        " collate using_nls_comp"
+                    } else {
+                        ""
+                    };
                     push(
                         Phase::Tables,
-                        format!("alter table {t} modify ({name} {})", col.data_type),
+                        format!(
+                            "alter table {t} modify ({name} {}{collation})",
+                            col.data_type
+                        ),
                         warning,
                         true,
                     );
@@ -800,6 +810,12 @@ pub fn narrowing(from: &str, to: &str) -> bool {
     }
 }
 
+/// Whether a column's type names its collation, `VARCHAR2(30 BYTE)
+/// COLLATE BINARY_CI` (#484).
+fn collated(data_type: &str) -> bool {
+    data_type.to_ascii_uppercase().contains(" COLLATE ")
+}
+
 fn split_type(t: &str) -> (String, Vec<u64>) {
     let t = t.to_ascii_uppercase();
     match t.split_once('(') {
@@ -844,6 +860,14 @@ pub fn load(
     } else {
         "c.data_type"
     };
+    // A column's collation (12.2, MAX_STRING_SIZE = EXTENDED) after its
+    // type where it isn't the default, as a column is made with it (#484):
+    // a copy of a `collate binary_ci` column compared with case.
+    let collation = if pythia_db::compat::at_least(conn, 12, 2)? {
+        " || case when c.collation <> 'USING_NLS_COMP' then ' COLLATE ' || c.collation end"
+    } else {
+        ""
+    };
     let (identity, on_null, always) = if twelve {
         ("c.identity_column", "c.default_on_null", "")
     } else {
@@ -869,7 +893,7 @@ pub fn load(
                   when c.data_type = 'NUMBER' and c.data_scale = 0 then 'NUMBER(*,0)' \
                   when c.data_type = 'FLOAT' then 'FLOAT(' || c.data_precision || ')' \
                   when c.data_type = 'VECTOR' then {vector} \
-                  else c.data_type end, \
+                  else c.data_type end{collation}, \
                 c.nullable, c.data_default, cc.comments, {identity}, c.virtual_column, \
                 c.hidden_column, {on_null}, {always} \
            from all_tab_cols c \
@@ -1161,6 +1185,37 @@ mod tests {
     #[test]
     fn equal_tables() {
         assert!(diff(&base(), &base(), true).is_empty());
+    }
+
+    /// A column's collation is part of its type: a copy is made with it,
+    /// and Compare changes it, back to the default too, which MODIFY
+    /// without COLLATE keeps (#484).
+    #[test]
+    fn collations() {
+        let mut source = base();
+        source.columns[1].data_type = "VARCHAR2(30 CHAR) COLLATE BINARY_CI".into();
+        let created = diff(&source, &TableDef::default(), true);
+        assert!(
+            sqls(&created)
+                .iter()
+                .any(|s| s.contains("(name VARCHAR2(30 CHAR) COLLATE BINARY_CI)")),
+            "{:?}",
+            sqls(&created)
+        );
+        let to_collated = diff(&source, &base(), true);
+        assert_eq!(
+            sqls(&to_collated),
+            ["alter table emp modify (name VARCHAR2(30 CHAR) COLLATE BINARY_CI)"]
+        );
+        let to_default = diff(&base(), &source, true);
+        assert_eq!(
+            sqls(&to_default),
+            ["alter table emp modify (name VARCHAR2(30 CHAR) collate using_nls_comp)"]
+        );
+        assert!(!narrowing(
+            "VARCHAR2(30 CHAR)",
+            "VARCHAR2(30 CHAR) COLLATE BINARY_CI"
+        ));
     }
 
     #[test]

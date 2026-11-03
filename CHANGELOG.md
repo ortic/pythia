@@ -513,6 +513,10 @@ All notable changes to Pythia are documented here. The format follows
   `unistr('…')`, by Edit and INSERT exports: as `'…'` literals they went
   through the database character set first, which one that isn't
   Unicode stored `€ 10 – 日本` as `? 10 ? ??` (#480).
+- Oracle: the table editor's copy of a table and Schema Compare keep a
+  column's collation (`collate binary_ci`, 12.2 with `MAX_STRING_SIZE =
+  EXTENDED`): a copy compared with case, and a differing collation wasn't
+  seen (#484).
 
 ## [0.11.0] - 2026-11-02
 
