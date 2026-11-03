@@ -304,6 +304,55 @@ fn query_and_fetch_more() {
     assert_eq!(h.scalar("select 'next'").as_deref(), Some("next"));
 }
 
+/// A column typed from its first rows is typed again when later ones
+/// have blobs (#482): blobs that came after a fetch were shown in hex in a
+/// column of text, which exports wrote as text and Edit's check took for
+/// a conflict. Whether declared TEXT or without a type.
+#[test]
+fn blobs_after_the_first_rows_retype_their_column() {
+    let db = TempDb::new("retype");
+    let mut h = Harness::connect(&db.create());
+    h.ok("create table m (id integer primary key, v, t text)");
+    h.ok(
+        "insert into m values (1, 'one', 'a'), (2, 'two', 'b'), (3, 'three', 'c'), \
+          (4, x'00ff', x'cafe'), (5, 'five', 'e')",
+    );
+    h.execute(1, "select v, t from m order by id", 2);
+    let DbEvent::QueryStarted { columns, .. } = h.next_result() else {
+        panic!("expected QueryStarted")
+    };
+    let types = |columns: &[pythia_db::Column]| -> Vec<String> {
+        columns.iter().map(|c| c.type_name.clone()).collect()
+    };
+    assert_eq!(types(&columns), ["TEXT", "TEXT"]);
+    assert!(matches!(h.next_result(), DbEvent::Rows { more: true, .. }));
+    h.session.send(DbRequest::FetchMore { id: 1, max_rows: 1 });
+    // No blob yet: the types stay.
+    let DbEvent::Rows {
+        rows, more: true, ..
+    } = h.next_result()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("three"));
+    h.session.send(DbRequest::FetchMore {
+        id: 1,
+        max_rows: 10,
+    });
+    let DbEvent::Retyped { id: 1, columns } = h.next_result() else {
+        panic!("expected Retyped")
+    };
+    assert_eq!(types(&columns), ["BLOB", "BLOB"]);
+    let DbEvent::Rows {
+        rows, more: false, ..
+    } = h.next_result()
+    else {
+        panic!("expected Rows")
+    };
+    assert_eq!(rows[0], vec![Some("00FF".into()), Some("CAFE".into())]);
+    h.settle();
+}
+
 /// A window with rows left to fetch doesn't keep another one from
 /// committing (#185): its open statement held a read lock on the file,
 /// and the other's commit failed after five seconds with "database is
@@ -1325,4 +1374,53 @@ fn values_bound_whole() {
     let row = h.whole_row("select b, t from lob_bound");
     assert!(unhex(row[0].as_deref().unwrap()) == second.0, "b");
     assert!(row[1].as_deref() == Some(second.1.as_str()), "t");
+}
+
+/// A table of a collation another application defines (#476): read-only,
+/// its columns compare without case through a stand-in; read-write, the
+/// error says whose the collation is and how to read them, and nothing is
+/// written with a stand-in, which would put the index out of order.
+#[test]
+fn another_applications_collation() {
+    let db = TempDb::new("collation");
+    {
+        let conn = rusqlite::Connection::open(db.path()).unwrap();
+        conn.create_collation("WIN32CASE", |a: &str, b: &str| {
+            a.to_lowercase().cmp(&b.to_lowercase())
+        })
+        .unwrap();
+        conn.execute_batch(
+            "create table w (id integer primary key, name text collate WIN32CASE);
+             create index w_name on w (name);
+             insert into w (name) values ('b'), ('A'), ('c');",
+        )
+        .unwrap();
+    }
+    let mut h = Harness::connect(&db.path());
+    h.execute(0, "select name from w order by name", 100);
+    let DbEvent::Failed { error, .. } = h.next_result() else {
+        panic!("expected the query to fail")
+    };
+    assert!(error.message.contains("WIN32CASE"), "{error:?}");
+    assert!(error.message.contains("read-only (?ro)"), "{error:?}");
+    h.settle();
+    drop(h);
+
+    let mut h = Harness::connect(&format!("{}?ro", db.path()));
+    h.execute(
+        0,
+        "select group_concat(name, ',') from (select name from w order by name)",
+        100,
+    );
+    assert!(matches!(h.next_result(), DbEvent::QueryStarted { .. }));
+    let DbEvent::Rows { rows, .. } = h.next_result() else {
+        panic!("expected rows")
+    };
+    assert_eq!(rows[0][0].as_deref(), Some("A,b,c"));
+    h.settle();
+    assert_eq!(
+        h.scalar("select id from w where name = 'a'").as_deref(),
+        Some("2")
+    );
+    h.fails("update w set name = 'B' where id = 1");
 }

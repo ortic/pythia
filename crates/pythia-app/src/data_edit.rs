@@ -74,6 +74,10 @@ pub struct Editable {
     /// The query as the user wrote it.
     pub source: String,
     pub key: RowKey,
+    /// MySQL key columns of type TIMESTAMP, fetched and found by their
+    /// instant (#474): shown in a time zone with daylight saving time, two
+    /// instants of the hour that repeats read the same.
+    pub instants: Vec<String>,
 }
 
 /// Wraps a query so the result carries the base table's ROWID.
@@ -87,17 +91,31 @@ pub fn editable_query(sql: &str) -> String {
 
 /// Adds the key columns to a query's select list, as `pythia$<column>`
 /// quoted the way of `dialect`. `None` unless [`can_edit`].
+#[cfg(test)]
 pub fn keyed_query(dialect: Dialect, sql: &str, key: &[String]) -> Option<String> {
+    keyed_query_with(dialect, sql, key, &[])
+}
+
+/// [`keyed_query`], `instants` (MySQL's TIMESTAMP key columns) as their
+/// `unix_timestamp` (#474).
+fn keyed_query_with(
+    dialect: Dialect,
+    sql: &str,
+    key: &[String],
+    instants: &[String],
+) -> Option<String> {
     let sql = sql.trim().trim_end_matches(';');
     let query = parse(dialect, sql).filter(|q| !q.grouped)?;
     let columns: Vec<String> = key
         .iter()
         .map(|k| {
-            format!(
-                "{} as {}",
-                dialect.quote_ident(k),
-                dialect.quote_ident(&format!("pythia${k}"))
-            )
+            let column = dialect.quote_ident(k);
+            let value = if instants.contains(k) {
+                format!("unix_timestamp({column})")
+            } else {
+                column
+            };
+            format!("{value} as {}", dialect.quote_ident(&format!("pythia${k}")))
         })
         .collect();
     Some(format!(
@@ -134,7 +152,7 @@ pub fn has_key_columns(edit: &Editable, columns: &[Column]) -> bool {
 pub fn edit_query(dialect: Dialect, edit: &Editable) -> Option<String> {
     match &edit.key {
         RowKey::Rowid => Some(editable_query(&edit.source)),
-        RowKey::Columns(key) => keyed_query(dialect, &edit.source, key),
+        RowKey::Columns(key) => keyed_query_with(dialect, &edit.source, key, &edit.instants),
     }
 }
 
@@ -493,7 +511,45 @@ pub fn plain_columns(dialect: Dialect, sql: &str, count: usize) -> Vec<bool> {
 /// The columns that identify a row of `table` (as written in a query):
 /// its primary key, or else a unique key on NOT NULL columns. Empty if it
 /// has neither, or isn't a table (a view's indexes don't count).
-pub fn row_key(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbError> {
+/// With them, the key columns found by their instant: MySQL's TIMESTAMP
+/// ones (#474).
+pub fn edit_key(
+    client: &mut dyn Client,
+    table: &str,
+) -> Result<(Vec<String>, Vec<String>), DbError> {
+    let key = key_columns(client, table)?;
+    let instants = if client.dialect().kind() == DbKind::MySql && !key.is_empty() {
+        mysql_timestamps(client, table)
+            .into_iter()
+            .filter(|c| key.iter().any(|k| k.eq_ignore_ascii_case(c)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((key, instants))
+}
+
+/// MySQL: the TIMESTAMP columns of `table` (as written in a query).
+fn mysql_timestamps(client: &mut dyn Client, table: &str) -> Vec<String> {
+    let quoted = |name: &str| format!("`{}`", name.replace('`', "``"));
+    let table = match unquote(table).as_slice() {
+        [schema, name] => format!("{}.{}", quoted(schema), quoted(name)),
+        [name] => quoted(name),
+        _ => return Vec::new(),
+    };
+    // Field, Type, …
+    client
+        .query(&format!("show columns from {table}"), &[])
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| {
+            value(row, 1).is_some_and(|t| t.to_ascii_lowercase().starts_with("timestamp"))
+        })
+        .filter_map(|row| value(row, 0))
+        .collect()
+}
+
+fn key_columns(client: &mut dyn Client, table: &str) -> Result<Vec<String>, DbError> {
     let keys = match client.dialect().kind() {
         // Rows are found by ROWID.
         DbKind::Oracle => Vec::new(),
@@ -1419,7 +1475,7 @@ pub fn cut_changes(edit: &Editable, columns: &[Column], changes: &Changes) -> us
 
 /// Where a fetched `row` of `edit`'s result is the row of its table, by
 /// the key in its last columns; `None` without its key (the key
-/// [`row_key`] picks can always be compared).
+/// [`edit_key`] picks can always be compared).
 fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -> Option<String> {
     let key_start = columns.len().saturating_sub(edit.key.width());
     match &edit.key {
@@ -1430,6 +1486,9 @@ fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -
                 .enumerate()
                 .map(|(i, name)| {
                     let v = value(row, key_start + i)?;
+                    if edit.instants.contains(name) {
+                        return instant_is(name, &v);
+                    }
                     same(dialect, name, &columns[key_start + i], Some(&v))
                 })
                 .collect::<Option<_>>()?;
@@ -1452,6 +1511,20 @@ fn row_is(dialect: Dialect, edit: &Editable, columns: &[Column], row: &[Cell]) -
             Some(checks.join(" and "))
         }
     }
+}
+
+/// SQL that holds where MySQL TIMESTAMP column `name` is the instant
+/// `seconds` (its `unix_timestamp`), within a range of local time the
+/// key's index finds, wider than any change of clocks (#474).
+fn instant_is(name: &str, seconds: &str) -> Option<String> {
+    let number = seconds.chars().all(|c| c.is_ascii_digit() || c == '.') && !seconds.is_empty();
+    number.then(|| {
+        let column = Dialect::MYSQL.quote_ident(name);
+        format!(
+            "unix_timestamp({column}) = {seconds} and {column} between \
+             from_unixtime({seconds} - 10800) and from_unixtime({seconds} + 10800)"
+        )
+    })
 }
 
 /// The query that fetches the value of column `col` of a fetched `row` of
@@ -1968,6 +2041,7 @@ mod tests {
             table: "docs".into(),
             source: "select * from docs".into(),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let columns = vec![
             col("ID", "NUMBER", true),
@@ -1983,6 +2057,7 @@ mod tests {
             table: "[dbo].[Docs]".into(),
             source: "select * from [dbo].[Docs]".into(),
             key: RowKey::Columns(vec!["doc id".into()]),
+            instants: Vec::new(),
         };
         let columns = vec![
             col("Body Text", "nvarchar", false),
@@ -2032,6 +2107,7 @@ mod tests {
             table: "t".into(),
             source: "select id, parent_id from t".into(),
             key,
+            instants: Vec::new(),
         };
         let id = edit(RowKey::Columns(vec!["id".into()]));
         let columns =
@@ -2077,6 +2153,7 @@ mod tests {
             table: "t".into(),
             source: "select id, status, note from t".into(),
             key: RowKey::Columns(vec!["id".into()]),
+            instants: Vec::new(),
         };
         let changes = Changes {
             inserts: vec![vec![Some("2".into()), None, None, None]],
@@ -2108,6 +2185,7 @@ mod tests {
             table: "emp".into(),
             source: "select * from emp".into(),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let sql: Vec<String> = dml(Dialect::ORACLE, &edit, &columns, &rows, &changes)
             .into_iter()
@@ -2160,6 +2238,7 @@ mod tests {
             table: "emp".into(),
             source: "select * from emp".into(),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let planned: Vec<Change> = dml(Dialect::ORACLE, &edit, &columns, &rows, &changes)
             .into_iter()
@@ -2235,6 +2314,7 @@ mod tests {
             table: "docs".into(),
             source: "select * from docs".into(),
             key: RowKey::Columns(vec!["id".into()]),
+            instants: Vec::new(),
         };
         let statements = dml(Dialect::MYSQL, &edit, &columns, &rows, &changes);
         let sql: Vec<&str> = statements.iter().map(|d| d.sql.as_str()).collect();
@@ -2312,6 +2392,7 @@ mod tests {
             table: "docs".into(),
             source: "select * from docs".into(),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let statements = dml(Dialect::ORACLE, &edit, &columns, &rows, &changes);
         let sql: Vec<&str> = statements.iter().map(|d| d.sql.as_str()).collect();
@@ -2367,6 +2448,7 @@ mod tests {
             table: "`order`".into(),
             source: "select * from `order`".into(),
             key: RowKey::Columns(vec!["id".into(), "line".into()]),
+            instants: Vec::new(),
         };
         let sql: Vec<String> = dml(Dialect::MYSQL, &edit, &columns, &rows, &changes)
             .into_iter()
@@ -2405,6 +2487,7 @@ mod tests {
             table: "t".into(),
             source: "select * from t".into(),
             key: RowKey::Columns(vec!["id".into()]),
+            instants: Vec::new(),
         };
         let updates = values
             .iter()
@@ -2559,6 +2642,7 @@ mod tests {
                 table: "t".into(),
                 source: "select id, b from t".into(),
                 key: RowKey::Columns(vec!["id".into()]),
+                instants: Vec::new(),
             };
             let rows = vec![row.clone()];
             let inserts = dml(dialect, &edit, &columns, &rows, &changes);

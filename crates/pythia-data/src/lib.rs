@@ -264,6 +264,15 @@ impl<W: Write> StreamWriter<W> {
         })
     }
 
+    /// The columns are of these types after all, for the rows written
+    /// next: SQLite's, typed from the first rows (#482). The same columns,
+    /// in the same order; others are ignored.
+    pub fn retype(&mut self, columns: Vec<Column>) {
+        if columns.len() == self.columns.len() {
+            self.columns = columns;
+        }
+    }
+
     pub fn write(&mut self, rows: &[Vec<Cell>]) -> Result<()> {
         check_whole(&self.columns, rows)?;
         let options = Options {
@@ -738,11 +747,18 @@ pub fn sql_literal(col: &Column, value: Option<&str>) -> String {
             format!("to_timestamp({quoted}, 'YYYY-MM-DD HH24:MI:SS.FF')")
         }
         Kind::Timestamp => format!("to_timestamp({quoted}, 'YYYY-MM-DD HH24:MI:SS')"),
-        // TZR takes an offset (`+02:00`) or a region (`Europe/Zurich`).
-        Kind::TimestampTz if v.contains('.') => {
-            format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS.FF TZR')")
+        // TZR takes an offset (`+02:00`) or a region (`Europe/Zurich`); a
+        // region's time in the hour that repeats has its abbreviation too,
+        // TZD (#481).
+        Kind::TimestampTz => {
+            let fraction = if v.contains('.') { ".FF" } else { "" };
+            let tzd = if v.split_whitespace().count() == 4 {
+                " TZD"
+            } else {
+                ""
+            };
+            format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS{fraction} TZR{tzd}')")
         }
-        Kind::TimestampTz => format!("to_timestamp_tz({quoted}, 'YYYY-MM-DD HH24:MI:SS TZR')"),
         // Typed as the grid shows it, `0x…`, a value is the bytes of its
         // digits (#256, #271).
         Kind::Binary => match typed_hex(v) {
@@ -774,12 +790,62 @@ pub fn sql_literal_replacing(col: &Column, value: &str, name: &str, held: &str) 
 /// parts slowly: INSERT statements append them in a PL/SQL block instead
 /// (see `oracle_block`).
 fn text_value(col: &Column, v: &str) -> String {
+    if national(col) && !v.is_ascii() {
+        return national_literal(col, v);
+    }
     if !long_text(col, v) {
         return text_literal(v);
     }
     text_parts(v)
         .into_iter()
         .map(|part| format!("to_clob({})", text_literal(part)))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// NCHAR, NVARCHAR2 and NCLOB columns: text in the national character
+/// set. A `'…'` literal, and an `N'…'` one, is in the database's, which
+/// loses what it doesn't have (#480): `€` is `?` in WE8ISO8859P1.
+fn national(col: &Column) -> bool {
+    let t = col.type_name.to_ascii_uppercase();
+    t.starts_with("NCHAR") || t.starts_with("NVARCHAR2") || t == "NCLOB"
+}
+
+/// National text past ASCII as `unistr('…')` of ASCII only: each other
+/// character as its UTF-16 code units, `\20AC`, a `&` too (see
+/// [`apart_from_ampersands`]), a `\` doubled. In parts of at most 4000
+/// bytes (ORA-01704); an NCLOB's of several, each an NCLOB (#317).
+fn national_literal(col: &Column, v: &str) -> String {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    for c in v.chars() {
+        let escaped = match c {
+            '\\' => "\\\\".to_owned(),
+            '\'' => "''".to_owned(),
+            '&' => "\\0026".to_owned(),
+            c if c.is_ascii() => c.to_string(),
+            c => c
+                .encode_utf16(&mut [0; 2])
+                .iter()
+                .map(|unit| format!("\\{unit:04X}"))
+                .collect(),
+        };
+        if part.len() + escaped.len() > TEXT_LITERAL_BYTES {
+            parts.push(std::mem::take(&mut part));
+        }
+        part.push_str(&escaped);
+    }
+    parts.push(part);
+    let clob = col.type_name.eq_ignore_ascii_case("NCLOB") && parts.len() > 1;
+    parts
+        .iter()
+        .map(|part| {
+            if clob {
+                format!("to_nclob(unistr('{part}'))")
+            } else {
+                format!("unistr('{part}')")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" || ")
 }
@@ -1690,6 +1756,12 @@ mod tests {
             "to_timestamp_tz('2026-07-01 12:00:00.000000 Europe/Zurich', \
              'YYYY-MM-DD HH24:MI:SS.FF TZR')"
         );
+        // The hour that repeats has its abbreviation (#481).
+        assert_eq!(
+            sql_literal(&tz, Some("2026-10-25 02:30:00.000000 Europe/Zurich CEST")),
+            "to_timestamp_tz('2026-10-25 02:30:00.000000 Europe/Zurich CEST', \
+             'YYYY-MM-DD HH24:MI:SS.FF TZR TZD')"
+        );
         assert_eq!(
             sql_literal(&tz, Some("2026-07-01 12:00:00 +02:00")),
             "to_timestamp_tz('2026-07-01 12:00:00 +02:00', 'YYYY-MM-DD HH24:MI:SS TZR')"
@@ -1744,6 +1816,64 @@ mod tests {
     /// bytes on every database (#256), as on SQL Server; a text column
     /// keeps it as text. An odd number of digits reads as MySQL's `0x…`
     /// does, with a 0 in front.
+    /// Oracle's national text past ASCII is `unistr('…')` of ASCII only,
+    /// which no database character set changes (#480); ASCII stays `'…'`.
+    #[test]
+    fn national_text_as_unistr() {
+        let col = |t: &str| Column {
+            name: "N".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let ora = |t: &str, v: &str| sql_literal(&col(t), Some(v));
+        assert_eq!(
+            ora("NVARCHAR2(20)", "€ 10 – 日本"),
+            r"unistr('\20AC 10 \2013 \65E5\672C')"
+        );
+        assert_eq!(
+            ora("NCHAR(4)", r"ü\'&😀"),
+            r"unistr('\00FC\\''\0026\D83D\DE00')"
+        );
+        assert_eq!(
+            ora("NVARCHAR2(20)", "plain & 'ASCII'"),
+            "'plain ' || chr(38) || ' ''ASCII'''"
+        );
+        assert_eq!(ora("VARCHAR2(20)", "€"), "'€'");
+        let long = ora("NVARCHAR2(2000)", &"€".repeat(1000));
+        assert_eq!(long.matches("unistr('").count(), 2, "{long}");
+        let clob = ora("NCLOB", &"€".repeat(1000));
+        assert!(clob.starts_with(r"to_nclob(unistr('\20AC"), "{clob}");
+        assert_eq!(clob.matches(" || ").count(), 1);
+    }
+
+    /// Rows written after the columns are typed again take their new
+    /// types: a SQLite column of text with blobs later (#482).
+    #[test]
+    fn streamed_rows_take_new_types() {
+        let column = |t: &str| Column {
+            name: "v".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let options = Options {
+            dialect: Dialect::SQLITE,
+            table: "m".into(),
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        let mut writer =
+            StreamWriter::new(Format::Insert, vec![column("TEXT")], options, &mut out).unwrap();
+        writer.write(&[vec![Some("00FF".into())]]).unwrap();
+        writer.retype(vec![column("BLOB")]);
+        writer.write(&[vec![Some("00FF".into())]]).unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("('00FF')") && text.contains("(X'00FF')"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn binary_values_typed_as_shown() {
         let col = |t: &str| Column {

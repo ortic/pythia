@@ -4683,6 +4683,8 @@ dependencies = [
 name = "pythia-db"
 version = "0.11.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "futures-util",
  "mysql",
  "mysql_common",

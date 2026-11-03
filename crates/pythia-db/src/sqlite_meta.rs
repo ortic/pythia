@@ -122,6 +122,7 @@ fn objects(
             valid: true,
             // SQLite doesn't keep when an object changed.
             last_ddl: String::new(),
+            note: String::new(),
         })
         .collect())
 }
@@ -206,6 +207,7 @@ fn find(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<DbObject>,
                     object_type,
                     valid: true,
                     last_ddl: String::new(),
+                    note: String::new(),
                 },
             ));
         }

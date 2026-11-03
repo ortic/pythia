@@ -1974,6 +1974,44 @@ fn a_partitioned_tables_ddl_has_its_partitions() {
     h.ok("drop schema r101_part, r101_part_copy cascade");
 }
 
+/// A session writes dates as ISO does, whatever a role's DateStyle (#475):
+/// `SQL, DMY` gave `04/03/2024`, which INSERT statements wrote and another
+/// server read as April 3. Its login script may set another.
+#[test]
+fn sessions_write_dates_as_iso() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    let superuser = h
+        .scalar("select rolsuper from pg_roles where rolname = current_user")
+        .as_deref()
+        == Some("t");
+    if !superuser {
+        return;
+    }
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop role if exists r101_dmy");
+    h.ok("create role r101_dmy login password 'Pw-dmy-1'");
+    h.ok("alter role r101_dmy set datestyle = 'SQL, DMY'");
+    let mut params = params().unwrap();
+    params.username = "r101_dmy".into();
+    params.password = "Pw-dmy-1".into();
+    let mut dmy = Harness::with(params.clone());
+    assert_eq!(
+        dmy.scalar("select date '2024-03-04'").as_deref(),
+        Some("2024-03-04")
+    );
+    drop(dmy);
+    params.init_sql = vec!["set datestyle = 'German'".into()];
+    let mut german = Harness::with(params);
+    assert_eq!(
+        german.scalar("select date '2024-03-04'").as_deref(),
+        Some("04.03.2024")
+    );
+    drop(german);
+    h.ok("drop role r101_dmy");
+}
+
 /// A foreign table's DDL makes a foreign table again, on its server with
 /// its options and its columns', not a plain table: run elsewhere, it made
 /// an empty local one. Needs postgres_fdw, which a superuser can create.
@@ -3331,4 +3369,125 @@ fn values_bound_whole() {
     // The changes' transaction would keep the table.
     h.ok("rollback");
     h.ok("drop table if exists lob_bound");
+}
+
+/// A partitioned table's partitions are tables of their schema that say
+/// whose partitions they are (#488): the browser and completion left them
+/// out. A partition's DDL makes it a partition of its table again.
+#[test]
+fn partitions_are_tables_that_say_whose() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop schema if exists r101_parts, r101_parts_copy cascade");
+    h.ok("create schema r101_parts");
+    h.ok("create schema r101_parts_copy");
+    for sql in [
+        "create table r101_parts.t (id int primary key, region text not null, n int check (n > 0)) \
+           partition by range (id)",
+        "create table r101_parts.t_low partition of r101_parts.t \
+           (constraint low_small check (id < 50)) for values from (0) to (100)",
+        "create index t_low_region on r101_parts.t_low (region)",
+        "comment on table r101_parts.t_low is 'the low ones'",
+        "create table r101_parts.t_def partition of r101_parts.t default",
+    ] {
+        h.ok(sql);
+    }
+    let MetaResult::Objects(tables) = h.meta(MetaQuery::Objects {
+        owner: "r101_parts".into(),
+        object_type: ObjectType::Table,
+        filter: None,
+    }) else {
+        panic!("expected objects")
+    };
+    let tables: Vec<(&str, &str)> = tables
+        .iter()
+        .map(|o| (o.name.as_str(), o.note.as_str()))
+        .collect();
+    assert_eq!(
+        tables,
+        [
+            ("t", ""),
+            ("t_def", "partition of r101_parts.t DEFAULT"),
+            (
+                "t_low",
+                "partition of r101_parts.t FOR VALUES FROM (0) TO (100)"
+            ),
+        ]
+    );
+    let MetaResult::Objects(found) = h.meta(MetaQuery::Find {
+        pattern: "t_low".into(),
+        limit: 100,
+    }) else {
+        panic!("expected objects")
+    };
+    assert!(found.iter().any(|o| o.owner == "r101_parts"), "{found:?}");
+    let ddl = ddl_of(&mut h, "r101_parts", "t_low", ObjectType::Table);
+    assert!(
+        ddl.starts_with(
+            "create table r101_parts.t_low partition of r101_parts.t (\n    \
+             constraint low_small CHECK (id < 50)\n)\nFOR VALUES FROM (0) TO (100);"
+        ),
+        "{ddl}"
+    );
+    let table = ddl_of(&mut h, "r101_parts", "t", ObjectType::Table);
+    run_ddl(&mut h, &table, "r101_parts.", "r101_parts_copy.");
+    h.ok("drop table r101_parts_copy.t_low");
+    run_ddl(&mut h, &ddl, "r101_parts.", "r101_parts_copy.");
+    h.ok("insert into r101_parts_copy.t values (1, 'eu', 1)");
+    assert_eq!(
+        h.scalar("select tableoid::regclass::text from r101_parts_copy.t")
+            .as_deref(),
+        Some("r101_parts_copy.t_low")
+    );
+    h.fails("insert into r101_parts_copy.t values (60, 'eu', 1)");
+    assert_eq!(
+        ddl_of(&mut h, "r101_parts", "t_def", ObjectType::Table)
+            .lines()
+            .next(),
+        Some("create table r101_parts.t_def partition of r101_parts.t")
+    );
+    h.ok("drop schema r101_parts, r101_parts_copy cascade");
+}
+
+/// Text of a SQL_ASCII database that isn't UTF-8 fails a query, which
+/// says why and how to read it (#487): the server sends text in UTF-8,
+/// which Pythia reads, only where its bytes are.
+#[test]
+fn sql_ascii_text_that_isnt_utf8_says_why() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop database if exists r101_ascii");
+    h.ok(
+        "create database r101_ascii with encoding 'SQL_ASCII' lc_collate 'C' lc_ctype 'C' \
+         template template0",
+    );
+    let mut params = params().expect("the test database");
+    let (server, _) = params.connect_string.rsplit_once('/').expect("a database");
+    params.connect_string = format!("{server}/r101_ascii");
+    let mut c = Harness::with(params);
+    c.session.send(DbRequest::SetAutocommit(true));
+    c.ok("create table t (s text)");
+    c.ok("insert into t values (E'M\\xfcnchen')");
+    c.execute(0, "select s from t", 100);
+    let error = loop {
+        match c.next_result() {
+            DbEvent::Failed { error, .. } => break error,
+            DbEvent::QueryStarted { .. } | DbEvent::Rows { .. } => {}
+            other => panic!("expected the query to fail: {other:?}"),
+        }
+    };
+    assert!(error.message.contains("22021"), "{error:?}");
+    assert!(error.message.contains("SQL_ASCII"), "{error:?}");
+    c.settle();
+    assert_eq!(
+        c.scalar("select convert_from(convert(s::bytea, 'WIN1252', 'UTF8'), 'SQL_ASCII') from t")
+            .as_deref(),
+        Some("München")
+    );
+    drop(c);
+    h.ok("drop database r101_ascii with (force)");
 }

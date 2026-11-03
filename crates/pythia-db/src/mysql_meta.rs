@@ -121,6 +121,7 @@ fn object_rows(rows: Vec<(String, String, String, Option<String>)>) -> Vec<DbObj
                 object_type: ObjectType::from_dictionary(&ty)?,
                 valid: true,
                 last_ddl: last_ddl.unwrap_or_default(),
+                note: String::new(),
             })
         })
         .collect()
@@ -234,10 +235,18 @@ fn columns(
     } else {
         "null"
     };
+    // A spatial column's SRID: MySQL 8's, MariaDB has none (#483).
+    let version: Option<String> = conn.query_first("select version()")?;
+    let version = version.unwrap_or_default();
+    let srid = if !version.contains("MariaDB") && crate::sql_text::release(&version) >= (8, 0) {
+        "c.srs_id"
+    } else {
+        "null"
+    };
     let sql = format!(
         "select c.column_name, c.column_type, c.is_nullable, c.column_default, \
                 nullif(c.column_comment, ''), {pk}, lower(c.data_type), c.extra, \
-                version() like '%MariaDB%', nullif(c.generation_expression, '') \
+                version() like '%MariaDB%', nullif(c.generation_expression, ''), {srid} \
            from information_schema.columns c \
           where c.table_schema = ? and c.table_name = ? \
           order by c.ordinal_position"
@@ -253,6 +262,7 @@ fn columns(
         String,
         bool,
         Option<String>,
+        Option<u32>,
     );
     let rows: Vec<Row> = conn.exec(sql, (owner, &table))?;
     Ok(rows
@@ -269,9 +279,13 @@ fn columns(
                 extra,
                 mariadb,
                 expression,
+                srid,
             )| TableColumn {
                 name,
-                data_type,
+                data_type: match srid {
+                    Some(srid) => format!("{data_type} SRID {srid}"),
+                    None => data_type,
+                },
                 nullable: nullable == "YES",
                 // A generated column says so, with its expression (#471).
                 default: match &expression {
@@ -283,13 +297,16 @@ fn columns(
                             "virtual"
                         }
                     )),
-                    None => default.map(|d| {
-                        if mariadb {
-                            d
-                        } else {
-                            mysql_default(d, &kind, &extra)
-                        }
-                    }),
+                    None => shown_default(
+                        default.map(|d| {
+                            if mariadb {
+                                d
+                            } else {
+                                mysql_default(d, &kind, &extra)
+                            }
+                        }),
+                        &extra,
+                    ),
                 },
                 comment,
                 pk_position: pk,
@@ -297,6 +314,20 @@ fn columns(
             },
         )
         .collect())
+}
+
+/// A column's default as the Columns tab shows it, with what `extra`
+/// says beside it: `on update CURRENT_TIMESTAMP`, and `auto_increment` for
+/// a column without a default (#483).
+fn shown_default(default: Option<String>, extra: &str) -> Option<String> {
+    let lower = extra.to_ascii_lowercase();
+    let on_update = lower.find("on update").map(|i| &extra[i..]);
+    match (default, on_update) {
+        (Some(d), Some(on_update)) => Some(format!("{d} {on_update}")),
+        (None, Some(on_update)) => Some(on_update.to_owned()),
+        (None, None) if lower.contains("auto_increment") => Some("auto_increment".to_owned()),
+        (d, _) => d,
+    }
 }
 
 /// A MySQL column's default as SQL, as MariaDB gives it and SHOW CREATE
@@ -400,7 +431,9 @@ fn details(
                       where k.constraint_schema = t.constraint_schema \
                         and k.constraint_name = t.constraint_name \
                         and k.table_name = t.table_name) as COLUMNS, \
-                    r.referenced_table_name as `REFERENCES`, \
+                    case when r.unique_constraint_schema <> t.table_schema \
+                         then concat(r.unique_constraint_schema, '.', r.referenced_table_name) \
+                         else r.referenced_table_name end as `REFERENCES`, \
                     r.delete_rule as DELETE_RULE, r.update_rule as UPDATE_RULE \
                from information_schema.table_constraints t \
                left join information_schema.referential_constraints r \

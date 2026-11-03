@@ -394,3 +394,59 @@ fn index_kinds_sync() {
         std::panic::resume_unwind(e);
     }
 }
+
+/// A vector column keeps its dimensions and format (23ai): a copy took any
+/// vector, and compare saw no difference (#486).
+#[test]
+fn vector_columns_sync() {
+    use pythia_compare::table::{self, CreateOptions};
+    let Ok(spec) = std::env::var("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let (credentials, connect_string) = spec.rsplit_once('@').unwrap();
+    let (user, password) = credentials.split_once('/').unwrap();
+    let conn = pythia_db::oracle::Connection::connect(user, password, connect_string).unwrap();
+    if !pythia_db::compat::at_least(&conn, 23, 0).unwrap() {
+        return;
+    }
+    let tables = ["FD_VEC_S", "FD_VEC_COPY"];
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    run(
+        &conn,
+        "create table fd_vec_s (a vector(3, float32), b vector(*, int8), c vector, \
+           d vector(5, *))",
+    );
+    let owner = user.to_ascii_uppercase();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source = table::load(&conn, &owner, Some("FD_VEC_S")).unwrap()["FD_VEC_S"].clone();
+        let types: Vec<&str> = source
+            .columns
+            .iter()
+            .map(|c| c.data_type.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "VECTOR(3, FLOAT32)",
+                "VECTOR(*, INT8)",
+                "VECTOR(*, *)",
+                "VECTOR(5, *)"
+            ]
+        );
+        let mut copy = source.clone();
+        copy.name = "FD_VEC_COPY".into();
+        for statement in table::create(&copy, &CreateOptions::default()) {
+            run(&conn, &statement.sql);
+        }
+        let made = table::load(&conn, &owner, Some("FD_VEC_COPY")).unwrap()["FD_VEC_COPY"].clone();
+        assert_eq!(made.columns, source.columns);
+    }));
+    for t in tables {
+        common::try_run(&conn, &format!("drop table {t} purge"));
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

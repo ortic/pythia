@@ -101,6 +101,7 @@ pub(crate) fn run(params: ConnectParams, requests: Requests, events: Events, sha
         autocommit: false,
         tx: Transaction::default(),
         context: NameContext::default(),
+        sql_ascii: false,
     };
     match worker.on_connect(&params.init_sql) {
         Ok((server, failed)) => {
@@ -255,6 +256,9 @@ struct Worker {
     tx: Transaction,
     /// The search path last reported (#320).
     context: NameContext,
+    /// The database's encoding is SQL_ASCII: its text is the bytes it was
+    /// given, which may not be UTF-8 (#487).
+    sql_ascii: bool,
 }
 
 /// How a statement ended: a query's rows were reported as they were
@@ -295,6 +299,11 @@ impl Worker {
     /// then reads what the server is and its current schema. The
     /// statements' failures come back as notices.
     fn on_connect(&mut self, init_sql: &[String]) -> Result<(ServerInfo, Vec<String>), DbError> {
+        // Dates as ISO writes them, whatever the server, database or role
+        // set: `SQL, DMY`'s `04/03/2024` went into INSERT statements, which
+        // another server read as April 3 (#475). The login script may set
+        // another.
+        self.pg().execute("set datestyle = 'ISO, YMD'")?;
         let mut failed = Vec::new();
         for sql in init_sql {
             if let Err(e) = self.pg().execute(sql) {
@@ -311,10 +320,12 @@ impl Worker {
         let row = self
             .pg()
             .first(
-                "select current_setting('server_version'), version(), current_schema()",
+                "select current_setting('server_version'), version(), current_schema(), \
+                        current_setting('server_encoding')",
                 &[],
             )?
             .ok_or_else(|| DbError::new("The server didn't report its version"))?;
+        self.sql_ascii = row.get(3).cloned().flatten().as_deref() == Some("SQL_ASCII");
         let mut values = row.into_iter().map(Option::unwrap_or_default);
         let full = values.next().unwrap_or_default();
         // `18.1 (Debian 18.1-1.pgdg13+2)` → `18.1`
@@ -368,6 +379,17 @@ impl Worker {
                 "client_encoding {encoding} can't be set back to UTF8: {e}"
             )),
         }
+    }
+
+    /// Reports that statement `id` failed. Text of a SQL_ASCII database
+    /// that isn't UTF-8 fails every query of it, which says why (#487):
+    /// the server sends a value in UTF-8 only where its bytes are, and
+    /// Pythia reads text in UTF-8 only.
+    fn fail(&self, id: u64, mut error: DbError, elapsed: Duration) {
+        if self.sql_ascii && error.message.contains(" 22021: ") {
+            error.message.push_str(SQL_ASCII_TEXT);
+        }
+        self.events.send(DbEvent::Failed { id, error, elapsed });
     }
 
     /// Reports the search path when it changed (#320).
@@ -428,11 +450,7 @@ impl Worker {
             Ok(())
         };
         if let Err(error) = before {
-            self.events.send(DbEvent::Failed {
-                id,
-                error,
-                elapsed: started.elapsed(),
-            });
+            self.fail(id, error, started.elapsed());
             self.check_aborted();
             self.report_transaction();
             return None;
@@ -475,11 +493,7 @@ impl Worker {
                 if binds.is_empty() {
                     error.offset = position.and_then(|p| char_offset(&sql, p));
                 }
-                self.events.send(DbEvent::Failed {
-                    id,
-                    error,
-                    elapsed: started.elapsed(),
-                });
+                self.fail(id, error, started.elapsed());
                 true
             }
         };
@@ -631,11 +645,7 @@ impl Worker {
                         let cells = match cells(&row) {
                             Ok(cells) => cells,
                             Err(error) => {
-                                self.events.send(DbEvent::Failed {
-                                    id,
-                                    error,
-                                    elapsed: started.elapsed(),
-                                });
+                                self.fail(id, error, started.elapsed());
                                 self.abandon(stream);
                                 return true;
                             }
@@ -664,11 +674,7 @@ impl Worker {
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        self.events.send(DbEvent::Failed {
-                            id,
-                            error: e.into(),
-                            elapsed: started.elapsed(),
-                        });
+                        self.fail(id, e.into(), started.elapsed());
                         return true;
                     }
                 }
@@ -703,11 +709,7 @@ impl Worker {
                     continue;
                 }
                 Some(Err(e)) => {
-                    self.events.send(DbEvent::Failed {
-                        id,
-                        error: e.into(),
-                        elapsed: started.elapsed(),
-                    });
+                    self.fail(id, e.into(), started.elapsed());
                     return true;
                 }
                 None if !more => return false,
@@ -758,11 +760,7 @@ impl Worker {
                 Ok(SimpleQueryMessage::RowDescription(_)) => results += 1,
                 Ok(_) => {}
                 Err(e) => {
-                    self.events.send(DbEvent::Failed {
-                        id,
-                        error: e.into(),
-                        elapsed: started.elapsed(),
-                    });
+                    self.fail(id, e.into(), started.elapsed());
                     return true;
                 }
             }
@@ -983,6 +981,13 @@ fn cells(row: &SimpleQueryRow) -> Result<Vec<Cell>, DbError> {
         })
         .collect()
 }
+
+/// Why text of a SQL_ASCII database can't be read, and how to read it.
+const SQL_ASCII_TEXT: &str = "\n\nThe database's encoding is SQL_ASCII: its text is the bytes it was \
+     given, which PostgreSQL sends only where they are UTF-8, as Pythia reads text. \
+     `column::bytea` shows a value's bytes, \
+     `convert_from(convert(column::bytea, 'WIN1252', 'UTF8'), 'SQL_ASCII')` reads them as \
+     Windows-1252.";
 
 /// What makes a session's `client_encoding` UTF8 again, and says so.
 const KEEP_UTF8: &str = "Pythia reads and writes text in UTF-8, which PostgreSQL converts from \

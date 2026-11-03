@@ -203,6 +203,8 @@ pub struct PythiaApp {
     /// Recently closed documents, for reopening (newest last).
     closed_docs: Vec<Document>,
     /// Native file dialog running on a helper thread.
+    /// The windows' files read at startup, on a thread of their own (#479).
+    disk_check: Option<std::sync::mpsc::Receiver<Vec<(DocId, crate::text_file::TextFile)>>>,
     file_dialog: Option<(
         std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
         FileAction,
@@ -294,6 +296,7 @@ impl PythiaApp {
             nav: NavHistory::default(),
             production_confirmed: false,
             closed_docs: Vec::new(),
+            disk_check: None,
             file_dialog: None,
             settings_dialog: Default::default(),
             finder: ObjectFinder::default(),
@@ -326,18 +329,10 @@ impl PythiaApp {
         app.focused = app.docs.keys().next().copied();
         // A file changed on disk while Pythia was closed (a `git pull`) is
         // read again, unless its window has changes of its own; saving
-        // those asks first.
-        let mut reloaded = Vec::new();
-        for doc in app.docs.values_mut() {
-            if let DocKind::Sql(w) = &mut doc.kind
-                && w.reload_if_clean()
-            {
-                reloaded.extend(w.path.clone());
-            }
-        }
-        for path in reloaded {
-            app.log(format!("Read {} again: it changed on disk", path.display()));
-        }
+        // those asks first. Read on a thread of its own once the window is
+        // up: a share that doesn't answer held startup for its timeout
+        // (#479).
+        app.disk_check = Some(check_files_on_disk(&app.docs, cc.egui_ctx.clone()));
 
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         theme::install(&cc.egui_ctx);
@@ -5164,6 +5159,7 @@ impl eframe::App for PythiaApp {
             theme::base(ui.visuals()),
         );
         self.pump_events();
+        self.reload_files_changed_on_disk();
         self.refresh_invalid_periodically(&ctx);
         self.handle_dropped_files(&ctx);
         self.poll_file_dialog();
@@ -6733,6 +6729,66 @@ fn read_only_refusal(request: &DbRequest) -> DbEvent {
         },
         _ => DbEvent::Error(error),
     }
+}
+
+impl PythiaApp {
+    /// Reads again the windows' files that changed on disk while Pythia
+    /// was closed, once their check answers (#479), where the window has
+    /// no changes of its own by now.
+    fn reload_files_changed_on_disk(&mut self) {
+        let Some(rx) = &self.disk_check else {
+            return;
+        };
+        let changed = match rx.try_recv() {
+            Ok(changed) => changed,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.disk_check = None;
+        for (id, file) in changed {
+            if let Some(DocKind::Sql(w)) = self.docs.get_mut(&id).map(|d| &mut d.kind)
+                && w.reload_from(file)
+                && let Some(path) = w.path.clone()
+            {
+                self.log(format!("Read {} again: it changed on disk", path.display()));
+            }
+        }
+    }
+
+    /// Checks the windows' files as startup does.
+    #[cfg(test)]
+    pub fn test_check_files_on_disk(&mut self, ctx: &egui::Context) {
+        self.disk_check = Some(check_files_on_disk(&self.docs, ctx.clone()));
+    }
+}
+
+/// The files of `docs`' SQL windows, read on a thread of its own (#479):
+/// those that differ from what their window last saved, as the windows'
+/// ids with what the files hold now.
+fn check_files_on_disk(
+    docs: &BTreeMap<DocId, Document>,
+    ctx: egui::Context,
+) -> std::sync::mpsc::Receiver<Vec<(DocId, crate::text_file::TextFile)>> {
+    let files: Vec<(DocId, std::path::PathBuf, String)> = docs
+        .iter()
+        .filter_map(|(id, d)| match &d.kind {
+            DocKind::Sql(w) => Some((*id, w.path.clone()?, w.saved_text.clone())),
+            _ => None,
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let changed = files
+            .into_iter()
+            .filter_map(|(id, path, saved)| {
+                let file = crate::text_file::read(&path).ok()?;
+                (file.text != saved).then_some((id, file))
+            })
+            .collect();
+        let _ = tx.send(changed);
+        ctx.request_repaint();
+    });
+    rx
 }
 
 fn request_key(request: &DbRequest) -> Option<u64> {

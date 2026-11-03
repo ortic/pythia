@@ -233,6 +233,12 @@ pub(crate) fn open(connect_string: &str) -> Result<Connection, DbError> {
         std::thread::sleep(LOCK_POLL);
         LOCK_POLL * u32::try_from(tries).unwrap_or(u32::MAX) < BUSY_TIMEOUT
     }))?;
+    // Another application's collation, which SQLite knows only there, has
+    // a stand-in where nothing is written (#476): an index ordered by it
+    // would be out of order for that application.
+    if target.read_only {
+        conn.collation_needed(stand_in_collation)?;
+    }
     // Not a database at all: SQLite only notices on the first read.
     waiting(&conn, || {
         conn.query_row("select count(*) from sqlite_schema", [], |_| Ok(()))
@@ -756,6 +762,8 @@ struct Fetch<'a> {
 struct Rest {
     rows: std::collections::VecDeque<Vec<Cell>>,
     end: Option<Option<DbError>>,
+    /// The value types of `rows`, which type the columns (#482).
+    seen: Vec<Seen>,
 }
 
 impl Fetch<'_> {
@@ -767,8 +775,14 @@ impl Fetch<'_> {
         while bytes < REST_BYTES {
             match rows.next() {
                 Ok(Some(row)) => {
-                    let cells: Vec<Cell> = (0..row.as_ref().column_count())
-                        .map(|i| cell(row.get_ref(i).unwrap_or(ValueRef::Null), self.whole))
+                    let count = row.as_ref().column_count();
+                    rest.seen.resize(count, Seen::default());
+                    let cells: Vec<Cell> = (0..count)
+                        .map(|i| {
+                            let value = row.get_ref(i).unwrap_or(ValueRef::Null);
+                            rest.seen[i].note(value);
+                            cell(value, self.whole)
+                        })
                         .collect();
                     bytes += row_bytes(&cells) + 8 * cells.len();
                     rest.rows.push_back(cells);
@@ -806,16 +820,19 @@ impl Fetch<'_> {
         let mut started = self.started;
         let mut columns: Option<Vec<Column>> = None;
         let mut rest = Rest::default();
+        // The value types of the rows so far, which type the columns: a
+        // later batch's may change them (#482).
+        let mut seen = vec![Seen::default(); names.len()];
         loop {
             let mut batch = Vec::with_capacity(max_rows.min(10_000));
-            // The value types of the first rows, for columns without a
-            // declared type.
-            let mut seen = vec![Seen::default(); if columns.is_none() { names.len() } else { 0 }];
             let mut more = true;
             let mut failed = None;
             let mut bytes = 0;
             while batch.len() < max_rows && bytes < WHOLE_BATCH_BYTES {
                 if let Some(cells) = rest.rows.pop_front() {
+                    for (seen, theirs) in seen.iter_mut().zip(std::mem::take(&mut rest.seen)) {
+                        seen.merge(theirs);
+                    }
                     if self.whole {
                         bytes += row_bytes(&cells);
                     }
@@ -856,19 +873,26 @@ impl Fetch<'_> {
                     }
                 }
             }
-            if columns.is_none() {
-                let described: Vec<Column> = names
-                    .iter()
-                    .zip(declared)
-                    .zip(&seen)
-                    .map(|((name, declared), seen)| column(name, declared.as_deref(), seen))
-                    .collect();
-                self.events.send(DbEvent::QueryStarted {
+            let described: Vec<Column> = names
+                .iter()
+                .zip(declared)
+                .zip(&seen)
+                .map(|((name, declared), seen)| column(name, declared.as_deref(), seen))
+                .collect();
+            match &columns {
+                None => self.events.send(DbEvent::QueryStarted {
                     id,
                     columns: described.clone(),
-                });
-                columns = Some(described);
+                }),
+                Some(before) if !same_types(before, &described) => {
+                    self.events.send(DbEvent::Retyped {
+                        id,
+                        columns: described.clone(),
+                    })
+                }
+                Some(_) => {}
             }
+            columns = Some(described);
             if let Some(error) = failed {
                 self.events.send(DbEvent::Failed {
                     id,
@@ -937,6 +961,14 @@ impl Seen {
         }
     }
 
+    /// Adds the kinds `other` saw.
+    fn merge(&mut self, other: Seen) {
+        self.integer |= other.integer;
+        self.real |= other.real;
+        self.text |= other.text;
+        self.blob |= other.blob;
+    }
+
     /// Only numbers (and NULLs), at least one.
     fn numbers(self) -> bool {
         (self.integer || self.real) && !self.text && !self.blob
@@ -981,6 +1013,14 @@ fn column(name: &str, declared: Option<&str>, seen: &Seen) -> Column {
         type_name,
         numeric,
     }
+}
+
+/// Whether columns are of the same types, shown alike.
+fn same_types(a: &[Column], b: &[Column]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| a.type_name == b.type_name && a.numeric == b.numeric)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1192,13 +1232,31 @@ impl From<rusqlite::Error> for DbError {
     }
 }
 
+/// A stand-in for collation `name`, which the application that made the
+/// file defines (`WIN32CASE`, Android's `LOCALIZED`): it compares text
+/// without case, as most of them do. Only for read-only connections.
+fn stand_in_collation(conn: &Connection, name: &str) -> rusqlite::Result<()> {
+    conn.create_collation(name, |a: &str, b: &str| {
+        a.chars()
+            .flat_map(char::to_lowercase)
+            .cmp(b.chars().flat_map(char::to_lowercase))
+    })
+}
+
 /// SQLite's message, which says what failed (`UNIQUE constraint failed:
-/// t.id`), and its error code's name.
+/// t.id`), and its error code's name. A collation it doesn't know says
+/// whose it is and how to read its columns (#476).
 fn message(error: rusqlite::ffi::Error, msg: Option<String>) -> String {
     use rusqlite::ffi::ErrorCode;
     let msg = msg.unwrap_or_else(|| error.to_string());
     match error.code {
         ErrorCode::OperationInterrupted => "Cancelled".to_owned(),
+        _ if msg.starts_with("no such collation sequence") => format!(
+            "{msg}\nThe collation is the application's that made the file: SQLite knows it only \
+             there. Connected read-only (?ro), Pythia compares such columns without case. \
+             It doesn't write to the file with a collation of its own, which would put an \
+             index on them out of order for that application."
+        ),
         _ => msg,
     }
 }

@@ -11,6 +11,10 @@ license.workspace = true
 thick = ["dep:oracle"]
 
 [dependencies]
+# Which instant a region's local time is, where the clocks went back (#481);
+# the driver brings both in already.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 futures-util.workspace = true
 mysql.workspace = true
 mysql_common.workspace = true

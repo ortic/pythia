@@ -211,6 +211,8 @@ pub struct DbObject {
     pub valid: bool,
     /// `LAST_DDL_TIME` as `YYYY-MM-DD HH24:MI:SS`.
     pub last_ddl: String,
+    /// What else to say of it, e.g. which table a partition is of (#488).
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +462,7 @@ fn object_rows(
             object_type,
             valid: status == "VALID",
             last_ddl: last_ddl.unwrap_or_default(),
+            note: String::new(),
         });
     }
     Ok(out)
@@ -580,6 +583,27 @@ fn columns(
     } else {
         "cast(null as number)"
     };
+    // A vector's dimensions and format (23ai), as the table model reads
+    // them (#486).
+    let vector = if crate::compat::at_least(conn, 23, 0)? {
+        "(select replace(replace(x.vector_info, ',DENSE', ''), ',', ', ') from all_tab_cols x \
+           where x.owner = c.owner and x.table_name = c.table_name \
+             and x.column_name = c.column_name)"
+    } else {
+        "c.data_type"
+    };
+    // An identity column's default is its sequence's NEXTVAL: how it is
+    // generated says more (#485). Identity columns came with 12.1.
+    let identity = if crate::compat::at_least(conn, 12, 1)? {
+        "(select 'generated ' || decode(i.generation_type, 'ALWAYS', 'always', 'by default') \
+                 || decode(x.default_on_null, 'YES', ' on null', '') || ' as identity' \
+            from all_tab_identity_cols i join all_tab_cols x on x.owner = i.owner \
+                 and x.table_name = i.table_name and x.column_name = i.column_name \
+           where i.owner = c.owner and i.table_name = c.table_name \
+             and i.column_name = c.column_name)"
+    } else {
+        "cast(null as varchar2(1))"
+    };
     let sql = format!(
         "select c.column_name, \
                 case \
@@ -590,10 +614,12 @@ fn columns(
                   when c.data_type = 'NUMBER' and c.data_precision is not null then \
                     'NUMBER(' || c.data_precision || nvl2(nullif(c.data_scale, 0), ',' || c.data_scale, '') || ')' \
                   when c.data_type = 'NUMBER' and c.data_scale = 0 then 'INTEGER' \
+                  when c.data_type = 'VECTOR' then {vector} \
                   else c.data_type end, \
                 c.nullable, c.data_default, cc.comments, {pk}, \
                 (select x.virtual_column from all_tab_cols x where x.owner = c.owner \
-                    and x.table_name = c.table_name and x.column_name = c.column_name) \
+                    and x.table_name = c.table_name and x.column_name = c.column_name), \
+                {identity} \
                from all_tab_columns c \
                left join all_col_comments cc \
                  on cc.owner = c.owner and cc.table_name = c.table_name and cc.column_name = c.column_name \
@@ -611,10 +637,15 @@ fn columns(
             Option<String>,
             Option<u32>,
         ) = row.get_as()?;
+        let identity: Option<String> = row.get(7)?;
+        // An identity GENERATED ALWAYS takes no value either (#490).
+        let always = identity.as_deref() == Some("generated always as identity");
         let generated = row.get::<_, Option<String>>(6)?.as_deref() == Some("YES");
-        let default = default
-            .map(|d| d.trim().to_owned())
-            .filter(|d| !d.is_empty());
+        let default = identity.or_else(|| {
+            default
+                .map(|d| d.trim().to_owned())
+                .filter(|d| !d.is_empty())
+        });
         out.push(TableColumn {
             name,
             data_type,
@@ -627,7 +658,7 @@ fn columns(
             },
             comment,
             pk_position: pk,
-            generated,
+            generated: generated || always,
         });
     }
     Ok(out)

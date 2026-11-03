@@ -462,6 +462,61 @@ All notable changes to Pythia are documented here. The format follows
   and its columns' and parameters', which a copy lacked (#472).
 - SQL Server: a lookup chosen as a deadlock's victim (Msg 1205), as the
   catalog deadlocks with other sessions' DDL, runs again (#473).
+- MySQL: Edit finds a row by a TIMESTAMP key by its instant: in the hour
+  that repeats when the clocks go back, two rows showed the same, and the
+  other one was changed (#474).
+- Oracle: a TIMESTAMP WITH TIME ZONE in a region shows its abbreviation
+  (`Europe/Zurich CEST`) in the hour that repeats when the clocks go back,
+  and INSERT statements and Edit write it: read back without it, it was
+  an hour off (#481).
+- PostgreSQL: sessions show and write dates as ISO, whatever DateStyle a
+  server, database or role sets: INSERT statements wrote `04/03/2024`,
+  which another server read otherwise (#475).
+- MySQL: the Constraints tab names a foreign key's referenced table with
+  its database where that isn't the table's (#477).
+- Oracle: the Columns tab says how an identity column is generated
+  (`generated always as identity`), not its sequence's NEXTVAL (#485).
+- Generate INSERT leaves out identity columns that take no value
+  (Oracle's and PostgreSQL's ALWAYS, SQL Server's), and Generate UPDATE
+  keeps a generated key for its WHERE (#490).
+- Oracle 23ai: a VECTOR column keeps its dimensions and format in table
+  copies, Schema Compare and the Columns tab, which read it as `VECTOR`
+  (#486).
+- Oracle: the table builder refuses a foreign key on a new temporary
+  table before anything runs; Oracle refused it after the table was made
+  (#489).
+- MySQL: the Columns tab shows `auto_increment`, `on update
+  CURRENT_TIMESTAMP` and a spatial column's SRID (#483).
+- The result grid's filter finds what the cells show: NULLs by the text
+  the grid writes for them, binary values with their `0x` (#478).
+- Pythia starts while a window's file is on a share that doesn't answer:
+  the windows' files are checked for changes on a thread of their own,
+  after the window is up (#479).
+- PostgreSQL: a partitioned table's partitions are listed among the
+  tables, in the object browser and completion, and say whose partitions
+  they are; a partition's DDL makes it a partition of its table again
+  (#488).
+- PostgreSQL: a query of text in a SQL_ASCII database that isn't UTF-8
+  says why it fails and how to read the text: `column::bytea` shows its
+  bytes, `convert_from(convert(column::bytea, 'WIN1252', 'UTF8'),
+  'SQL_ASCII')` reads them as Windows-1252 (#487).
+- SQLite: a result column typed from its first rows is typed again when
+  later rows have blobs in it: they were shown in hex in a column of
+  text, which INSERT exports wrote as text (`'00FF'`) and Edit's check
+  took for a conflict (#482).
+- SQLite: a table whose columns use another application's collation
+  (`WIN32CASE`, Android's `LOCALIZED`) can be read, filtered and sorted
+  on a read-only connection (`?ro`), which compares them without case;
+  read-write, the error says whose the collation is and how to read
+  them (#476).
+- Oracle: NVARCHAR2, NCHAR and NCLOB values past ASCII are written as
+  `unistr('…')`, by Edit and INSERT exports: as `'…'` literals they went
+  through the database character set first, which one that isn't
+  Unicode stored `€ 10 – 日本` as `? 10 ? ??` (#480).
+- Oracle: the table editor's copy of a table and Schema Compare keep a
+  column's collation (`collate binary_ci`, 12.2 with `MAX_STRING_SIZE =
+  EXTENDED`): a copy compared with case, and a differing collation wasn't
+  seen (#484).
 
 ## [0.11.0] - 2026-11-02
 

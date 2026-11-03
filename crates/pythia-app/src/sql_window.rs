@@ -487,13 +487,20 @@ impl SqlWindow {
 
     /// Reads the file again where it changed on disk and the window has
     /// no changes of its own; whether it did.
+    #[cfg(test)]
     pub fn reload_if_clean(&mut self) -> bool {
-        if self.is_dirty() {
+        match self.changed_on_disk() {
+            Some(file) => self.reload_from(file),
+            None => false,
+        }
+    }
+
+    /// Takes `file`, read from the window's path, where the window has no
+    /// changes of its own; whether it did.
+    pub fn reload_from(&mut self, file: crate::text_file::TextFile) -> bool {
+        if self.is_dirty() || file.text == self.saved_text {
             return false;
         }
-        let Some(file) = self.changed_on_disk() else {
-            return false;
-        };
         self.editor.set_text(file.text.clone());
         self.saved_text = file.text;
         self.encoding = file.encoding;
@@ -830,6 +837,10 @@ impl SqlWindow {
         };
         let failed = match event {
             DbEvent::QueryStarted { columns, .. } => sink.columns(&columns).err(),
+            DbEvent::Retyped { columns, .. } => {
+                sink.retype(&columns);
+                None
+            }
             DbEvent::Rows { rows, more, .. } => match sink.rows(&rows) {
                 Ok(written) => {
                     job.rows
@@ -1367,7 +1378,7 @@ impl SqlWindow {
                 DbRequest::Run {
                     id,
                     task: Box::new(move |client| {
-                        let key = crate::data_edit::row_key(client, &table)?;
+                        let key = crate::data_edit::edit_key(client, &table)?;
                         Ok(Box::new(key) as Box<dyn std::any::Any + Send>)
                     }),
                 }
@@ -1432,6 +1443,7 @@ impl SqlWindow {
                 table,
                 source,
                 key: crate::data_edit::RowKey::Rowid,
+                instants: Vec::new(),
             };
             self.queue_edit_query(edit, Some(replaces), cx);
         } else {
@@ -1933,6 +1945,7 @@ impl SqlWindow {
         };
         let streamed = match &event {
             DbEvent::QueryStarted { id, .. }
+            | DbEvent::Retyped { id, .. }
             | DbEvent::Rows { id, .. }
             | DbEvent::QueryClosed { id }
             | DbEvent::Executed { id, .. }
@@ -2128,12 +2141,12 @@ impl SqlWindow {
                     return effects;
                 };
                 let key = result.and_then(|any| {
-                    any.downcast::<Vec<String>>()
+                    any.downcast::<(Vec<String>, Vec<String>)>()
                         .map(|key| *key)
                         .map_err(|_| DbError::new("unexpected result"))
                 });
                 match key {
-                    Ok(key) if key.is_empty() => {
+                    Ok((key, _)) if key.is_empty() => {
                         self.state.queue.clear();
                         self.warn(format!(
                             "The rows of {table} can't be edited: it has no primary key (or \
@@ -2141,11 +2154,12 @@ impl SqlWindow {
                         ));
                         self.state.bottom = BottomTab::Messages;
                     }
-                    Ok(key) => {
+                    Ok((key, instants)) => {
                         let edit = crate::data_edit::Editable {
                             table,
                             source,
                             key: crate::data_edit::RowKey::Columns(key),
+                            instants,
                         };
                         self.queue_edit_query(edit, Some(replaces), cx);
                         effects.extend(self.run_next(cx));
@@ -2202,6 +2216,18 @@ impl SqlWindow {
                     self.state.fetching = None;
                 }
                 self.query_closed(id, "its query was closed by what ran after it");
+            }
+            // Later rows had blobs in a column of text (SQLite, #482):
+            // exports and Edit take its values as what they are.
+            DbEvent::Retyped { id, columns } => {
+                if let Some(result) = self.state.results.iter_mut().rev().find(|r| r.id == id)
+                    && result.columns.len() == columns.len()
+                {
+                    for (column, retyped) in result.columns.iter_mut().zip(columns) {
+                        column.type_name = retyped.type_name;
+                        column.numeric = retyped.numeric;
+                    }
+                }
             }
             DbEvent::Rows {
                 id,
@@ -3946,6 +3972,7 @@ mod tests {
             table: "t".into(),
             source: "select x from t".into(),
             key: crate::data_edit::RowKey::Columns(vec!["id".into()]),
+            instants: Vec::new(),
         });
         r.grid.set_editable(Some(1));
         let rows = r.rows.clone();
@@ -4580,6 +4607,49 @@ mod tests {
         // A `:` in a string is none.
         w.editor.set_text("select ':id' from t");
         assert_eq!(explained(&w.explain()), ["select ':id' from t"]);
+    }
+
+    /// A result's columns take the types its session says later rows
+    /// have (SQLite, #482): a column of text with blobs after the first
+    /// fetch is a BLOB one, which exports and Edit write as `X'…'`.
+    #[test]
+    fn results_are_retyped() {
+        let settings = pythia_config::Settings::default();
+        let cx = test_cx(&settings, false);
+        let mut w = SqlWindow::new("t".into(), "select v from m".into());
+        let id = sent(&w.execute(false, &cx))[0].0;
+        let column = |type_name: &str| pythia_db::Column {
+            name: "v".into(),
+            type_name: type_name.into(),
+            numeric: false,
+        };
+        let columns = vec![column("TEXT")];
+        w.on_event(DbEvent::QueryStarted { id, columns }, &cx);
+        let rows = |w: &mut SqlWindow, value: &str, more| {
+            w.on_event(
+                DbEvent::Rows {
+                    id,
+                    rows: vec![vec![Some(value.into())]],
+                    more,
+                    elapsed: Duration::ZERO,
+                },
+                &cx,
+            )
+        };
+        rows(&mut w, "one", true);
+        let columns = vec![column("BLOB")];
+        w.on_event(DbEvent::Retyped { id, columns }, &cx);
+        rows(&mut w, "00FF", false);
+        let result = &w.state.results[0];
+        assert_eq!(result.columns[0].type_name, "BLOB");
+        assert_eq!(
+            pythia_data::literal(
+                pythia_db::Dialect::SQLITE,
+                &result.columns[0],
+                result.rows[1][0].as_deref()
+            ),
+            "X'00FF'"
+        );
     }
 
     /// Explain plan runs in the window's own session (#269), so not while

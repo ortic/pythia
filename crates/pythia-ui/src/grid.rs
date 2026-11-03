@@ -101,6 +101,8 @@ pub struct GridState {
     /// The time zone MySQL showed the rows' TIMESTAMP values in: INSERT
     /// statements set it (#213).
     pub time_zone: Option<String>,
+    /// What a NULL shows as, which the filter finds (#478).
+    shown_null: String,
     /// The table's columns the database computes, and its identity columns
     /// that take a value only when told to: INSERT statements leave the
     /// first out and tell for the others (#457).
@@ -746,16 +748,27 @@ impl GridState {
     /// The rows passing the filter, in the order shown.
     fn order_of(&self, rows: &[Vec<Cell>], columns: &[Column]) -> Vec<usize> {
         let needle = self.filter.trim().to_lowercase();
+        // As the cells show them (#478): a NULL as the grid writes it, a
+        // binary value with its `0x`.
+        let null = match self.shown_null.as_str() {
+            "" => "null".to_owned(),
+            shown => shown.to_lowercase(),
+        };
+        let binary: Vec<bool> = columns.iter().map(|c| is_binary(self.dialect, c)).collect();
+        let shows = |c: usize, v: &Cell| match v {
+            None => null.contains(&needle),
+            Some(v) => {
+                let v = v.to_lowercase();
+                v.contains(&needle)
+                    || binary.get(c).copied().unwrap_or(false)
+                        && format!("0x{}", hex_digits(&v)).contains(&needle)
+            }
+        };
         let mut order: Vec<usize> = if needle.is_empty() {
             (0..rows.len()).collect()
         } else {
             (0..rows.len())
-                .filter(|&i| {
-                    rows[i]
-                        .iter()
-                        .flatten()
-                        .any(|v| v.to_lowercase().contains(&needle))
-                })
+                .filter(|&i| rows[i].iter().enumerate().any(|(c, v)| shows(c, v)))
                 .collect()
         };
         if let Some((col, asc)) = self.sort {
@@ -1876,11 +1889,19 @@ fn table(
         }
         None => (None, vec![false; columns.len()]),
     };
+    let look = Look::new(ui);
+    if state.shown_null != look.null_text {
+        state.shown_null = look.null_text.clone();
+        // The filter's rows, where there is one, as it may find NULLs.
+        if !state.filter.trim().is_empty() {
+            state.ordered_rows = usize::MAX;
+        }
+    }
     let mut d = Draw {
         columns,
         rows,
         id,
-        look: Look::new(ui),
+        look,
         visible: state.visible_columns(columns.len()),
         frozen: state.frozen_columns(columns.len()),
         selected_rows,
@@ -3946,6 +3967,31 @@ mod tests {
         s.set_filter("");
         s.sync(&r, &c);
         assert_eq!(s.visible_rows(), 3);
+    }
+
+    /// The filter finds what the cells show (#478): a NULL as the grid
+    /// writes it, a binary value with its `0x`.
+    #[test]
+    fn filter_what_cells_show() {
+        let (c, r) = (cols(), rows());
+        let mut s = GridState::default();
+        s.set_filter("null");
+        s.sync(&r, &c);
+        assert_eq!(s.order, [1, 2]);
+        s.shown_null = "(none)".into();
+        s.set_filter("none");
+        s.sync(&r, &c);
+        assert_eq!(s.order, [1, 2]);
+        let raw = vec![Column {
+            name: "R".into(),
+            type_name: "RAW(4)".into(),
+            numeric: false,
+        }];
+        let values = vec![vec![Some("1F8B0800".into())], vec![Some("00FF".into())]];
+        let mut s = GridState::default();
+        s.set_filter("0x1f8b");
+        s.sync(&values, &raw);
+        assert_eq!(s.order, [0]);
     }
 
     #[test]

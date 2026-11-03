@@ -14,7 +14,7 @@ use pythia_db::{
 };
 use pythia_ui::{Changes, Loaded, RowRef};
 
-use super::{Editable, RowKey, dml, edit_query, has_key_columns, row_key, same};
+use super::{Editable, RowKey, dml, edit_query, has_key_columns, same};
 
 struct Live {
     session: Session,
@@ -160,20 +160,25 @@ impl Live {
         rows[0][0].clone().unwrap_or_default()
     }
 
-    /// The key `row_key` finds for `table`, on the session as the window's
+    /// The key `edit_key` finds for `table`, on the session as the window's
     /// own lookup runs.
     fn key(&mut self, table: &str) -> Vec<String> {
+        self.edit_key(table).0
+    }
+
+    /// The key and its instants, as the window's lookup finds them.
+    fn edit_key(&mut self, table: &str) -> (Vec<String>, Vec<String>) {
         let table = table.to_owned();
         self.session.send(DbRequest::Run {
             id: 2,
             task: Box::new(move |client: &mut dyn Client| {
-                row_key(client, &table).map(|key| Box::new(key) as Box<dyn Any + Send>)
+                super::edit_key(client, &table).map(|key| Box::new(key) as Box<dyn Any + Send>)
             }),
         });
         loop {
             if let DbEvent::TaskDone { result, .. } = self.next() {
                 let any = result.unwrap_or_else(|e| panic!("{e}"));
-                return *any.downcast::<Vec<String>>().expect("a key");
+                return *any.downcast::<(Vec<String>, Vec<String>)>().expect("a key");
             }
         }
     }
@@ -200,12 +205,13 @@ impl Live {
 
     /// The result of `table` as *Edit* fetches it, with its key.
     fn editable(&mut self, table: &str, order: &str) -> (Editable, Vec<Column>, Vec<Vec<Cell>>) {
-        let key = self.key(table);
+        let (key, instants) = self.edit_key(table);
         assert!(!key.is_empty(), "{table} has no key");
         let edit = Editable {
             table: table.into(),
             source: format!("select * from {table} order by {order}"),
             key: RowKey::Columns(key),
+            instants,
         };
         let sql = edit_query(self.dialect, &edit).expect("an editable query");
         let (columns, rows) = self.query(&sql);
@@ -367,6 +373,7 @@ fn mysql_keys() {
         table: "pythia_live_k".into(),
         source: "select id, code # the columns\nfrom pythia_live_k".into(),
         key: RowKey::Columns(vec!["id".into()]),
+        instants: Vec::new(),
     };
     let sql = edit_query(db.dialect, &edit).expect("an editable query");
     let (columns, _) = db.query(&sql);
@@ -754,6 +761,7 @@ fn renamed_columns(db: &mut Live, create: &str) {
                  r.name, r.* from fd_renamed r"
             .into(),
         key: RowKey::Columns(key),
+        instants: Vec::new(),
     };
     let sql = edit_query(db.dialect, &edit).expect("an editable query");
     let (columns, rows) = db.query(&sql);
@@ -1150,6 +1158,50 @@ fn sqlite_rowids_renumbered_find_no_row() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A MySQL TIMESTAMP key in a session time zone with daylight saving time
+/// finds its row by its instant (#474): in the hour that repeats when the
+/// clocks go back, two rows show the same, and the other one was changed.
+#[test]
+fn mysql_timestamp_keys_in_the_repeated_hour() {
+    let Some(mut db) = Live::connect("PYTHIA_TEST_MYSQL", DbKind::MySql) else {
+        return;
+    };
+    db.script(&[
+        "set time_zone = '+00:00'",
+        "drop table if exists fd_dst",
+        // A default of its own: MariaDB's first TIMESTAMP column is
+        // otherwise ON UPDATE CURRENT_TIMESTAMP.
+        "create table fd_dst (ts timestamp not null default current_timestamp primary key, n int)",
+        "insert into fd_dst values ('2026-10-25 00:30:00', 1), ('2026-10-25 01:30:00', 2)",
+    ]);
+    // Without the zone tables, no named zones: nothing to show.
+    if db.run("set time_zone = 'Europe/Zurich'").is_err() {
+        db.ok("drop table fd_dst");
+        return;
+    }
+    let (edit, columns, rows) = db.editable("fd_dst", "n");
+    assert_eq!(edit.instants, ["ts"]);
+    assert_eq!(rows[0][0], rows[1][0], "both show the same local time");
+    let changes = Changes {
+        updates: BTreeMap::from([(1, BTreeMap::from([(1, Some("9".into()))]))]),
+        ..Changes::default()
+    };
+    for statement in dml(db.dialect, &edit, &columns, &rows, &changes) {
+        let ran = db.run(&statement.sql);
+        assert!(
+            matches!(ran, Ok(Ran::Done(Some(1)))),
+            "{ran:?}\n{}",
+            statement.sql
+        );
+    }
+    db.ok("set time_zone = '+00:00'");
+    assert_eq!(
+        db.count("select group_concat(concat(ts, '=', n) order by ts) from fd_dst"),
+        "2026-10-25 00:30:00=1,2026-10-25 01:30:00=9"
+    );
+    db.ok("drop table fd_dst");
+}
+
 /// MySQL's VECTOR values, shown as the hex of their floats (#436) like the
 /// other binary values, not as their bytes read as text: typed again they
 /// find their row, and a new one is written as those bytes.
@@ -1296,6 +1348,7 @@ fn oracle_binary_values_typed_as_shown() {
             table: table.into(),
             source: format!("select * from {table} order by id"),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
         for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, changes) {
@@ -1385,6 +1438,7 @@ fn oracle_lobs_of_fetched_rows() {
         table: table.into(),
         source: format!("select * from {table} order by id"),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     // Each value of each row set to another, one UPDATE at a time.
     let new = |type_name: &str| match type_name {
@@ -1535,6 +1589,7 @@ fn oracle_long_clobs_can_be_changed() {
         table: "r65_long_clob".into(),
         source: "select * from r65_long_clob order by id".into(),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
     let changed = format!("{}z{}", "x".repeat(4000), "y".repeat(999));
@@ -1619,6 +1674,7 @@ fn oracle_values_past_their_literals() {
             table: table.into(),
             source: format!("select * from {table} order by id"),
             key: RowKey::Rowid,
+            instants: Vec::new(),
         };
         let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
         let mut new = vec![Some("2".to_owned())];
@@ -1701,6 +1757,7 @@ fn oracle_binary_floats_find_their_rows() {
         table: "r76_floats".into(),
         source: "select * from r76_floats order by id".into(),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
     // Each value set to itself, and each row again as a new one.
@@ -1775,6 +1832,7 @@ fn oracle_json_and_vectors_of_fetched_rows() {
         table: "r76_json".into(),
         source: "select * from r76_json order by id".into(),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
     assert_eq!(columns[1].type_name, "JSON");
@@ -1901,6 +1959,7 @@ fn oracle_long_json_and_vectors_can_be_changed() {
         table: "r76_long_json".into(),
         source: "select * from r76_long_json order by id".into(),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
     let mut apply = |changes: &Changes| {
@@ -2006,6 +2065,7 @@ fn oracle_json_extended_scalars() {
         table: "r84_json".into(),
         source: "select * from r84_json order by id".into(),
         key: RowKey::Rowid,
+        instants: Vec::new(),
     };
     let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
     let shown: Vec<&str> = rows.iter().map(|row| row[1].as_deref().unwrap()).collect();
@@ -2117,4 +2177,82 @@ fn oracle_json_extended_scalars() {
         r#"{"$oracleTimestampTZ":"2021-02-03T04:05:06.700000-05:30"}"#
     );
     conn.execute("drop table r84_json purge", &[]).unwrap();
+}
+
+/// NVARCHAR2 and NCHAR values past ASCII go in as `unistr('…')`, which a
+/// database character set that isn't Unicode doesn't change (#480): as
+/// `'…'`, `€ 10 – 日本` was stored `? 10 ? ??` there. Changed twice, the
+/// second change finds its row by the first's value; a long one comes in
+/// parts.
+#[test]
+fn oracle_national_text_past_ascii() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r101_national purge", &[]);
+    for sql in [
+        "create table r101_national (id number primary key, n nvarchar2(2000), c nchar(6))",
+        "insert into r101_national values (1, 'x', 'x')",
+        "commit",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = Editable {
+        table: "r101_national".into(),
+        source: "select id, n, c from r101_national order by id".into(),
+        key: RowKey::Rowid,
+        instants: Vec::new(),
+    };
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let long = "€".repeat(1000);
+    // Escapes: the UI's fonts have no glyphs for these.
+    for (n, c) in [
+        ("€ 10 – \u{65E5}\u{672C} 😀 \\ & '", "ü€&'\\x"),
+        ("ŝ 2 – \u{4E2D}\u{6587}", "ŝŝŝŝŝŝ"),
+    ] {
+        let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+        let changes = Changes {
+            updates: BTreeMap::from([(
+                0,
+                BTreeMap::from([(1, Some(n.to_owned())), (2, Some(c.to_owned()))]),
+            )]),
+            ..Changes::default()
+        };
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+            assert!(statement.sql.contains("unistr('"), "{}", statement.sql);
+            let ran = db.apply(&statement);
+            assert!(
+                matches!(ran, Ok(Ran::Done(Some(1)))),
+                "{ran:?}\n{}",
+                statement.sql
+            );
+        }
+        let (_, rows) = fetch("select n, c from r101_national where id = 1");
+        assert_eq!(rows, [[Some(n.to_owned()), Some(c.to_owned())]]);
+    }
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let mut new = vec![None; columns.len()];
+    new[0] = Some("2".to_owned());
+    new[1] = Some(long.clone());
+    let changes = Changes {
+        inserts: vec![new],
+        ..Changes::default()
+    };
+    for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+        let ran = db.apply(&statement);
+        assert!(matches!(ran, Ok(Ran::Done(Some(1)))), "{ran:?}");
+    }
+    let (_, rows) = fetch("select n from r101_national where id = 2");
+    assert_eq!(rows, [[Some(long)]]);
+    conn.execute("drop table r101_national purge", &[]).unwrap();
 }

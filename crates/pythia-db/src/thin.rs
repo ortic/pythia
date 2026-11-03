@@ -1519,6 +1519,33 @@ impl<T: RowValue> Iterator for ResultSet<'_, T> {
 
 // ----- formats -----------------------------------------------------------
 
+/// The abbreviation of `region`'s time (`CEST`) at `shown`, a local
+/// `YYYY-MM-DD HH24:MI:SS…` with `offset` minutes from UTC, where that
+/// local time is two instants; none elsewhere, or where the abbreviation is
+/// only an offset (`+03`), which Oracle doesn't take.
+fn repeated_hour_abbreviation(region: &str, shown: &str, offset: i32) -> Option<String> {
+    use chrono::{NaiveDateTime, TimeZone};
+    use chrono_tz::OffsetName;
+    let tz = region.parse::<chrono_tz::Tz>().ok().or_else(|| {
+        chrono_tz::TZ_VARIANTS
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(region))
+    })?;
+    let local = NaiveDateTime::parse_from_str(shown.get(..19)?, "%Y-%m-%d %H:%M:%S").ok()?;
+    let chrono::LocalResult::Ambiguous(a, b) = tz.from_local_datetime(&local) else {
+        return None;
+    };
+    use chrono::Offset;
+    let at = [a, b]
+        .into_iter()
+        .find(|t| t.offset().fix().local_minus_utc() == offset * 60)?;
+    let abbreviation = at.offset().abbreviation()?;
+    abbreviation
+        .chars()
+        .all(|c| c.is_ascii_alphabetic())
+        .then(|| abbreviation.to_owned())
+}
+
 /// `YYYY-MM-DD HH24:MI:SS[.FF][ +TZH:TZM| TZR]`, local time: a TIMESTAMP
 /// WITH TIME ZONE value in its own time zone (its region's name if it has
 /// one), a TIMESTAMP WITH LOCAL TIME ZONE value, which the driver hands over
@@ -1557,6 +1584,13 @@ fn timestamp(ts: &OracleTimestamp, kind: TsKind, scale: u8) -> String {
     if let (TsKind::Tz, Some(region)) = (kind, ts.tz_region()) {
         out.push(' ');
         out.push_str(region);
+        // In the hour that repeats when the clocks go back, the region's
+        // time is two instants: its abbreviation tells which, as Oracle's
+        // own literals write it (#481). Read without, it was standard time.
+        if let Some(abbreviation) = repeated_hour_abbreviation(region, &out, offset) {
+            out.push(' ');
+            out.push_str(&abbreviation);
+        }
     } else if matches!(kind, TsKind::Tz | TsKind::Ltz(_)) {
         let sign = if offset < 0 { '-' } else { '+' };
         out.push_str(&format!(
@@ -1915,6 +1949,38 @@ mod tests {
             conn.query_row_as::<i64>("select 1 from dual", &[]).unwrap(),
             1
         );
+    }
+
+    /// In the hour that repeats when the clocks go back, a region's value
+    /// shows its abbreviation, and reads back as its instant (#481).
+    #[test]
+    fn the_repeated_hour_shows_its_abbreviation() {
+        let Some(conn) = connect() else {
+            return;
+        };
+        let row = conn
+            .query_row(
+                "select from_tz(timestamp '2026-10-25 00:30:00', 'UTC') at time zone 'Europe/Zurich', \
+                        from_tz(timestamp '2026-10-25 01:30:00', 'UTC') at time zone 'Europe/Zurich', \
+                        from_tz(timestamp '2026-07-01 12:00:00', 'Europe/Zurich') \
+                   from dual",
+                &[],
+            )
+            .unwrap();
+        let shown: Vec<String> = (0..3).map(|i| row.get(i).unwrap()).collect();
+        assert!(shown[0].ends_with(" Europe/Zurich CEST"), "{shown:?}");
+        assert!(shown[1].ends_with(" Europe/Zurich CET"), "{shown:?}");
+        assert!(shown[2].ends_with(" Europe/Zurich"), "{shown:?}");
+        for (text, utc) in shown[..2].iter().zip(["00:30", "01:30"]) {
+            let back = conn
+                .query_row_as::<String>(
+                    "select to_char(to_timestamp_tz(:1, 'YYYY-MM-DD HH24:MI:SS.FF TZR TZD') \
+                            at time zone 'UTC', 'HH24:MI') from dual",
+                    &[text],
+                )
+                .unwrap();
+            assert_eq!(back, utc, "{text}");
+        }
     }
 
     /// TIMESTAMP WITH TIME ZONE values show in their own time zone, a
