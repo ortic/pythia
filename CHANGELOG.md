@@ -496,6 +496,10 @@ All notable changes to Pythia are documented here. The format follows
   tables, in the object browser and completion, and say whose partitions
   they are; a partition's DDL makes it a partition of its table again
   (#488).
+- PostgreSQL: a query of text in a SQL_ASCII database that isn't UTF-8
+  says why it fails and how to read the text: `column::bytea` shows its
+  bytes, `convert_from(convert(column::bytea, 'WIN1252', 'UTF8'),
+  'SQL_ASCII')` reads them as Windows-1252 (#487).
 
 ## [0.11.0] - 2026-11-02
 

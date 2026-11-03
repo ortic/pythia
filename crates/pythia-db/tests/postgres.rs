@@ -3450,3 +3450,44 @@ fn partitions_are_tables_that_say_whose() {
     );
     h.ok("drop schema r101_parts, r101_parts_copy cascade");
 }
+
+/// Text of a SQL_ASCII database that isn't UTF-8 fails a query, which
+/// says why and how to read it (#487): the server sends text in UTF-8,
+/// which Pythia reads, only where its bytes are.
+#[test]
+fn sql_ascii_text_that_isnt_utf8_says_why() {
+    let Some(mut h) = Harness::connect() else {
+        return;
+    };
+    h.session.send(DbRequest::SetAutocommit(true));
+    h.ok("drop database if exists r101_ascii");
+    h.ok(
+        "create database r101_ascii with encoding 'SQL_ASCII' lc_collate 'C' lc_ctype 'C' \
+         template template0",
+    );
+    let mut params = params().expect("the test database");
+    let (server, _) = params.connect_string.rsplit_once('/').expect("a database");
+    params.connect_string = format!("{server}/r101_ascii");
+    let mut c = Harness::with(params);
+    c.session.send(DbRequest::SetAutocommit(true));
+    c.ok("create table t (s text)");
+    c.ok("insert into t values (E'M\\xfcnchen')");
+    c.execute(0, "select s from t", 100);
+    let error = loop {
+        match c.next_result() {
+            DbEvent::Failed { error, .. } => break error,
+            DbEvent::QueryStarted { .. } | DbEvent::Rows { .. } => {}
+            other => panic!("expected the query to fail: {other:?}"),
+        }
+    };
+    assert!(error.message.contains("22021"), "{error:?}");
+    assert!(error.message.contains("SQL_ASCII"), "{error:?}");
+    c.settle();
+    assert_eq!(
+        c.scalar("select convert_from(convert(s::bytea, 'WIN1252', 'UTF8'), 'SQL_ASCII') from t")
+            .as_deref(),
+        Some("München")
+    );
+    drop(c);
+    h.ok("drop database r101_ascii with (force)");
+}
