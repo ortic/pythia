@@ -487,6 +487,8 @@ All notable changes to Pythia are documented here. The format follows
   (#489).
 - MySQL: the Columns tab shows `auto_increment`, `on update
   CURRENT_TIMESTAMP` and a spatial column's SRID (#483).
+- The result grid's filter finds what the cells show: NULLs by the text
+  the grid writes for them, binary values with their `0x` (#478).
 
 ## [0.11.0] - 2026-11-02
 
