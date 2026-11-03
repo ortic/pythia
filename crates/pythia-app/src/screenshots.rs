@@ -12114,6 +12114,41 @@ fn passwords_not_saved() {
     );
 }
 
+/// The windows' files are checked for changes on a thread of their own,
+/// not before the window is up (#479): one changed is read again, one
+/// with changes in its window is left as it is.
+#[test]
+fn files_changed_on_disk_are_read_on_a_thread() {
+    let dir = std::env::temp_dir().join(format!("pythia-disk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("r101.sql");
+    std::fs::write(&file, "select 1 from dual;\n").unwrap();
+    let mut h = harness(true);
+    h.state_mut().test_open_file(file.clone());
+    h.run_steps(2);
+    std::fs::write(&file, "select 2 from dual;\n").unwrap();
+    let ctx = h.ctx.clone();
+    h.state_mut().test_check_files_on_disk(&ctx);
+    wait_until(&mut h, "the file read again", |app| {
+        app.test_sql_window_ref()
+            .is_some_and(|w| w.editor.text() == "select 2 from dual;\n")
+    });
+    // Changed in the window meanwhile: left as it is.
+    h.state_mut()
+        .test_sql_window()
+        .editor
+        .set_text("select 3 from dual;\n");
+    std::fs::write(&file, "select 4 from dual;\n").unwrap();
+    h.state_mut().test_check_files_on_disk(&ctx);
+    h.run_steps(5);
+    assert_eq!(
+        h.state().test_sql_window_ref().unwrap().editor.text(),
+        "select 3 from dual;\n"
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The connect dialog never saves a connection over another one (#246):
 /// Save under another saved connection's name replaced it, and after a
 /// rename that changed only the case, Connect kept both. Saved in a

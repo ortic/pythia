@@ -488,12 +488,18 @@ impl SqlWindow {
     /// Reads the file again where it changed on disk and the window has
     /// no changes of its own; whether it did.
     pub fn reload_if_clean(&mut self) -> bool {
-        if self.is_dirty() {
+        match self.changed_on_disk() {
+            Some(file) => self.reload_from(file),
+            None => false,
+        }
+    }
+
+    /// Takes `file`, read from the window's path, where the window has no
+    /// changes of its own; whether it did.
+    pub fn reload_from(&mut self, file: crate::text_file::TextFile) -> bool {
+        if self.is_dirty() || file.text == self.saved_text {
             return false;
         }
-        let Some(file) = self.changed_on_disk() else {
-            return false;
-        };
         self.editor.set_text(file.text.clone());
         self.saved_text = file.text;
         self.encoding = file.encoding;

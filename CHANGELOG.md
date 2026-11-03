@@ -489,6 +489,9 @@ All notable changes to Pythia are documented here. The format follows
   CURRENT_TIMESTAMP` and a spatial column's SRID (#483).
 - The result grid's filter finds what the cells show: NULLs by the text
   the grid writes for them, binary values with their `0x` (#478).
+- Pythia starts while a window's file is on a share that doesn't answer:
+  the windows' files are checked for changes on a thread of their own,
+  after the window is up (#479).
 
 ## [0.11.0] - 2026-11-02
 
