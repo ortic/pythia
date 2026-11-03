@@ -479,6 +479,9 @@ All notable changes to Pythia are documented here. The format follows
 - Generate INSERT leaves out identity columns that take no value
   (Oracle's and PostgreSQL's ALWAYS, SQL Server's), and Generate UPDATE
   keeps a generated key for its WHERE (#490).
+- Oracle 23ai: a VECTOR column keeps its dimensions and format in table
+  copies, Schema Compare and the Columns tab, which read it as `VECTOR`
+  (#486).
 
 ## [0.11.0] - 2026-11-02
 

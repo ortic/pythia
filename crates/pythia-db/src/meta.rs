@@ -580,6 +580,15 @@ fn columns(
     } else {
         "cast(null as number)"
     };
+    // A vector's dimensions and format (23ai), as the table model reads
+    // them (#486).
+    let vector = if crate::compat::at_least(conn, 23, 0)? {
+        "(select replace(replace(x.vector_info, ',DENSE', ''), ',', ', ') from all_tab_cols x \
+           where x.owner = c.owner and x.table_name = c.table_name \
+             and x.column_name = c.column_name)"
+    } else {
+        "c.data_type"
+    };
     // An identity column's default is its sequence's NEXTVAL: how it is
     // generated says more (#485). Identity columns came with 12.1.
     let identity = if crate::compat::at_least(conn, 12, 1)? {
@@ -602,6 +611,7 @@ fn columns(
                   when c.data_type = 'NUMBER' and c.data_precision is not null then \
                     'NUMBER(' || c.data_precision || nvl2(nullif(c.data_scale, 0), ',' || c.data_scale, '') || ')' \
                   when c.data_type = 'NUMBER' and c.data_scale = 0 then 'INTEGER' \
+                  when c.data_type = 'VECTOR' then {vector} \
                   else c.data_type end, \
                 c.nullable, c.data_default, cc.comments, {pk}, \
                 (select x.virtual_column from all_tab_cols x where x.owner = c.owner \

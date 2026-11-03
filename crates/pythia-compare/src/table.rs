@@ -837,6 +837,13 @@ pub fn load(
 
     // Identity columns, invisible ones and DEFAULT ON NULL came with 12.1.
     let twelve = pythia_db::compat::at_least(conn, 12, 1)?;
+    // A vector's dimensions and format (23ai), `VECTOR(3,FLOAT32,DENSE)`,
+    // DENSE as a vector is unless said (#486).
+    let vector = if pythia_db::compat::at_least(conn, 23, 0)? {
+        "replace(replace(c.vector_info, ',DENSE', ''), ',', ', ')"
+    } else {
+        "c.data_type"
+    };
     let (identity, on_null, always) = if twelve {
         ("c.identity_column", "c.default_on_null", "")
     } else {
@@ -861,6 +868,7 @@ pub fn load(
                     'NUMBER(' || c.data_precision || nvl2(nullif(c.data_scale, 0), ',' || c.data_scale, '') || ')' \
                   when c.data_type = 'NUMBER' and c.data_scale = 0 then 'NUMBER(*,0)' \
                   when c.data_type = 'FLOAT' then 'FLOAT(' || c.data_precision || ')' \
+                  when c.data_type = 'VECTOR' then {vector} \
                   else c.data_type end, \
                 c.nullable, c.data_default, cc.comments, {identity}, c.virtual_column, \
                 c.hidden_column, {on_null}, {always} \
