@@ -790,12 +790,62 @@ pub fn sql_literal_replacing(col: &Column, value: &str, name: &str, held: &str) 
 /// parts slowly: INSERT statements append them in a PL/SQL block instead
 /// (see `oracle_block`).
 fn text_value(col: &Column, v: &str) -> String {
+    if national(col) && !v.is_ascii() {
+        return national_literal(col, v);
+    }
     if !long_text(col, v) {
         return text_literal(v);
     }
     text_parts(v)
         .into_iter()
         .map(|part| format!("to_clob({})", text_literal(part)))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// NCHAR, NVARCHAR2 and NCLOB columns: text in the national character
+/// set. A `'…'` literal, and an `N'…'` one, is in the database's, which
+/// loses what it doesn't have (#480): `€` is `?` in WE8ISO8859P1.
+fn national(col: &Column) -> bool {
+    let t = col.type_name.to_ascii_uppercase();
+    t.starts_with("NCHAR") || t.starts_with("NVARCHAR2") || t == "NCLOB"
+}
+
+/// National text past ASCII as `unistr('…')` of ASCII only: each other
+/// character as its UTF-16 code units, `\20AC`, a `&` too (see
+/// [`apart_from_ampersands`]), a `\` doubled. In parts of at most 4000
+/// bytes (ORA-01704); an NCLOB's of several, each an NCLOB (#317).
+fn national_literal(col: &Column, v: &str) -> String {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    for c in v.chars() {
+        let escaped = match c {
+            '\\' => "\\\\".to_owned(),
+            '\'' => "''".to_owned(),
+            '&' => "\\0026".to_owned(),
+            c if c.is_ascii() => c.to_string(),
+            c => c
+                .encode_utf16(&mut [0; 2])
+                .iter()
+                .map(|unit| format!("\\{unit:04X}"))
+                .collect(),
+        };
+        if part.len() + escaped.len() > TEXT_LITERAL_BYTES {
+            parts.push(std::mem::take(&mut part));
+        }
+        part.push_str(&escaped);
+    }
+    parts.push(part);
+    let clob = col.type_name.eq_ignore_ascii_case("NCLOB") && parts.len() > 1;
+    parts
+        .iter()
+        .map(|part| {
+            if clob {
+                format!("to_nclob(unistr('{part}'))")
+            } else {
+                format!("unistr('{part}')")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" || ")
 }
@@ -1766,6 +1816,36 @@ mod tests {
     /// bytes on every database (#256), as on SQL Server; a text column
     /// keeps it as text. An odd number of digits reads as MySQL's `0x…`
     /// does, with a 0 in front.
+    /// Oracle's national text past ASCII is `unistr('…')` of ASCII only,
+    /// which no database character set changes (#480); ASCII stays `'…'`.
+    #[test]
+    fn national_text_as_unistr() {
+        let col = |t: &str| Column {
+            name: "N".into(),
+            type_name: t.into(),
+            numeric: false,
+        };
+        let ora = |t: &str, v: &str| sql_literal(&col(t), Some(v));
+        assert_eq!(
+            ora("NVARCHAR2(20)", "€ 10 – 日本"),
+            r"unistr('\20AC 10 \2013 \65E5\672C')"
+        );
+        assert_eq!(
+            ora("NCHAR(4)", r"ü\'&😀"),
+            r"unistr('\00FC\\''\0026\D83D\DE00')"
+        );
+        assert_eq!(
+            ora("NVARCHAR2(20)", "plain & 'ASCII'"),
+            "'plain ' || chr(38) || ' ''ASCII'''"
+        );
+        assert_eq!(ora("VARCHAR2(20)", "€"), "'€'");
+        let long = ora("NVARCHAR2(2000)", &"€".repeat(1000));
+        assert_eq!(long.matches("unistr('").count(), 2, "{long}");
+        let clob = ora("NCLOB", &"€".repeat(1000));
+        assert!(clob.starts_with(r"to_nclob(unistr('\20AC"), "{clob}");
+        assert_eq!(clob.matches(" || ").count(), 1);
+    }
+
     /// Rows written after the columns are typed again take their new
     /// types: a SQLite column of text with blobs later (#482).
     #[test]

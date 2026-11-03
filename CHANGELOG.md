@@ -509,6 +509,10 @@ All notable changes to Pythia are documented here. The format follows
   on a read-only connection (`?ro`), which compares them without case;
   read-write, the error says whose the collation is and how to read
   them (#476).
+- Oracle: NVARCHAR2, NCHAR and NCLOB values past ASCII are written as
+  `unistr('…')`, by Edit and INSERT exports: as `'…'` literals they went
+  through the database character set first, which one that isn't
+  Unicode stored `€ 10 – 日本` as `? 10 ? ??` (#480).
 
 ## [0.11.0] - 2026-11-02
 

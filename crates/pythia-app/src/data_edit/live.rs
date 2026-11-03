@@ -2178,3 +2178,80 @@ fn oracle_json_extended_scalars() {
     );
     conn.execute("drop table r84_json purge", &[]).unwrap();
 }
+
+/// NVARCHAR2 and NCHAR values past ASCII go in as `unistr('…')`, which a
+/// database character set that isn't Unicode doesn't change (#480): as
+/// `'…'`, `€ 10 – 日本` was stored `? 10 ? ??` there. Changed twice, the
+/// second change finds its row by the first's value; a long one comes in
+/// parts.
+#[test]
+fn oracle_national_text_past_ascii() {
+    let Some(conn) = crate::test_db::connect("PYTHIA_TEST_DB") else {
+        return;
+    };
+    let _ = conn.execute("drop table r101_national purge", &[]);
+    for sql in [
+        "create table r101_national (id number primary key, n nvarchar2(2000), c nchar(6))",
+        "insert into r101_national values (1, 'x', 'x')",
+        "commit",
+    ] {
+        conn.execute(sql, &[]).unwrap();
+    }
+    let fetch = |sql: &str| {
+        let mut fetched = (Vec::new(), Vec::new());
+        pythia_db::stream_query(&conn, sql, 100, |columns, rows| {
+            fetched.0 = columns.to_vec();
+            fetched.1.extend_from_slice(rows);
+            Ok(())
+        })
+        .unwrap();
+        fetched
+    };
+    let edit = Editable {
+        table: "r101_national".into(),
+        source: "select id, n, c from r101_national order by id".into(),
+        key: RowKey::Rowid,
+        instants: Vec::new(),
+    };
+    let mut db = Live::connect("PYTHIA_TEST_DB", DbKind::Oracle).expect("PYTHIA_TEST_DB");
+    let long = "€".repeat(1000);
+    for (n, c) in [
+        ("€ 10 – 日本 😀 \\ & '", "ü€&'\\x"),
+        ("ŝ 2 – 中文", "ŝŝŝŝŝŝ"),
+    ] {
+        let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+        let changes = Changes {
+            updates: BTreeMap::from([(
+                0,
+                BTreeMap::from([(1, Some(n.to_owned())), (2, Some(c.to_owned()))]),
+            )]),
+            ..Changes::default()
+        };
+        for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+            assert!(statement.sql.contains("unistr('"), "{}", statement.sql);
+            let ran = db.apply(&statement);
+            assert!(
+                matches!(ran, Ok(Ran::Done(Some(1)))),
+                "{ran:?}\n{}",
+                statement.sql
+            );
+        }
+        let (_, rows) = fetch("select n, c from r101_national where id = 1");
+        assert_eq!(rows, [[Some(n.to_owned()), Some(c.to_owned())]]);
+    }
+    let (columns, rows) = fetch(&edit_query(Dialect::ORACLE, &edit).unwrap());
+    let mut new = vec![None; columns.len()];
+    new[0] = Some("2".to_owned());
+    new[1] = Some(long.clone());
+    let changes = Changes {
+        inserts: vec![new],
+        ..Changes::default()
+    };
+    for statement in dml(Dialect::ORACLE, &edit, &columns, &rows, &changes) {
+        let ran = db.apply(&statement);
+        assert!(matches!(ran, Ok(Ran::Done(Some(1)))), "{ran:?}");
+    }
+    let (_, rows) = fetch("select n from r101_national where id = 2");
+    assert_eq!(rows, [[Some(long)]]);
+    conn.execute("drop table r101_national purge", &[]).unwrap();
+}
