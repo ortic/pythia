@@ -7,6 +7,11 @@ All notable changes to Pythia are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- Windows: Pythia draws through DirectX 12 before Vulkan (#491). wgpu
+  took Vulkan wherever the driver has it, and with Intel's Vulkan driver
+  the whole window flickered now and then as the mouse moved over it.
+  Vulkan and OpenGL remain the fallbacks, `WGPU_BACKEND=vulkan` still
+  chooses Vulkan, and the log names the adapter Pythia draws with.
 - SQL Server: `money` and `smallmoney` show every digit (#186): read as
   a double, 922337203685477.5807 showed as 922337203685477.6, and an
   edit of such a value found no row. They show with their four decimals,

@@ -97,18 +97,40 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|p| shared::Workspace::claim(&p.data_dir));
     let kept = workspace.as_ref().map(|w| w.path.clone());
+    // Set when the adapter chosen is DirectX 12's (#491).
+    let dx12 = Arc::new(AtomicBool::new(false));
     let result = run(
         eframe::Renderer::Wgpu,
+        wgpu_options(true, &dx12),
         paths.clone(),
         kept.clone(),
         &started,
     )
     .or_else(|e| {
+        if started.load(Ordering::SeqCst) || !dx12.load(Ordering::SeqCst) {
+            return Err(e);
+        }
+        warn!("DirectX 12 failed ({e}), trying the other wgpu backends");
+        run(
+            eframe::Renderer::Wgpu,
+            wgpu_options(false, &dx12),
+            paths.clone(),
+            kept.clone(),
+            &started,
+        )
+    })
+    .or_else(|e| {
         if started.load(Ordering::SeqCst) {
             return Err(e);
         }
         warn!("wgpu renderer failed ({e}), falling back to OpenGL");
-        run(eframe::Renderer::Glow, paths.clone(), kept, &started)
+        run(
+            eframe::Renderer::Glow,
+            Default::default(),
+            paths.clone(),
+            kept,
+            &started,
+        )
     });
     drop(workspace);
     if let Err(e) = &result {
@@ -166,6 +188,7 @@ fn attach_parent_console() {
 /// works and the app exists.
 fn run(
     renderer: eframe::Renderer,
+    wgpu_options: eframe::WgpuConfiguration,
     paths: Option<Paths>,
     workspace: Option<std::path::PathBuf>,
     started: &Arc<AtomicBool>,
@@ -173,6 +196,7 @@ fn run(
     let started = started.clone();
     let options = eframe::NativeOptions {
         renderer,
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_title("Pythia")
             .with_app_id("pythia")
@@ -191,6 +215,74 @@ fn run(
             Ok(Box::new(app::PythiaApp::new(cc, paths)))
         }),
     )
+}
+
+/// wgpu's defaults, but Pythia chooses the adapter: with `dx12`, a DirectX
+/// 12 one first, else none of DirectX 12. Sets `chose_dx12` when it's
+/// DirectX 12's.
+fn wgpu_options(dx12: bool, chose_dx12: &Arc<AtomicBool>) -> eframe::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew, adapter_info_summary, wgpu};
+    let chose_dx12 = chose_dx12.clone();
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
+        let usable: Vec<&wgpu::Adapter> = adapters
+            .iter()
+            .filter(|a| dx12 || a.get_info().backend != wgpu::Backend::Dx12)
+            .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+            .collect();
+        let infos: Vec<wgpu::AdapterInfo> = usable.iter().map(|a| a.get_info()).collect();
+        let preference =
+            wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance);
+        let kinds: Vec<_> = infos.iter().map(|a| (a.backend, a.device_type)).collect();
+        let Some(chosen) = choose_adapter(&kinds, preference) else {
+            return Err(format!(
+                "none of the {} wgpu adapters can draw the window",
+                adapters.len()
+            ));
+        };
+        let all = adapters
+            .iter()
+            .map(|a| format!("{{{}}}", adapter_info_summary(&a.get_info())))
+            .collect::<Vec<_>>();
+        info!("wgpu adapters: {}", all.join(", "));
+        info!("drawing with {}", adapter_info_summary(&infos[chosen]));
+        chose_dx12.store(
+            infos[chosen].backend == wgpu::Backend::Dx12,
+            Ordering::SeqCst,
+        );
+        Ok(usable[chosen].clone())
+    }));
+    eframe::WgpuConfiguration {
+        wgpu_setup: WgpuSetup::CreateNew(setup),
+        ..Default::default()
+    }
+}
+
+/// The adapter to draw with, as wgpu orders them: the kind of GPU
+/// `preference` (`WGPU_POWER_PREF`) puts first, by default a discrete one,
+/// the software rasterizer last. Of the same kind, DirectX 12 goes first,
+/// Windows' own: wgpu takes Vulkan, and with Intel's Vulkan driver the
+/// window flickered (#491).
+fn choose_adapter(
+    adapters: &[(eframe::wgpu::Backend, eframe::wgpu::DeviceType)],
+    preference: eframe::wgpu::PowerPreference,
+) -> Option<usize> {
+    use eframe::wgpu::{Backend, DeviceType, PowerPreference};
+    let kind = |device: DeviceType| match (device, preference) {
+        (_, PowerPreference::None) => 0,
+        (DeviceType::DiscreteGpu, PowerPreference::HighPerformance) => 1,
+        (DeviceType::IntegratedGpu, PowerPreference::HighPerformance) => 2,
+        (DeviceType::IntegratedGpu, PowerPreference::LowPower) => 1,
+        (DeviceType::DiscreteGpu, PowerPreference::LowPower) => 2,
+        (DeviceType::Other, _) => 3,
+        (DeviceType::VirtualGpu, _) => 4,
+        (DeviceType::Cpu, _) => 5,
+    };
+    adapters
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (backend, device))| (kind(*device), *backend != Backend::Dx12))
+        .map(|(i, _)| i)
 }
 
 /// Under WSLg the window opens through X11 (Xwayland). WSLg's compositor,
@@ -279,6 +371,63 @@ fn install_panic_hook(paths: Option<&Paths>) {
         }
         default_hook(panic);
     }));
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::choose_adapter;
+    use eframe::wgpu::{Backend, DeviceType, PowerPreference};
+
+    /// As wgpu lists them on Windows: Vulkan before DirectX 12 (#491).
+    const INTEL: [(Backend, DeviceType); 4] = [
+        (Backend::Vulkan, DeviceType::IntegratedGpu),
+        (Backend::Dx12, DeviceType::IntegratedGpu),
+        (Backend::Dx12, DeviceType::Cpu),
+        (Backend::Gl, DeviceType::IntegratedGpu),
+    ];
+
+    #[test]
+    fn directx_12_before_vulkan_of_the_same_gpu() {
+        assert_eq!(
+            choose_adapter(&INTEL, PowerPreference::HighPerformance),
+            Some(1)
+        );
+        assert_eq!(choose_adapter(&INTEL, PowerPreference::None), Some(1));
+        // The software rasterizer only when there's nothing else.
+        assert_eq!(
+            choose_adapter(&INTEL[2..3], PowerPreference::HighPerformance),
+            Some(0)
+        );
+        assert_eq!(choose_adapter(&[], PowerPreference::HighPerformance), None);
+    }
+
+    #[test]
+    fn the_kind_of_gpu_goes_before_the_backend() {
+        let laptop = [
+            (Backend::Vulkan, DeviceType::IntegratedGpu),
+            (Backend::Vulkan, DeviceType::DiscreteGpu),
+            (Backend::Dx12, DeviceType::IntegratedGpu),
+            (Backend::Dx12, DeviceType::DiscreteGpu),
+        ];
+        assert_eq!(
+            choose_adapter(&laptop, PowerPreference::HighPerformance),
+            Some(3)
+        );
+        assert_eq!(choose_adapter(&laptop, PowerPreference::LowPower), Some(2));
+        // Without DirectX 12 (Linux, or the second try): wgpu's order.
+        assert_eq!(
+            choose_adapter(&laptop[..2], PowerPreference::HighPerformance),
+            Some(1)
+        );
+        let linux = [
+            (Backend::Vulkan, DeviceType::IntegratedGpu),
+            (Backend::Gl, DeviceType::IntegratedGpu),
+        ];
+        assert_eq!(
+            choose_adapter(&linux, PowerPreference::HighPerformance),
+            Some(0)
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
